@@ -1,0 +1,31 @@
+[package]
+name = "doom-sbf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+# This is intentionally a standalone program.  In particular, it must not be
+# adopted by the root workspace or inherit chain/program's deploy profile.
+[workspace]
+
+[lib]
+name = "doom_sbf"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "=2.3.0"
+# These constraints keep the SBF build on the graph supported by platform-tools
+# v1.51 (Cargo 1.84).
+indexmap = "=2.13.0"
+blake3 = "=1.8.2"
+proc-macro-crate = "=3.3.0"
+zeroize = "=1.8.1"
+
+[build-dependencies]
+cc = "=1.2.58"
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1
