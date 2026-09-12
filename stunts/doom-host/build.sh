@@ -16,9 +16,11 @@ git -C "$src" fetch --quiet origin a77dfb96cb91780ca334d0d4cfd86957558007e0
 git -C "$src" checkout --detach --force a77dfb96cb91780ca334d0d4cfd86957558007e0
 # The patch creates this host-only directory; remove only that prior generated
 # path so repeat builds apply the exact same patch to the pinned checkout.
-git -C "$src" clean -fdx -- linuxdoom-1.10/headless
-git -C "$src" apply --check "$root/stunts/doom-host/patches/0001-headless-lp64.patch"
-git -C "$src" apply "$root/stunts/doom-host/patches/0001-headless-lp64.patch"
+git -C "$src" clean -fdx -- linuxdoom-1.10/headless linuxdoom-1.10/doom_wrap.h
+for patch in "$root"/stunts/doom-host/patches/*.patch; do
+  git -C "$src" apply --check "$patch"
+  git -C "$src" apply "$patch"
+done
 
 mkdir -p "$wad_dir"
 if [ ! -f "$wad" ]; then
