@@ -1,0 +1,169 @@
+diff --git a/linuxdoom-1.10/headless/Makefile b/linuxdoom-1.10/headless/Makefile
+index 690a863..7a4b0f1 100644
+--- a/linuxdoom-1.10/headless/Makefile
++++ b/linuxdoom-1.10/headless/Makefile
+@@ -8,7 +8,7 @@ LDLIBS ?= -lm
+ 
+ OUT ?= ../doom-headless
+-OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_state.o doom_account.o doom_stubs.o
++OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_state.o doom_account.o doom_render.o doom_stubs.o
+ SOURCES = \
+  ../doomdef.c ../doomstat.c ../dstrings.c ../d_items.c ../g_game.c \
+  ../m_argv.c ../m_bbox.c ../m_fixed.c ../m_random.c ../m_swap.c \
+  ../tables.c ../info.c ../z_zone.c ../w_wad.c ../v_video.c \
+@@ -37,5 +37,8 @@ doom_account.o: doom_account.c doom_account.h doom_state.h
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu99 -c $< -o $@
+ 
++doom_render.o: doom_render.c doom_render.h doom_account.h doom_state.h
++	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu99 -c $< -o $@
++
+ doom_stubs.o: doom_stubs.c
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+ 
+diff --git a/linuxdoom-1.10/headless/doom_render.h b/linuxdoom-1.10/headless/doom_render.h
+new file mode 100644
+index 0000000..8aebc43
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_render.h
+@@ -0,0 +1,19 @@
++#ifndef DOOM_RENDER_H
++#define DOOM_RENDER_H
++#include <stddef.h>
++#include <stdint.h>
++#include "doom_account.h"
++#define DOOM_RENDER_STRIPS 8
++#define DOOM_RENDER_STRIP_WIDTH 40
++#define DOOM_RENDER_FRAME_BYTES (320 * 200)
++#define DOOM_RENDER_STRIP_PIXELS (DOOM_RENDER_STRIP_WIDTH * 200)
++#define DOOM_RENDER_STRIP_ACCOUNT_BYTES 8192
++#define DOOM_RENDER_STRIP_HEADER_BYTES 64
++#define DOOM_RENDER_SCRATCH_BYTES 131072
++#define DOOM_RENDER_SCRATCH_HEADER_BYTES 128
++#define DOOM_RENDER_SEED_OFFSET DOOM_RENDER_SCRATCH_HEADER_BYTES
++#define DOOM_RENDER_FRAME_OFFSET (DOOM_RENDER_SCRATCH_HEADER_BYTES + DOOM_RENDER_FRAME_BYTES)
++enum doom_render_refusal { DOOM_RENDER_OK=0, DOOM_RENDER_REFUSE_STRIP=1, DOOM_RENDER_REFUSE_SCRATCH=2, DOOM_RENDER_REFUSE_STATE=3, DOOM_RENDER_REFUSE_WAD=4 };
++typedef struct { uint64_t host_ticks; uint64_t wall_ns; unsigned drawsegs; unsigned vissprites; unsigned fuzz_columns; } doom_render_metrics_t;
++void DoomRenderScratchInit(uint8_t *, size_t, const doom_account_t *);
++int DoomRenderStrip(unsigned, const uint8_t *, size_t, const doom_account_t *, uint8_t *, size_t, uint8_t[DOOM_RENDER_STRIP_ACCOUNT_BYTES], doom_render_metrics_t *, uint32_t);
++extern unsigned doom_render_fuzz_columns;
++#endif
+diff --git a/linuxdoom-1.10/headless/doom_render.c b/linuxdoom-1.10/headless/doom_render.c
+new file mode 100644
+index 0000000..45fcb34
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_render.c
+@@ -0,0 +1,40 @@
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/wait.h>
++#ifdef __APPLE__
++#include <mach/mach_time.h>
++#endif
++#ifdef false
++#undef false
++#undef true
++#endif
++#include "doom_render.h"
++#include "doom_state.h"
++#include "doomdef.h"
++#include "doomstat.h"
++#include "r_local.h"
++#include "r_main.h"
++#include "r_things.h"
++#define close doom_p_spec_close
++#include "p_local.h"
++#undef close
++#include "z_zone.h"
++#include "v_video.h"
++extern void R_ExecuteSetViewSize(void);
++extern void R_RenderPlayerView(player_t *);
++extern int fuzzpos, prndindex, skytexture, framecount;
++unsigned doom_render_fuzz_columns;
++static uint64_t ht(void) {
++#ifdef __APPLE__
++    return mach_absolute_time();
++#else
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
++#endif
++}
++static uint64_t ns(uint64_t t) {
++#ifdef __APPLE__
++    static mach_timebase_info_data_t tb; if(!tb.denom)mach_timebase_info(&tb); return t*(uint64_t)tb.numer/(uint64_t)tb.denom;
++#else
++    return t;
++#endif
++}
++static uint32_t g32(const uint8_t*p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
++static void p32(uint8_t*p,uint32_t x){p[0]=(uint8_t)x;p[1]=(uint8_t)(x>>8);p[2]=(uint8_t)(x>>16);p[3]=(uint8_t)(x>>24);}
++static uint32_t stamp(const uint8_t*p,size_t n){uint32_t h=2166136261u;while(n--)h=(h^*p++)*16777619u;return h;}
++static void release_thinkers(void){thinker_t*t=thinkercap.next,*n;if(!t)return;while(t!=&thinkercap){n=t->next;Z_Free(t);t=n;}P_InitThinkers();}
++void DoomRenderScratchInit(uint8_t*s,size_t n,const doom_account_t*a){if(!s||n<DOOM_RENDER_SCRATCH_BYTES)return;memset(s,0,n);memcpy(s,"DOOM-RS1",8);p32(s+8,1);p32(s+12,DOOM_RENDER_SCRATCH_HEADER_BYTES);p32(s+16,DOOM_RENDER_SCRATCH_BYTES);p32(s+48,0xffffffffu);if(a)memcpy(s+20,DoomAccountWadHash(a),32);}
++static int DoomRenderStripLocal(unsigned id,const uint8_t*image,size_t bytes,const doom_account_t*a,uint8_t*s,size_t n,uint8_t out[DOOM_RENDER_STRIP_ACCOUNT_BYTES],doom_render_metrics_t*m,uint32_t expected){byte*old[5],*frame;uint64_t b,e;unsigned x,y;uint32_t z;if(id>=8)return DOOM_RENDER_REFUSE_STRIP;if(!s||n<DOOM_RENDER_SCRATCH_BYTES||!out)return DOOM_RENDER_REFUSE_SCRATCH;if(!a||!DoomAccountWadHash(a))return DOOM_RENDER_REFUSE_WAD;if(!image||bytes<24||memcmp(image,"DOOM-ST1",8)||g32(image+8)!=0||g32(image+20)!=expected)return DOOM_RENDER_REFUSE_STATE;z=stamp(image,bytes);if(g32(s+48)!=z){p32(s+72,(uint32_t)fuzzpos);p32(s+76,(uint32_t)validcount);p32(s+80,(uint32_t)rndindex);p32(s+84,(uint32_t)prndindex);p32(s+88,(uint32_t)skytexture);p32(s+92,(uint32_t)framecount);release_thinkers();if(DoomStateDecode(image,bytes))return DOOM_RENDER_REFUSE_STATE;p32(s+48,z);p32(s+52,(uint32_t)fuzzpos);p32(s+56,(uint32_t)validcount);p32(s+60,(uint32_t)rndindex);p32(s+64,(uint32_t)prndindex);p32(s+68,(uint32_t)skytexture);}fuzzpos=(int)g32(s+52);validcount=(int)g32(s+56);rndindex=(int)g32(s+60);prndindex=(int)g32(s+64);skytexture=(int)g32(s+68);validcount=(int)(0x40000000u+id*2u);frame=s+DOOM_RENDER_FRAME_OFFSET;memcpy(old,screens,sizeof(old));memcpy(frame,s+DOOM_RENDER_SEED_OFFSET,DOOM_RENDER_FRAME_BYTES);screens[0]=screens[1]=screens[2]=screens[3]=screens[4]=frame;R_ExecuteSetViewSize();doom_render_fuzz_columns=0;b=ht();R_RenderPlayerView(&players[displayplayer]);e=ht();memset(out,0,DOOM_RENDER_STRIP_ACCOUNT_BYTES);memcpy(out,"DOOM-STRIP1",8);p32(out+8,1);p32(out+12,64);p32(out+16,8192);p32(out+20,id);p32(out+24,expected);memcpy(out+28,DoomAccountWadHash(a),32);for(x=0;x<40;x++)for(y=0;y<200;y++)out[64+x*200+y]=frame[y*320+id*40+x];if(m){m->host_ticks=e-b;m->wall_ns=ns(e)-ns(b);m->drawsegs=(unsigned)(ds_p-drawsegs);m->vissprites=(unsigned)(vissprite_p-vissprites);m->fuzz_columns=doom_render_fuzz_columns;}memcpy(screens,old,sizeof(old));R_ExecuteSetViewSize();fuzzpos=(int)g32(s+72);validcount=(int)g32(s+76);rndindex=(int)g32(s+80);prndindex=(int)g32(s+84);skytexture=(int)g32(s+88);framecount=(int)g32(s+92);return DOOM_RENDER_OK;}
++typedef struct { int rc; uint8_t out[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t metrics; } render_ipc_t;
++static int io_write(int fd,const void*p,size_t n){const uint8_t*b=p;ssize_t k;while(n){k=write(fd,b,n);if(k<=0)return -1;b+=k;n-=(size_t)k;}return 0;}
++static int io_read(int fd,void*p,size_t n){uint8_t*b=p;ssize_t k;while(n){k=read(fd,b,n);if(k<=0)return -1;b+=k;n-=(size_t)k;}return 0;}
++int DoomRenderStrip(unsigned id,const uint8_t*image,size_t bytes,const doom_account_t*a,uint8_t*s,size_t n,uint8_t out[DOOM_RENDER_STRIP_ACCOUNT_BYTES],doom_render_metrics_t*m,uint32_t expected){int f[2],status;pid_t pid;render_ipc_t p;if(id>=8)return DOOM_RENDER_REFUSE_STRIP;if(!s||n<DOOM_RENDER_SCRATCH_BYTES||!out)return DOOM_RENDER_REFUSE_SCRATCH;memcpy(s+DOOM_RENDER_SEED_OFFSET,screens[0],DOOM_RENDER_FRAME_BYTES);if(pipe(f)<0)return DOOM_RENDER_REFUSE_SCRATCH;pid=fork();if(pid<0){close(f[0]);close(f[1]);return DOOM_RENDER_REFUSE_SCRATCH;}if(pid==0){memset(&p,0,sizeof(p));p.rc=DoomRenderStripLocal(id,image,bytes,a,s,n,p.out,&p.metrics,expected);close(f[0]);io_write(f[1],&p,sizeof(p));close(f[1]);_exit(0);}close(f[1]);if(io_read(f[0],&p,sizeof(p))<0){close(f[0]);waitpid(pid,&status,0);return DOOM_RENDER_REFUSE_SCRATCH;}close(f[0]);waitpid(pid,&status,0);if(!WIFEXITED(status)||WEXITSTATUS(status)!=0)return DOOM_RENDER_REFUSE_SCRATCH;memcpy(out,p.out,sizeof(p.out));if(m)*m=p.metrics;return p.rc;}
+diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
+index f3c36d1..d9c7d1a 100644
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -24,6 +24,8 @@
+ //-----------------------------------------------------------------------------
+ 
+ 
++#include "headless/doom_render.h"
++
+ #include <stdint.h>
+ 
+ static const char
+@@ -312,5 +314,6 @@ void R_DrawFuzzColumn (void)
+ 	*dest = colormaps[6*256+dest[fuzzoffset[fuzzpos]]]; 
+ 
+ 	// Clamp table lookup index.
++	doom_render_fuzz_columns++;
+ 	if (++fuzzpos == FUZZTABLE) 
+ 	    fuzzpos = 0;
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+index e0da8fb..2ed4801 100644
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -26,0 +27 @@
++#include "doom_render.h"
+@@ -75,1 +76,1 @@
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N]\n",argv0); }
+@@ -78,4 +78,6 @@ int main(int argc, char **argv) {
+-int main(int argc, char **argv) {
++int main(int argc, char **argv) {
+-  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *states=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1; FILE *out, *stateout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0;
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *states=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics");
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000; FILE *out, *stateout=0, *parityout=0, *probeout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS];
+-  if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
++  if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
++  if(max_tics_arg){char *end=0;long v=strtol(max_tics_arg,&end,10);if(!end||*end||v<1||v>1000000){fprintf(stderr,"bad --max-tics\n");return 2;}max_tics=(int)v;}
+@@ -95,4 +97,8 @@ int main(int argc, char **argv) {
+-  if(load&&DoomStateLoad(load)){fprintf(stderr,"cannot load DOOM-ST1 %s\n",load);return 2;}
+-  if(s0){if(DoomStateEncode(&state_image,&state_bytes)){fprintf(stderr,"cannot encode S0\n");return 2;}DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);out=fopen(s0,"w");if(!out){fprintf(stderr,"cannot open %s\n",s0);return 2;}fprintf(out,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);fclose(out);}
++  if(load&&DoomStateLoad(load)){fprintf(stderr,"cannot load DOOM-ST1 %s\n",load);return 2;}
++  if(s0){if(DoomStateEncode(&state_image,&state_bytes)){fprintf(stderr,"cannot encode S0\n");return 2;}DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);out=fopen(s0,"w");if(!out){fprintf(stderr,"cannot open %s\n",s0);return 2;}fprintf(out,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);fclose(out);}
+-  if(resave){if(DoomStateSave(resave)){fprintf(stderr,"cannot resave %s\n",resave);return 2;}return 0;}
+-  if(save_at==0){if(DoomStateSave(save)){fprintf(stderr,"cannot save %s\n",save);return 2;}return 0;}
++  if(resave){if(DoomStateSave(resave)){fprintf(stderr,"cannot resave %s\n",resave);return 2;}return 0;}
++  if(save_at==0){if(DoomStateSave(save)){fprintf(stderr,"cannot save %s\n",save);return 2;}return 0;}
++  if((parity_path||probe_path)&&!account){fprintf(stderr,"reentrant host tools require -account-manifest\n");return 2;}
++  if(parity_path){parityout=fopen(parity_path,"w");if(!parityout){fprintf(stderr,"cannot open parity output\n");return 2;}}
++  if(parity_path||probe_path){render_scratch=malloc(DOOM_RENDER_SCRATCH_BYTES);if(!render_scratch){fprintf(stderr,"cannot allocate render scratch\n");return 2;}DoomRenderScratchInit(render_scratch,DOOM_RENDER_SCRATCH_BYTES,account);}
++  if(probe_path){int refusal;uint8_t bad[64],probe[DOOM_RENDER_STRIP_ACCOUNT_BYTES],*p=0;size_t n=0;probeout=fopen(probe_path,"w");DoomStateEncode(&p,&n);memcpy(bad,p,n<sizeof(bad)?n:sizeof(bad));refusal=DoomRenderStrip(8,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"{\"strip_id_8\":%d,",refusal==DOOM_RENDER_REFUSE_STRIP);refusal=DoomRenderStrip(0,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES-1,probe,0,(uint32_t)gametic);fprintf(probeout,"\"short_scratch\":%d,",refusal==DOOM_RENDER_REFUSE_SCRATCH);bad[0]='X';refusal=DoomRenderStrip(0,bad,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"\"bad_state\":%d}\n",refusal==DOOM_RENDER_REFUSE_STATE);DoomStateFree(p);fclose(probeout);}
+@@ -100,6 +106,1 @@ int main(int argc, char **argv) {
+-  for(tic=0;!doom_headless_demo_done && tic<100000;tic++) { int strip_id,x,y;double started=now_ms(),render_started;
+-    G_Ticker(); if (doom_headless_demo_done) break; render_started=now_ms(); R_RenderPlayerView(&players[displayplayer]); render_ms+=now_ms()-render_started;
+-    for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*FB_HEIGHT+y]=screens[0][y*FB_WIDTH+strip_id*STRIP_WIDTH+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}
+-    hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);
+-    gametic++; if(stateout){if(DoomStateEncode(&state_image,&state_bytes)){fprintf(stderr,"cannot encode DOOM-ST1\n");return 1;}DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);} tic_ms+=now_ms()-started; rendered++; if(save_at==rendered){if(DoomStateSave(save)){fprintf(stderr,"cannot save %s\n",save);return 1;}break;}
+-  }
++  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs,tic_metrics[strip_id].vissprites,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
+@@ -106,1 +107,1 @@ int main(int argc, char **argv) {
+-  fclose(out); if(stateout)fclose(stateout); if(tic==100000){fprintf(stderr,"demo did not terminate\n");return 1;} fprintf(stderr,"doom-headless: tics=%d ms/tic=%.6f ms/render=%.6f\n",rendered,tic_ms/rendered,render_ms/rendered); return 0;
++  fclose(out);if(parityout)fclose(parityout);free(render_scratch);if(stateout)fclose(stateout);if(tic==100000){fprintf(stderr,"demo did not terminate\n");return 1;}fprintf(stderr,"doom-headless: tics=%d ms/tic=%.6f ms/render=%.6f\n",rendered,tic_ms/(rendered?rendered:1),render_ms/(rendered?rendered:1));return 0;
