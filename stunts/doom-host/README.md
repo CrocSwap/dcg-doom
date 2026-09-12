@@ -10,6 +10,21 @@ is the built-in shareware lump.  `--flip-forwardmove-tic 100` changes bit zero
 of the first command byte in the private cached demo buffer; it never writes
 the WAD.
 
+To exercise the account-backed loader, first build the five chunk accounts and
+manifest from the pinned WAD:
+
+```
+PYTHONPATH=. python3 stunts/doom-host/tools/doom_account_image.py build DOOM1.WAD \
+  --out-dir out/doom-account
+```
+
+Then pass `-account-manifest out/doom-account/manifest.json` instead of
+`-iwad`. The loader verifies ordered 1-MiB chunk accounts and reads WAD lumps
+from the checked concatenated image without file I/O. `--account-level-state`
+and `--account-mobj-pool` write the fixed 131,072-byte and 65,536-byte account
+images. `verify` checks the manifest/chunks; `dump-level-state` and
+`verify-level-state` extract or compare the embedded `DOOM-ST1` image.
+
 `-state-hashes FILE` adds one `DOOM-ST1` v0 state digest per rendered tic;
 `--s0 FILE` records the post-`load_level`, pre-first-tic state.  Use
 `--save-at T --save FILE`, then a fresh invocation with `--load FILE` to

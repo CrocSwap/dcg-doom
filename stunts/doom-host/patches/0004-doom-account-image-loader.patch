@@ -1,0 +1,506 @@
+diff --git a/linuxdoom-1.10/headless/Makefile b/linuxdoom-1.10/headless/Makefile
+index 5150383..690a863 100644
+--- a/linuxdoom-1.10/headless/Makefile
++++ b/linuxdoom-1.10/headless/Makefile
+@@ -8,7 +8,7 @@ LDFLAGS ?=
+ LDLIBS ?= -lm
+ 
+ OUT ?= ../doom-headless
+-OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_state.o doom_stubs.o
++OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_state.o doom_account.o doom_stubs.o
+ SOURCES = \
+  ../doomdef.c ../doomstat.c ../dstrings.c ../d_items.c ../g_game.c \
+  ../m_argv.c ../m_bbox.c ../m_fixed.c ../m_random.c ../m_swap.c \
+@@ -34,6 +34,9 @@ doom_headless.o: doom_headless.c
+ doom_state.o: doom_state.c doom_state.h
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+ 
++doom_account.o: doom_account.c doom_account.h doom_state.h
++	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu99 -c $< -o $@
++
+ doom_stubs.o: doom_stubs.c
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+ 
+diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/doom_account.c
+new file mode 100644
+index 0000000..04cbc03
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_account.c
+@@ -0,0 +1,283 @@
++/*
++ * Account-image loader.  Manifest files and chunk accounts are read once at
++ * process start.  W_* then sees one checked, immutable byte image and never
++ * opens or seeks a file.  The native Doom heap remains host-only setup
++ * scratch; persisted level and thinker bytes are explicit offset records.
++ */
++#include <ctype.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "doom_account.h"
++#include "doom_state.h"
++#include "doomdef.h"
++#include "doomstat.h"
++#include "g_game.h"
++#include "p_local.h"
++#include "p_mobj.h"
++#include "p_setup.h"
++#include "w_wad.h"
++
++#define PINNED_WAD "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771"
++#define MANIFEST_MAX 1048576
++#define LEVEL_IMAGE_CAP (DOOM_ACCOUNT_LEVEL_BYTES - DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET)
++
++typedef struct { uint32_t h[8]; uint64_t bits; uint8_t block[64]; size_t used; } sha256_t;
++static const uint32_t sha_k[64] = {
++  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,
++  0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,
++  0xa4506ceb,0xbef9a3f7,0xc67178f2
++};
++static uint32_t ar(uint32_t x,unsigned n){return (x>>n)|(x<<(32-n));}
++static void shb(sha256_t*s,const uint8_t*p){uint32_t w[64],a,b,c,d,e,f,g,h,t1,t2;int i;for(i=0;i<16;i++)w[i]=((uint32_t)p[4*i]<<24)|((uint32_t)p[4*i+1]<<16)|((uint32_t)p[4*i+2]<<8)|p[4*i+3];for(;i<64;i++){uint32_t x=w[i-15],y=w[i-2];w[i]=w[i-16]+(ar(x,7)^ar(x,18)^(x>>3))+w[i-7]+(ar(y,17)^ar(y,19)^(y>>10));}a=s->h[0];b=s->h[1];c=s->h[2];d=s->h[3];e=s->h[4];f=s->h[5];g=s->h[6];h=s->h[7];for(i=0;i<64;i++){uint32_t s1=ar(e,6)^ar(e,11)^ar(e,25),ch=(e&f)^((~e)&g),s0=ar(a,2)^ar(a,13)^ar(a,22),ma=(a&b)^(a&c)^(b&c);t1=h+s1+ch+sha_k[i]+w[i];t2=s0+ma;h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}s->h[0]+=a;s->h[1]+=b;s->h[2]+=c;s->h[3]+=d;s->h[4]+=e;s->h[5]+=f;s->h[6]+=g;s->h[7]+=h;}
++static void shi(sha256_t*s){static const uint32_t iv[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};memcpy(s->h,iv,sizeof(iv));s->bits=0;s->used=0;}
++static void shu(sha256_t*s,const void*p,size_t n){const uint8_t*q=p;s->bits+=(uint64_t)n*8;while(n){size_t x=64-s->used;if(x>n)x=n;memcpy(s->block+s->used,q,x);s->used+=x;q+=x;n-=x;if(s->used==64){shb(s,s->block);s->used=0;}}}
++static void shf(sha256_t*s,uint8_t out[32]){uint8_t l[8];int i;for(i=0;i<8;i++)l[7-i]=(uint8_t)(s->bits>>(i*8));s->block[s->used++]=128;if(s->used>56){while(s->used<64)s->block[s->used++]=0;shb(s,s->block);s->used=0;}while(s->used<56)s->block[s->used++]=0;memcpy(s->block+56,l,8);shb(s,s->block);for(i=0;i<8;i++){out[4*i]=(uint8_t)(s->h[i]>>24);out[4*i+1]=(uint8_t)(s->h[i]>>16);out[4*i+2]=(uint8_t)(s->h[i]>>8);out[4*i+3]=(uint8_t)s->h[i];}}
++static uint32_t at32(const uint8_t*p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
++static void put32(uint8_t*p,uint32_t x){p[0]=(uint8_t)x;p[1]=(uint8_t)(x>>8);p[2]=(uint8_t)(x>>16);p[3]=(uint8_t)(x>>24);}
++static int hexval(int c){if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;}
++static int hex32(const char*s,uint8_t out[32]){int i,a,b;for(i=0;i<32;i++){a=hexval((unsigned char)s[2*i]);b=hexval((unsigned char)s[2*i+1]);if(a<0||b<0)return -1;out[i]=(uint8_t)((a<<4)|b);}return s[64]==0?0:-1;}
++static int hash_bytes(const void*p,size_t n,uint8_t out[32]){sha256_t s;shi(&s);shu(&s,p,n);shf(&s,out);return 0;}
++static int hex_equal(const uint8_t a[32],const char*b){uint8_t x[32];return !hex32(b,x)&&!memcmp(a,x,32);}
++
++struct doom_account_s { uint8_t *wad; size_t wad_bytes; uint8_t wad_hash[32]; uint8_t palette_hash[32]; uint8_t level[DOOM_ACCOUNT_LEVEL_BYTES]; uint8_t pool[DOOM_ACCOUNT_POOL_BYTES]; int level_started; };
++
++static char *read_all(const char*path,size_t*size){FILE*f;long n;char*p;if(!(f=fopen(path,"rb")))return 0;if(fseek(f,0,SEEK_END)||((n=ftell(f))<0)||n>MANIFEST_MAX||fseek(f,0,SEEK_SET)){fclose(f);return 0;}p=malloc((size_t)n+1);if(!p){fclose(f);return 0;}if(fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return 0;}fclose(f);p[n]=0;*size=(size_t)n;return p;}
++static const char *jkey(const char*s,const char*k){char pat[80];const char*p;snprintf(pat,sizeof(pat),"\"%s\"",k);p=strstr(s,pat);if(!p)return 0;p=strchr(p+strlen(pat),':');return p?p+1:0;}
++static int ju32(const char*s,const char*k,uint32_t*out){const char*p=jkey(s,k);char*e;unsigned long n;if(!p)return -1;while(isspace((unsigned char)*p))p++;n=strtoul(p,&e,10);if(e==p||n>0xffffffffUL)return -1;*out=(uint32_t)n;return 0;}
++static int jstr(const char*s,const char*k,char*out,size_t cap){const char*p=jkey(s,k);size_t n=0;if(!p)return -1;while(isspace((unsigned char)*p))p++;if(*p++!='\"')return -1;while(*p&&*p!='\"'){if(*p=='\\')return -1;if(n+1>=cap)return -1;out[n++]=*p++;}if(*p!='\"')return -1;out[n]=0;return 0;}
++static int read_account(const char*path,uint8_t*out){FILE*f=fopen(path,"rb");int c;if(!f)return -1;if(fread(out,1,DOOM_ACCOUNT_WAD_ACCOUNT_BYTES,f)!=DOOM_ACCOUNT_WAD_ACCOUNT_BYTES){fclose(f);return -1;}c=fgetc(f);fclose(f);return c==EOF?0:-1;}
++static int padding_zero(const uint8_t*p,size_t n){size_t i;for(i=0;i<n;i++)if(p[i])return 0;return 1;}
++static int find_lump(const uint8_t*wad,size_t n,const char*name,uint32_t*pos,uint32_t*len){uint32_t count,dir,i;char lump[9];int j;if(n<12)return -1;count=at32(wad+4);dir=at32(wad+8);if(dir>n||count>(n-dir)/16)return -1;for(i=0;i<count;i++){const uint8_t*p=wad+dir+i*16;uint32_t x=at32(p),z=at32(p+4);if(x>n||z>n-x)return -1;memcpy(lump,p+8,8);lump[8]=0;for(j=0;j<8;j++)lump[j]=(char)toupper((unsigned char)lump[j]);if(!strncmp(lump,name,8)){*pos=x;*len=z;return 0;}}return -1;}
++static int path_join(const char*manifest,const char*part,char*out,size_t cap){const char*slash=strrchr(manifest,'/');size_t n;if(part[0]=='/'){if(strlen(part)+1>cap)return -1;strcpy(out,part);return 0;}n=slash?(size_t)(slash-manifest+1):0;if(n+strlen(part)+1>cap)return -1;if(n)memcpy(out,manifest,n);strcpy(out+n,part);return 0;}
++
++int DoomAccountOpenManifest(const char *manifest_path, doom_account_t **out)
++{
++    char *text, *format, *port, *root, *palette;
++    size_t text_bytes;
++    doom_account_t *a;
++    uint8_t account[DOOM_ACCOUNT_WAD_ACCOUNT_BYTES], digest[32], *wad;
++    uint32_t i, index, length, expected, total = 0, pos, plen;
++    char hex[65], part[512], full[1024];
++    const char *cursor;
++
++    if (!out)
++	return -1;
++    *out = 0;
++    text = read_all(manifest_path, &text_bytes);
++    if (!text)
++	return -1;
++    format = malloc(32);
++    port = malloc(64);
++    root = malloc(65);
++    palette = malloc(65);
++    if (!format || !port || !root || !palette)
++	goto fail_text;
++    if (jstr(text, "format", format, 32)
++	|| strcmp(format, "DOOM-WAD-MANIFEST1")
++	|| jstr(text, "port_version", port, 64)
++	|| strcmp(port, "doom-host-0004")
++	|| jstr(text, "wad_sha256", root, 65)
++	|| strcmp(root, PINNED_WAD)
++	|| ju32(text, "wad_bytes", &expected)
++	|| ju32(text, "chunk_count", &index)
++	|| index != DOOM_ACCOUNT_WAD_COUNT)
++	goto fail_text;
++
++    wad = malloc((size_t) DOOM_ACCOUNT_WAD_COUNT
++			 * DOOM_ACCOUNT_WAD_PAYLOAD_BYTES);
++    if (!wad)
++	goto fail_text;
++    cursor = strstr(text, "\"chunks\"");
++    if (!cursor)
++	goto fail_wad;
++    for (i = 0; i < DOOM_ACCOUNT_WAD_COUNT; i++)
++    {
++	const char *obj = strstr(cursor, "\"index\"");
++	if (!obj || ju32(obj, "index", &index) || index != i
++	    || jstr(obj, "path", part, sizeof(part))
++	    || ju32(obj, "length", &length)
++	    || length > DOOM_ACCOUNT_WAD_PAYLOAD_BYTES
++	    || jstr(obj, "sha256", hex, sizeof(hex))
++	    || path_join(manifest_path, part, full, sizeof(full))
++	    || read_account(full, account))
++	    goto fail_wad;
++	if (memcmp(account, "DOOM-WC1", 8)
++	    || at32(account + 8) != 1
++	    || at32(account + 12) != DOOM_ACCOUNT_WAD_HEADER_BYTES
++	    || at32(account + 16) != DOOM_ACCOUNT_WAD_ACCOUNT_BYTES
++	    || at32(account + 20) != i
++	    || at32(account + 24) != length
++	    || !padding_zero(account + DOOM_ACCOUNT_WAD_HEADER_BYTES + length,
++			 DOOM_ACCOUNT_WAD_ACCOUNT_BYTES - DOOM_ACCOUNT_WAD_HEADER_BYTES - length))
++	    goto fail_wad;
++	hash_bytes(account + DOOM_ACCOUNT_WAD_HEADER_BYTES, length, digest);
++	if (!hex_equal(digest, hex))
++	    goto fail_wad;
++	memcpy(wad + total, account + DOOM_ACCOUNT_WAD_HEADER_BYTES, length);
++	total += length;
++	cursor = obj + 7;
++    }
++    if (total != expected)
++	goto fail_wad;
++    hash_bytes(wad, total, digest);
++    if (!hex_equal(digest, root))
++	goto fail_wad;
++    if (jstr(text, "palette_sha256", palette, 65)
++	|| find_lump(wad, total, "PLAYPAL", &pos, &plen)
++	|| hash_bytes(wad + pos, plen, digest)
++	|| !hex_equal(digest, palette))
++	goto fail_wad;
++
++    a = calloc(1, sizeof(*a));
++    if (!a)
++	goto fail_wad;
++    a->wad = wad;
++    a->wad_bytes = total;
++    hex32(root, a->wad_hash);
++    memcpy(a->palette_hash, digest, 32);
++    W_InitAccountImage(a->wad, (int) a->wad_bytes);
++    free(text);
++    free(format);
++    free(port);
++    free(root);
++    free(palette);
++    *out = a;
++    return 0;
++
++fail_wad:
++    free(wad);
++fail_text:
++    free(text);
++    free(format);
++    free(port);
++    free(root);
++    free(palette);
++    return -1;
++}
++
++static void p32(uint8_t *p, uint32_t x) { put32(p, x); }
++static void p16(uint8_t *p, uint16_t x) { p[0] = (uint8_t) x; p[1] = (uint8_t) (x >> 8); }
++static uint32_t slot_of(mobj_t **m, unsigned n, mobj_t *o)
++{
++    unsigned i;
++    if (!o)
++	return 0;
++    for (i = 0; i < n; i++)
++	if (m[i] == o)
++	    return i + 1;
++    return 0;
++}
++static int fill_pool(doom_account_t *a)
++{
++    mobj_t *m[DOOM_ACCOUNT_POOL_SLOTS];
++    thinker_t *t;
++    unsigned n = 0, i;
++    uint8_t *s;
++    memset(a->pool, 0, sizeof(a->pool));
++    memcpy(a->pool, "DOOM-MP1", 8);
++    p32(a->pool + 8, 1);
++    p32(a->pool + 12, DOOM_ACCOUNT_POOL_HEADER_BYTES);
++    p32(a->pool + 16, DOOM_ACCOUNT_POOL_BYTES);
++    p32(a->pool + 20, DOOM_ACCOUNT_POOL_SLOT_BYTES);
++    p32(a->pool + 24, DOOM_ACCOUNT_POOL_SLOTS);
++    for (t = thinkercap.next; t != &thinkercap; t = t->next)
++	if (t->function.acp1 == (actionf_p1) P_MobjThinker)
++	{
++	    if (n == DOOM_ACCOUNT_POOL_SLOTS)
++		return -1;
++	    m[n++] = (mobj_t *) t;
++	}
++    p32(a->pool + 28, n);
++    p32(a->pool + 32, n < DOOM_ACCOUNT_POOL_SLOTS ? n : 0xffffffffU);
++    memcpy(a->pool + 36, a->wad_hash, 32);
++    for (i = 0; i < n; i++)
++    {
++	mobj_t *o = m[i];
++	int32_t st = o->state ? (int32_t) (o->state - states) : -1;
++	int32_t pl = o->player ? (int32_t) (o->player - players) + 1 : 0;
++	s = a->pool + DOOM_ACCOUNT_POOL_HEADER_BYTES
++	    + i * DOOM_ACCOUNT_POOL_SLOT_BYTES;
++	p32(s + 0, i + 1);
++	p32(s + 4, 1);
++	p32(s + 8, slot_of(m, n, o->target));
++	p32(s + 12, slot_of(m, n, o->tracer));
++	p32(s + 16, (uint32_t) o->x);
++	p32(s + 20, (uint32_t) o->y);
++	p32(s + 24, (uint32_t) o->z);
++	p32(s + 28, (uint32_t) o->angle);
++	p32(s + 32, (uint32_t) o->sprite);
++	p32(s + 36, (uint32_t) o->frame);
++	p32(s + 40, (uint32_t) o->floorz);
++	p32(s + 44, (uint32_t) o->ceilingz);
++	p32(s + 48, (uint32_t) o->radius);
++	p32(s + 52, (uint32_t) o->height);
++	p32(s + 56, (uint32_t) o->momx);
++	p32(s + 60, (uint32_t) o->momy);
++	p32(s + 64, (uint32_t) o->momz);
++	p32(s + 68, (uint32_t) o->validcount);
++	p32(s + 72, (uint32_t) o->type);
++	p32(s + 76, (uint32_t) st);
++	p32(s + 80, (uint32_t) o->tics);
++	p32(s + 84, (uint32_t) o->flags);
++	p32(s + 88, (uint32_t) o->health);
++	p32(s + 92, (uint32_t) o->movedir);
++	p32(s + 96, (uint32_t) o->movecount);
++	p32(s + 100, (uint32_t) o->reactiontime);
++	p32(s + 104, (uint32_t) o->threshold);
++	p32(s + 108, (uint32_t) pl);
++	p32(s + 112, (uint32_t) o->lastlook);
++	p16(s + 116, (uint16_t) o->spawnpoint.x);
++	p16(s + 118, (uint16_t) o->spawnpoint.y);
++	p16(s + 120, (uint16_t) o->spawnpoint.angle);
++	p16(s + 122, (uint16_t) o->spawnpoint.type);
++	p16(s + 124, (uint16_t) o->spawnpoint.options);
++    }
++return 0;}
++
++int DoomAccountBeginLevel(doom_account_t*a,int episode,int map){if(!a||episode!=1||map<1||map>9)return -1;memset(a->level,0,sizeof(a->level));memset(a->pool,0,sizeof(a->pool));a->level_started=1;return 0;}
++int DoomAccountCommitLevel(doom_account_t *a)
++{
++    uint8_t *image = 0;
++    size_t n;
++    uint8_t raw[32];
++    if (!a || !a->level_started)
++	return -1;
++    if (DoomStateEncode(&image, &n) || n > LEVEL_IMAGE_CAP)
++    {
++	if (image)
++	    DoomStateFree(image);
++	return -1;
++    }
++    memcpy(a->level, "DOOM-LS1", 8);
++    p32(a->level + 8, 1);
++    p32(a->level + 12, DOOM_ACCOUNT_LEVEL_HEADER_BYTES);
++    p32(a->level + 16, DOOM_ACCOUNT_LEVEL_BYTES);
++    p32(a->level + 20, DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET);
++    p32(a->level + 24, LEVEL_IMAGE_CAP);
++    p32(a->level + 28, (uint32_t) n);
++    memcpy(a->level + 32, a->wad_hash, 32);
++    hash_bytes(image, n, raw);
++    memcpy(a->level + 64, raw, 32);
++    p32(a->level + 96, at32(image + 20));
++    memcpy(a->level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image, n);
++    DoomStateFree(image);
++    return fill_pool(a);
++}
++static int write_image(const char*path,const uint8_t*p,size_t n){FILE*f=fopen(path,"wb");if(!f)return -1;if(fwrite(p,1,n,f)!=n){fclose(f);return -1;}return fclose(f)?-1:0;}
++int DoomAccountWriteLevelState(const doom_account_t*a,const char*path){return a?write_image(path,a->level,sizeof(a->level)):-1;}
++int DoomAccountWriteMobjPool(const doom_account_t*a,const char*path){return a?write_image(path,a->pool,sizeof(a->pool)):-1;}
++const uint8_t*DoomAccountWadHash(const doom_account_t*a){return a?a->wad_hash:0;}
++const uint8_t*DoomAccountLevelState(const doom_account_t*a){return a?a->level:0;}
++const uint8_t*DoomAccountMobjPool(const doom_account_t*a){return a?a->pool:0;}
++void DoomAccountClose(doom_account_t*a){if(a){free(a->wad);free(a);}}
++int DoomAccountLoadLevel(doom_account_t*a,int episode,int map,int skill){if(DoomAccountBeginLevel(a,episode,map))return -1;memset(players,0,sizeof(players));memset(playeringame,0,sizeof(playeringame));playeringame[0]=1;consoleplayer=0;displayplayer=0;deathmatch=0;gameepisode=episode;gamemap=map;gameskill=(skill_t)skill;precache=false;P_SetupLevel(episode,map,0,(skill_t)skill);precache=true;return DoomAccountCommitLevel(a);}
+diff --git a/linuxdoom-1.10/headless/doom_account.h b/linuxdoom-1.10/headless/doom_account.h
+new file mode 100644
+index 0000000..75d5415
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_account.h
+@@ -0,0 +1,33 @@
++/* Host account-image adapter for Doom step 3. */
++#ifndef DOOM_ACCOUNT_H
++#define DOOM_ACCOUNT_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define DOOM_ACCOUNT_WAD_COUNT 5
++#define DOOM_ACCOUNT_WAD_ACCOUNT_BYTES 1048576
++#define DOOM_ACCOUNT_WAD_HEADER_BYTES 32
++#define DOOM_ACCOUNT_WAD_PAYLOAD_BYTES 1048544
++#define DOOM_ACCOUNT_LEVEL_BYTES 131072
++#define DOOM_ACCOUNT_LEVEL_HEADER_BYTES 128
++#define DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET 4096
++#define DOOM_ACCOUNT_POOL_BYTES 65536
++#define DOOM_ACCOUNT_POOL_HEADER_BYTES 4096
++#define DOOM_ACCOUNT_POOL_SLOT_BYTES 160
++#define DOOM_ACCOUNT_POOL_SLOTS 384
++
++typedef struct doom_account_s doom_account_t;
++
++int DoomAccountOpenManifest(const char *manifest_path, doom_account_t **out);
++void DoomAccountClose(doom_account_t *account);
++const uint8_t *DoomAccountWadHash(const doom_account_t *account);
++int DoomAccountBeginLevel(doom_account_t *account, int episode, int map);
++int DoomAccountLoadLevel(doom_account_t *account, int episode, int map, int skill);
++int DoomAccountCommitLevel(doom_account_t *account);
++int DoomAccountWriteLevelState(const doom_account_t *account, const char *path);
++int DoomAccountWriteMobjPool(const doom_account_t *account, const char *path);
++const uint8_t *DoomAccountLevelState(const doom_account_t *account);
++const uint8_t *DoomAccountMobjPool(const doom_account_t *account);
++
++#endif
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+index 53a6ad4..e0da8fb 100644
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -22,6 +22,7 @@
+ #include "w_wad.h"
+ #include "z_zone.h"
+ #include "doom_state.h"
++#include "doom_account.h"
+ 
+ extern void R_ExecuteSetViewSize(void);
+ 
+@@ -70,20 +71,24 @@ static int hash_file(const char *path, uint8_t out[32]) { uint8_t buf[8192]; siz
+ static void le32(uint8_t out[4], uint32_t n) {out[0]=n;out[1]=n>>8;out[2]=n>>16;out[3]=n>>24;}
+ static void hash_record(const char *tag,const uint8_t wad[32],uint32_t tic,uint32_t strip,const uint8_t *pixels,size_t n,char out[65]) { sha256_t s;uint8_t x[4],d[32];sha_init(&s);sha_update(&s,tag,strlen(tag));le32(x,0);sha_update(&s,x,4);sha_update(&s,wad,32);le32(x,tic);sha_update(&s,x,4);le32(x,strip);sha_update(&s,x,4);sha_update(&s,pixels,n);sha_final(&s,d);hex(d,out); }
+ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec*1000.0+(double)t.tv_nsec/1000000.0; }
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless -iwad DOOM1.WAD [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N]\n",argv0); }
+ static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
+ static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
+ 
+ int main(int argc, char **argv) {
+-  char *iwad=arg_after(argc,argv,"-iwad"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *states=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1; FILE *out, *stateout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0;
+-  if(!has_arg(argc,argv,"-headless")||!iwad||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *states=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool");
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1; FILE *out, *stateout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0;
++  if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
+   if(save_at_arg){char *end=0;long v=strtol(save_at_arg,&end,10);if(!end||*end||v<0||v>1000000||!save){fprintf(stderr,"bad --save-at/--save\n");return 2;}save_at=(int)v;} else if(save||(resave&&!load)){fprintf(stderr,"--save requires --save-at; --resave requires --load\n");return 2;}
+-  if(hash_file(iwad,wad_hash)){fprintf(stderr,"cannot hash %s: %s\n",iwad,strerror(errno));return 2;}
++  if(iwad){if(hash_file(iwad,wad_hash)){fprintf(stderr,"cannot hash %s: %s\n",iwad,strerror(errno));return 2;}}
+   myargc=argc;myargv=argv;gamemode=shareware;gamemission=doom;language=english;deathmatch=0;consoleplayer=0;displayplayer=0;
+-  Z_Init(); W_InitFile(iwad); V_Init(); R_Init(); R_ExecuteSetViewSize(); P_Init();
++  Z_Init(); if(manifest){if(DoomAccountOpenManifest(manifest,&account)){fprintf(stderr,"refusing account manifest %s\n",manifest);return 2;}memcpy(wad_hash,DoomAccountWadHash(account),32);}else W_InitFile(iwad); V_Init(); R_Init(); R_ExecuteSetViewSize(); P_Init();
+   demo_len=W_LumpLength(W_GetNumForName(demo_name)); demo=W_CacheLumpName(demo_name,PU_STATIC); if(demo_len<14){fprintf(stderr,"demo too short\n");return 2;}
++  if(account && (demo[2]!=1 || demo[3]<1 || demo[3]>9 || DoomAccountBeginLevel(account,demo[2],demo[3]))){fprintf(stderr,"account loader accepts only E1 shareware DEMO1\n");return 2;}
+   defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo();
++  if(account && DoomAccountCommitLevel(account)){fprintf(stderr,"cannot commit fixed account image\n");return 2;}
++  if(account_level && (!account || DoomAccountWriteLevelState(account,account_level))){fprintf(stderr,"cannot write account level_state\n");return 2;}
++  if(account_pool && (!account || DoomAccountWriteMobjPool(account,account_pool))){fprintf(stderr,"cannot write account mobj_pool\n");return 2;}
+   /* G_DoPlayDemo consumes the 13-byte header.  Mutate the forwardmove
+      command at the requested stream tic, not the immutable WAD file. */
+   if(flip_tic>=0){long off=(long)flip_tic*4L;if(off<0||off+4>demo_len-(demo_p-demobuffer)){fprintf(stderr,"flip tic outside one-player demo\n");return 2;}demo_p[off]^=1;}
+diff --git a/linuxdoom-1.10/w_wad.c b/linuxdoom-1.10/w_wad.c
+index 212d10b..409bcf6 100644
+--- a/linuxdoom-1.10/w_wad.c
++++ b/linuxdoom-1.10/w_wad.c
+@@ -63,6 +63,9 @@ int			numlumps;
+ 
+ void**			lumpcache;
+ 
++static const byte *doom_account_wad;
++static int doom_account_wad_bytes;
++
+ 
+ #define strcmpi	strcasecmp
+ 
+@@ -242,6 +245,9 @@ void W_Reload (void)
+     int			handle;
+     int			length;
+     filelump_t*		fileinfo;
++
++    if (doom_account_wad)
++	return;
+ 	
+     if (!reloadname)
+ 	return;
+@@ -333,6 +339,56 @@ void W_InitFile (char* filename)
+ 
+ 
+ 
++//
++// W_InitAccountImage
++// The account adapter has already checked the root and chunk manifest.  This
++// function only parses the little-endian WAD directory and binds every lump
++// to an offset in the immutable concatenated image.
++//
++void W_InitAccountImage (const byte* image, int image_bytes)
++{
++    wadinfo_t header;
++    filelump_t fileinfo;
++    lumpinfo_t* lump_p;
++    int i;
++    int directory_bytes;
++
++    if (!image || image_bytes < (int)sizeof(header))
++	I_Error ("W_InitAccountImage: short image");
++    memcpy (&header, image, sizeof(header));
++    header.numlumps = LONG(header.numlumps);
++    header.infotableofs = LONG(header.infotableofs);
++    if (header.numlumps < 0 || header.infotableofs < (int)sizeof(header))
++	I_Error ("W_InitAccountImage: bad directory");
++    if (header.numlumps > (image_bytes - header.infotableofs) / (int)sizeof(filelump_t))
++	I_Error ("W_InitAccountImage: directory overflow");
++    directory_bytes = header.numlumps * (int)sizeof(filelump_t);
++    if (header.infotableofs > image_bytes || directory_bytes > image_bytes - header.infotableofs)
++	I_Error ("W_InitAccountImage: directory outside image");
++
++    doom_account_wad = image;
++    doom_account_wad_bytes = image_bytes;
++    numlumps = header.numlumps;
++    lumpinfo = malloc (numlumps * sizeof(*lumpinfo));
++    lumpcache = calloc (numlumps, sizeof(*lumpcache));
++    if ((numlumps && !lumpinfo) || (numlumps && !lumpcache))
++	I_Error ("W_InitAccountImage: out of memory");
++    for (i=0, lump_p=lumpinfo; i<numlumps; i++, lump_p++)
++    {
++	memcpy (&fileinfo, image + header.infotableofs + i*sizeof(filelump_t),
++		 sizeof(fileinfo));
++	lump_p->handle = -2; /* account image */
++	lump_p->position = LONG(fileinfo.filepos);
++	lump_p->size = LONG(fileinfo.size);
++	memcpy (lump_p->name, fileinfo.name, sizeof(lump_p->name));
++	if (lump_p->position < 0 || lump_p->size < 0
++	    || lump_p->position > image_bytes
++	    || lump_p->size > image_bytes - lump_p->position)
++	    I_Error ("W_InitAccountImage: lump %i outside image", i);
++    }
++}
++
++
+ //
+ // W_NumLumps
+ //
+@@ -442,6 +498,16 @@ W_ReadLump
+ 
+     l = lumpinfo+lump;
+ 	
++    if (l->handle == -2)
++    {
++	if (l->position < 0 || l->size < 0
++	    || l->position > doom_account_wad_bytes
++	    || l->size > doom_account_wad_bytes - l->position)
++	    I_Error ("W_ReadLump: account offset outside image");
++	memcpy (dest, doom_account_wad + l->position, l->size);
++	return;
++    }
++
+     // ??? I_BeginRead ();
+ 	
+     if (l->handle == -1)
+diff --git a/linuxdoom-1.10/w_wad.h b/linuxdoom-1.10/w_wad.h
+index 0796303..0cddff5 100644
+--- a/linuxdoom-1.10/w_wad.h
++++ b/linuxdoom-1.10/w_wad.h
+@@ -70,6 +70,9 @@ void    W_InitMultipleFiles (char** filenames);
+ void    W_InitFile (char* filename);
+ void    W_Reload (void);
+ 
++/* Account-backed WAD image.  Once installed, W_* performs no file I/O. */
++void    W_InitAccountImage (const byte* image, int image_bytes);
++
+ int	W_CheckNumForName (char* name);
+ int	W_GetNumForName (char* name);
+ 
