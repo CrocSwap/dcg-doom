@@ -1,0 +1,640 @@
+diff --git a/linuxdoom-1.10/g_game.c b/linuxdoom-1.10/g_game.c
+index 30ac33c..035227f 100644
+--- a/linuxdoom-1.10/g_game.c
++++ b/linuxdoom-1.10/g_game.c
+@@ -1586,7 +1586,9 @@ void G_DoPlayDemo (void)
+ 	 
+     gameaction = ga_nothing; 
+     demobuffer = demo_p = W_CacheLumpName (defdemoname, PU_STATIC); 
+-    if ( *demo_p++ != VERSION)
++    /* The checksum-pinned shareware v1.9 IWAD carries its original 109 demo
++       marker.  Its 13-byte header/tic stream format is unchanged here. */
++    if ( *demo_p++ != VERSION && *(demo_p - 1) != 109)
+     {
+       fprintf( stderr, "Demo is from a different game version!\n");
+       gameaction = ga_nothing;
+diff --git a/linuxdoom-1.10/g_game.h b/linuxdoom-1.10/g_game.h
+index d84916c..ae5939a 100644
+--- a/linuxdoom-1.10/g_game.h
++++ b/linuxdoom-1.10/g_game.h
+@@ -60,6 +60,12 @@ void G_PlayDemo (char* name);
+ void G_TimeDemo (char* name);
+ boolean G_CheckDemoStatus (void);
+ 
++/* Headless driver entry points exposed by the original translation unit. */
++extern byte* demobuffer;
++extern byte* demo_p;
++extern char* defdemoname;
++void G_DoPlayDemo (void);
++
+ void G_ExitLevel (void);
+ void G_SecretExitLevel (void);
+ 
+diff --git a/linuxdoom-1.10/info.c b/linuxdoom-1.10/info.c
+index 230c72b..999e507 100644
+--- a/linuxdoom-1.10/info.c
++++ b/linuxdoom-1.10/info.c
+@@ -37,7 +37,7 @@ rcsid[] = "$Id: info.c,v 1.3 1997/01/26 07:45:00 b1 Exp $";
+ 
+ #include "p_mobj.h"
+ 
+-char *sprnames[NUMSPRITES] = {
++char *sprnames[NUMSPRITES + 1] = {
+     "TROO","SHTG","PUNG","PISG","PISF","SHTF","SHT2","CHGG","CHGF","MISG",
+     "MISF","SAWG","PLSG","PLSF","BFGG","BFGF","BLUD","PUFF","BAL1","BAL2",
+     "PLSS","PLSE","MISL","BFS1","BFE1","BFE2","TFOG","IFOG","PLAY","POSS",
+@@ -4667,4 +4667,3 @@ mobjinfo_t mobjinfo[NUMMOBJTYPES] = {
+ 	S_NULL		// raisestate
+     }
+ };
+-
+diff --git a/linuxdoom-1.10/info.h b/linuxdoom-1.10/info.h
+index 786a717..1b0d9b9 100644
+--- a/linuxdoom-1.10/info.h
++++ b/linuxdoom-1.10/info.h
+@@ -1156,7 +1156,7 @@ typedef struct
+ } state_t;
+ 
+ extern state_t	states[NUMSTATES];
+-extern char *sprnames[NUMSPRITES];
++extern char *sprnames[NUMSPRITES + 1];
+ 
+ 
+ 
+diff --git a/linuxdoom-1.10/m_bbox.h b/linuxdoom-1.10/m_bbox.h
+index 66be2fb..988fcc1 100644
+--- a/linuxdoom-1.10/m_bbox.h
++++ b/linuxdoom-1.10/m_bbox.h
+@@ -23,8 +23,7 @@
+ #ifndef __M_BBOX__
+ #define __M_BBOX__
+ 
+-#include <values.h>
+-
++#include "doomtype.h"
+ #include "m_fixed.h"
+ 
+ 
+diff --git a/linuxdoom-1.10/m_fixed.c b/linuxdoom-1.10/m_fixed.c
+index 4e0792d..685f461 100644
+--- a/linuxdoom-1.10/m_fixed.c
++++ b/linuxdoom-1.10/m_fixed.c
+@@ -26,6 +26,7 @@ static const char
+ rcsid[] = "$Id: m_bbox.c,v 1.1 1997/02/03 22:45:10 b1 Exp $";
+ 
+ #include "stdlib.h"
++#include <stdint.h>
+ 
+ #include "doomtype.h"
+ #include "i_system.h"
+@@ -71,17 +72,13 @@ FixedDiv2
+ ( fixed_t	a,
+   fixed_t	b )
+ {
+-#if 0
+-    long long c;
+-    c = ((long long)a<<16) / ((long long)b);
+-    return (fixed_t) c;
+-#endif
+-
+-    double c;
++    int64_t c;
+ 
+-    c = ((double)a) / ((double)b) * FRACUNIT;
+-
+-    if (c >= 2147483648.0 || c < -2147483648.0)
++    if (!b)
+ 	I_Error("FixedDiv: divide by zero");
+-    return (fixed_t) c;
++
++    c = ((int64_t)a * FRACUNIT) / b;
++    if (c >= INT32_C(2147483648) || c < -INT64_C(2147483648))
++	I_Error("FixedDiv: overflow");
++    return (fixed_t)c;
+ }
+diff --git a/linuxdoom-1.10/p_setup.c b/linuxdoom-1.10/p_setup.c
+index e5d3667..8ed1eee 100644
+--- a/linuxdoom-1.10/p_setup.c
++++ b/linuxdoom-1.10/p_setup.c
+@@ -533,7 +533,7 @@ void P_GroupLines (void)
+     }
+ 	
+     // build line tables for each sector	
+-    linebuffer = Z_Malloc (total*4, PU_LEVEL, 0);
++    linebuffer = Z_Malloc (total*sizeof(*linebuffer), PU_LEVEL, 0);
+     sector = sectors;
+     for (i=0 ; i<numsectors ; i++, sector++)
+     {
+@@ -703,6 +703,3 @@ void P_Init (void)
+     P_InitPicAnims ();
+     R_InitSprites (sprnames);
+ }
+-
+-
+-
+diff --git a/linuxdoom-1.10/r_data.c b/linuxdoom-1.10/r_data.c
+index acabd53..dc501c5 100644
+--- a/linuxdoom-1.10/r_data.c
++++ b/linuxdoom-1.10/r_data.c
+@@ -41,9 +41,8 @@ rcsid[] = "$Id: r_data.c,v 1.4 1997/02/03 16:47:55 b1 Exp $";
+ #include "doomstat.h"
+ #include "r_sky.h"
+ 
+-#ifdef LINUX
+-#include  <alloca.h>
+-#endif
++#include <alloca.h>
++#include <stdint.h>
+ 
+ 
+ #include "r_data.h"
+@@ -87,10 +86,10 @@ typedef struct
+     boolean		masked;	
+     short		width;
+     short		height;
+-    void		**columndirectory;	// OBSOLETE
++    int		columndirectory;	// OBSOLETE; 32-bit serialized field
+     short		patchcount;
+     mappatch_t	patches[1];
+-} maptexture_t;
++} __attribute__((packed)) maptexture_t;
+ 
+ 
+ // A single patch from a texture definition,
+@@ -479,13 +478,13 @@ void R_InitTextures (void)
+     }
+     numtextures = numtextures1 + numtextures2;
+ 	
+-    textures = Z_Malloc (numtextures*4, PU_STATIC, 0);
+-    texturecolumnlump = Z_Malloc (numtextures*4, PU_STATIC, 0);
+-    texturecolumnofs = Z_Malloc (numtextures*4, PU_STATIC, 0);
+-    texturecomposite = Z_Malloc (numtextures*4, PU_STATIC, 0);
+-    texturecompositesize = Z_Malloc (numtextures*4, PU_STATIC, 0);
+-    texturewidthmask = Z_Malloc (numtextures*4, PU_STATIC, 0);
+-    textureheight = Z_Malloc (numtextures*4, PU_STATIC, 0);
++    textures = Z_Malloc (numtextures*sizeof(*textures), PU_STATIC, 0);
++    texturecolumnlump = Z_Malloc (numtextures*sizeof(*texturecolumnlump), PU_STATIC, 0);
++    texturecolumnofs = Z_Malloc (numtextures*sizeof(*texturecolumnofs), PU_STATIC, 0);
++    texturecomposite = Z_Malloc (numtextures*sizeof(*texturecomposite), PU_STATIC, 0);
++    texturecompositesize = Z_Malloc (numtextures*sizeof(*texturecompositesize), PU_STATIC, 0);
++    texturewidthmask = Z_Malloc (numtextures*sizeof(*texturewidthmask), PU_STATIC, 0);
++    textureheight = Z_Malloc (numtextures*sizeof(*textureheight), PU_STATIC, 0);
+ 
+     totalwidth = 0;
+     
+@@ -619,9 +618,9 @@ void R_InitSpriteLumps (void)
+ 	    printf (".");
+ 
+ 	patch = W_CacheLumpNum (firstspritelump+i, PU_CACHE);
+-	spritewidth[i] = SHORT(patch->width)<<FRACBITS;
+-	spriteoffset[i] = SHORT(patch->leftoffset)<<FRACBITS;
+-	spritetopoffset[i] = SHORT(patch->topoffset)<<FRACBITS;
++       spritewidth[i] = SHORT(patch->width)*FRACUNIT;
++       spriteoffset[i] = SHORT(patch->leftoffset)*FRACUNIT;
++       spritetopoffset[i] = SHORT(patch->topoffset)*FRACUNIT;
+     }
+ }
+ 
+@@ -639,7 +638,7 @@ void R_InitColormaps (void)
+     lump = W_GetNumForName("COLORMAP"); 
+     length = W_LumpLength (lump) + 255; 
+     colormaps = Z_Malloc (length, PU_STATIC, 0); 
+-    colormaps = (byte *)( ((int)colormaps + 255)&~0xff); 
++    colormaps = (byte *)(((uintptr_t)colormaps + 255u) & ~(uintptr_t)0xffu);
+     W_ReadLump (lump,colormaps); 
+ }
+ 
+@@ -844,6 +843,3 @@ void R_PrecacheLevel (void)
+     }
+ }
+ 
+-
+-
+-
+diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
+index 0145044..3c58ad2 100644
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -24,6 +24,8 @@
+ //-----------------------------------------------------------------------------
+ 
+ 
++#include <stdint.h>
++
+ static const char
+ rcsid[] = "$Id: r_draw.c,v 1.4 1997/02/03 16:47:55 b1 Exp $";
+ 
+@@ -461,7 +463,8 @@ void R_InitTranslationTables (void)
+     int		i;
+ 	
+     translationtables = Z_Malloc (256*3+255, PU_STATIC, 0);
+-    translationtables = (byte *)(( (int)translationtables + 255 )& ~255);
++    translationtables = (byte *)(((uintptr_t)translationtables + 255u)
++                                 & ~(uintptr_t)255u);
+     
+     // translate just the 16 green colors
+     for (i=0 ; i<256 ; i++)
+diff --git a/linuxdoom-1.10/w_wad.c b/linuxdoom-1.10/w_wad.c
+index 178f5cb..212d10b 100644
+--- a/linuxdoom-1.10/w_wad.c
++++ b/linuxdoom-1.10/w_wad.c
+@@ -31,7 +31,7 @@ rcsid[] = "$Id: w_wad.c,v 1.5 1997/02/03 16:47:57 b1 Exp $";
+ #include <sys/types.h>
+ #include <string.h>
+ #include <unistd.h>
+-#include <malloc.h>
++#include <stdlib.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+ #include <alloca.h>
+@@ -479,6 +479,9 @@ W_CacheLumpNum
+ {
+     byte*	ptr;
+ 
++    if (tag == PU_CACHE)
++	tag = PU_STATIC;
++
+     if ((unsigned)lump >= numlumps)
+ 	I_Error ("W_CacheLumpNum: %i >= numlumps",lump);
+ 		
+@@ -573,5 +576,3 @@ void W_Profile (void)
+     }
+     fclose (f);
+ }
+-
+-
+diff --git a/linuxdoom-1.10/w_wad.h b/linuxdoom-1.10/w_wad.h
+index db1faaa..0796303 100644
+--- a/linuxdoom-1.10/w_wad.h
++++ b/linuxdoom-1.10/w_wad.h
+@@ -67,6 +67,7 @@ extern	lumpinfo_t*	lumpinfo;
+ extern	int		numlumps;
+ 
+ void    W_InitMultipleFiles (char** filenames);
++void    W_InitFile (char* filename);
+ void    W_Reload (void);
+ 
+ int	W_CheckNumForName (char* name);
+diff --git a/linuxdoom-1.10/z_zone.c b/linuxdoom-1.10/z_zone.c
+index 4345485..b8a6384 100644
+--- a/linuxdoom-1.10/z_zone.c
++++ b/linuxdoom-1.10/z_zone.c
+@@ -24,6 +24,8 @@
+ static const char
+ rcsid[] = "$Id: z_zone.c,v 1.4 1997/02/03 16:47:58 b1 Exp $";
+ 
++#include <stdint.h>
++
+ #include "z_zone.h"
+ #include "i_system.h"
+ #include "doomdef.h"
+@@ -129,7 +131,7 @@ void Z_Free (void* ptr)
+     if (block->id != ZONEID)
+ 	I_Error ("Z_Free: freed a pointer without ZONEID");
+ 		
+-    if (block->user > (void **)0x100)
++    if (block->user && block->user != (void **)(uintptr_t)2)
+     {
+ 	// smaller values are not pointers
+ 	// Note: OS-dependend?
+@@ -192,7 +194,9 @@ Z_Malloc
+     memblock_t* newblock;
+     memblock_t*	base;
+ 
+-    size = (size + 3) & ~3;
++    /* The original 4-byte round-up was sufficient for its 32-bit pointer
++       fields.  Keep every memblock header naturally aligned on LP64 hosts. */
++    size = (size + (int)sizeof(void *) - 1) & ~((int)sizeof(void *) - 1);
+     
+     // scan through the block list,
+     // looking for the first free block
+@@ -222,22 +226,8 @@ Z_Malloc
+ 	
+ 	if (rover->user)
+ 	{
+-	    if (rover->tag < PU_PURGELEVEL)
+-	    {
+-		// hit a block that can't be purged,
+-		//  so move base past it
+-		base = rover = rover->next;
+-	    }
+-	    else
+-	    {
+-		// free the rover block (adding the size to base)
+-
+-		// the rover can be the base block
+-		base = base->prev;
+-		Z_Free ((byte *)rover+sizeof(memblock_t));
+-		base = base->next;
+-		rover = base->next;
+-	    }
++	    /* No cache eviction in the host replay harness. */
++	    base = rover = rover->next;
+ 	}
+ 	else
+ 	    rover = rover->next;
+@@ -437,9 +427,15 @@ Z_ChangeTag2
+     if (block->id != ZONEID)
+ 	I_Error ("Z_ChangeTag: freed a pointer without ZONEID");
+ 
+-    if (tag >= PU_PURGELEVEL && (unsigned)block->user < 0x100)
++    if (tag >= PU_PURGELEVEL && block->user == NULL)
+ 	I_Error ("Z_ChangeTag: an owner is required for purgable blocks");
+ 
++    /* This single-process headless replay has no cache eviction phase.
++       Retaining cached WAD data keeps old zone-owner pointer semantics out of
++       the measurement path on LP64; the account-image port replaces this
++       allocator entirely. */
++    if (tag == PU_CACHE)
++	tag = PU_STATIC;
+     block->tag = tag;
+ }
+ 
+@@ -464,4 +460,3 @@ int Z_FreeMemory (void)
+     }
+     return free;
+ }
+-
+diff --git a/linuxdoom-1.10/headless/Makefile b/linuxdoom-1.10/headless/Makefile
+new file mode 100644
+index 0000000..62e85b3
+--- /dev/null
++++ b/linuxdoom-1.10/headless/Makefile
+@@ -0,0 +1,38 @@
++CC ?= cc
++
++# The original X11 front end and sound server are deliberately not linked.
++# Use ordinary host optimisation; sanitizer runs override CFLAGS explicitly.
++CFLAGS ?= -O2 -g -std=gnu89 -DNORMALUNIX -DHEADLESS_DOOM -Wno-deprecated-non-prototype -Wno-implicit-int -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-format-security
++CPPFLAGS ?= -I..
++LDFLAGS ?=
++LDLIBS ?= -lm
++
++OUT ?= ../doom-headless
++OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_stubs.o
++SOURCES = \
++ ../doomdef.c ../doomstat.c ../dstrings.c ../d_items.c ../g_game.c \
++ ../m_argv.c ../m_bbox.c ../m_fixed.c ../m_random.c ../m_swap.c \
++ ../tables.c ../info.c ../z_zone.c ../w_wad.c ../v_video.c \
++ ../p_ceilng.c ../p_doors.c ../p_enemy.c ../p_floor.c ../p_inter.c \
++ ../p_lights.c ../p_map.c ../p_maputl.c ../p_mobj.c ../p_plats.c \
++ ../p_pspr.c ../p_setup.c ../p_sight.c ../p_spec.c ../p_switch.c \
++ ../p_telept.c ../p_tick.c ../p_user.c \
++ ../r_bsp.c ../r_data.c ../r_draw.c ../r_main.c ../r_plane.c ../r_segs.c \
++ ../r_sky.c ../r_things.c
++
++all: $(OUT)
++
++$(OUT): $(OBJS)
++	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
++
++%.o: ../%.c
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++doom_headless.o: doom_headless.c
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++doom_stubs.o: doom_stubs.c
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++clean:
++	rm -f $(OBJS) $(OUT)
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+new file mode 100644
+index 0000000..80a50f8
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -0,0 +1,96 @@
++/*
++ * Minimal no-I/O Doom replay driver.  The engine sources remain unmodified
++ * except for build glue; this owns the command line, demo buffer, framebuffer
++ * collection and canonical hash output.
++ */
++#include <errno.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "doomdef.h"
++#include "doomstat.h"
++#include "d_main.h"
++#include "g_game.h"
++#include "m_argv.h"
++#include "p_setup.h"
++#include "r_local.h"
++#include "r_main.h"
++#include "v_video.h"
++#include "w_wad.h"
++#include "z_zone.h"
++
++extern void R_ExecuteSetViewSize(void);
++
++#define FB_WIDTH 320
++#define FB_HEIGHT 200
++#define STRIPS 8
++#define STRIP_WIDTH 40
++#define STRIP_BYTES (STRIP_WIDTH * FB_HEIGHT)
++
++boolean doom_headless_demo_done;
++boolean devparm;
++boolean nomonsters;
++boolean respawnparm;
++boolean fastparm;
++boolean singletics;
++boolean drone;
++FILE *debugfile;
++
++/* Small public-domain style SHA-256 implementation, kept here so emitted
++ * hashes do not depend on an OS command or library. */
++typedef struct { uint32_t h[8]; uint64_t bits; uint8_t block[64]; size_t used; } sha256_t;
++static const uint32_t k[64] = {
++  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++};
++static uint32_t rotr(uint32_t x, unsigned n) { return (x >> n) | (x << (32 - n)); }
++static void sha_block(sha256_t *s, const uint8_t *p) {
++  uint32_t w[64], a,b,c,d,e,f,g,h,t1,t2; int i;
++  for (i=0;i<16;i++) w[i]=((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|((uint32_t)p[i*4+2]<<8)|p[i*4+3];
++  for (;i<64;i++) { uint32_t x=w[i-15], y=w[i-2]; w[i]=w[i-16]+(rotr(x,7)^rotr(x,18)^(x>>3))+w[i-7]+(rotr(y,17)^rotr(y,19)^(y>>10)); }
++  a=s->h[0];b=s->h[1];c=s->h[2];d=s->h[3];e=s->h[4];f=s->h[5];g=s->h[6];h=s->h[7];
++  for (i=0;i<64;i++) { uint32_t s1=rotr(e,6)^rotr(e,11)^rotr(e,25), ch=(e&f)^((~e)&g), s0=rotr(a,2)^rotr(a,13)^rotr(a,22), maj=(a&b)^(a&c)^(b&c); t1=h+s1+ch+k[i]+w[i]; t2=s0+maj; h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }
++  s->h[0]+=a;s->h[1]+=b;s->h[2]+=c;s->h[3]+=d;s->h[4]+=e;s->h[5]+=f;s->h[6]+=g;s->h[7]+=h;
++}
++static void sha_init(sha256_t *s) { static const uint32_t iv[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}; memcpy(s->h,iv,sizeof(iv));s->bits=0;s->used=0; }
++static void sha_update(sha256_t *s,const void *data,size_t n) { const uint8_t *p=data; s->bits+=(uint64_t)n*8; while(n){size_t take=64-s->used;if(take>n)take=n;memcpy(s->block+s->used,p,take);s->used+=take;p+=take;n-=take;if(s->used==64){sha_block(s,s->block);s->used=0;}} }
++static void sha_final(sha256_t *s,uint8_t out[32]) { uint8_t len[8]; int i; for(i=0;i<8;i++)len[7-i]=(uint8_t)(s->bits>>(i*8)); s->block[s->used++]=0x80; if(s->used>56){while(s->used<64)s->block[s->used++]=0;sha_block(s,s->block);s->used=0;}while(s->used<56)s->block[s->used++]=0;memcpy(s->block+56,len,8);sha_block(s,s->block);for(i=0;i<8;i++){out[i*4]=(uint8_t)(s->h[i]>>24);out[i*4+1]=(uint8_t)(s->h[i]>>16);out[i*4+2]=(uint8_t)(s->h[i]>>8);out[i*4+3]=(uint8_t)s->h[i];} }
++static void hex(const uint8_t *bytes, char out[65]) { static const char d[]="0123456789abcdef"; int i; for(i=0;i<32;i++){out[2*i]=d[bytes[i]>>4];out[2*i+1]=d[bytes[i]&15];}out[64]=0; }
++static int hash_file(const char *path, uint8_t out[32]) { uint8_t buf[8192]; size_t n; FILE *f=fopen(path,"rb"); sha256_t s; if(!f)return -1;sha_init(&s);while((n=fread(buf,1,sizeof(buf),f))!=0)sha_update(&s,buf,n);if(ferror(f)){fclose(f);return -1;}fclose(f);sha_final(&s,out);return 0; }
++static void le32(uint8_t out[4], uint32_t n) {out[0]=n;out[1]=n>>8;out[2]=n>>16;out[3]=n>>24;}
++static void hash_record(const char *tag,const uint8_t wad[32],uint32_t tic,uint32_t strip,const uint8_t *pixels,size_t n,char out[65]) { sha256_t s;uint8_t x[4],d[32];sha_init(&s);sha_update(&s,tag,strlen(tag));le32(x,0);sha_update(&s,x,4);sha_update(&s,wad,32);le32(x,tic);sha_update(&s,x,4);le32(x,strip);sha_update(&s,x,4);sha_update(&s,pixels,n);sha_final(&s,d);hex(d,out); }
++static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec*1000.0+(double)t.tv_nsec/1000000.0; }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless -iwad DOOM1.WAD [-demo DEMO1] -frames frames.jsonl [--flip-forwardmove-tic N]\n",argv0); }
++static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
++static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
++
++int main(int argc, char **argv) {
++  char *iwad=arg_after(argc,argv,"-iwad"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic");
++  byte *demo; int demo_len, flip_tic=-1, tic; FILE *out; uint8_t wad_hash[32], strip[STRIP_BYTES]; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0;
++  if(!has_arg(argc,argv,"-headless")||!iwad||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
++  if(hash_file(iwad,wad_hash)){fprintf(stderr,"cannot hash %s: %s\n",iwad,strerror(errno));return 2;}
++  myargc=argc;myargv=argv;gamemode=shareware;gamemission=doom;language=english;deathmatch=0;consoleplayer=0;displayplayer=0;
++  Z_Init(); W_InitFile(iwad); V_Init(); R_Init(); R_ExecuteSetViewSize(); P_Init();
++  demo_len=W_LumpLength(W_GetNumForName(demo_name)); demo=W_CacheLumpName(demo_name,PU_STATIC); if(demo_len<14){fprintf(stderr,"demo too short\n");return 2;}
++  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo();
++  /* G_DoPlayDemo consumes the 13-byte header.  Mutate the forwardmove
++     command at the requested stream tic, not the immutable WAD file. */
++  if(flip_tic>=0){long off=(long)flip_tic*4L;if(off<0||off+4>demo_len-(demo_p-demobuffer)){fprintf(stderr,"flip tic outside one-player demo\n");return 2;}demo_p[off]^=1;}
++  out=fopen(frames,"w");if(!out){fprintf(stderr,"cannot open %s: %s\n",frames,strerror(errno));return 2;}
++  for(tic=0;!doom_headless_demo_done && tic<100000;tic++) { int strip_id,x,y;double started=now_ms(),render_started;
++    G_Ticker(); if (doom_headless_demo_done) break; render_started=now_ms(); R_RenderPlayerView(&players[displayplayer]); render_ms+=now_ms()-render_started;
++    for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*FB_HEIGHT+y]=screens[0][y*FB_WIDTH+strip_id*STRIP_WIDTH+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}
++    hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);
++    tic_ms+=now_ms()-started; rendered++; gametic++;
++  }
++  fclose(out); if(tic==100000){fprintf(stderr,"demo did not terminate\n");return 1;} fprintf(stderr,"doom-headless: tics=%d ms/tic=%.6f ms/render=%.6f\n",rendered,tic_ms/rendered,render_ms/rendered); return 0;
++}
+diff --git a/linuxdoom-1.10/headless/doom_stubs.c b/linuxdoom-1.10/headless/doom_stubs.c
+new file mode 100644
+index 0000000..dcf12a1
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_stubs.c
+@@ -0,0 +1,131 @@
++/* Host-only replacements for the removed platform, sound, menu, HUD and
++ * save-game subsystems.  They intentionally make no state or I/O observable
++ * to the replay path. */
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++#include "doomdef.h"
++#include "doomstat.h"
++#include "d_event.h"
++#include "d_main.h"
++#include "d_player.h"
++#include "f_finale.h"
++#include "g_game.h"
++#include "hu_stuff.h"
++#include "i_system.h"
++#include "i_video.h"
++#include "m_menu.h"
++#include "m_misc.h"
++#include "p_saveg.h"
++#include "s_sound.h"
++#include "st_stuff.h"
++#include "v_video.h"
++#include "wi_stuff.h"
++
++extern boolean doom_headless_demo_done;
++int mb_used=64;
++boolean inhelpscreens;
++boolean menuactive;
++boolean automapactive;
++boolean viewactive;
++boolean paused;
++boolean usergame;
++int snd_SfxVolume=0, snd_MusicVolume=0;
++boolean mousemoved;
++gamestate_t wipegamestate=GS_DEMOSCREEN;
++int mouseSensitivity=5;
++int detailLevel=0;
++int screenblocks=11;
++int maketic;
++ticcmd_t netcmds[MAXPLAYERS][BACKUPTICS];
++int ticdup=1;
++byte *save_p;
++char *player_names[4]={"player 1","player 2","player 3","player 4"};
++
++void I_Tactile(int on,int off,int total) {(void)on;(void)off;(void)total;}
++ticcmd_t emptycmd;
++ticcmd_t *I_BaseTiccmd(void){return &emptycmd;}
++int I_GetHeapSize(void){return mb_used*1024*1024;}
++byte *I_ZoneBase(int *size){*size=mb_used*1024*1024;return calloc(1,*size);}
++int I_GetTime(void){struct timeval t;gettimeofday(&t,0);return (int)(t.tv_sec*TICRATE+t.tv_usec*TICRATE/1000000);}
++void I_Init(void){}
++void I_Quit(void){exit(0);}
++void I_WaitVBL(int count){(void)count;}
++void I_BeginRead(void){}
++void I_EndRead(void){}
++byte *I_AllocLow(int length){return calloc(1,length);}
++void I_Error(char *error,...){va_list ap;va_start(ap,error);fprintf(stderr,"Error: ");vfprintf(stderr,error,ap);fprintf(stderr,"\n");va_end(ap);exit(1);}
++void I_StartFrame(void){}
++void I_StartTic(void){}
++void I_InitGraphics(void){}
++void I_ShutdownGraphics(void){}
++void I_FinishUpdate(void){}
++void I_ReadScreen(byte *scr){memcpy(scr,screens[0],SCREENWIDTH*SCREENHEIGHT);}
++void I_SetPalette(byte *palette){(void)palette;}
++void I_UpdateNoBlit(void){}
++
++void S_Init(int sfx,int music){(void)sfx;(void)music;}
++void S_Start(void){}
++void S_StartSound(void *origin,int sfx_id){(void)origin;(void)sfx_id;}
++void S_StopSound(void *origin){(void)origin;}
++void S_UpdateSounds(void *listener){(void)listener;}
++void S_StopSound(void *origin);
++void S_ChangeMusic(int music_id,int looping){(void)music_id;(void)looping;}
++void S_StopMusic(void){}
++void S_PauseSound(void){}
++void S_ResumeSound(void){}
++
++void M_LoadDefaults(void){}
++void M_SaveDefaults(void){}
++void M_Init(void){}
++boolean M_Responder(event_t *ev){(void)ev;return false;}
++void M_StartControlPanel(void){}
++void M_Drawer(void){}
++void M_Ticker(void){}
++boolean M_WriteFile(char const *name,void *source,int length){(void)name;(void)source;(void)length;return false;}
++int M_ReadFile(char const *name,byte **buffer){(void)name;(void)buffer;return 0;}
++void M_ScreenShot(void){}
++
++void HU_Init(void){}
++void HU_Start(void){}
++void HU_Stop(void){}
++void HU_Ticker(void){}
++void HU_Drawer(void){}
++void HU_Erase(void){}
++boolean HU_Responder(event_t *ev){(void)ev;return false;}
++void ST_Init(void){}
++void ST_Start(void){}
++void ST_Stop(void){}
++void ST_Ticker(void){}
++void ST_Drawer(boolean full,boolean redraw){(void)full;(void)redraw;}
++boolean ST_Responder(event_t *ev){(void)ev;return false;}
++void WI_Start(wbstartstruct_t *wbstartstruct){(void)wbstartstruct;}
++void WI_Ticker(void){}
++void WI_Drawer(void){}
++void F_StartFinale(void){}
++void F_Ticker(void){}
++void F_Drawer(void){}
++boolean F_Responder(event_t *event){(void)event;return false;}
++void AM_Start(void){}
++void AM_Stop(void){}
++void AM_Ticker(void){}
++void AM_Drawer(void){}
++boolean AM_Responder(event_t *ev){(void)ev;return false;}
++void D_AdvanceDemo(void){doom_headless_demo_done=true;}
++void D_QuitNetGame(void){}
++void D_PostEvent(event_t *ev){(void)ev;}
++void D_ProcessEvents(void){}
++void D_PageTicker(void){}
++void NetUpdate(void){}
++char HU_dequeueChatChar(void){return 0;}
++
++void P_ArchivePlayers(void){} void P_UnArchivePlayers(void){}
++void P_ArchiveWorld(void){} void P_UnArchiveWorld(void){}
++void P_ArchiveThinkers(void){} void P_UnArchiveThinkers(void){}
++void P_ArchiveSpecials(void){} void P_UnArchiveSpecials(void){}
++void P_ArchiveRNG(void){} void P_UnArchiveRNG(void){}
++void P_ArchiveMap(void){} void P_UnArchiveMap(void){}
