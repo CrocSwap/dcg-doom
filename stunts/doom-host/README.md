@@ -39,3 +39,14 @@ the 40-column strip, y advances over each 200-pixel column. `DOOM-FB1` v0 is
 u32le(strip_id) || 8000 strip bytes)`. Whole records use the distinct
 `DOOM-FB1-FRAME` domain, strip id 0, and the native row-major 64,000-byte
 framebuffer.
+
+Patch `0005` adds the host-only reentrant parity harness. Pass
+`--reentrant-parity FILE` with `-account-manifest` to compare the ordinary
+full framebuffer against eight selected-strip calls from the same state image;
+`-probe-refusals FILE` measures the three required fail-closed controls, and
+`--max-tics N` bounds a diagnostic interval. Each strip account is 8,192 B:
+64 B header followed by 8,000 column-major palette indexes. The 131,072-B
+scratch reserves its 128-B header, a 64,000-B full-frame seed, and a 64,000-B
+private render framebuffer. The host call forks a copy-on-write child so
+vanilla renderer globals and decoded thinker allocations cannot alter the
+ordinary replay; this is a host parity/cost tool, not an SBF measurement.
