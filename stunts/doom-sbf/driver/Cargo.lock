@@ -1197,6 +1197,7 @@ dependencies = [
 name = "doom-sbf-driver"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "doom-sbf",
  "solana-account",
  "solana-compute-budget-interface",

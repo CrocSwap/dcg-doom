@@ -9,6 +9,8 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
+pub mod bring_up;
+
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
 pub const W1_COLUMN: u8 = 0;
@@ -60,6 +62,9 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    if instruction_data.starts_with(bring_up::INIT_MAGIC) {
+        return bring_up::process_init(_program_id, accounts, instruction_data);
+    }
     if instruction_data.len() != 1 {
         return Err(ProgramError::InvalidInstructionData);
     }
