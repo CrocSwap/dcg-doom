@@ -10,6 +10,8 @@ use solana_program::{
 };
 
 pub mod bring_up;
+mod step5;
+pub use step5::*;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
@@ -58,15 +60,18 @@ fn require_mutable_frame(frame: &AccountInfo) -> Result<(), ProgramError> {
 }
 
 pub fn process_instruction(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    if is_step5_instruction(instruction_data) {
+        return process_step5(program_id, accounts, instruction_data);
+    }
     if instruction_data.starts_with(bring_up::DIRECTORY_MAGIC) {
-        return bring_up::process_directory(_program_id, accounts, instruction_data);
+        return bring_up::process_directory(program_id, accounts, instruction_data);
     }
     if instruction_data.starts_with(bring_up::INIT_MAGIC) {
-        return bring_up::process_init(_program_id, accounts, instruction_data);
+        return bring_up::process_init(program_id, accounts, instruction_data);
     }
     if accounts.iter().any(|account| {
         account.is_writable
