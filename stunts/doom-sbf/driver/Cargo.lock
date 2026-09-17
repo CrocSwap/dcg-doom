@@ -1189,6 +1189,7 @@ dependencies = [
  "cc",
  "indexmap",
  "proc-macro-crate 3.3.0",
+ "sha2 0.10.9",
  "solana-program",
  "zeroize",
 ]

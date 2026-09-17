@@ -65,6 +65,12 @@ pub fn process_instruction(
     if instruction_data.starts_with(bring_up::INIT_MAGIC) {
         return bring_up::process_init(_program_id, accounts, instruction_data);
     }
+    if accounts.iter().any(|account| {
+        account.is_writable
+            && matches!(account.data_len(), bring_up::CONFIG_BYTES | bring_up::CHUNK_BYTES)
+    }) {
+        return Err(ProgramError::InvalidAccountData);
+    }
     if instruction_data.len() != 1 {
         return Err(ProgramError::InvalidInstructionData);
     }
