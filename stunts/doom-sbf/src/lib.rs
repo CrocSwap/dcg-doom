@@ -28,6 +28,13 @@ pub const W3_FIXED_MUL_DIV: u8 = 7;
 /// puts a `.data` section in the image and the loader then refuses it.
 #[cfg(feature = "static-write-probe")]
 pub const W4_STATIC_WRITE: u8 = 8;
+/// Same measurement, but the global has no initializer, so it is a `.bss`
+/// (zero-fill) cell rather than a `.data` cell.  Present only under the
+/// `zero-bss-probe` feature.  This decides whether the "no writable static
+/// data" refusal M1006 measured is specific to nonzero `.data` content or
+/// also covers a zero-initialized `.bss` cell.
+#[cfg(feature = "zero-bss-probe")]
+pub const W5_ZERO_BSS_WRITE: u8 = 9;
 
 unsafe extern "C" {
     fn doom_draw_columns(framebuffer: *mut u8, state: *mut u8);
@@ -39,6 +46,8 @@ unsafe extern "C" {
     fn doom_write_strip(strip: *mut u8, bytes: u32, state: *const u8);
     #[cfg(feature = "static-write-probe")]
     fn doom_probe_static_write(value: u64) -> u64;
+    #[cfg(feature = "zero-bss-probe")]
+    fn doom_probe_zero_bss_write(value: u64) -> u64;
 }
 
 entrypoint!(process_instruction);
@@ -137,6 +146,14 @@ pub fn process_instruction(
             require_mutable_state(state)?;
             let mut state_data = state.data.borrow_mut();
             let result = unsafe { doom_probe_static_write(0x0123_4567_89ab_cdef) };
+            write_result(&mut state_data[..], result)?;
+        }
+        #[cfg(feature = "zero-bss-probe")]
+        W5_ZERO_BSS_WRITE => {
+            let state = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+            require_mutable_state(state)?;
+            let mut state_data = state.data.borrow_mut();
+            let result = unsafe { doom_probe_zero_bss_write(0x0123_4567_89ab_cdef) };
             write_result(&mut state_data[..], result)?;
         }
         W3_FULL | W3_BSP_ONLY | W3_FIXED_MUL_ONLY | W3_FIXED_DIV_ONLY | W3_FIXED_MUL_DIV => {

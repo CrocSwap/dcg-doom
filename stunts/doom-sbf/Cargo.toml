@@ -21,6 +21,11 @@ crate-type = ["cdylib", "lib"]
 default = []
 static-write-probe = []
 account-address-probe = []
+# `zero-bss-probe` adds one mutable C global with NO initializer (a `.bss`
+# cell) and the instruction that writes it, to test whether the "no writable
+# static data" loader refusal M1006 measured with a nonzero `.data` cell also
+# covers a zero-initialized `.bss` cell.
+zero-bss-probe = []
 
 [dependencies]
 solana-program = "=2.3.0"

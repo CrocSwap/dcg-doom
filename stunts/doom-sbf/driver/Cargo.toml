@@ -14,10 +14,17 @@ publish = false
 # such data in the image is on.
 [features]
 static-write-probe = ["doom-sbf/static-write-probe"]
+# `zero_bss_probe` measures whether the loader's writable-static-data refusal
+# also covers a zero-initialized (.bss) cell, not just a nonzero (.data) one.
+zero-bss-probe = ["doom-sbf/zero-bss-probe"]
 
 [[bin]]
 name = "static_probe"
 required-features = ["static-write-probe"]
+
+[[bin]]
+name = "zero_bss_probe"
+required-features = ["zero-bss-probe"]
 
 [dependencies]
 doom-sbf = { path = ".." }

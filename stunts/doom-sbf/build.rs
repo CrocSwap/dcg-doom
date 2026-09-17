@@ -5,11 +5,15 @@ fn main() {
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZERO_BSS_PROBE");
 
     let mut build = cc::Build::new();
     build.file("src/doom_hotloops.c");
     if env::var("CARGO_FEATURE_STATIC_WRITE_PROBE").is_ok() {
         build.define("DOOM_STATIC_WRITE_PROBE", None);
+    }
+    if env::var("CARGO_FEATURE_ZERO_BSS_PROBE").is_ok() {
+        build.define("DOOM_ZERO_BSS_PROBE", None);
     }
 
     if target == "sbf-solana-solana" {

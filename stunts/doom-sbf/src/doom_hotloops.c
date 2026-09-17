@@ -254,3 +254,20 @@ u64 doom_probe_static_write(u64 value) {
     return doom_probe_cell;
 }
 #endif
+
+/* Same measurement as doom_probe_static_write, but the cell carries no
+ * initializer, so it lands in .bss (zero-fill-on-load) rather than .data
+ * (nonzero image content).  Whether the SBF loader's "no writable static
+ * data" refusal is specific to a nonzero .data cell or also covers a
+ * zero-initialized .bss cell was not measured by M1006's static-write-probe,
+ * and it decides whether a single lone pointer (e.g. a base/context pointer
+ * left un-initialized until the platform layer sets it at instruction entry)
+ * could ever be a global rather than a threaded parameter. */
+#ifdef DOOM_ZERO_BSS_PROBE
+static u64 doom_probe_bss_cell;
+
+u64 doom_probe_zero_bss_write(u64 value) {
+    doom_probe_bss_cell ^= value;
+    return doom_probe_bss_cell;
+}
+#endif
