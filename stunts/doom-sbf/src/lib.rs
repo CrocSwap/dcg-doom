@@ -62,6 +62,9 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    if instruction_data.starts_with(bring_up::DIRECTORY_MAGIC) {
+        return bring_up::process_directory(_program_id, accounts, instruction_data);
+    }
     if instruction_data.starts_with(bring_up::INIT_MAGIC) {
         return bring_up::process_init(_program_id, accounts, instruction_data);
     }

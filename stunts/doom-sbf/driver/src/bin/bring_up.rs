@@ -30,7 +30,7 @@ fn account(data: Vec<u8>) -> Account {
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        return Err("usage: bring_up (--native | deploy/doom_sbf.so) STEP3_ACCOUNT_DIR; offline bounded WAD-hash verification only; no engine replay".into());
+        return Err("usage: bring_up (--native | deploy/doom_sbf.so) STEP3_ACCOUNT_DIR; offline bounded WAD hash then DOOM-DI1 directory validation; no engine replay".into());
     }
     let native = args[1] == "--native";
     let root = PathBuf::from(&args[2]).canonicalize()?;
@@ -210,11 +210,90 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes())
         .map(|b| format!("{b:02x}"))
         .collect();
-    let digest: String = stored[64..96]
-        .chunks_exact(4)
-        .flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes())
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    if complete {
+        let mut cursor = 0u32;
+        loop {
+            let before = client.get_account(config.pubkey()).await?.unwrap();
+            for label in ["before_hash", "wrong_directory_version", "ahead", "honest"] {
+                let mut data = doom_sbf::bring_up::DIRECTORY_MAGIC.to_vec();
+                data.extend_from_slice(&1u32.to_le_bytes());
+                data.extend_from_slice(&cursor.to_le_bytes());
+                match label {
+                    "before_hash" => {
+                        let mut bad = before.clone();
+                        bad.data[48] = 0;
+                        context.set_account(&config.pubkey(), &AccountSharedData::from(bad));
+                    }
+                    "wrong_directory_version" => data[8] = 2,
+                    "ahead" => data[12..16].copy_from_slice(&(cursor + 64).to_le_bytes()),
+                    _ => (),
+                }
+                context.last_blockhash = client
+                    .get_new_latest_blockhash(&context.last_blockhash)
+                    .await?;
+                let tx = Transaction::new(
+                    &[&context.payer, &config],
+                    Message::new_with_blockhash(
+                        &[
+                            ComputeBudgetInstruction::set_compute_unit_limit(BUDGET),
+                            Instruction {
+                                program_id: PROGRAM,
+                                accounts: metas.clone(),
+                                data,
+                            },
+                        ],
+                        Some(&context.payer.pubkey()),
+                        &context.last_blockhash,
+                    ),
+                    context.last_blockhash,
+                );
+                let packet = bincode::serialize(&tx)?.len();
+                assert!(packet <= 1_232);
+                let result = client.process_transaction_with_metadata(tx).await?;
+                let status = format!("{:?}", result.result);
+                let units = result
+                    .metadata
+                    .as_ref()
+                    .ok_or("missing metadata")?
+                    .compute_units_consumed;
+                println!("DIRECTORY native={native} label={label} cursor={cursor} result={status} tx_cu={units} packet_bytes={packet} loaded_data_bytes={}", CONFIG_BYTES + 5 * CHUNK_BYTES);
+                if label == "honest" {
+                    assert_eq!(result.result, Ok(()));
+                    assert!(units <= BUDGET as u64);
+                } else {
+                    let expected = match label {
+                        "before_hash" => "Custom(3)",
+                        "wrong_directory_version" => "InvalidInstructionData",
+                        _ => "Custom(2)",
+                    };
+                    assert!(status.contains(expected), "{status}");
+                    let mut expected_account = before.data.clone();
+                    if label == "before_hash" {
+                        expected_account[48] = 0;
+                    }
+                    assert_eq!(
+                        client.get_account(config.pubkey()).await?.unwrap().data,
+                        expected_account
+                    );
+                    context.set_account(&config.pubkey(), &AccountSharedData::from(before.clone()));
+                }
+            }
+            let after = client.get_account(config.pubkey()).await?.unwrap().data;
+            cursor = u32::from_le_bytes(after[268..272].try_into().unwrap());
+            assert_eq!(
+                u32::from_le_bytes(after[272..276].try_into().unwrap()),
+                1_264
+            );
+            assert_eq!(
+                cursor,
+                (u32::from_le_bytes(before.data[268..272].try_into().unwrap()) + 64).min(1_264)
+            );
+            if after[280] == 1 {
+                break;
+            }
+        }
+        println!("DIRECTORY_ACCEPTANCE=PASS entries={cursor}");
+    }
     println!("HASH_ACCEPTANCE={} native={native} steps={steps} chunk_bytes={COMPRESS_WINDOW_BYTES} max_tx_cu={maximum} total_tx_cu={total} budget={BUDGET} digest_or_midstate={digest}", if complete { "PASS" } else { "PARTIAL" });
     println!("STEP5_ACCEPTANCE=INCOMPLETE load_level/tic/strip/golden_replay=UNIMPLEMENTED");
     Ok(())

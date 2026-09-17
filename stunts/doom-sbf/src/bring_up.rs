@@ -163,10 +163,220 @@ pub fn process_init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     Ok(())
 }
 
+pub const DIRECTORY_MAGIC: &[u8; 8] = b"DOOM-DI1";
+pub const DIRECTORY_WINDOW: usize = 64;
+
+fn wad_read(payloads: &[&[u8]; 5], offset: usize, output: &mut [u8]) -> ProgramResult {
+    if offset > WAD_BYTES || output.len() > WAD_BYTES - offset {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut cursor = offset;
+    let mut filled = 0;
+    while filled < output.len() {
+        let index = cursor / PAYLOAD_BYTES;
+        let start = cursor % PAYLOAD_BYTES;
+        let source = payloads[index]
+            .get(start..)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        let take = source.len().min(output.len() - filled);
+        if take == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        output[filled..filled + take].copy_from_slice(&source[..take]);
+        cursor += take;
+        filled += take;
+    }
+    Ok(())
+}
+
+fn directory_step(config: &mut [u8], payloads: &[&[u8]; 5], cursor: usize) -> ProgramResult {
+    if config.len() != CONFIG_BYTES || &config[..8] != INIT_MAGIC || u32_at(config, 8) != 1 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if config[48] != 1 || u32_at(config, 12) as usize != WAD_BYTES {
+        return Err(ProgramError::Custom(3));
+    }
+    if config[16..48] != WAD_HASH {
+        return Err(ProgramError::Custom(1));
+    }
+    for (index, word) in WAD_HASH.chunks_exact(4).enumerate() {
+        if u32_at(config, 64 + index * 4) != u32::from_be_bytes(word.try_into().unwrap()) {
+            return Err(ProgramError::Custom(1));
+        }
+    }
+    let fresh = config[256..288].iter().all(|&b| b == 0);
+    if fresh {
+        if cursor != 0 {
+            return Err(ProgramError::Custom(2));
+        }
+    } else if &config[256..264] != DIRECTORY_MAGIC || u32_at(config, 264) != 1 {
+        return Err(ProgramError::InvalidAccountData);
+    } else if u32_at(config, 268) as usize != cursor || config[280] != 0 {
+        return Err(ProgramError::Custom(2));
+    }
+    let mut header = [0; 12];
+    wad_read(payloads, 0, &mut header)?;
+    let count = u32_at(&header, 4) as usize;
+    let directory = u32_at(&header, 8) as usize;
+    if &header[..4] != b"IWAD"
+        || count == 0
+        || directory < 12
+        || directory > WAD_BYTES
+        || count > (WAD_BYTES - directory) / 16
+        || cursor >= count
+        || cursor % DIRECTORY_WINDOW != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if !fresh
+        && (u32_at(config, 272) as usize != count || u32_at(config, 276) as usize != directory)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let end = (cursor + DIRECTORY_WINDOW).min(count);
+    for entry in cursor..end {
+        let mut lump = [0; 16];
+        wad_read(payloads, directory + entry * 16, &mut lump)?;
+        let offset = u32_at(&lump, 0) as usize;
+        let length = u32_at(&lump, 4) as usize;
+        if offset > WAD_BYTES || length > WAD_BYTES - offset {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    config[256..264].copy_from_slice(DIRECTORY_MAGIC);
+    config[264..268].copy_from_slice(&1u32.to_le_bytes());
+    config[268..272].copy_from_slice(&(end as u32).to_le_bytes());
+    config[272..276].copy_from_slice(&(count as u32).to_le_bytes());
+    config[276..280].copy_from_slice(&(directory as u32).to_le_bytes());
+    config[280] = u8::from(end == count);
+    Ok(())
+}
+
+pub fn process_directory(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if data.len() != 16 || &data[..8] != DIRECTORY_MAGIC || u32_at(data, 8) != 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if accounts.len() != 6 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let config = &accounts[0];
+    if config.owner != program || !config.is_signer || !config.is_writable {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    if config.data_len() != CONFIG_BYTES {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut output = config.try_borrow_mut_data()?;
+    for (index, chunk) in accounts[1..].iter().enumerate() {
+        if chunk.owner != program
+            || chunk.is_writable
+            || chunk.data_len() != CHUNK_BYTES
+            || output[96 + index * 32..128 + index * 32] != chunk.key.to_bytes()
+            || accounts[..index + 1].iter().any(|a| a.key == chunk.key)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    let chunks = [
+        accounts[1].try_borrow_data()?,
+        accounts[2].try_borrow_data()?,
+        accounts[3].try_borrow_data()?,
+        accounts[4].try_borrow_data()?,
+        accounts[5].try_borrow_data()?,
+    ];
+    let mut payloads: [&[u8]; 5] = [&[]; 5];
+    for (index, chunk) in chunks.iter().enumerate() {
+        let length = (WAD_BYTES - index * PAYLOAD_BYTES).min(PAYLOAD_BYTES);
+        if &chunk[..8] != b"DOOM-WC1"
+            || u32_at(chunk, 8) != 1
+            || u32_at(chunk, 12) != 32
+            || u32_at(chunk, 16) != CHUNK_BYTES as u32
+            || u32_at(chunk, 20) != index as u32
+            || u32_at(chunk, 24) != length as u32
+            || u32_at(chunk, 28) != 0
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        payloads[index] = &chunk[32..32 + length];
+    }
+    directory_step(&mut output, &payloads, u32_at(data, 12) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn directory_continuation_refuses_invalid_lifecycle_and_bounds_without_writes() {
+        let mut wad = vec![0; WAD_BYTES];
+        wad[..4].copy_from_slice(b"IWAD");
+        wad[4..8].copy_from_slice(&65u32.to_le_bytes());
+        let directory = PAYLOAD_BYTES - 8;
+        wad[8..12].copy_from_slice(&(directory as u32).to_le_bytes());
+        let mut config = vec![0; CONFIG_BYTES];
+        config[..8].copy_from_slice(INIT_MAGIC);
+        config[8..12].copy_from_slice(&1u32.to_le_bytes());
+        config[12..16].copy_from_slice(&(WAD_BYTES as u32).to_le_bytes());
+        config[16..48].copy_from_slice(&WAD_HASH);
+        config[48] = 1;
+        for (index, word) in WAD_HASH.chunks_exact(4).enumerate() {
+            config[64 + index * 4..68 + index * 4]
+                .copy_from_slice(&u32::from_be_bytes(word.try_into().unwrap()).to_le_bytes());
+        }
+        let payloads: [&[u8]; 5] = wad
+            .chunks(PAYLOAD_BYTES)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        for (offset, error) in [
+            (8, ProgramError::InvalidAccountData),
+            (48, ProgramError::Custom(3)),
+            (64, ProgramError::Custom(1)),
+        ] {
+            let mut bad = config.clone();
+            bad[offset] ^= 1;
+            let before = bad.clone();
+            assert_eq!(directory_step(&mut bad, &payloads, 0), Err(error));
+            assert_eq!(bad, before);
+        }
+        let initial = config.clone();
+        assert_eq!(
+            directory_step(&mut config, &payloads, 64),
+            Err(ProgramError::Custom(2))
+        );
+        assert_eq!(config, initial);
+        directory_step(&mut config, &payloads, 0).unwrap();
+        assert_eq!(u32_at(&config, 268), 64);
+        assert_eq!(config[280], 0);
+        let before = config.clone();
+        assert_eq!(
+            directory_step(&mut config, &payloads, 0),
+            Err(ProgramError::Custom(2))
+        );
+        assert_eq!(config, before);
+        directory_step(&mut config, &payloads, 64).unwrap();
+        assert_eq!(u32_at(&config, 268), 65);
+        assert_eq!(config[280], 1);
+        let before = config.clone();
+        assert_eq!(
+            directory_step(&mut config, &payloads, 64),
+            Err(ProgramError::Custom(2))
+        );
+        assert_eq!(config, before);
+        wad[directory..directory + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let payloads = wad
+            .chunks(PAYLOAD_BYTES)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        config = initial.clone();
+        assert_eq!(
+            directory_step(&mut config, &payloads, 0),
+            Err(ProgramError::InvalidAccountData)
+        );
+        assert_eq!(config, initial);
+    }
 
     #[test]
     fn midstate_matches_standard_hash_across_account_boundaries() {
