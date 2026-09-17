@@ -16,8 +16,7 @@ pub const WAD_HASH: [u8; 32] = [
     0x3b, 0xf3, 0x30, 0x75, 0xe8, 0x59, 0x72, 0x18, 0x16, 0xf6, 0x52, 0xa5, 0x26, 0xca, 0xc7, 0x71,
 ];
 const IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 fn u32_at(data: &[u8], offset: usize) -> u32 {
@@ -118,18 +117,22 @@ pub fn process_init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         }
     }
     let chunks = [
-        accounts[1].try_borrow_data()?, accounts[2].try_borrow_data()?,
-        accounts[3].try_borrow_data()?, accounts[4].try_borrow_data()?,
+        accounts[1].try_borrow_data()?,
+        accounts[2].try_borrow_data()?,
+        accounts[3].try_borrow_data()?,
+        accounts[4].try_borrow_data()?,
         accounts[5].try_borrow_data()?,
     ];
     let mut payloads: [&[u8]; 5] = [&[]; 5];
     for (index, chunk) in chunks.iter().enumerate() {
         let length = (WAD_BYTES - index * PAYLOAD_BYTES).min(PAYLOAD_BYTES);
         if &chunk[..8] != b"DOOM-WC1"
-            || u32_at(chunk, 8) != 1 || u32_at(chunk, 12) != 32
+            || u32_at(chunk, 8) != 1
+            || u32_at(chunk, 12) != 32
             || u32_at(chunk, 16) != CHUNK_BYTES as u32
             || u32_at(chunk, 20) != index as u32
-            || u32_at(chunk, 24) != length as u32 || u32_at(chunk, 28) != 0
+            || u32_at(chunk, 24) != length as u32
+            || u32_at(chunk, 28) != 0
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -167,7 +170,9 @@ mod tests {
 
     #[test]
     fn midstate_matches_standard_hash_across_account_boundaries() {
-        let wad: Vec<u8> = (0..WAD_BYTES).map(|i| (i.wrapping_mul(131) >> 5) as u8).collect();
+        let wad: Vec<u8> = (0..WAD_BYTES)
+            .map(|i| (i.wrapping_mul(131) >> 5) as u8)
+            .collect();
         let payloads: Vec<&[u8]> = wad.chunks(PAYLOAD_BYTES).collect();
         let payloads: [&[u8]; 5] = payloads.try_into().unwrap();
         let mut words = IV;

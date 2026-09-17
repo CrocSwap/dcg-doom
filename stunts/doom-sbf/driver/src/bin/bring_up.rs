@@ -1,6 +1,8 @@
 use std::{env, error::Error, fs, path::PathBuf};
 
-use doom_sbf::bring_up::{CHUNK_BYTES, COMPRESS_WINDOW_BYTES, CONFIG_BYTES, INIT_MAGIC, WAD_BYTES, WAD_HASH};
+use doom_sbf::bring_up::{
+    CHUNK_BYTES, COMPRESS_WINDOW_BYTES, CONFIG_BYTES, INIT_MAGIC, WAD_BYTES, WAD_HASH,
+};
 use solana_account::{Account, AccountSharedData};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::{account_meta::AccountMeta, Instruction};
@@ -15,7 +17,13 @@ const PROGRAM: Pubkey = Pubkey::new_from_array([0xda; 32]);
 const BUDGET: u32 = 1_190_000;
 
 fn account(data: Vec<u8>) -> Account {
-    Account { lamports: 100_000_000_000, data, owner: PROGRAM, executable: false, rent_epoch: 0 }
+    Account {
+        lamports: 100_000_000_000,
+        data,
+        owner: PROGRAM,
+        executable: false,
+        rent_epoch: 0,
+    }
 }
 
 #[tokio::main]
@@ -29,7 +37,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut bank = ProgramTest::default();
     if native {
         bank.prefer_bpf(false);
-        bank.add_program("doom_sbf", PROGRAM, processor!(doom_sbf::process_instruction));
+        bank.add_program(
+            "doom_sbf",
+            PROGRAM,
+            processor!(doom_sbf::process_instruction),
+        );
     } else {
         let so = PathBuf::from(&args[1]).canonicalize()?;
         if so.file_name().and_then(|s| s.to_str()) != Some("doom_sbf.so") {
@@ -48,7 +60,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for index in 0..5 {
         let bytes = fs::read(root.join(format!("wad-{index:03}.bin")))?;
         assert_eq!(bytes.len(), CHUNK_BYTES);
-        if index == 4 { tail = bytes.clone(); }
+        if index == 4 {
+            tail = bytes.clone();
+        }
         let key = Pubkey::new_from_array([0xe0 + index; 32]);
         bank.add_account(key, account(bytes));
         metas.push(AccountMeta::new_readonly(key, false));
@@ -58,14 +72,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut maximum = 0;
     let mut total = 0;
     let mut steps = 0;
-    let step_limit: usize = env::var("DOOM_HASH_MAX_STEPS").ok().map(|s| s.parse()).transpose()?.unwrap_or(usize::MAX);
-    for cursor in (0..WAD_BYTES).step_by(COMPRESS_WINDOW_BYTES).take(step_limit) {
+    let step_limit: usize = env::var("DOOM_HASH_MAX_STEPS")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(usize::MAX);
+    for cursor in (0..WAD_BYTES)
+        .step_by(COMPRESS_WINDOW_BYTES)
+        .take(step_limit)
+    {
         let final_step = cursor + COMPRESS_WINDOW_BYTES >= WAD_BYTES;
         let labels: &[&str] = if cursor == 0 {
-            &["wrong_hash", "wrong_version", "out_of_order", "permuted_chunks", "malformed", "honest"]
+            &[
+                "wrong_hash",
+                "wrong_version",
+                "out_of_order",
+                "permuted_chunks",
+                "malformed",
+                "honest",
+            ]
         } else if final_step {
-            &["corrupt_tail", "wrong_state_version", "out_of_order", "honest"]
-        } else { &["honest"] };
+            &[
+                "corrupt_tail",
+                "wrong_state_version",
+                "out_of_order",
+                "honest",
+            ]
+        } else {
+            &["honest"]
+        };
         for &label in labels {
             let before = client.get_account(config.pubkey()).await?.unwrap();
             let mut data = INIT_MAGIC.to_vec();
@@ -76,37 +111,60 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match label {
                 "wrong_hash" => data[16] ^= 1,
                 "wrong_version" => data[8] = 2,
-                "out_of_order" => data[12..16].copy_from_slice(&((cursor + COMPRESS_WINDOW_BYTES) as u32).to_le_bytes()),
+                "out_of_order" => data[12..16]
+                    .copy_from_slice(&((cursor + COMPRESS_WINDOW_BYTES) as u32).to_le_bytes()),
                 "permuted_chunks" => accounts.swap(1, 2),
-                "malformed" => { data.pop(); },
+                "malformed" => {
+                    data.pop();
+                }
                 "corrupt_tail" => {
                     let mut bad = tail.clone();
                     bad[32 + WAD_BYTES % doom_sbf::bring_up::PAYLOAD_BYTES - 1] ^= 1;
                     context.set_account(&metas[5].pubkey, &AccountSharedData::from(account(bad)));
-                },
+                }
                 "wrong_state_version" => {
                     let mut bad = before.clone();
                     bad.data[8] = 2;
                     context.set_account(&config.pubkey(), &AccountSharedData::from(bad));
-                },
+                }
                 _ => (),
             }
-            context.last_blockhash = client.get_new_latest_blockhash(&context.last_blockhash).await?;
-            let tx = Transaction::new(&[&context.payer, &config], Message::new_with_blockhash(&[
-                ComputeBudgetInstruction::set_compute_unit_limit(BUDGET),
-                Instruction { program_id: PROGRAM, accounts, data },
-            ], Some(&context.payer.pubkey()), &context.last_blockhash), context.last_blockhash);
+            context.last_blockhash = client
+                .get_new_latest_blockhash(&context.last_blockhash)
+                .await?;
+            let tx = Transaction::new(
+                &[&context.payer, &config],
+                Message::new_with_blockhash(
+                    &[
+                        ComputeBudgetInstruction::set_compute_unit_limit(BUDGET),
+                        Instruction {
+                            program_id: PROGRAM,
+                            accounts,
+                            data,
+                        },
+                    ],
+                    Some(&context.payer.pubkey()),
+                    &context.last_blockhash,
+                ),
+                context.last_blockhash,
+            );
             let packet_bytes = bincode::serialize(&tx)?.len();
             assert!(packet_bytes <= 1_232);
             let result = client.process_transaction_with_metadata(tx).await?;
             let status = format!("{:?}", result.result);
             println!("MEASURE native={native} label={label} cursor={cursor} result={status} tx_cu={} packet_bytes={packet_bytes} loaded_data_bytes={}", result.metadata.as_ref().map(|m| m.compute_units_consumed).unwrap_or(0), CONFIG_BYTES + 5 * CHUNK_BYTES);
-            let details = result.metadata.as_ref().ok_or(format!("missing transaction metadata: {status}"))?;
+            let details = result
+                .metadata
+                .as_ref()
+                .ok_or(format!("missing transaction metadata: {status}"))?;
             if label == "honest" {
                 assert_eq!(result.result, Ok(()), "{status} {:?}", details.log_messages);
                 assert!(details.compute_units_consumed <= BUDGET as u64);
                 let stored = client.get_account(config.pubkey()).await?.unwrap().data;
-                assert_eq!(u32::from_le_bytes(stored[12..16].try_into().unwrap()) as usize, (cursor + COMPRESS_WINDOW_BYTES).min(WAD_BYTES));
+                assert_eq!(
+                    u32::from_le_bytes(stored[12..16].try_into().unwrap()) as usize,
+                    (cursor + COMPRESS_WINDOW_BYTES).min(WAD_BYTES)
+                );
                 assert_eq!(stored[48], u8::from(final_step));
                 maximum = maximum.max(details.compute_units_consumed);
                 total += details.compute_units_consumed;
@@ -122,9 +180,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if label == "wrong_state_version" {
                     context.set_account(&config.pubkey(), &AccountSharedData::from(before.clone()));
                 }
-                assert_eq!(client.get_account(config.pubkey()).await?.unwrap().data, before.data);
+                assert_eq!(
+                    client.get_account(config.pubkey()).await?.unwrap().data,
+                    before.data
+                );
                 if label == "corrupt_tail" {
-                    context.set_account(&metas[5].pubkey, &AccountSharedData::from(account(tail.clone())));
+                    context.set_account(
+                        &metas[5].pubkey,
+                        &AccountSharedData::from(account(tail.clone())),
+                    );
                 }
             }
         }
@@ -132,10 +196,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let stored = client.get_account(config.pubkey()).await?.unwrap().data;
     let complete = stored[48] == 1;
     if complete {
-        assert_eq!(stored[64..96].chunks_exact(4).flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes()).collect::<Vec<u8>>(), WAD_HASH, "final digest != committed WAD sha256");
+        assert_eq!(
+            stored[64..96]
+                .chunks_exact(4)
+                .flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes())
+                .collect::<Vec<u8>>(),
+            WAD_HASH,
+            "final digest != committed WAD sha256"
+        );
     }
-    let digest: String = stored[64..96].chunks_exact(4).flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes()).map(|b| format!("{b:02x}")).collect();
-    let digest: String = stored[64..96].chunks_exact(4).flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes()).map(|b| format!("{b:02x}")).collect();
+    let digest: String = stored[64..96]
+        .chunks_exact(4)
+        .flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes())
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let digest: String = stored[64..96]
+        .chunks_exact(4)
+        .flat_map(|word| u32::from_le_bytes(word.try_into().unwrap()).to_be_bytes())
+        .map(|b| format!("{b:02x}"))
+        .collect();
     println!("HASH_ACCEPTANCE={} native={native} steps={steps} chunk_bytes={COMPRESS_WINDOW_BYTES} max_tx_cu={maximum} total_tx_cu={total} budget={BUDGET} digest_or_midstate={digest}", if complete { "PASS" } else { "PARTIAL" });
     println!("STEP5_ACCEPTANCE=INCOMPLETE load_level/tic/strip/golden_replay=UNIMPLEMENTED");
     Ok(())

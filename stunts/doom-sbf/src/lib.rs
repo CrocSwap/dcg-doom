@@ -67,7 +67,10 @@ pub fn process_instruction(
     }
     if accounts.iter().any(|account| {
         account.is_writable
-            && matches!(account.data_len(), bring_up::CONFIG_BYTES | bring_up::CHUNK_BYTES)
+            && matches!(
+                account.data_len(),
+                bring_up::CONFIG_BYTES | bring_up::CHUNK_BYTES
+            )
     }) {
         return Err(ProgramError::InvalidAccountData);
     }
