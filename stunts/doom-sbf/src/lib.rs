@@ -70,6 +70,10 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    #[cfg(feature = "account-address-probe")]
+    if instruction_data.starts_with(b"DOOM-AP1") {
+        return process_address_probe(_program_id, accounts, instruction_data);
+    }
     if instruction_data.starts_with(bring_up::DIRECTORY_MAGIC) {
         return bring_up::process_directory(_program_id, accounts, instruction_data);
     }
@@ -176,6 +180,28 @@ pub fn process_instruction(
         }
         _ => return Err(ProgramError::InvalidInstructionData),
     }
+    Ok(())
+}
+
+#[cfg(feature = "account-address-probe")]
+fn process_address_probe(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() != 9 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let account = accounts.last().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if account.owner != program_id || !account.is_writable || account.data_len() < 24 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut data = account.try_borrow_mut_data()?;
+    let address = data.as_mut_ptr() as u64;
+    let previous = u64::from_le_bytes(data[..8].try_into().unwrap());
+    data[8..16].copy_from_slice(&previous.to_le_bytes());
+    data[..8].copy_from_slice(&address.to_le_bytes());
+    data[16..24].copy_from_slice(&u64::from(instruction_data[8]).to_le_bytes());
     Ok(())
 }
 

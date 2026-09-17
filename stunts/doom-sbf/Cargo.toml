@@ -20,6 +20,7 @@ crate-type = ["cdylib", "lib"]
 [features]
 default = []
 static-write-probe = []
+account-address-probe = []
 
 [dependencies]
 solana-program = "=2.3.0"
