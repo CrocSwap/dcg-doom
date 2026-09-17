@@ -9,6 +9,16 @@ publish = false
 # processor to ProgramTest.
 [workspace]
 
+# `static_probe` measures what the loader does with an image that carries
+# writable static data, so it only builds when the crate feature that puts
+# such data in the image is on.
+[features]
+static-write-probe = ["doom-sbf/static-write-probe"]
+
+[[bin]]
+name = "static_probe"
+required-features = ["static-write-probe"]
+
 [dependencies]
 doom-sbf = { path = ".." }
 bincode = "=1.3.3"

@@ -1,7 +1,8 @@
 # Headless Doom host replay
 
 Run `stunts/doom-host/build.sh`; it clones the pinned upstream source into the
-mandated session scratchpad, applies the ordered patch set, fetches the NetBSD
+scratch area named by `DOOM_SCRATCH` (default: the session scratchpad that
+first recorded this path), applies the ordered patch set, fetches the NetBSD
 `doom1-1.9.tgz` public mirror, and rejects any WAD except the
 4,196,020-byte SHA-256-pinned v1.9 shareware asset.
 
@@ -39,6 +40,14 @@ the 40-column strip, y advances over each 200-pixel column. `DOOM-FB1` v0 is
 u32le(strip_id) || 8000 strip bytes)`. Whole records use the distinct
 `DOOM-FB1-FRAME` domain, strip id 0, and the native row-major 64,000-byte
 framebuffer.
+
+Patch `0006` removes the six `alloca` sites (the SBF backend rejects dynamic
+stack allocation) in favour of `Z_Malloc`/`Z_Free`, and adds read-only
+instrumentation: `--zone-census FILE` writes one JSON line per phase
+(`z_init`, `wad_open`, `engine_init`, `load_level`, `tic_1`, `tic_100`,
+`tic_1000`, `final`) reporting non-purgeable, purgeable and extent bytes, and
+`-mb-used N` sets the zone size so the floor can be probed. The DEMO1 stream
+is unchanged by `0006`.
 
 Patch `0005` adds the host-only reentrant parity harness. Pass
 `--reentrant-parity FILE` with `-account-manifest` to compare the ordinary

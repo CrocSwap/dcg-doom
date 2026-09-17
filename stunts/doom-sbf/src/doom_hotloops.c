@@ -240,3 +240,17 @@ void doom_write_strip(byte *strip, u32 bytes, const byte *state) {
         strip[i] = (byte)(seed + (byte)(i * 37));
     }
 }
+
+/* Writability probe for the engine port.  linuxdoom-1.10 keeps its live state
+ * in ordinary C globals, which land in the program image's .data/.bss.  This
+ * probe writes one such global and reads it back, so whether an SBF program
+ * may hold mutable static state is settled by measurement rather than by
+ * assumption.  It is not part of any Doom code path. */
+#ifdef DOOM_STATIC_WRITE_PROBE
+static u64 doom_probe_cell = 0x5a5a5a5a5a5a5a5aull;
+
+u64 doom_probe_static_write(u64 value) {
+    doom_probe_cell ^= value;
+    return doom_probe_cell;
+}
+#endif

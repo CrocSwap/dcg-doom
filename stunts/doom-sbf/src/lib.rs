@@ -22,6 +22,12 @@ pub const W3_BSP_ONLY: u8 = 4;
 pub const W3_FIXED_MUL_ONLY: u8 = 5;
 pub const W3_FIXED_DIV_ONLY: u8 = 6;
 pub const W3_FIXED_MUL_DIV: u8 = 7;
+/// Writes one mutable C global and reads it back: the engine-port probe for
+/// whether an SBF program image may hold mutable static state.  Present only
+/// under the `static-write-probe` feature, because the mutable global it adds
+/// puts a `.data` section in the image and the loader then refuses it.
+#[cfg(feature = "static-write-probe")]
+pub const W4_STATIC_WRITE: u8 = 8;
 
 unsafe extern "C" {
     fn doom_draw_columns(framebuffer: *mut u8, state: *mut u8);
@@ -31,6 +37,8 @@ unsafe extern "C" {
     fn doom_fixed_div_only(state: *mut u8) -> u64;
     fn doom_fixed_mul_div(state: *mut u8) -> u64;
     fn doom_write_strip(strip: *mut u8, bytes: u32, state: *const u8);
+    #[cfg(feature = "static-write-probe")]
+    fn doom_probe_static_write(value: u64) -> u64;
 }
 
 entrypoint!(process_instruction);
@@ -118,6 +126,14 @@ pub fn process_instruction(
                     (&mut state_data[..]).as_mut_ptr(),
                 )
             };
+        }
+        #[cfg(feature = "static-write-probe")]
+        W4_STATIC_WRITE => {
+            let state = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+            require_mutable_state(state)?;
+            let mut state_data = state.data.borrow_mut();
+            let result = unsafe { doom_probe_static_write(0x0123_4567_89ab_cdef) };
+            write_result(&mut state_data[..], result)?;
         }
         W3_FULL | W3_BSP_ONLY | W3_FIXED_MUL_ONLY | W3_FIXED_DIV_ONLY | W3_FIXED_MUL_DIV => {
             let state = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;

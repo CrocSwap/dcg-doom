@@ -13,6 +13,14 @@ build = "build.rs"
 name = "doom_sbf"
 crate-type = ["cdylib", "lib"]
 
+# `static-write-probe` adds one mutable C global and the instruction that
+# writes it.  It is OFF by default and must stay off for any image meant to
+# load: the measurement it exists to make is that an image carrying writable
+# static data is rejected by the loader.
+[features]
+default = []
+static-write-probe = []
+
 [dependencies]
 solana-program = "=2.3.0"
 sha2 = { version = "=0.10.9", default-features = false, features = ["compress"] }

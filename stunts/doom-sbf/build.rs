@@ -4,8 +4,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_hotloops.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
+
     let mut build = cc::Build::new();
     build.file("src/doom_hotloops.c");
+    if env::var("CARGO_FEATURE_STATIC_WRITE_PROBE").is_ok() {
+        build.define("DOOM_STATIC_WRITE_PROBE", None);
+    }
 
     if target == "sbf-solana-solana" {
         // Do not let cc discover the host compiler: the C object has to be

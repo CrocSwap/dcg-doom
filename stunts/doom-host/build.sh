@@ -2,7 +2,10 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-scratch=/private/tmp/claude-501/-Users-colkitt-sith-toys-crypto-basanos/e8f2923b-4704-46b4-a218-5d8564c5ea3f/scratchpad
+# The scratch area holds the fetched upstream source and the WAD; neither may
+# enter Git.  DOOM_SCRATCH lets a later session point at its own scratchpad
+# instead of the one that first recorded this path.
+scratch=${DOOM_SCRATCH:-/private/tmp/claude-501/-Users-colkitt-sith-toys-crypto-basanos/e8f2923b-4704-46b4-a218-5d8564c5ea3f/scratchpad}
 src="$scratch/doom-src"
 wad_dir="$scratch/doom-wad"
 wad="$wad_dir/share/doom/doom1.wad"

@@ -1,0 +1,290 @@
+Subject: [PATCH 0006] Remove dynamic stack allocation and add a zone census
+
+linuxdoom-1.10 uses alloca in six places.  The SBF backend rejects dynamic
+stack allocation outright ("error in backend: Unsupported dynamic stack
+allocation" in R_GenerateLookup), so those six sites are the only thing that
+stops the engine's translation units from compiling for sbf-solana-solana.
+Each one is a short-lived scratch buffer with a single lifetime, so the zone
+allocator covers them exactly: Z_Malloc with PU_STATIC, released on every
+exit path.  Z_Malloc for a non-purgeable tag cannot purge the caller's own
+block, so the allocation sequence the engine observes is unchanged, and the
+DEMO1 replay stream is byte-identical afterwards
+(DOOM-FB1 2db988a2fa58c294d070fc9e2e6a52de615a8aa4b13ec9af33056985189d69c2,
+the retained M463 golden).
+
+Z_Census and the host's --zone-census flag report how much zone the engine
+actually holds, which is the number an account-resident arena has to cover.
+-mb-used makes the zone size settable so that floor can be probed.  Both are
+read-only instrumentation on the host path.
+
+Applies on top of 0001-0005.
+--- a/linuxdoom-1.10/r_data.c
++++ b/linuxdoom-1.10/r_data.c
+--- a/linuxdoom-1.10/r_data.c
++++ b/linuxdoom-1.10/r_data.c
+@@ -41,7 +41,6 @@
+ #include "doomstat.h"
+ #include "r_sky.h"
+ 
+-#include <alloca.h>
+ #include <stdint.h>
+ 
+ 
+@@ -323,7 +322,11 @@
+     //  that are covered by more than one patch.
+     // Fill in the lump / offset, so columns
+     //  with only a single patch are all done.
+-    patchcount = (byte *)alloca (texture->width);
++    // SBF has no dynamic stack allocation, so this scratch buffer comes from
++    // the zone instead of alloca.  It is non-purgeable for its whole lifetime
++    // and freed on every exit path, so the allocation sequence a caller sees
++    // is unchanged.
++    patchcount = (byte *)Z_Malloc (texture->width, PU_STATIC, 0);
+     memset (patchcount, 0, texture->width);
+     patch = texture->patches;
+ 		
+@@ -356,6 +359,7 @@
+ 	{
+ 	    printf ("R_GenerateLookup: column without a patch (%s)\n",
+ 		    texture->name);
++	    Z_Free (patchcount);
+ 	    return;
+ 	}
+ 	// I_Error ("R_GenerateLookup: column without a patch");
+@@ -375,6 +379,7 @@
+ 	    texturecompositesize[texnum] += texture->height;
+ 	}
+     }	
++    Z_Free (patchcount);
+ }
+ 
+ 
+@@ -452,7 +457,7 @@
+     names = W_CacheLumpName ("PNAMES", PU_STATIC);
+     nummappatches = LONG ( *((int *)names) );
+     name_p = names+4;
+-    patchlookup = alloca (nummappatches*sizeof(*patchlookup));
++    patchlookup = Z_Malloc (nummappatches*sizeof(*patchlookup), PU_STATIC, 0);
+     
+     for (i=0 ; i<nummappatches ; i++)
+     {
+@@ -562,6 +567,7 @@
+ 	totalwidth += texture->width;
+     }
+ 
++    Z_Free (patchlookup);
+     Z_Free (maptex1);
+     if (maptex2)
+ 	Z_Free (maptex2);
+@@ -763,7 +769,7 @@
+ 	return;
+     
+     // Precache flats.
+-    flatpresent = alloca(numflats);
++    flatpresent = Z_Malloc(numflats, PU_STATIC, 0);
+     memset (flatpresent,0,numflats);	
+ 
+     for (i=0 ; i<numsectors ; i++)
+@@ -785,7 +791,7 @@
+     }
+     
+     // Precache textures.
+-    texturepresent = alloca(numtextures);
++    texturepresent = Z_Malloc(numtextures, PU_STATIC, 0);
+     memset (texturepresent,0, numtextures);
+ 	
+     for (i=0 ; i<numsides ; i++)
+@@ -820,7 +826,7 @@
+     }
+     
+     // Precache sprites.
+-    spritepresent = alloca(numsprites);
++    spritepresent = Z_Malloc(numsprites, PU_STATIC, 0);
+     memset (spritepresent,0, numsprites);
+ 	
+     for (th = thinkercap.next ; th != &thinkercap ; th=th->next)
+@@ -846,4 +852,7 @@
+ 	    }
+ 	}
+     }
++    Z_Free (spritepresent);
++    Z_Free (texturepresent);
++    Z_Free (flatpresent);
+ }
+--- a/linuxdoom-1.10/w_wad.c
++++ b/linuxdoom-1.10/w_wad.c
+@@ -34,7 +34,6 @@
+ #include <stdlib.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+-#include <alloca.h>
+ #define O_BINARY		0
+ #endif
+ 
+@@ -150,6 +149,7 @@
+     int			length;
+     int			startlump;
+     filelump_t*		fileinfo;
++    filelump_t*		fileinfo_zone = NULL;
+     filelump_t		singleinfo;
+     int			storehandle;
+     
+@@ -199,7 +199,10 @@
+ 	header.numlumps = LONG(header.numlumps);
+ 	header.infotableofs = LONG(header.infotableofs);
+ 	length = header.numlumps*sizeof(filelump_t);
+-	fileinfo = alloca (length);
++	// SBF has no dynamic stack allocation; the directory scratch comes
++	// from the zone and is released before this function returns.
++	fileinfo_zone = Z_Malloc (length, PU_STATIC, 0);
++	fileinfo = fileinfo_zone;
+ 	lseek (handle, header.infotableofs, SEEK_SET);
+ 	read (handle, fileinfo, length);
+ 	numlumps += header.numlumps;
+@@ -224,6 +227,9 @@
+ 	strncpy (lump_p->name, fileinfo->name, 8);
+     }
+ 	
++    if (fileinfo_zone)
++	Z_Free (fileinfo_zone);
++
+     if (reloadname)
+ 	close (handle);
+ }
+@@ -245,6 +251,7 @@
+     int			handle;
+     int			length;
+     filelump_t*		fileinfo;
++    filelump_t*		fileinfo_zone;
+ 
+     if (doom_account_wad)
+ 	return;
+@@ -259,7 +266,8 @@
+     lumpcount = LONG(header.numlumps);
+     header.infotableofs = LONG(header.infotableofs);
+     length = lumpcount*sizeof(filelump_t);
+-    fileinfo = alloca (length);
++    fileinfo_zone = Z_Malloc (length, PU_STATIC, 0);
++    fileinfo = fileinfo_zone;
+     lseek (handle, header.infotableofs, SEEK_SET);
+     read (handle, fileinfo, length);
+     
+@@ -277,6 +285,8 @@
+ 	lump_p->size = LONG(fileinfo->size);
+     }
+ 	
++    Z_Free (fileinfo_zone);
++
+     close (handle);
+ }
+ 
+--- a/linuxdoom-1.10/z_zone.c
++++ b/linuxdoom-1.10/z_zone.c
+@@ -115,6 +115,44 @@
+     block->user = NULL;
+     
+     block->size = mainzone->size - sizeof(memzone_t);
++}
++
++
++//
++// Z_Census
++// Walks the block list and reports, for the current zone, the bytes held by
++// non-purgeable tags (the hard floor a fixed arena must cover), the bytes
++// held by purgeable cache, and the byte extent of the highest live block.
++// Read-only: it allocates nothing and frees nothing.
++//
++void Z_Census (int* fixed, int* purgeable, int* extent, int* zonesize)
++{
++    memblock_t*	block;
++    int		held_fixed = 0;
++    int		held_purge = 0;
++    int		high = 0;
++
++    for (block = mainzone->blocklist.next ;
++	 block != &mainzone->blocklist ;
++	 block = block->next)
++    {
++	if (!block->user)
++	    continue;
++	if (block->tag < PU_PURGELEVEL)
++	    held_fixed += block->size;
++	else
++	    held_purge += block->size;
++	high = (int)((byte *)block - (byte *)mainzone) + block->size;
++    }
++
++    if (fixed)
++	*fixed = held_fixed;
++    if (purgeable)
++	*purgeable = held_purge;
++    if (extent)
++	*extent = high;
++    if (zonesize)
++	*zonesize = mainzone->size;
+ }
+ 
+ 
+--- a/linuxdoom-1.10/z_zone.h
++++ b/linuxdoom-1.10/z_zone.h
+@@ -53,6 +53,7 @@
+ void    Z_CheckHeap (void);
+ void    Z_ChangeTag2 (void *ptr, int tag);
+ int     Z_FreeMemory (void);
++void    Z_Census (int* fixed, int* purgeable, int* extent, int* zonesize);
+ 
+ 
+ typedef struct memblock_s
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -75,19 +75,26 @@
+ static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N]\n",argv0); }
+ static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
+ static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
++extern int mb_used;
++/* One census line per named phase: the non-purgeable zone bytes are the hard
++   floor an account-resident arena has to cover; the purgeable bytes can be
++   evicted; the extent is the highest live byte offset in the zone. */
++static void zone_census(FILE *f,const char *phase) { int fixed=0,purge=0,extent=0,zonesize=0; if(!f)return; Z_Census(&fixed,&purge,&extent,&zonesize); fprintf(f,"{\"phase\":\"%s\",\"fixed_bytes\":%d,\"purgeable_bytes\":%d,\"extent_bytes\":%d,\"zone_bytes\":%d}\n",phase,fixed,purge,extent,zonesize); fflush(f); }
+ 
+ int main(int argc, char **argv) {
+-  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *states=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000; FILE *out, *stateout=0, *parityout=0, *probeout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS];
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *states=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used");
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS];
+   if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
+   if(max_tics_arg){char *end=0;long v=strtol(max_tics_arg,&end,10);if(!end||*end||v<1||v>1000000){fprintf(stderr,"bad --max-tics\n");return 2;}max_tics=(int)v;}
+   if(save_at_arg){char *end=0;long v=strtol(save_at_arg,&end,10);if(!end||*end||v<0||v>1000000||!save){fprintf(stderr,"bad --save-at/--save\n");return 2;}save_at=(int)v;} else if(save||(resave&&!load)){fprintf(stderr,"--save requires --save-at; --resave requires --load\n");return 2;}
+   if(iwad){if(hash_file(iwad,wad_hash)){fprintf(stderr,"cannot hash %s: %s\n",iwad,strerror(errno));return 2;}}
++  if(mb_used_arg){char *end=0;long v=strtol(mb_used_arg,&end,10);if(!end||*end||v<1||v>256){fprintf(stderr,"bad -mb-used\n");return 2;}mb_used=(int)v;}
++  if(zone_census_path){censusout=fopen(zone_census_path,"w");if(!censusout){fprintf(stderr,"cannot open %s\n",zone_census_path);return 2;}}
+   myargc=argc;myargv=argv;gamemode=shareware;gamemission=doom;language=english;deathmatch=0;consoleplayer=0;displayplayer=0;
+-  Z_Init(); if(manifest){if(DoomAccountOpenManifest(manifest,&account)){fprintf(stderr,"refusing account manifest %s\n",manifest);return 2;}memcpy(wad_hash,DoomAccountWadHash(account),32);}else W_InitFile(iwad); V_Init(); R_Init(); R_ExecuteSetViewSize(); P_Init();
++  Z_Init(); zone_census(censusout,"z_init"); if(manifest){if(DoomAccountOpenManifest(manifest,&account)){fprintf(stderr,"refusing account manifest %s\n",manifest);return 2;}memcpy(wad_hash,DoomAccountWadHash(account),32);}else W_InitFile(iwad); V_Init(); zone_census(censusout,"wad_open"); R_Init(); R_ExecuteSetViewSize(); P_Init(); zone_census(censusout,"engine_init");
+   demo_len=W_LumpLength(W_GetNumForName(demo_name)); demo=W_CacheLumpName(demo_name,PU_STATIC); if(demo_len<14){fprintf(stderr,"demo too short\n");return 2;}
+   if(account && (demo[2]!=1 || demo[3]<1 || demo[3]>9 || DoomAccountBeginLevel(account,demo[2],demo[3]))){fprintf(stderr,"account loader accepts only E1 shareware DEMO1\n");return 2;}
+-  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo();
++  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo(); zone_census(censusout,"load_level");
+   if(account && DoomAccountCommitLevel(account)){fprintf(stderr,"cannot commit fixed account image\n");return 2;}
+   if(account_level && (!account || DoomAccountWriteLevelState(account,account_level))){fprintf(stderr,"cannot write account level_state\n");return 2;}
+   if(account_pool && (!account || DoomAccountWriteMobjPool(account,account_pool))){fprintf(stderr,"cannot write account mobj_pool\n");return 2;}
+@@ -103,6 +110,7 @@
+   if(parity_path||probe_path){render_scratch=malloc(DOOM_RENDER_SCRATCH_BYTES);if(!render_scratch){fprintf(stderr,"cannot allocate render scratch\n");return 2;}DoomRenderScratchInit(render_scratch,DOOM_RENDER_SCRATCH_BYTES,account);}
+   if(probe_path){int refusal;uint8_t bad[64],probe[DOOM_RENDER_STRIP_ACCOUNT_BYTES],*p=0;size_t n=0;probeout=fopen(probe_path,"w");DoomStateEncode(&p,&n);memcpy(bad,p,n<sizeof(bad)?n:sizeof(bad));refusal=DoomRenderStrip(8,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"{\"strip_id_8\":%d,",refusal==DOOM_RENDER_REFUSE_STRIP);refusal=DoomRenderStrip(0,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES-1,probe,0,(uint32_t)gametic);fprintf(probeout,"\"short_scratch\":%d,",refusal==DOOM_RENDER_REFUSE_SCRATCH);bad[0]='X';refusal=DoomRenderStrip(0,bad,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"\"bad_state\":%d}\n",refusal==DOOM_RENDER_REFUSE_STATE);DoomStateFree(p);fclose(probeout);}
+   out=fopen(frames,"w");if(!out){fprintf(stderr,"cannot open %s: %s\n",frames,strerror(errno));return 2;}if(states){stateout=fopen(states,"w");if(!stateout){fprintf(stderr,"cannot open %s: %s\n",states,strerror(errno));fclose(out);return 2;}}
+-  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs,tic_metrics[strip_id].vissprites,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
++  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs,tic_metrics[strip_id].vissprites,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(censusout&&(rendered==1||rendered==100||rendered==1000)){char ph[32];sprintf(ph,"tic_%d",rendered);zone_census(censusout,ph);}if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
++  zone_census(censusout,"final");if(censusout)fclose(censusout);
+   fclose(out);if(parityout)fclose(parityout);free(render_scratch);if(stateout)fclose(stateout);if(tic==100000){fprintf(stderr,"demo did not terminate\n");return 1;}fprintf(stderr,"doom-headless: tics=%d ms/tic=%.6f ms/render=%.6f\n",rendered,tic_ms/(rendered?rendered:1),render_ms/(rendered?rendered:1));return 0;
+ }
+--- a/linuxdoom-1.10/headless/doom_stubs.c
++++ b/linuxdoom-1.10/headless/doom_stubs.c
+@@ -27,7 +27,7 @@
+ #include "wi_stuff.h"
+ 
+ extern boolean doom_headless_demo_done;
+-int mb_used=64;
++int mb_used=64;  /* overridable with -mb-used so the zone floor can be measured */
+ boolean inhelpscreens;
+ boolean menuactive;
+ boolean automapactive;
