@@ -1189,6 +1189,7 @@ dependencies = [
  "cc",
  "indexmap",
  "proc-macro-crate 3.3.0",
+ "sha2 0.10.9",
  "solana-program",
  "zeroize",
 ]
@@ -1197,6 +1198,7 @@ dependencies = [
 name = "doom-sbf-driver"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "doom-sbf",
  "solana-account",
  "solana-compute-budget-interface",
@@ -1205,7 +1207,6 @@ dependencies = [
  "solana-keypair",
  "solana-message",
  "solana-program-test",
- "solana-program",
  "solana-pubkey",
  "solana-signer",
  "solana-transaction",
