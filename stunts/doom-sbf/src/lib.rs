@@ -35,6 +35,24 @@ pub const W4_STATIC_WRITE: u8 = 8;
 /// also covers a zero-initialized `.bss` cell.
 #[cfg(feature = "zero-bss-probe")]
 pub const W5_ZERO_BSS_WRITE: u8 = 9;
+/// DOOM-CX1 instruction magic: guard, then write one context field through
+/// the compile-time constant DOOM_CTX and read it back.  Present only under
+/// the `ctx-engine` feature, which is the only build that links the engine.
+#[cfg(feature = "ctx-engine")]
+pub const CTX_MAGIC: &[u8; 8] = b"DOOM-CX1";
+/// The instruction's own refusal code: the moved-position control must
+/// observe exactly this (a guard refusal), never a generic loader or
+/// validation error.  Mirrors DOOM_CTX_GUARD_REFUSED in doom_sbf_platform.c.
+#[cfg(feature = "ctx-engine")]
+pub const CTX_GUARD_REFUSED: u32 = 199;
+/// Exact context-account length the instruction accepts: the generated
+/// sizeof(doom_ctx_t) (host-measured, 3_440_920) plus one scratch triple
+/// (observed base, SBF-side sizeof, readback) past the end of the struct.
+/// The driver asserts the SBF-side sizeof the probe writes back against its
+/// own copy, so layout drift between the host-measured constant and the SBF
+/// struct fails loudly instead of aliasing engine state.
+#[cfg(feature = "ctx-engine")]
+pub const CTX_MIN_BYTES: usize = 3_440_920 + 24;
 
 unsafe extern "C" {
     fn doom_draw_columns(framebuffer: *mut u8, state: *mut u8);
@@ -48,6 +66,24 @@ unsafe extern "C" {
     fn doom_probe_static_write(value: u64) -> u64;
     #[cfg(feature = "zero-bss-probe")]
     fn doom_probe_zero_bss_write(value: u64) -> u64;
+    #[cfg(feature = "ctx-engine")]
+    fn doom_ctx_probe(seen: *const u8, value: u64, out: *mut u64) -> i32;
+}
+
+/// A Doom I_Error (or any fail-closed platform abort) surfaces as a program
+/// error rather than committed half-built account state.  Defined here so the
+/// context-mode platform layer, which keeps no static data of its own, has
+/// somewhere to go when the engine asks to die.
+///
+/// # Safety
+///
+/// Calling convention only: takes no arguments and never returns (it panics
+/// through the SBF abort path), so there is no aliasing or validity contract
+/// for a caller to uphold.
+#[cfg(feature = "ctx-engine")]
+#[no_mangle]
+pub unsafe extern "C" fn doom_sbf_panic() -> ! {
+    panic!("doom_sbf_panic");
 }
 
 entrypoint!(process_instruction);
@@ -88,6 +124,10 @@ pub fn process_instruction(
     }
     if instruction_data.starts_with(bring_up::INIT_MAGIC) {
         return bring_up::process_init(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.starts_with(CTX_MAGIC) {
+        return process_ctx_probe(_program_id, accounts, instruction_data);
     }
     if accounts.iter().any(|account| {
         account.is_writable
@@ -219,6 +259,38 @@ fn process_address_probe(
     data[8..16].copy_from_slice(&previous.to_le_bytes());
     data[..8].copy_from_slice(&address.to_le_bytes());
     data[16..24].copy_from_slice(&u64::from(instruction_data[8]).to_le_bytes());
+    Ok(())
+}
+
+/// DOOM-CX1: the context account is the LAST account (mirroring M1021's
+/// PREFIX control: at the honest single-account layout first == last and the
+/// guard passes; with a preceding account the mapping moves and the guard
+/// refuses).  The guard runs inside C against the address the VM actually
+/// mapped, so a layout change fails loudly instead of aliasing engine state
+/// onto the wrong account.  No engine init/tic/render runs here by design.
+#[cfg(feature = "ctx-engine")]
+fn process_ctx_probe(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() != 16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let ctx = accounts.last().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    // Exact length: the scratch triple sits at a fixed offset past the
+    // struct, so any size drift fails here or in the driver's sizeof
+    // writeback assertion instead of aliasing engine state.
+    if ctx.owner != program_id || !ctx.is_writable || ctx.data_len() != CTX_MIN_BYTES {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let value = u64::from_le_bytes(instruction_data[8..16].try_into().unwrap());
+    let mut data = ctx.try_borrow_mut_data()?;
+    let (body, scratch) = data.split_at_mut(CTX_MIN_BYTES - 24);
+    let rc = unsafe { doom_ctx_probe(body.as_ptr(), value, scratch.as_mut_ptr() as *mut u64) };
+    if rc != 0 {
+        return Err(ProgramError::Custom(rc as u32));
+    }
     Ok(())
 }
 
