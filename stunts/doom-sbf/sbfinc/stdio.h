@@ -5,9 +5,12 @@
 #define DOOM_SBF_STDIO_H
 #include <stddef.h>
 typedef struct _DOOM_SBF_FILE FILE;
-extern FILE *stdout;
-extern FILE *stderr;
-extern FILE *stdin;
+/* Const NULL: in-cut engine code only reads these (never assigns them), so
+ * the SBF link supplies them from .rodata instead of .bss.  A TU that
+ * assigns one fails to compile here rather than growing writable static. */
+extern FILE *const stdout;
+extern FILE *const stderr;
+extern FILE *const stdin;
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2

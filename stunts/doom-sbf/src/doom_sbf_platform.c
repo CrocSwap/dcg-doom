@@ -1,26 +1,49 @@
 /*
- * SBF platform layer for the patched linuxdoom-1.10 headless cut.
+ * SBF platform layer for the patch-0007 linuxdoom-1.10 headless cut.
  *
  * This file replaces stunts/doom-host/.../headless/doom_stubs.c for the
  * sbf-solana-solana target.  It supplies:
  *
  *   - the subsystem stubs the headless cut already removed (sound, menu, HUD,
  *     intermission, finale, automap, netgame, savegame),
- *   - the freestanding libc subset the engine actually calls, and
- *   - I_ZoneBase, which hands Doom's zone allocator a caller-supplied arena
- *     instead of calloc.  On SBF that arena is a writable account's data, so
- *     every dynamic Doom allocation lands in account state rather than in the
- *     32 KiB program heap.
+ *   - the freestanding libc subset the engine actually calls,
+ *   - the freestanding libc subset the engine actually calls.
+ *
+ * (I_ZoneBase, the arena, the error latch, the ticcmd scratch, the
+ * constant-address guard and the write/read probe live in doom_sbf_ctx.c,
+ * which is the only platform file that sees doom_ctx.h: this one must NOT
+ * be compiled with -include doom_ctx.h, because the engine headers pull in
+ * sbfinc/stdio.h's variadic printf declarations, and SBF cannot define a
+ * variadic function.)
+ *
+ * Zero-static-data design: this translation unit defines NO mutable global
+ * and no const-pointer table.  stdout / stderr / stdin are const NULL
+ * pointers (.rodata): in-cut engine code only reads them (sbfinc/stdio.h
+ * declares them const to match).  Stub globals nothing in the 41-TU cut
+ * references (devparm, drone, inhelpscreens, mousemoved, snd volumes,
+ * debugfile, errno) are deleted, not moved.
  *
  * Nothing here opens a file, allocates from the program heap, or keeps state
- * that outlives the arena.  The file-descriptor entry points exist only
+ * outside the context account.  The file-descriptor entry points exist only
  * because w_wad.c still references them on the non-account path; they are
  * fail-closed and are never reached once the account loader is bound.
  *
  * No Doom source is copied into this file.  See ../LICENSE-NOTE.md.
+ *
+ * Engine init/load_level/tic/render are NOT implemented here: tan() (called
+ * once, r_main.c R_InitTextureMapping) and the other init-only paths abort
+ * through doom_sbf_panic so a future caller fails loudly instead of running
+ * on stub state.
  */
 
 #include <stddef.h>
+
+/* Local twin of sbfinc/stdio.h's FILE: including that header would also pull
+ * its variadic printf declarations into conflict with the fixed-arity
+ * definitions below (SBF cannot define a variadic function, only call one).
+ * Both spell an incomplete-struct pointer, so the stranded const-NULL
+ * definitions link against engine references. */
+typedef struct _DOOM_SBF_FILE DOOM_SBF_FILE;
 
 typedef unsigned char byte_t;
 typedef unsigned long u64_t;
@@ -32,102 +55,12 @@ typedef long i64_t;
 void doom_sbf_panic(void);
 
 /* ------------------------------------------------------------------ */
-/* Arena                                                               */
-/* ------------------------------------------------------------------ */
-
-/* Set by doom_sbf_bind_arena before any engine call.  A single bump pointer
- * serves I_ZoneBase, I_AllocLow and malloc; the engine never frees any of
- * them, so a bump allocator is a complete implementation rather than a
- * simplification.  Z_Free/Z_Malloc operate inside the zone Doom carves out of
- * this arena and are unaffected. */
-static byte_t *arena_base;
-static u64_t arena_bytes;
-static u64_t arena_used;
-static u64_t arena_zone_bytes;
-static int arena_exhausted;
-
-/* The furthest the bump pointer ever reached, reported as the heap
- * high-water receipt. */
-static u64_t arena_high_water;
-
-void doom_sbf_bind_arena(void *base, u64_t bytes, u64_t zone_bytes)
-{
-    arena_base = (byte_t *)base;
-    arena_bytes = bytes;
-    arena_used = 0;
-    arena_zone_bytes = zone_bytes;
-    arena_exhausted = 0;
-    arena_high_water = 0;
-}
-
-u64_t doom_sbf_arena_high_water(void)
-{
-    return arena_high_water;
-}
-
-int doom_sbf_arena_exhausted(void)
-{
-    return arena_exhausted;
-}
-
-static void *arena_take(u64_t bytes)
-{
-    u64_t start = (arena_used + 15u) & ~(u64_t)15u;
-    if (!arena_base || bytes > arena_bytes || start > arena_bytes - bytes)
-    {
-	arena_exhausted = 1;
-	return (void *)0;
-    }
-    arena_used = start + bytes;
-    if (arena_used > arena_high_water)
-	arena_high_water = arena_used;
-    return arena_base + start;
-}
-
-/* ------------------------------------------------------------------ */
 /* Doom platform entry points                                          */
 /* ------------------------------------------------------------------ */
 
-/* Doom's own headers are not included here: this file is deliberately
- * independent of the engine tree so that the engine sources stay out of Git.
- * The declarations below match linuxdoom-1.10's definitions exactly. */
-
-/* Measured zone floor: 2 MiB fails the DEMO1 replay, 3 MiB completes all
- * 5,026 tics with the golden stream.  See the experiment note. */
-int mb_used = 3;
-
-int I_GetHeapSize(void)
-{
-    return (int)arena_zone_bytes;
-}
-
-byte_t *I_ZoneBase(int *size)
-{
-    byte_t *zone = (byte_t *)arena_take(arena_zone_bytes);
-    u64_t i;
-    if (!zone)
-    {
-	*size = 0;
-	return (byte_t *)0;
-    }
-    /* calloc semantics: the host stub zeroes the zone, and Doom's
-     * Z_Init/Z_Malloc residue repairs assume that. */
-    for (i = 0; i < arena_zone_bytes; i++)
-	zone[i] = 0;
-    *size = (int)arena_zone_bytes;
-    return zone;
-}
-
-byte_t *I_AllocLow(int length)
-{
-    byte_t *p = (byte_t *)arena_take((u64_t)(length < 0 ? 0 : length));
-    int i;
-    if (!p)
-	return p;
-    for (i = 0; i < length; i++)
-	p[i] = 0;
-    return p;
-}
+/* Doom's own headers are not included here at all (the declarations below
+ * match linuxdoom-1.10's definitions exactly; the context-mode entry points
+ * that need doom_ctx.h live in doom_sbf_ctx.c). */
 
 /* A transaction has no wall clock.  Doom's headless cut uses I_GetTime only
  * for the frame pacing the replay path does not run. */
@@ -147,49 +80,6 @@ void I_FinishUpdate(void) {}
 void I_SetPalette(byte_t *palette) { (void)palette; }
 void I_UpdateNoBlit(void) {}
 void I_ReadScreen(byte_t *scr) { (void)scr; }
-
-/* I_Error is Doom's fail-closed exit.  On SBF it must abort the instruction:
- * a program that kept running after I_Error would commit half-built state. */
-static int doom_error_latched;
-int doom_sbf_error_latched(void) { return doom_error_latched; }
-
-/* SBF cannot define a variadic function, only call one.  Doom's headers
- * declare I_Error and the printf family as variadic and callers pass extra
- * arguments; these definitions accept the first argument and ignore the rest,
- * which is safe because none of them reads a va_list. */
-void I_Error(char *error)
-{
-    (void)error;
-    doom_error_latched = 1;
-    doom_sbf_panic();
-}
-
-/* ticcmd_t is 8 bytes in the LP64 headless build (patch 0001). */
-static byte_t empty_ticcmd[8];
-void *I_BaseTiccmd(void) { return (void *)empty_ticcmd; }
-
-/* ------------------------------------------------------------------ */
-/* Globals the removed subsystems owned                                */
-/* ------------------------------------------------------------------ */
-
-int devparm, nomonsters, respawnparm, fastparm, singletics, drone;
-int inhelpscreens, menuactive, automapactive;
-/* viewactive, paused and usergame are defined by g_game.c; the host stub
- * relied on tentative-definition merging, which ld.lld does not do. */
-int mousemoved;
-int snd_SfxVolume, snd_MusicVolume;
-int wipegamestate = 0;
-int mouseSensitivity = 5;
-int detailLevel = 0;
-int screenblocks = 11;
-int maketic;
-int ticdup = 1;
-byte_t *save_p;
-/* MAXPLAYERS(4) * BACKUPTICS(128) * sizeof(ticcmd_t)(8) */
-byte_t netcmds[4 * 128 * 8];
-char *player_names[4] = { "player 1", "player 2", "player 3", "player 4" };
-void *debugfile;
-unsigned int doom_render_fuzz_columns;
 
 /* ------------------------------------------------------------------ */
 /* Removed subsystems                                                  */
@@ -245,8 +135,6 @@ void AM_Ticker(void) {}
 void AM_Drawer(void) {}
 int AM_Responder(void *ev) { (void)ev; return 0; }
 
-int doom_sbf_demo_done;
-void D_AdvanceDemo(void) { doom_sbf_demo_done = 1; }
 void D_QuitNetGame(void) {}
 void D_PostEvent(void *ev) { (void)ev; }
 void D_ProcessEvents(void) {}
@@ -435,68 +323,6 @@ int atoi(const char *s)
     return sign * value;
 }
 
-void *malloc(size_t n) { return arena_take((u64_t)n); }
-void *calloc(size_t n, size_t size)
-{
-    u64_t total = (u64_t)n * (u64_t)size;
-    byte_t *p = (byte_t *)arena_take(total);
-    u64_t i;
-    if (p)
-	for (i = 0; i < total; i++)
-	    p[i] = 0;
-    return p;
-}
-/* The engine's only realloc is w_wad.c's lumpinfo growth, which happens once
- * per WAD file and never shrinks.  Copying forward in the arena is correct;
- * the old block is simply left behind. */
-void *realloc(void *old, size_t n)
-{
-    byte_t *p = (byte_t *)arena_take((u64_t)n);
-    if (p && old)
-	memcpy(p, old, n);
-    return p;
-}
-void free(void *p) { (void)p; }
-void exit(int code) { (void)code; doom_sbf_panic(); }
-void abort(void) { doom_sbf_panic(); }
-
-/* Diagnostic output has no destination inside a transaction.  These are
- * present because the engine calls them on its progress and error paths;
- * they deliberately produce nothing rather than logging, so that CU cost does
- * not depend on how chatty a code path is. */
-void *stdout;
-void *stderr;
-void *stdin;
-int printf(const char *fmt) { (void)fmt; return 0; }
-int fprintf(void *f, const char *fmt) { (void)f; (void)fmt; return 0; }
-int sprintf(char *dst, const char *fmt) { (void)fmt; dst[0] = 0; return 0; }
-int snprintf(char *dst, size_t n, const char *fmt) { (void)fmt; if (n) dst[0] = 0; return 0; }
-int sscanf(const char *s, const char *fmt) { (void)s; (void)fmt; return 0; }
-int puts(const char *s) { (void)s; return 0; }
-int fputs(const char *s, void *f) { (void)s; (void)f; return 0; }
-int putchar(int c) { return c; }
-int fflush(void *f) { (void)f; return 0; }
-
-/* Fail-closed file descriptors.  The account loader is the only supported
- * WAD source on SBF; if the engine ever reaches these, the caller has bound
- * the wrong source and the instruction must not silently produce state. */
-void *fopen(const char *p, const char *m) { (void)p; (void)m; return (void *)0; }
-int fclose(void *f) { (void)f; return -1; }
-size_t fread(void *d, size_t s, size_t n, void *f) { (void)d; (void)s; (void)n; (void)f; return 0; }
-size_t fwrite(const void *d, size_t s, size_t n, void *f) { (void)d; (void)s; (void)n; (void)f; return 0; }
-int fseek(void *f, long o, int w) { (void)f; (void)o; (void)w; return -1; }
-long ftell(void *f) { (void)f; return -1; }
-int open(const char *p, int f) { (void)p; (void)f; return -1; }
-int close(int fd) { (void)fd; return -1; }
-long read(int fd, void *b, size_t n) { (void)fd; (void)b; (void)n; return -1; }
-long write(int fd, const void *b, size_t n) { (void)fd; (void)b; (void)n; return -1; }
-long lseek(int fd, long o, int w) { (void)fd; (void)o; (void)w; return -1; }
-int access(const char *p, int m) { (void)p; (void)m; return -1; }
-struct doom_sbf_stat { long st_size; };
-int fstat(int fd, struct doom_sbf_stat *st) { (void)fd; (void)st; return -1; }
-int stat(const char *p, struct doom_sbf_stat *st) { (void)p; (void)st; return -1; }
-int errno;
-
 /* SBF has 64-bit multiply and divide instructions, but the backend still
  * emits calls to these helpers for signed 64-bit division in the fixed-point
  * paths.  Implementing them here keeps the image free of compiler-rt. */
@@ -519,3 +345,64 @@ i64_t __moddi3(i64_t a, i64_t b)
     r = ub ? ua % ub : 0u;
     return negate ? -(i64_t)r : (i64_t)r;
 }
+
+DOOM_SBF_FILE *const stdout = 0;
+DOOM_SBF_FILE *const stderr = 0;
+DOOM_SBF_FILE *const stdin = 0;
+
+/* Native (host) feature builds: the engine TUs include sbfinc's shims (the
+ * -I order shadows the system headers), so every sbfinc-declared name the
+ * engine references must resolve here even natively.  That is ONLY the
+ * const-NULL stdio pointers below (in-cut engine code merely reads them,
+ * and the host libc has no sbfinc-typed `stderr` symbol to offer).  Every
+ * other libc-named definition (getenv, tan, the silent printf family, the
+ * fail-closed descriptors) is SBF-only: natively the real libc serves, so a
+ * stub can neither swallow test output nor lie to a native caller.  The SBF
+ * image has no libc: there these are the only definitions.  (The same split
+ * holds in doom_sbf_ctx.c for malloc/calloc/realloc/free/exit/abort.) */
+#ifdef DOOM_SBF_BUILD
+/* No environment inside a transaction. */
+char *getenv(const char *name) { (void)name; return (char *)0; }
+
+
+/* Engine init is not implemented in this brief (no init/load_level/tic/
+ * render): tan() has exactly one in-cut call site (r_main.c
+ * R_InitTextureMapping) and must fail loudly if init is ever attempted. */
+double tan(double x) { (void)x; doom_sbf_panic(); return 0.0; }
+
+/* Diagnostic output has no destination inside a transaction.  These are
+ * present because the engine calls them on its progress and error paths;
+ * they deliberately produce nothing rather than logging, so that CU cost does
+ * not depend on how chatty a code path is.  SBF cannot define a variadic
+ * function, only call one; callers pass extra arguments that these bodies
+ * ignore, which is safe because none of them reads a va_list. */
+int printf(const char *fmt) { (void)fmt; return 0; }
+int fprintf(DOOM_SBF_FILE *f, const char *fmt) { (void)f; (void)fmt; return 0; }
+int sprintf(char *dst, const char *fmt) { (void)fmt; dst[0] = 0; return 0; }
+int snprintf(char *dst, size_t n, const char *fmt) { (void)fmt; if (n) dst[0] = 0; return 0; }
+int sscanf(const char *s, const char *fmt) { (void)s; (void)fmt; return 0; }
+int puts(const char *s) { (void)s; return 0; }
+int fputs(const char *s, DOOM_SBF_FILE *f) { (void)s; (void)f; return 0; }
+int putchar(int c) { return c; }
+int fflush(DOOM_SBF_FILE *f) { (void)f; return 0; }
+
+/* Fail-closed file descriptors.  The account loader is the only supported
+ * WAD source on SBF; if the engine ever reaches these, the caller has bound
+ * the wrong source and the instruction must not silently produce state. */
+DOOM_SBF_FILE *fopen(const char *p, const char *m) { (void)p; (void)m; return (DOOM_SBF_FILE *)0; }
+int fclose(DOOM_SBF_FILE *f) { (void)f; return -1; }
+size_t fread(void *d, size_t s, size_t n, DOOM_SBF_FILE *f) { (void)d; (void)s; (void)n; (void)f; return 0; }
+size_t fwrite(const void *d, size_t s, size_t n, DOOM_SBF_FILE *f) { (void)d; (void)s; (void)n; (void)f; return 0; }
+int fseek(DOOM_SBF_FILE *f, long o, int w) { (void)f; (void)o; (void)w; return -1; }
+long ftell(DOOM_SBF_FILE *f) { (void)f; return -1; }
+int open(const char *p, int f) { (void)p; (void)f; return -1; }
+int close(int fd) { (void)fd; return -1; }
+long read(int fd, void *b, size_t n) { (void)fd; (void)b; (void)n; return -1; }
+long write(int fd, const void *b, size_t n) { (void)fd; (void)b; (void)n; return -1; }
+long lseek(int fd, long o, int w) { (void)fd; (void)o; (void)w; return -1; }
+int access(const char *p, int m) { (void)p; (void)m; return -1; }
+struct doom_sbf_stat { long st_size; };
+int fstat(int fd, struct doom_sbf_stat *st) { (void)fd; (void)st; return -1; }
+int stat(const char *p, struct doom_sbf_stat *st) { (void)p; (void)st; return -1; }
+
+#endif /* DOOM_SBF_BUILD */

@@ -26,6 +26,12 @@ account-address-probe = []
 # static data" loader refusal M1006 measured with a nonzero `.data` cell also
 # covers a zero-initialized `.bss` cell.
 zero-bss-probe = []
+# `ctx-engine` folds the 41-TU patch-0007 engine, its generated initializer,
+# and the context-mode platform layer into the image, plus the DOOM-CX1
+# instruction that writes and reads one context field through the
+# compile-time constant DOOM_CTX (guarded).  Needs DOOM_SCRATCH pointing at
+# the build.sh tree (doom-src at patches 0001-0007) at build time.
+ctx-engine = []
 
 [dependencies]
 solana-program = "=2.3.0"
