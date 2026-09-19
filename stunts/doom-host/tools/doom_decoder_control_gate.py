@@ -14,7 +14,10 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import struct
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -129,17 +132,28 @@ def check_id(value: int, count: int, *, nullable: bool = True) -> None:
 
 def _read_player(cur: Cursor) -> tuple[int, int]:
     mo = cur.u32()
-    cur.i32()
+    playerstate = cur.i32()
+    if not 0 <= playerstate <= 4:
+        raise Refusal("player state outside the frozen enum")
     cur.take(8)
-    cur.skip_i32(7 + NUM_POWERS)
+    values = [cur.i32() for _ in range(7)]
+    if not 0 <= values[6] <= 2:
+        raise Refusal("armor type outside the frozen enum")
+    cur.skip_i32(NUM_POWERS)
     cur.take(NUM_CARDS + 1)
     cur.skip_i32(MAX_PLAYERS)
-    cur.skip_i32(2)
+    ready, pending = cur.i32(), cur.i32()
+    if not 0 <= ready < NUM_WEAPONS or not 0 <= pending <= NUM_WEAPONS + 1:
+        raise Refusal("weapon enum outside the frozen table")
     cur.take(NUM_WEAPONS)
     cur.skip_i32(NUM_AMMO * 2)
-    cur.skip_i32(9)
+    control = [cur.i32() for _ in range(9)]
+    if control[2] & ~(1 | 2 | 4):
+        raise Refusal("player cheat flags outside the frozen mask")
     attacker = cur.u32()
-    cur.skip_i32(3)
+    extralight, fixedcolormap, colormap = (cur.i32(), cur.i32(), cur.i32())
+    if not 0 <= fixedcolormap <= 31 or not 0 <= colormap <= 3:
+        raise Refusal("player colormap index outside the frozen table")
     for _ in range(NUM_PSPS):
         state = cur.i32()
         cur.skip_i32(3)
@@ -149,7 +163,7 @@ def _read_player(cur: Cursor) -> tuple[int, int]:
     return mo, attacker
 
 
-def _map_shape(wad: bytes) -> tuple[list[int], int]:
+def _map_shape(wad: bytes, *, episode: int, map_number: int) -> tuple[list[int], int]:
     if len(wad) < 12 or wad[:4] not in (b"IWAD", b"PWAD"):
         raise Refusal("invalid captured WAD image")
     count, directory = struct.unpack_from("<II", wad, 4)
@@ -163,20 +177,21 @@ def _map_shape(wad: bytes) -> tuple[list[int], int]:
         if pos > len(wad) or size > len(wad) - pos:
             raise Refusal("WAD lump outside image")
         lumps.append((name.upper(), pos, size))
+    map_name = f"E{episode}M{map_number}"
     try:
-        marker = next(i for i, (name, _, _) in enumerate(lumps) if name == "E1M1")
+        marker = next(i for i, (name, _, _) in enumerate(lumps) if name == map_name)
     except StopIteration as exc:
-        raise Refusal("captured WAD has no E1M1") from exc
+        raise Refusal(f"captured WAD has no {map_name}") from exc
     by_name: dict[str, tuple[int, int]] = {}
     for name, pos, size in lumps[marker + 1 : marker + 12]:
         by_name.setdefault(name, (pos, size))
     if not {"LINEDEFS", "SIDEDEFS", "SECTORS"} <= by_name.keys():
-        raise Refusal("captured E1M1 geometry is incomplete")
+        raise Refusal(f"captured {map_name} geometry is incomplete")
     lpos, lsize = by_name["LINEDEFS"]
     spos, ssize = by_name["SIDEDEFS"]
     secpos, secsize = by_name["SECTORS"]
     if lsize % 14 or ssize % 30 or secsize % 26:
-        raise Refusal("captured E1M1 geometry has a partial record")
+        raise Refusal(f"captured {map_name} geometry has a partial record")
     side_count = ssize // 30
     counts: list[int] = []
     for n in range(lsize // 14):
@@ -184,8 +199,23 @@ def _map_shape(wad: bytes) -> tuple[list[int], int]:
         if front < 0 or front >= side_count or (back < -1 or back >= side_count):
             raise Refusal("LINEDEFS side id outside SIDDEFS")
         counts.append(1 + int(back != -1))
-    demo_bytes = next((size for name, _, size in lumps if name == "DEMO1"), 0)
-    return counts, demo_bytes
+    demo = next((wad[pos : pos + size] for name, pos, size in lumps if name == "DEMO1"), b"")
+    return counts, len(demo)
+
+
+def _demo_identity(wad: bytes) -> tuple[int, int]:
+    if len(wad) < 12 or wad[:4] not in (b"IWAD", b"PWAD"):
+        raise Refusal("invalid captured WAD image")
+    count, directory = struct.unpack_from("<II", wad, 4)
+    for n in range(count):
+        off = directory + n * 16
+        pos, size = struct.unpack_from("<II", wad, off)
+        name = wad[off + 8 : off + 16].rstrip(b"\0").decode("ascii", "replace").upper()
+        if name == "DEMO1":
+            if size < 4:
+                raise Refusal("retained DEMO1 is too short")
+            return wad[pos + 2], wad[pos + 3]
+    raise Refusal("captured WAD has no DEMO1")
 
 
 def _parse_wad_accounts(account_dir: Path) -> bytes:
@@ -240,9 +270,35 @@ def parse_st1(
         raise Refusal("LINEDEFS shape does not match the ST1 resource counts")
     cur = Cursor(image)
     globals_ = [cur.i32() for _ in range(21)]
-    for _ in range(12 + MAX_PLAYERS):
-        if cur.u8() > 1:
-            raise Refusal("boolean global is not 0/1")
+    if (
+        not 0 <= globals_[0] <= 4
+        or globals_[1] != 1
+        or not 1 <= globals_[2] <= 9
+        or not 0 <= globals_[3] <= 3
+        or not 0 <= globals_[4] <= 7
+        or globals_[5] < 0
+        or globals_[6] < 0
+        or globals_[7] < 0
+        or globals_[8] < 0
+        or globals_[9] < 0
+        or globals_[10] < 0
+        or not 0 <= globals_[11] < MAX_PLAYERS
+        or not 0 <= globals_[12] < MAX_PLAYERS
+        or not 0 <= globals_[13] < numtextures
+        or not 0 <= globals_[14] < numflats
+        or not 0 <= globals_[15] < 256
+        or not 0 <= globals_[16] < 256
+        or globals_[17] < 0
+        or not 0 <= globals_[18] < 50
+        or not 0 <= globals_[19] < BODY_QUEUE
+        or globals_[20] < 0
+    ):
+        raise Refusal("global enum, index, RNG, or queue cursor is invalid")
+    booleans = [cur.u8() for _ in range(12 + MAX_PLAYERS)]
+    if any(value > 1 for value in booleans):
+        raise Refusal("boolean global is not 0/1")
+    if not booleans[12 + globals_[11]]:
+        raise Refusal("console player is not active")
     players_mo, players_attacker = [], []
     for _ in range(MAX_PLAYERS):
         mo, attacker = _read_player(cur)
@@ -266,7 +322,8 @@ def parse_st1(
     cur.skip_i32(numtextures + 1)
     for _ in range(128):
         cur.take(10)
-        cur.i32()
+        if cur.i32() < 0:
+            raise Refusal("negative item-respawn time")
     cur.skip_i32(2)
     button_line, button_soundorg = [], []
     for _ in range(MAX_BUTTONS):
@@ -302,7 +359,19 @@ def parse_st1(
             lastlook = cur.i32()
             mapthing = struct.unpack("<5H", cur.take(10))
             tracer = cur.u32()
-            if obj_type < 0 or obj_type >= NUM_MOBJ_TYPES or state < 0 or state >= NUM_STATES:
+            sprite, frame = fields[0], fields[1]
+            if (
+                sprite < 0
+                or sprite >= 138
+                or frame < 0
+                or (frame & ~0x8000) > 0x7FFF
+                or obj_type < 0
+                or obj_type >= NUM_MOBJ_TYPES
+                or state < 0
+                or state >= NUM_STATES
+                or movedir < 0
+                or movedir > 8
+            ):
                 raise Refusal("object type/state outside the frozen tables")
             records.append({
                 "kind": kind, "offset": offset, "target_offset": target_offset,
@@ -338,9 +407,12 @@ def parse_st1(
                 sector_offset = cur.pos; sector = cur.i32(); cur.skip_i32(3)
             else:
                 sector_offset = cur.pos; sector = cur.i32(); cur.skip_i32(3)
-            if sector < 0 or sector >= numsectors or sector in used_sector:
-                raise Refusal("special thinker has an invalid or duplicate sector owner")
-            used_sector.add(sector)
+            if sector < 0 or sector >= numsectors:
+                raise Refusal("special thinker has an invalid sector")
+            if kind <= 5:
+                if sector in used_sector:
+                    raise Refusal("special thinker has a duplicate sector owner")
+                used_sector.add(sector)
             records.append({"kind": kind, "offset": offset,
                             "sector_offset": sector_offset, "sector": sector})
     if cur.pos != len(image):
@@ -470,7 +542,7 @@ def mutate_controls(plan: Plan, level: bytes, pool: bytes, demo_bytes: int) -> d
         bad_sector = bytearray(image)
         put_u32(bad_sector, plan.specials[0]["sector_offset"], plan.numsectors)
         out["sector-id-out-of-range"] = bytes(bad_sector)
-        if len(plan.specials) > 1:
+        if len(plan.specials) > 1 and plan.specials[1]["kind"] <= 5:
             duplicate = bytearray(image)
             put_u32(duplicate, plan.specials[1]["sector_offset"], plan.specials[0]["sector"])
             out["duplicate-sector-owner"] = bytes(duplicate)
@@ -484,59 +556,285 @@ def mutate_controls(plan: Plan, level: bytes, pool: bytes, demo_bytes: int) -> d
     out["duplicated-gametic"] = bytes(gametic)
     cursor = bytearray(image); put_u32(cursor, 24, demo_bytes + 1)
     out["demo-cursor-out-of-range"] = bytes(cursor)
+    console = bytearray(image); put_u32(console, 64 + 11 * 4, MAX_PLAYERS)
+    out["console-player-out-of-range"] = bytes(console)
+    rng = bytearray(image); put_u32(rng, 64 + 15 * 4, 256)
+    out["rng-index-out-of-range"] = bytes(rng)
+    queue = bytearray(image); put_u32(queue, 64 + 19 * 4, BODY_QUEUE)
+    out["body-queue-cursor-out-of-range"] = bytes(queue)
+    sky = bytearray(image); put_u32(sky, 64 + 13 * 4, plan.numtextures)
+    out["texture-index-out-of-range"] = bytes(sky)
+    flat = bytearray(image); put_u32(flat, 64 + 14 * 4, plan.numflats)
+    out["flat-index-out-of-range"] = bytes(flat)
+    playerstate = bytearray(image)
+    put_u32(playerstate, 64 + 21 * 4 + 12 + MAX_PLAYERS + 4, 99)
+    out["playerstate-enum-out-of-range"] = bytes(playerstate)
+    if plan.mobjs:
+        sprite = bytearray(image)
+        put_u32(sprite, plan.mobjs[0]["offset"] + 17, 138)
+        out["sprite-index-out-of-range"] = bytes(sprite)
     changed_pool = bytearray(pool); changed_pool[4096 + 16] ^= 1
     out["pool-single-field-mutation"] = (level, bytes(changed_pool))
     return out
 
 
-def run_gate(capture_root: Path) -> dict[str, Any]:
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _native_command(
+    engine: Path,
+    manifest: Path,
+    image: Path | None,
+    report: Path | None,
+    *,
+    allocation_fail: int = -1,
+    publish_dir: Path | None = None,
+    publish_fail_after: int | None = None,
+    import_pair_dir: Path | None = None,
+    resave: Path | None = None,
+    frames: Path | None = None,
+) -> list[str]:
+    frames = frames or (report or manifest).with_suffix(".frames.jsonl")
+    command = [
+        str(engine), "-headless", "-account-manifest", str(manifest), "-demo", "DEMO1",
+        "-frames", str(frames), "--max-tics", "1",
+    ]
+    if image is not None:
+        command += ["--load", str(image)]
+    if report is not None:
+        command += ["--decoder-report", str(report), "--allocation-fail", str(allocation_fail)]
+    if publish_dir is not None:
+        command += ["--publish-dir", str(publish_dir)]
+    if publish_fail_after is not None:
+        command += ["--publish-fail-after", str(publish_fail_after)]
+    if import_pair_dir is not None:
+        command += ["--import-pair-dir", str(import_pair_dir)]
+    if resave is not None:
+        command += ["--resave", str(resave)]
+    return command
+
+
+def _run_native(
+    engine: Path,
+    manifest: Path,
+    image: Path | None,
+    report: Path | None,
+    *,
+    allocation_fail: int = -1,
+    publish_dir: Path | None = None,
+    publish_fail_after: int | None = None,
+    import_pair_dir: Path | None = None,
+    resave: Path | None = None,
+    frames: Path | None = None,
+) -> dict[str, Any]:
+    command = _native_command(
+        engine, manifest, image, report, allocation_fail=allocation_fail,
+        publish_dir=publish_dir, publish_fail_after=publish_fail_after,
+        import_pair_dir=import_pair_dir, resave=resave, frames=frames,
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+    result: dict[str, Any] = {
+        "command": command,
+        "returncode": completed.returncode,
+        "stderr": completed.stderr[-2000:],
+    }
+    if report and report.exists():
+        result["report"] = json.loads(report.read_text())
+    return result
+
+
+def _native_gate(
+    capture_root: Path,
+    wad_line_sides: list[int],
+    demo_bytes: int,
+    controls: dict[str, bytes | tuple[bytes, bytes]],
+    *,
+    engine: Path | None,
+    wad_hash: bytes,
+) -> dict[str, Any]:
+    manifest = capture_root / "account" / "manifest.json"
+    if engine is None or not engine.exists():
+        return {
+            "status": "unverified",
+            "reason": "BASANOS_DOOM_ENGINE is not set to a built native executable",
+            "allocation_failure_commit_unchanged": "unverified",
+            "commands": [],
+        }
+    source_root = engine.parent
+    with tempfile.TemporaryDirectory(prefix="doom-decoder-gate-") as scratch_name:
+        scratch = Path(scratch_name)
+        positive = scratch / "positive.st1"
+        positive.write_bytes((capture_root / "dumped-doom-st1.bin").read_bytes())
+        positive_report = scratch / "positive.report.json"
+        publication = scratch / "publication"
+        first = _run_native(engine, manifest, positive, positive_report, publish_dir=publication, frames=scratch / "positive.frames.jsonl")
+        commands = [first]
+        positive_result = first.get("report", {})
+        if first["returncode"] != 0 or positive_result.get("decode_rc") != 0:
+            return {"status": "failed", "commands": commands, "positive": positive_result}
+        publication_failures: dict[str, bool] = {}
+        for fail_after in range(3):
+            failed_publication = scratch / f"publication-fail-{fail_after}"
+            run = _run_native(
+                engine, manifest, positive, None,
+                publish_dir=failed_publication,
+                publish_fail_after=fail_after,
+                allocation_fail=-1,
+                frames=scratch / f"publication-fail-{fail_after}.frames.jsonl",
+            )
+            commands.append(run)
+            publication_failures[str(fail_after)] = (
+                run["returncode"] == 3
+                and not (failed_publication / "publication.manifest").exists()
+            )
+        allocation_calls = int(positive_result.get("allocation_calls", 0))
+        allocations: dict[str, Any] = {}
+        for fail_at in range(allocation_calls):
+            report = scratch / f"allocation-{fail_at}.json"
+            run = _run_native(engine, manifest, positive, report, allocation_fail=fail_at, frames=scratch / f"allocation-{fail_at}.frames.jsonl")
+            commands.append(run)
+            decoded = run.get("report", {})
+            allocations[str(fail_at)] = (
+                run["returncode"] != 0
+                and decoded.get("decode_rc", 0) != 0
+                and decoded.get("graph_equal") is True
+                and decoded.get("account_equal") is True
+            )
+        native_controls: dict[str, bool] = {}
+        for name, mutated in controls.items():
+            if isinstance(mutated, tuple):
+                continue
+            image_path = scratch / f"{name}.st1"
+            image_path.write_bytes(mutated)
+            report = scratch / f"{name}.json"
+            run = _run_native(engine, manifest, image_path, report, frames=scratch / f"{name}.frames.jsonl")
+            commands.append(run)
+            decoded = run.get("report", {})
+            native_controls[name] = (
+                run["returncode"] != 0
+                and decoded.get("decode_rc", 0) != 0
+                and decoded.get("graph_equal") is True
+                and decoded.get("account_equal") is True
+            )
+        publication_import = None
+        publication_pool_mutation = None
+        if publication.exists() and (publication / "publication.manifest").exists():
+            publication_import = _run_native(
+                engine, manifest, None, scratch / "publication-import.json", import_pair_dir=publication,
+                frames=scratch / "publication-import.frames.jsonl",
+            )
+            commands.append(publication_import)
+            bad_pair = scratch / "publication-pool-mutated"
+            shutil.copytree(publication, bad_pair)
+            mp1 = next(bad_pair.glob("generation-*-mp1.bin"))
+            mutated_pool = bytearray(mp1.read_bytes()); mutated_pool[4096 + 16] ^= 1; mp1.write_bytes(mutated_pool)
+            bad_report = scratch / "publication-pool-mutated.json"
+            publication_pool_mutation = _run_native(
+                engine, manifest, None, bad_report, import_pair_dir=bad_pair,
+                frames=scratch / "publication-pool-mutated.frames.jsonl",
+            )
+            commands.append(publication_pool_mutation)
+        exe_hash = _sha256_path(engine)
+        return {
+            "status": "measured",
+            "positive": positive_result,
+            "allocation_failure_commit_unchanged": {
+                "failure_points": allocation_calls,
+                "all_unchanged": all(allocations.values()),
+                "points": allocations,
+            },
+            "negative_controls_refused": native_controls,
+            "publication_import": publication_import,
+            "publication_pool_mutation": publication_pool_mutation,
+            "publication_failure_between_writes": publication_failures,
+            "commands": commands,
+            "executable_sha256": exe_hash,
+            "wad_sha256": wad_hash.hex(),
+            "resource_shape": {"wad_line_count": len(wad_line_sides), "wad_side_count": sum(wad_line_sides), "demo_bytes": demo_bytes},
+        }
+
+
+def run_gate(capture_root: Path, *, engine: Path | None = None) -> dict[str, Any]:
     account_dir = capture_root / "account"
     wad = _parse_wad_accounts(account_dir)
-    wad_line_sides, demo_bytes = _map_shape(wad)
+    episode, map_number = _demo_identity(wad)
+    wad_line_sides, demo_bytes = _map_shape(wad, episode=episode, map_number=map_number)
+    mismatch_line_sides, _ = _map_shape(wad, episode=1, map_number=1)
     level = (capture_root / "level_state.bin").read_bytes()
     pool = (capture_root / "mobj_pool.bin").read_bytes()
     image_bytes = u32(level, 28)
     image = level[4096 : 4096 + image_bytes]
     capture_shape = (u32(image, 40), u32(image, 44))
     image_before_preflight = image
-    plan = validate_level_pair(level, pool, line_side_counts=capture_shape,
-                               demo_bytes=demo_bytes, wad_hash=hashlib.sha256(wad).digest())
+    wad_hash = hashlib.sha256(wad).digest()
+    plan = validate_level_pair(level, pool, line_side_counts=wad_line_sides,
+                               demo_bytes=demo_bytes, wad_hash=wad_hash)
     controls = mutate_controls(plan, level, pool, demo_bytes)
     refused: dict[str, bool] = {}
     for name, mutated in controls.items():
         try:
             if isinstance(mutated, tuple):
-                validate_level_pair(mutated[0], mutated[1], line_side_counts=capture_shape,
-                                    demo_bytes=demo_bytes, wad_hash=hashlib.sha256(wad).digest())
+                validate_level_pair(mutated[0], mutated[1], line_side_counts=wad_line_sides,
+                                    demo_bytes=demo_bytes, wad_hash=wad_hash)
             else:
-                parse_st1(mutated, line_side_counts=capture_shape, demo_bytes=demo_bytes)
+                parse_st1(mutated, line_side_counts=wad_line_sides, demo_bytes=demo_bytes)
         except Refusal:
             refused[name] = True
         else:
             refused[name] = False
-    allocation_points = plan.nmo + plan.nsp
-    allocation = {}
-    for fail_at in range(allocation_points):
-        committed = (level, pool)
-        allocation[str(fail_at)] = committed == (level, pool)
+    lighting_coexistence_accepted = False
+    lighting = [record for record in plan.specials if record["kind"] > 5]
+    if len(lighting) >= 2:
+        coexist = bytearray(image)
+        put_u32(coexist, lighting[0]["sector_offset"], lighting[1]["sector"])
+        try:
+            parse_st1(bytes(coexist), line_side_counts=wad_line_sides, demo_bytes=demo_bytes)
+        except Refusal:
+            lighting_coexistence_accepted = False
+        else:
+            lighting_coexistence_accepted = True
+    try:
+        validate_level_pair(level, pool, line_side_counts=mismatch_line_sides,
+                            demo_bytes=demo_bytes, wad_hash=wad_hash)
+    except Refusal:
+        mismatched_shape_refused = True
+    else:
+        mismatched_shape_refused = False
+    native = _native_gate(capture_root, wad_line_sides, demo_bytes, controls,
+                          engine=engine or (Path(os.environ["BASANOS_DOOM_ENGINE"]) if os.environ.get("BASANOS_DOOM_ENGINE") else None), wad_hash=wad_hash)
+    root = Path(__file__).resolve().parents[3]
+    patch_path = root / "stunts/doom-host/patches/0009-doom-state-import-preflight.patch"
     return {
         "capture_root": str(capture_root),
+        "retained_inputs": {
+            "manifest": str(account_dir / "manifest.json"),
+            "level_state": {"path": str(capture_root / "level_state.bin"), "sha256": _sha256_path(capture_root / "level_state.bin")},
+            "mobj_pool": {"path": str(capture_root / "mobj_pool.bin"), "sha256": _sha256_path(capture_root / "mobj_pool.bin")},
+            "st1": {"path": str(capture_root / "dumped-doom-st1.bin"), "sha256": _sha256_path(capture_root / "dumped-doom-st1.bin")},
+            "wad": {"sha256": wad_hash.hex(), "bytes": len(wad)},
+        },
+        "source_patch": {"patch": str(patch_path), "patch_sha256": _sha256_path(patch_path) if patch_path.exists() else "unavailable"},
         "resource_shape": {
             "capture_header_lines_sides": capture_shape,
             "wad_lines_sides": (len(wad_line_sides), sum(wad_line_sides)),
-            "binding": "wire preflight uses the retained capture's exact encoded line-byte shape; WAD geometry mismatch remains open",
+            "demo_identity": [episode, map_number],
+            "mismatched_e1m1_refused": mismatched_shape_refused,
+            "binding": "line/side shape is derived from DEMO1-selected pinned-WAD map; ST1 header geometry is checked against it",
         },
         "positive": {
             "st1_bytes": len(plan.data), "mobjs": plan.nmo, "specials": plan.nsp,
             "pair_matches": True,
             "preflight_input_bytes_unchanged": image == image_before_preflight,
-            "captured_tick": "unverified: engine/SBF execution is intentionally not run by this host gate",
+            "captured_tick": "native gate result is reported separately; prior captured equality is not independent controller causality",
         },
         "negative_controls_refused": refused,
-        "allocation_failure_commit_unchanged": {
-            "failure_points": allocation_points,
-            "all_unchanged": all(allocation.values()),
-        },
+        "lighting_coexistence_accepted": lighting_coexistence_accepted,
+        "native": native,
     }
 
 
@@ -552,8 +850,23 @@ def main() -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     if not all(result["negative_controls_refused"].values()):
         return 1
-    if not result["allocation_failure_commit_unchanged"]["all_unchanged"]:
+    if not result["resource_shape"]["mismatched_e1m1_refused"]:
         return 1
+    if not result["lighting_coexistence_accepted"]:
+        return 1
+    if result["native"].get("status") == "measured" and not result["native"]["allocation_failure_commit_unchanged"]["all_unchanged"]:
+        return 1
+    if result["native"].get("status") == "measured" and not all(result["native"]["negative_controls_refused"].values()):
+        return 1
+    if result["native"].get("status") == "measured" and not all(result["native"]["publication_failure_between_writes"].values()):
+        return 1
+    if result["native"].get("status") == "measured":
+        imported = result["native"].get("publication_import") or {}
+        mutated = result["native"].get("publication_pool_mutation") or {}
+        if imported.get("returncode") != 0 or mutated.get("returncode") == 0:
+            return 1
+        if mutated.get("report", {}).get("graph_equal") is not True or mutated.get("report", {}).get("account_equal") is not True:
+            return 1
     return 0
 
 

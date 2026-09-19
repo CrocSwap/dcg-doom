@@ -1,30 +1,84 @@
-diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom_state.c
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: basanos worker <worker@localhost>
+Date: Sat, 19 Sep 2026 00:00:00 -0400
+Subject: [PATCH] Harden Doom decoder transaction and native publication gate
+
 --- a/linuxdoom-1.10/headless/doom_state.c
 +++ b/linuxdoom-1.10/headless/doom_state.c
-@@ -92,63 +92,512 @@
+@@ -1,6 +1,6 @@
+ /*
+- * DOOM-ST1 v0: canonical, host-width-independent state codec for the
+- * retained one-player E1M1 headless path.  Every scalar is emitted by an
++ * DOOM-ST1: canonical, host-width-independent state codec for the
++ * retained one-player shareware headless path.  Every scalar is emitted by an
+  * explicit little-endian writer.  Pointer-bearing engine links are emitted as
+  * zero/null, map-array indexes, player indexes, or 1-based thinker slots.
+  */
+@@ -92,63 +92,871 @@
  static void ds_mapthing(ds_buf_t *b,const mapthing_t *x){ds_u16(b,(uint16_t)x->x);ds_u16(b,(uint16_t)x->y);ds_u16(b,(uint16_t)x->angle);ds_u16(b,(uint16_t)x->type);ds_u16(b,(uint16_t)x->options);}
  static void ds_rmapthing(ds_read_t *r,mapthing_t *x){x->x=(short)ds_r16(r);x->y=(short)ds_r16(r);x->angle=(short)ds_r16(r);x->type=(short)ds_r16(r);x->options=(short)ds_r16(r);}
  
 -static void ds_player(ds_buf_t *b, const player_t *p, mobj_t **m, unsigned n) {
+-    int i;
+-    ds_u32(b,ds_mobj_id(m,n,p->mo)); ds_i32(b,p->playerstate);
+-    ds_u8(b,(uint8_t)p->cmd.forwardmove_m);ds_u8(b,(uint8_t)p->cmd.sidemove);ds_u16(b,(uint16_t)p->cmd.angleturn);ds_u16(b,(uint16_t)p->cmd.consistancy_m);ds_u8(b,p->cmd.chatchar);ds_u8(b,p->cmd.buttons);
+-    ds_i32(b,p->viewz_m);ds_i32(b,p->viewheight_m);ds_i32(b,p->deltaviewheight);ds_i32(b,p->bob);ds_i32(b,p->health);ds_i32(b,p->armorpoints);ds_i32(b,p->armortype);
+-    for(i=0;i<NUMPOWERS;i++)ds_i32(b,p->powers[i]);for(i=0;i<NUMCARDS;i++)ds_u8(b,(uint8_t)p->cards[i]);ds_u8(b,(uint8_t)p->backpack);for(i=0;i<MAXPLAYERS;i++)ds_i32(b,p->frags[i]);
+-    ds_i32(b,p->readyweapon);ds_i32(b,p->pendingweapon);for(i=0;i<NUMWEAPONS;i++)ds_u8(b,(uint8_t)p->weaponowned[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->ammo[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->maxammo[i]);
+-    ds_i32(b,p->attackdown);ds_i32(b,p->usedown);ds_i32(b,p->cheats);ds_i32(b,p->refire);ds_i32(b,p->killcount);ds_i32(b,p->itemcount);ds_i32(b,p->secretcount);ds_i32(b,p->damagecount);ds_i32(b,p->bonuscount);ds_u32(b,ds_mobj_id(m,n,p->attacker));ds_i32(b,p->extralight_m);ds_i32(b,p->fixedcolormap_m);ds_i32(b,p->colormap);
+-    for(i=0;i<NUMPSPRITES;i++){ds_i32(b,ds_state_id(p->psprites[i].state));ds_i32(b,p->psprites[i].tics);ds_i32(b,p->psprites[i].sx);ds_i32(b,p->psprites[i].sy);}ds_u8(b,(uint8_t)p->didsecret);
 +
 +#define DS_MAX_IMAGE_BYTES 126976u
 +#define DS_ACTION_TABLE_VERSION 1u
++#define DS_ST1_V0 0u
++#define DS_ST1_STRICT_V1 1u
++#define DS_IMPORT_PROFILE_V0 0u
++#define DS_IMPORT_PROFILE_STRICT_V1 1u
++
++typedef struct {
++    int32_t floorheight, ceilingheight, soundtraversed, soundtarget;
++    int32_t blockbox[4], saved_validcount;
++    uint16_t floorpic, ceilingpic, lightlevel, special, tag;
++} ds_sector_shadow_t;
++
++typedef struct {
++    int32_t flags, special, tag, saved_validcount;
++    int32_t textureoffset[2], rowoffset[2];
++    int32_t toptexture[2], bottomtexture[2], midtexture[2];
++} ds_line_shadow_t;
++
++typedef struct {
++    mapthing_t thing;
++    int32_t time;
++} ds_item_shadow_t;
++
++typedef struct {
++    int32_t line, where, btexture, btimer;
++    uint32_t soundorg;
++} ds_button_shadow_t;
 +
 +typedef struct {
 +    uint32_t nmo, nsp, nrec;
 +    uint32_t pm[MAXPLAYERS], pa[MAXPLAYERS], body[DS_BODYQUESIZE];
++    int32_t saved_iquehead, saved_iquetail;
 +    uint32_t mtarget[DS_MAX_OBJECTS], mtracer[DS_MAX_OBJECTS];
 +    int32_t mplayer[DS_MAX_OBJECTS];
++    int32_t globals[21];
++    uint8_t booleans[12 + MAXPLAYERS];
++    player_t player_shadow[MAXPLAYERS];
 +    uint32_t sector_soundtarget_count;
++    uint8_t *sector_owner;
 +    uint32_t *sector_soundtarget;
-+    int32_t button_line[MAXBUTTONS];
-+    uint32_t button_soundorg[MAXBUTTONS];
++    ds_sector_shadow_t *sector_shadow;
++    ds_line_shadow_t *line_shadow;
++    int32_t *flat_translation, *texture_translation;
++    ds_item_shadow_t *item_shadow;
++    ds_button_shadow_t button_shadow[MAXBUTTONS];
 +    unsigned kinds[DS_MAX_OBJECTS];
 +    unsigned special_kinds[DS_MAX_OBJECTS];
 +    int32_t special_sector[DS_MAX_OBJECTS];
 +    unsigned mobj_actual, special_actual, ceiling_count, plat_count;
-+    int32_t gametic;
-+    uint8_t *sector_owner;
++    int32_t saved_gametic;
 +    mobj_t *mobj_mem[DS_MAX_OBJECTS];
 +    void *special_mem[DS_MAX_OBJECTS];
 +} ds_plan_t;
@@ -38,18 +92,48 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +{
 +    ds_alloc_fail_after = fail_after;
 +    ds_alloc_calls = 0;
-+}
+ }
+-static void ds_rplayer(ds_read_t *r, player_t *p, uint32_t *mo, uint32_t *attacker) {
+-    int i; memset(p,0,sizeof(*p));*mo=ds_r32(r);p->playerstate=(playerstate_t)ds_ri32(r);p->cmd.forwardmove_m=(char)ds_r8(r);p->cmd.sidemove=(char)ds_r8(r);p->cmd.angleturn=(short)ds_r16(r);p->cmd.consistancy_m=(short)ds_r16(r);p->cmd.chatchar=ds_r8(r);p->cmd.buttons=ds_r8(r);
+-    p->viewz_m=ds_ri32(r);p->viewheight_m=ds_ri32(r);p->deltaviewheight=ds_ri32(r);p->bob=ds_ri32(r);p->health=ds_ri32(r);p->armorpoints=ds_ri32(r);p->armortype=ds_ri32(r);
+-    for(i=0;i<NUMPOWERS;i++)p->powers[i]=ds_ri32(r);for(i=0;i<NUMCARDS;i++)p->cards[i]=(boolean)ds_r8(r);p->backpack=(boolean)ds_r8(r);for(i=0;i<MAXPLAYERS;i++)p->frags[i]=ds_ri32(r);
+-    p->readyweapon=(weapontype_t)ds_ri32(r);p->pendingweapon=(weapontype_t)ds_ri32(r);for(i=0;i<NUMWEAPONS;i++)p->weaponowned[i]=(boolean)ds_r8(r);for(i=0;i<NUMAMMO;i++)p->ammo[i]=ds_ri32(r);for(i=0;i<NUMAMMO;i++)p->maxammo[i]=ds_ri32(r);
+-    p->attackdown=ds_ri32(r);p->usedown=ds_ri32(r);p->cheats=ds_ri32(r);p->refire=ds_ri32(r);p->killcount=ds_ri32(r);p->itemcount=ds_ri32(r);p->secretcount=ds_ri32(r);p->damagecount=ds_ri32(r);p->bonuscount=ds_ri32(r);*attacker=ds_r32(r);p->extralight_m=ds_ri32(r);p->fixedcolormap_m=ds_ri32(r);p->colormap=ds_ri32(r);
+-    for(i=0;i<NUMPSPRITES;i++){int32_t st=ds_ri32(r);p->psprites[i].state=(st<0||st>=NUMSTATES)?0:&states[st];p->psprites[i].tics=ds_ri32(r);p->psprites[i].sx=ds_ri32(r);p->psprites[i].sy=ds_ri32(r);}p->didsecret=(boolean)ds_r8(r);
++
++long DoomStateAllocationCalls(void)
++{
++    return ds_alloc_calls;
+ }
+ 
+-static void ds_mobj(ds_buf_t *b,mobj_t *o,mobj_t **m,unsigned n,int kind) {
+-    ds_u8(b,(uint8_t)kind);ds_i32(b,o->x);ds_i32(b,o->y);ds_i32(b,o->z);ds_u32(b,o->angle);ds_i32(b,o->sprite);ds_i32(b,o->frame);ds_i32(b,o->floorz);ds_i32(b,o->ceilingz);ds_i32(b,o->radius);ds_i32(b,o->height);ds_i32(b,o->momx);ds_i32(b,o->momy);ds_i32(b,o->momz);ds_i32(b,0);ds_i32(b,o->type);ds_i32(b,o->tics);ds_i32(b,ds_state_id(o->state));ds_i32(b,o->flags);ds_i32(b,o->health);ds_i32(b,o->movedir);ds_i32(b,o->movecount);ds_u32(b,ds_mobj_id(m,n,o->target));ds_i32(b,o->reactiontime);ds_i32(b,o->threshold);ds_i32(b,o->player?(int32_t)(o->player-players)+1:0);ds_i32(b,o->lastlook);ds_mapthing(b,&o->spawnpoint);ds_u32(b,ds_mobj_id(m,n,o->tracer));
++static void *ds_alloc_bytes(size_t n, int zero)
++{
++    long call = ds_alloc_calls++;
++    if (ds_alloc_fail_after >= 0 && call >= ds_alloc_fail_after)
++        return 0;
++    if (n == 0 || n > 0x7fffffffU)
++        return 0;
++    return zero ? calloc(1, n) : malloc(n);
+ }
+-static mobj_t *ds_rmobj(ds_read_t *r,uint32_t *target,uint32_t *tracer,int32_t *player,int removed) {
+-    int32_t st; mobj_t *o=Z_Malloc(sizeof(*o),PU_LEVEL,0);if(!o){r->bad=1;return 0;}memset(o,0,sizeof(*o));o->x=ds_ri32(r);o->y=ds_ri32(r);o->z=ds_ri32(r);o->angle=ds_r32(r);o->sprite=(spritenum_t)ds_ri32(r);o->frame=ds_ri32(r);o->floorz=ds_ri32(r);o->ceilingz=ds_ri32(r);o->radius=ds_ri32(r);o->height=ds_ri32(r);o->momx=ds_ri32(r);o->momy=ds_ri32(r);o->momz=ds_ri32(r);o->validcount_m=ds_ri32(r);o->type=(mobjtype_t)ds_ri32(r);o->tics=ds_ri32(r);st=ds_ri32(r);if(st<0||st>=NUMSTATES){r->bad=1;return 0;}o->state=&states[st];o->flags=ds_ri32(r);o->health=ds_ri32(r);o->movedir=ds_ri32(r);o->movecount=ds_ri32(r);*target=ds_r32(r);o->reactiontime=ds_ri32(r);o->threshold=ds_ri32(r);*player=ds_ri32(r);o->lastlook=ds_ri32(r);ds_rmapthing(r,&o->spawnpoint);*tracer=ds_r32(r);if(o->type<0||o->type>=NUMMOBJTYPES){r->bad=1;return 0;}o->info=&mobjinfo[o->type];if(removed)o->thinker.function.acv=(actionf_v)-1;else {o->thinker.function.acp1=(actionf_p1)P_MobjThinker;P_SetThingPosition(o);}P_AddThinker(&o->thinker);return o;
 +
 +static void *ds_zone_alloc(size_t n)
 +{
-+    if (ds_alloc_fail_after >= 0
-+        && ds_alloc_calls++ >= ds_alloc_fail_after)
++    long call = ds_alloc_calls++;
++    if (ds_alloc_fail_after >= 0 && call >= ds_alloc_fail_after)
 +        return 0;
-+    if (n > 0x7fffffffU)
++    if (n == 0 || n > 0x7fffffffU)
 +        return 0;
 +    return Z_Malloc((int)n, PU_LEVEL, 0);
-+}
-+
+ }
+ 
+-static int ds_kind(thinker_t *t) { if(t->function.acv==(actionf_v)-1)return 0;if(t->function.acp1==(actionf_p1)P_MobjThinker)return DS_MOBJ;if(t->function.acp1==(actionf_p1)T_MoveCeiling)return DS_CEILING;if(t->function.acp1==(actionf_p1)T_VerticalDoor)return DS_DOOR;if(t->function.acp1==(actionf_p1)T_MoveFloor)return DS_FLOOR;if(t->function.acp1==(actionf_p1)T_PlatRaise)return DS_PLAT;if(t->function.acp1==(actionf_p1)T_LightFlash)return DS_FLASH;if(t->function.acp1==(actionf_p1)T_StrobeFlash)return DS_STROBE;if(t->function.acp1==(actionf_p1)T_Glow)return DS_GLOW;if(t->function.acp1==(actionf_p1)T_FireFlicker)return DS_FIREFLICKER;return 0; }
+-static void ds_special(ds_buf_t *b, thinker_t *t, int k) { int32_t sec; ds_u8(b,(uint8_t)k); if(k==DS_CEILING){ceiling_t*x=(ceiling_t*)t;sec=ds_sector_id(x->sector);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->bottomheight);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->direction);ds_i32(b,x->tag);ds_i32(b,x->olddirection);}else if(k==DS_DOOR){vldoor_t*x=(vldoor_t*)t;ds_i32(b,x->type);ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_i32(b,x->direction);ds_i32(b,x->topwait);ds_i32(b,x->topcountdown);}else if(k==DS_FLOOR){floormove_t*x=(floormove_t*)t;ds_i32(b,x->type);ds_u8(b,(uint8_t)x->crush);ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->direction);ds_i32(b,x->newspecial);ds_u16(b,(uint16_t)x->texture);ds_i32(b,x->floordestheight);ds_i32(b,x->speed);}else if(k==DS_PLAT){plat_t*x=(plat_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->speed);ds_i32(b,x->low);ds_i32(b,x->high);ds_i32(b,x->wait);ds_i32(b,x->count);ds_i32(b,x->status);ds_i32(b,x->oldstatus);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->tag);ds_i32(b,x->type);}else if(k==DS_FLASH){lightflash_t*x=(lightflash_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);ds_i32(b,x->maxtime);ds_i32(b,x->mintime);}else if(k==DS_STROBE){strobe_t*x=(strobe_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->darktime);ds_i32(b,x->brighttime);}else if(k==DS_GLOW){glow_t*x=(glow_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->direction);}else {fireflicker_t*x=(fireflicker_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);} }
+-static sector_t *ds_rsector(ds_read_t *r){int32_t n=ds_ri32(r);if(n<0||n>=numsectors){r->bad=1;return 0;}return &sectors[n];}
+-static void ds_rspecial(ds_read_t *r,int k) { thinker_t *t; if(k==DS_CEILING){ceiling_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(ceiling_e)ds_ri32(r);x->sector=ds_rsector(r);x->bottomheight=ds_ri32(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->crush=(boolean)ds_r8(r);x->direction=ds_ri32(r);x->tag=ds_ri32(r);x->olddirection=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_MoveCeiling;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActiveCeiling(x);}else if(k==DS_DOOR){vldoor_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(vldoor_e)ds_ri32(r);x->sector=ds_rsector(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->direction=ds_ri32(r);x->topwait=ds_ri32(r);x->topcountdown=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_VerticalDoor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_FLOOR){floormove_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(floor_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->sector=ds_rsector(r);x->direction=ds_ri32(r);x->newspecial=ds_ri32(r);x->texture=(short)ds_r16(r);x->floordestheight=ds_ri32(r);x->speed=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_MoveFloor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_PLAT){plat_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->speed=ds_ri32(r);x->low=ds_ri32(r);x->high=ds_ri32(r);x->wait=ds_ri32(r);x->count=ds_ri32(r);x->status=(plat_e)ds_ri32(r);x->oldstatus=(plat_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->tag=ds_ri32(r);x->type=(plattype_e)ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_PlatRaise;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActivePlat(x);}else if(k==DS_FLASH){lightflash_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->maxtime=ds_ri32(r);x->mintime=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_LightFlash;P_AddThinker(&x->thinker);}else if(k==DS_STROBE){strobe_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->darktime=ds_ri32(r);x->brighttime=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_StrobeFlash;P_AddThinker(&x->thinker);}else if(k==DS_GLOW){glow_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->direction=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_Glow;P_AddThinker(&x->thinker);}else if(k==DS_FIREFLICKER){fireflicker_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_FireFlicker;P_AddThinker(&x->thinker);}else r->bad=1; (void)t; }
 +static void ds_plan_release(ds_plan_t *p, int native)
 +{
 +    unsigned i;
@@ -62,11 +146,20 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +            if (p->special_mem[i])
 +                Z_Free(p->special_mem[i]);
 +    }
++    free(p->sector_shadow);
 +    free(p->sector_owner);
 +    free(p->sector_soundtarget);
++    free(p->line_shadow);
++    free(p->flat_translation);
++    free(p->texture_translation);
++    free(p->item_shadow);
 +    memset(p, 0, sizeof(*p));
 +}
-+
+ 
+-int DoomStateEncode(uint8_t **image, size_t *image_bytes) {
+-    ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, i; int k; memset(&b,0,sizeof(b)); ds_need(&b,DS_HEADER_BYTES);if(b.bad)return -1;memset(b.p,0,DS_HEADER_BYTES);b.used=DS_HEADER_BYTES;
+-    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(!k||nr>=DS_MAX_OBJECTS){fprintf(stderr,"DOOM-ST1 unknown thinker %p at %u\n",(void*)t->function.acp1,nr);free(b.p);return -1;}if(k==DS_MOBJ)nm++;else ns++;nr++;}m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;
+-    /* mutable game/demo globals */
 +static size_t ds_special_size(unsigned k)
 +{
 +    switch (k)
@@ -105,23 +198,39 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +
 +static void ds_scan_player(ds_read_t *r, uint32_t *mo, uint32_t *attacker)
 +{
-     int i;
--    ds_u32(b,ds_mobj_id(m,n,p->mo)); ds_i32(b,p->playerstate);
++    int i;
++    int32_t value, ready, pending;
 +    *mo = ds_r32(r);
-+    ds_scan_i32(r);
++    value = ds_scan_i32(r);
++    if (value < PST_LIVE || value > PST_REBORN) r->bad = 1;
 +    ds_r8(r); ds_r8(r); ds_r16(r); ds_r16(r); ds_r8(r); ds_r8(r);
-+    for (i = 0; i < 7; i++) ds_scan_i32(r);
++    for (i = 0; i < 7; i++)
++    {
++        value = ds_scan_i32(r);
++        if (i == 6 && (value < 0 || value > 2)) r->bad = 1;
++    }
 +    for (i = 0; i < NUMPOWERS; i++) ds_scan_i32(r);
 +    for (i = 0; i < NUMCARDS; i++) ds_scan_bool(r);
 +    ds_scan_bool(r);
 +    for (i = 0; i < MAXPLAYERS; i++) ds_scan_i32(r);
-+    ds_scan_i32(r); ds_scan_i32(r);
++    ready = ds_scan_i32(r); pending = ds_scan_i32(r);
++    if (ready < 0 || ready >= NUMWEAPONS
++        || (pending < 0 || pending > wp_nochange)) r->bad = 1;
 +    for (i = 0; i < NUMWEAPONS; i++) ds_scan_bool(r);
 +    for (i = 0; i < NUMAMMO; i++) ds_scan_i32(r);
 +    for (i = 0; i < NUMAMMO; i++) ds_scan_i32(r);
-+    for (i = 0; i < 9; i++) ds_scan_i32(r);
++    for (i = 0; i < 9; i++)
++    {
++        value = ds_scan_i32(r);
++        if (i == 2 && (value & ~(CF_NOCLIP | CF_GODMODE | CF_NOMOMENTUM)))
++            r->bad = 1;
++    }
 +    *attacker = ds_r32(r);
-+    ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++    value = ds_scan_i32(r);
++    if (value < 0 || value > 31) r->bad = 1;
++    value = ds_scan_i32(r);
++    if (value < 0 || value > 3) r->bad = 1;
++    ds_scan_i32(r);
 +    for (i = 0; i < NUMPSPRITES; i++)
 +    {
 +        int32_t state = ds_scan_i32(r);
@@ -140,29 +249,42 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +static int ds_scan_special(ds_read_t *r, ds_plan_t *p, unsigned si,
 +                           unsigned k)
 +{
-+    int32_t sector;
++    int32_t sector, value;
 +    switch (k)
 +    {
 +    case DS_CEILING:
-+        ds_scan_i32(r); sector = ds_scan_i32(r);
-+        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_bool(r);
++        value = ds_scan_i32(r); sector = ds_scan_i32(r);
++        if (value < lowerToFloor || value > silentCrushAndRaise) return -1;
 +        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        ds_scan_bool(r); value = ds_scan_i32(r);
++        if (value < -1 || value > 1) return -1;
++        ds_scan_i32(r); ds_scan_i32(r);
 +        break;
 +    case DS_DOOR:
-+        ds_scan_i32(r); sector = ds_scan_i32(r);
-+        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        value = ds_scan_i32(r); sector = ds_scan_i32(r);
++        if (value < normal || value > blazeClose) return -1;
++        ds_scan_i32(r); ds_scan_i32(r); value = ds_scan_i32(r);
++        if (value < -1 || value > 1) return -1;
 +        ds_scan_i32(r); ds_scan_i32(r);
 +        break;
 +    case DS_FLOOR:
-+        ds_scan_i32(r); ds_scan_bool(r); sector = ds_scan_i32(r);
-+        ds_scan_i32(r); ds_scan_i32(r); ds_r16(r);
++        value = ds_scan_i32(r); ds_scan_bool(r); sector = ds_scan_i32(r);
++        if (value < lowerFloor || value > raiseFloor512) return -1;
++        value = ds_scan_i32(r); if (value < -1 || value > 1) return -1;
++        ds_scan_i32(r); value = (int16_t)ds_r16(r);
++        if (value < -1 || value >= numflats) return -1;
 +        ds_scan_i32(r); ds_scan_i32(r);
 +        break;
 +    case DS_PLAT:
 +        sector = ds_scan_i32(r);
 +        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
-+        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_bool(r);
++        ds_scan_i32(r);
++        value = ds_scan_i32(r); if (value < up || value > in_stasis) return -1;
++        value = ds_scan_i32(r); if (value < up || value > in_stasis) return -1;
++        ds_scan_bool(r);
 +        ds_scan_i32(r); ds_scan_i32(r);
++        value = ds_scan_i32(r);
++        if (value < perpetualRaise || value > blazeDWUS) return -1;
 +        break;
 +    case DS_FLASH:
 +        sector = ds_scan_i32(r);
@@ -185,9 +307,12 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +    default:
 +        return -1;
 +    }
-+    if (sector < 0 || sector >= numsectors || p->sector_owner[sector])
++    if (sector < 0 || sector >= numsectors)
 +        return -1;
-+    p->sector_owner[sector] = 1;
++    /* Only these thinker kinds write sector->specialdata.  Lighting
++     * thinkers intentionally coexist on one sector in the v0 capture. */
++    if (k <= DS_PLAT && p->sector_owner[sector]) return -1;
++    if (k <= DS_PLAT) p->sector_owner[sector] = 1;
 +    p->special_sector[si] = sector;
 +    return 0;
 +}
@@ -195,22 +320,29 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +static void ds_scan_mobj(ds_read_t *r, ds_plan_t *p, unsigned mi)
 +{
 +    int i;
-+    int32_t type, state, player;
++    int32_t type, state, player, sprite, frame, movedir;
 +    ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_r32(r);
-+    for (i = 0; i < 9; i++) ds_scan_i32(r);
++    sprite = ds_scan_i32(r);
++    frame = ds_scan_i32(r);
++    for (i = 2; i < 9; i++) ds_scan_i32(r);
 +    ds_scan_i32(r);
 +    type = ds_scan_i32(r);
 +    ds_scan_i32(r);
 +    state = ds_scan_i32(r);
-+    ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++    ds_scan_i32(r); ds_scan_i32(r);
++    movedir = ds_scan_i32(r);
++    ds_scan_i32(r);
 +    p->mtarget[mi] = ds_r32(r);
 +    ds_scan_i32(r); ds_scan_i32(r);
 +    player = ds_scan_i32(r);
 +    ds_scan_i32(r); ds_scan_mapthing(r);
 +    p->mtracer[mi] = ds_r32(r);
 +    p->mplayer[mi] = player;
-+    if (type < 0 || type >= NUMMOBJTYPES
++    if (sprite < 0 || sprite >= NUMSPRITES
++        || frame < 0 || (frame & ~FF_FULLBRIGHT) > FF_FRAMEMASK
++        || type < 0 || type >= NUMMOBJTYPES
 +        || state < 0 || state >= NUMSTATES
++        || movedir < 0 || movedir > 8
 +        || player < 0 || player > MAXPLAYERS)
 +        r->bad = 1;
 +}
@@ -221,18 +353,17 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +}
 +
 +static int ds_preflight(const uint8_t *image, size_t image_bytes,
-+                        ds_plan_t *p)
++                        ds_plan_t *p, unsigned profile)
 +{
 +    ds_read_t r;
 +    uint32_t nmo, nsp, nrec;
 +    unsigned i, j, kind, line_sides;
-+    int32_t line;
 +    memset(p, 0, sizeof(*p));
 +    if (!image || image_bytes < DS_HEADER_BYTES
 +        || image_bytes > DS_MAX_IMAGE_BYTES
 +        || image_bytes > 0xffffffffU
 +        || memcmp(image, "DOOM-ST1", 8)
-+        || ds_at32(image + 8) != 0
++        || ds_at32(image + 8) != profile
 +        || ds_at32(image + 12) != DS_HEADER_BYTES
 +        || ds_at32(image + 16) != (uint32_t)image_bytes
 +        || ds_at32(image + 36) != (uint32_t)numsectors
@@ -252,33 +383,63 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +        return -1;
 +    p->nmo = nmo; p->nsp = nsp; p->nrec = nrec;
 +    p->sector_soundtarget_count = (uint32_t)numsectors;
-+    p->sector_owner = numsectors ? calloc((size_t)numsectors, 1) : 0;
++    p->sector_owner = numsectors
++        ? ds_alloc_bytes((size_t)numsectors, 1) : 0;
 +    p->sector_soundtarget = numsectors
-+        ? calloc((size_t)numsectors, sizeof(*p->sector_soundtarget)) : 0;
++        ? ds_alloc_bytes((size_t)numsectors * sizeof(*p->sector_soundtarget), 1) : 0;
 +    if (numsectors && (!p->sector_owner || !p->sector_soundtarget))
 +        goto bad;
 +    memset(&r, 0, sizeof(r)); r.p = image; r.cap = image_bytes;
 +    r.used = DS_HEADER_BYTES;
-+    for (i = 0; i < 21; i++)
-+    {
-+        int32_t value = ds_scan_i32(&r);
-+        if (i == 5) p->gametic = value;
-+    }
-+    for (i = 0; i < 12 + MAXPLAYERS; i++) ds_scan_bool(&r);
++    for (i = 0; i < 21; i++) p->globals[i] = ds_scan_i32(&r);
++    p->saved_gametic = p->globals[5];
++    if (p->globals[0] < sk_baby || p->globals[0] > sk_nightmare
++        || p->globals[1] != 1 || p->globals[2] < 1 || p->globals[2] > 9
++        || p->globals[3] < GS_LEVEL || p->globals[3] > GS_DEMOSCREEN
++        || p->globals[4] < ga_nothing || p->globals[4] > ga_screenshot
++        || p->globals[11] < 0 || p->globals[11] >= MAXPLAYERS
++        || p->globals[12] < 0 || p->globals[12] >= MAXPLAYERS
++        || p->globals[13] < 0 || p->globals[13] >= numtextures
++        || p->globals[14] < 0 || p->globals[14] >= numflats
++        || p->globals[5] < 0 || p->globals[6] < 0 || p->globals[7] < 0
++        || p->globals[8] < 0 || p->globals[9] < 0 || p->globals[10] < 0
++        || p->globals[15] < 0 || p->globals[15] >= 256
++        || p->globals[16] < 0 || p->globals[16] >= 256
++        || p->globals[17] < 0
++        || p->globals[18] < 0 || p->globals[18] >= 50
++        || p->globals[19] < 0 || p->globals[19] >= DS_BODYQUESIZE
++        || p->globals[20] < 0
++        || ds_at32(image + 20) != (uint32_t)p->saved_gametic)
++        goto bad;
++    for (i = 0; i < 12 + MAXPLAYERS; i++)
++        p->booleans[i] = ds_scan_bool(&r);
++    if (!p->booleans[12 + p->globals[11]])
++        goto bad;
 +    for (i = 0; i < MAXPLAYERS; i++)
 +        ds_scan_player(&r, &p->pm[i], &p->pa[i]);
 +    for (i = 0; i < DS_BODYQUESIZE; i++) p->body[i] = ds_r32(&r);
 +    for (i = 0; i < (unsigned)numsectors; i++)
 +    {
 +        int k;
++        int32_t value;
 +        for (k = 0; k < 2; k++) ds_scan_i32(&r);
-+        for (k = 0; k < 5; k++) ds_r16(&r);
++        value = (int16_t)ds_r16(&r);
++        if (value < 0 || value >= numflats) goto bad;
++        value = (int16_t)ds_r16(&r);
++        if (value < 0 || value >= numflats) goto bad;
++        for (k = 2; k < 5; k++) ds_r16(&r);
 +        ds_scan_i32(&r);
 +        p->sector_soundtarget[i] = ds_r32(&r);
-+        for (k = 0; k < 5; k++) ds_scan_i32(&r);
++        for (k = 0; k < 4; k++)
++        {
++            value = ds_scan_i32(&r);
++            if (value < 0 || value >= (k < 2 ? bmapheight : bmapwidth)) goto bad;
++        }
++        ds_scan_i32(&r);
 +    }
 +    for (i = 0; i < (unsigned)(DOOM_CTX->numlines); i++)
 +    {
++        int k;
 +        ds_r16(&r); ds_r16(&r); ds_r16(&r);
 +        for (j = 0, line_sides = 0; j < 2; j++)
 +        {
@@ -290,20 +451,47 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +        for (j = 0; j < line_sides; j++)
 +        {
 +            ds_scan_i32(&r); ds_scan_i32(&r);
-+            ds_r16(&r); ds_r16(&r); ds_r16(&r);
++            for (k = 0; k < 3; k++)
++            {
++                int32_t texture = (int16_t)ds_r16(&r);
++                if (texture < -1 || texture >= numtextures) goto bad;
++            }
 +        }
 +        ds_scan_i32(&r);
 +    }
-+    for (i = 0; i <= (unsigned)numflats; i++) ds_scan_i32(&r);
-+    for (i = 0; i <= (unsigned)numtextures; i++) ds_scan_i32(&r);
++    for (i = 0; i <= (unsigned)numflats; i++)
++    {
++        int32_t value = ds_scan_i32(&r);
++        if (value < 0 || value > numflats) goto bad;
++    }
++    for (i = 0; i <= (unsigned)numtextures; i++)
++    {
++        int32_t value = ds_scan_i32(&r);
++        if (value < 0 || value > numtextures) goto bad;
++    }
 +    for (i = 0; i < ITEMQUESIZE; i++)
-+    { ds_scan_mapthing(&r); ds_scan_i32(&r); }
-+    ds_scan_i32(&r); ds_scan_i32(&r);
++    { ds_scan_mapthing(&r); if (ds_scan_i32(&r) < 0) goto bad; }
++    {
++        int32_t head = ds_scan_i32(&r), tail = ds_scan_i32(&r);
++        if (head < 0 || head >= ITEMQUESIZE || tail < 0 || tail >= ITEMQUESIZE)
++            goto bad;
++        p->saved_iquehead = head; p->saved_iquetail = tail;
++    }
 +    for (i = 0; i < MAXBUTTONS; i++)
 +    {
-+        p->button_line[i] = ds_scan_i32(&r);
-+        ds_scan_i32(&r); ds_scan_i32(&r); ds_scan_i32(&r);
-+        p->button_soundorg[i] = ds_r32(&r);
++        p->button_shadow[i].line = ds_scan_i32(&r);
++        p->button_shadow[i].where = ds_scan_i32(&r);
++        p->button_shadow[i].btexture = ds_scan_i32(&r);
++        p->button_shadow[i].btimer = ds_scan_i32(&r);
++        p->button_shadow[i].soundorg = ds_r32(&r);
++        if (p->button_shadow[i].line < -1
++            || p->button_shadow[i].line >= DOOM_CTX->numlines
++            || p->button_shadow[i].where < top
++            || p->button_shadow[i].where > bottom
++            || p->button_shadow[i].btexture < -1
++            || p->button_shadow[i].btexture >= numtextures
++            || p->button_shadow[i].btimer < 0)
++            goto bad;
 +    }
 +    for (i = 0; i < nrec && !r.bad; i++)
 +    {
@@ -330,9 +518,10 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +    }
 +    if (r.bad || r.used != r.cap
 +        || p->mobj_actual != nmo || p->special_actual != nsp
-+        || ds_at32(image + 20) != (uint32_t)p->gametic)
++        || ds_at32(image + 20) != (uint32_t)p->saved_gametic)
 +        goto bad;
 +    if (!demobuffer
++        || ds_at32(image + 24) < 13
 +        || ds_at32(image + 24) > (uint32_t)W_LumpLength(W_GetNumForName(defdemoname)))
 +        goto bad;
 +    for (i = 0; i < MAXPLAYERS; i++)
@@ -344,11 +533,7 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +    for (i = 0; i < (unsigned)numsectors; i++)
 +        if (!ds_ref_ok(p->sector_soundtarget[i], nmo)) goto bad;
 +    for (i = 0; i < MAXBUTTONS; i++)
-+    {
-+        line = p->button_line[i];
-+        if (line < -1 || line >= (DOOM_CTX->numlines)
-+            || !ds_ref_ok(p->button_soundorg[i], nmo)) goto bad;
-+    }
++        if (!ds_ref_ok(p->button_shadow[i].soundorg, nmo)) goto bad;
 +    for (i = 0; i < nmo; i++)
 +    {
 +        if (!ds_ref_ok(p->mtarget[i], nmo)
@@ -370,6 +555,20 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +static int ds_plan_prepare(ds_plan_t *p)
 +{
 +    unsigned i;
++    p->sector_shadow = numsectors
++        ? ds_alloc_bytes((size_t)numsectors * sizeof(*p->sector_shadow), 1) : 0;
++    p->line_shadow = DOOM_CTX->numlines
++        ? ds_alloc_bytes((size_t)DOOM_CTX->numlines * sizeof(*p->line_shadow), 1) : 0;
++    p->flat_translation = ds_alloc_bytes(
++        ((size_t)numflats + 1) * sizeof(*p->flat_translation), 1);
++    p->texture_translation = ds_alloc_bytes(
++        ((size_t)numtextures + 1) * sizeof(*p->texture_translation), 1);
++    p->item_shadow = ds_alloc_bytes(
++        (size_t)ITEMQUESIZE * sizeof(*p->item_shadow), 1);
++    if ((numsectors && !p->sector_shadow)
++        || (DOOM_CTX->numlines && !p->line_shadow)
++        || !p->flat_translation || !p->texture_translation || !p->item_shadow)
++        goto bad;
 +    for (i = 0; i < p->nmo; i++)
 +    {
 +        p->mobj_mem[i] = ds_zone_alloc(sizeof(mobj_t));
@@ -384,6 +583,20 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +bad:
 +    ds_plan_release(p, 1);
 +    return -1;
++}
++
++/* The caller must not tear down the committed graph before preflight.  This
++ * is the only destructive step, reached after every decoder allocation has
++ * succeeded and the strict scan has accepted the whole image. */
++static void ds_release_current_thinkers(void)
++{
++    thinker_t *t = thinkercap.next, *next;
++    while (t != &thinkercap)
++    {
++        next = t->next;
++        Z_Free(t);
++        t = next;
++    }
 +}
 +
 +static uint32_t ds_mobj_ref(ds_buf_t *b, mobj_t **m, unsigned n, mobj_t *x)
@@ -432,7 +645,7 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +    p->cmd.forwardmove_m=(char)ds_r8(r); p->cmd.sidemove=(char)ds_r8(r);
 +    p->cmd.angleturn=(short)ds_r16(r); p->cmd.consistancy_m=(short)ds_r16(r);
 +    p->cmd.chatchar=ds_r8(r); p->cmd.buttons=ds_r8(r);
-+    p->viewz_m=ds_ri32(r); p->viewheight=ds_ri32(r); p->deltaviewheight=ds_ri32(r);
++    p->viewz_m=ds_ri32(r); p->viewheight_m=ds_ri32(r); p->deltaviewheight=ds_ri32(r);
 +    p->bob=ds_ri32(r); p->health=ds_ri32(r); p->armorpoints=ds_ri32(r); p->armortype=ds_ri32(r);
 +    for(i=0;i<NUMPOWERS;i++)p->powers[i]=ds_ri32(r);
 +    for(i=0;i<NUMCARDS;i++)p->cards[i]=(boolean)ds_r8(r);
@@ -458,28 +671,10 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +{
 +    int i;
 +    ds_u32(b,ds_mobj_ref(b,m,n,p->mo)); ds_i32(b,p->playerstate);
-     ds_u8(b,(uint8_t)p->cmd.forwardmove_m);ds_u8(b,(uint8_t)p->cmd.sidemove);ds_u16(b,(uint16_t)p->cmd.angleturn);ds_u16(b,(uint16_t)p->cmd.consistancy_m);ds_u8(b,p->cmd.chatchar);ds_u8(b,p->cmd.buttons);
--    ds_i32(b,p->viewz_m);ds_i32(b,p->viewheight_m);ds_i32(b,p->deltaviewheight);ds_i32(b,p->bob);ds_i32(b,p->health);ds_i32(b,p->armorpoints);ds_i32(b,p->armortype);
-+    ds_i32(b,p->viewz_m);ds_i32(b,p->viewheight);ds_i32(b,p->deltaviewheight);ds_i32(b,p->bob);ds_i32(b,p->health);ds_i32(b,p->armorpoints);ds_i32(b,p->armortype);
-     for(i=0;i<NUMPOWERS;i++)ds_i32(b,p->powers[i]);for(i=0;i<NUMCARDS;i++)ds_u8(b,(uint8_t)p->cards[i]);ds_u8(b,(uint8_t)p->backpack);for(i=0;i<MAXPLAYERS;i++)ds_i32(b,p->frags[i]);
-     ds_i32(b,p->readyweapon);ds_i32(b,p->pendingweapon);for(i=0;i<NUMWEAPONS;i++)ds_u8(b,(uint8_t)p->weaponowned[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->ammo[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->maxammo[i]);
--    ds_i32(b,p->attackdown);ds_i32(b,p->usedown);ds_i32(b,p->cheats);ds_i32(b,p->refire);ds_i32(b,p->killcount);ds_i32(b,p->itemcount);ds_i32(b,p->secretcount);ds_i32(b,p->damagecount);ds_i32(b,p->bonuscount);ds_u32(b,ds_mobj_id(m,n,p->attacker));ds_i32(b,p->extralight_m);ds_i32(b,p->fixedcolormap_m);ds_i32(b,p->colormap);
--    for(i=0;i<NUMPSPRITES;i++){ds_i32(b,ds_state_id(p->psprites[i].state));ds_i32(b,p->psprites[i].tics);ds_i32(b,p->psprites[i].sx);ds_i32(b,p->psprites[i].sy);}ds_u8(b,(uint8_t)p->didsecret);
--}
--static void ds_rplayer(ds_read_t *r, player_t *p, uint32_t *mo, uint32_t *attacker) {
--    int i; memset(p,0,sizeof(*p));*mo=ds_r32(r);p->playerstate=(playerstate_t)ds_ri32(r);p->cmd.forwardmove_m=(char)ds_r8(r);p->cmd.sidemove=(char)ds_r8(r);p->cmd.angleturn=(short)ds_r16(r);p->cmd.consistancy_m=(short)ds_r16(r);p->cmd.chatchar=ds_r8(r);p->cmd.buttons=ds_r8(r);
--    p->viewz_m=ds_ri32(r);p->viewheight_m=ds_ri32(r);p->deltaviewheight=ds_ri32(r);p->bob=ds_ri32(r);p->health=ds_ri32(r);p->armorpoints=ds_ri32(r);p->armortype=ds_ri32(r);
--    for(i=0;i<NUMPOWERS;i++)p->powers[i]=ds_ri32(r);for(i=0;i<NUMCARDS;i++)p->cards[i]=(boolean)ds_r8(r);p->backpack=(boolean)ds_r8(r);for(i=0;i<MAXPLAYERS;i++)p->frags[i]=ds_ri32(r);
--    p->readyweapon=(weapontype_t)ds_ri32(r);p->pendingweapon=(weapontype_t)ds_ri32(r);for(i=0;i<NUMWEAPONS;i++)p->weaponowned[i]=(boolean)ds_r8(r);for(i=0;i<NUMAMMO;i++)p->ammo[i]=ds_ri32(r);for(i=0;i<NUMAMMO;i++)p->maxammo[i]=ds_ri32(r);
--    p->attackdown=ds_ri32(r);p->usedown=ds_ri32(r);p->cheats=ds_ri32(r);p->refire=ds_ri32(r);p->killcount=ds_ri32(r);p->itemcount=ds_ri32(r);p->secretcount=ds_ri32(r);p->damagecount=ds_ri32(r);p->bonuscount=ds_ri32(r);*attacker=ds_r32(r);p->extralight_m=ds_ri32(r);p->fixedcolormap_m=ds_ri32(r);p->colormap=ds_ri32(r);
--    for(i=0;i<NUMPSPRITES;i++){int32_t st=ds_ri32(r);p->psprites[i].state=(st<0||st>=NUMSTATES)?0:&states[st];p->psprites[i].tics=ds_ri32(r);p->psprites[i].sx=ds_ri32(r);p->psprites[i].sy=ds_ri32(r);}p->didsecret=(boolean)ds_r8(r);
--}
--
--static void ds_mobj(ds_buf_t *b,mobj_t *o,mobj_t **m,unsigned n,int kind) {
--    ds_u8(b,(uint8_t)kind);ds_i32(b,o->x);ds_i32(b,o->y);ds_i32(b,o->z);ds_u32(b,o->angle);ds_i32(b,o->sprite);ds_i32(b,o->frame);ds_i32(b,o->floorz);ds_i32(b,o->ceilingz);ds_i32(b,o->radius);ds_i32(b,o->height);ds_i32(b,o->momx);ds_i32(b,o->momy);ds_i32(b,o->momz);ds_i32(b,0);ds_i32(b,o->type);ds_i32(b,o->tics);ds_i32(b,ds_state_id(o->state));ds_i32(b,o->flags);ds_i32(b,o->health);ds_i32(b,o->movedir);ds_i32(b,o->movecount);ds_u32(b,ds_mobj_id(m,n,o->target));ds_i32(b,o->reactiontime);ds_i32(b,o->threshold);ds_i32(b,o->player?(int32_t)(o->player-players)+1:0);ds_i32(b,o->lastlook);ds_mapthing(b,&o->spawnpoint);ds_u32(b,ds_mobj_id(m,n,o->tracer));
--}
--static mobj_t *ds_rmobj(ds_read_t *r,uint32_t *target,uint32_t *tracer,int32_t *player,int removed) {
--    int32_t st; mobj_t *o=Z_Malloc(sizeof(*o),PU_LEVEL,0);if(!o){r->bad=1;return 0;}memset(o,0,sizeof(*o));o->x=ds_ri32(r);o->y=ds_ri32(r);o->z=ds_ri32(r);o->angle=ds_r32(r);o->sprite=(spritenum_t)ds_ri32(r);o->frame=ds_ri32(r);o->floorz=ds_ri32(r);o->ceilingz=ds_ri32(r);o->radius=ds_ri32(r);o->height=ds_ri32(r);o->momx=ds_ri32(r);o->momy=ds_ri32(r);o->momz=ds_ri32(r);o->validcount_m=ds_ri32(r);o->type=(mobjtype_t)ds_ri32(r);o->tics=ds_ri32(r);st=ds_ri32(r);if(st<0||st>=NUMSTATES){r->bad=1;return 0;}o->state=&states[st];o->flags=ds_ri32(r);o->health=ds_ri32(r);o->movedir=ds_ri32(r);o->movecount=ds_ri32(r);*target=ds_r32(r);o->reactiontime=ds_ri32(r);o->threshold=ds_ri32(r);*player=ds_ri32(r);o->lastlook=ds_ri32(r);ds_rmapthing(r,&o->spawnpoint);*tracer=ds_r32(r);if(o->type<0||o->type>=NUMMOBJTYPES){r->bad=1;return 0;}o->info=&mobjinfo[o->type];if(removed)o->thinker.function.acv=(actionf_v)-1;else {o->thinker.function.acp1=(actionf_p1)P_MobjThinker;P_SetThingPosition(o);}P_AddThinker(&o->thinker);return o;
++    ds_u8(b,(uint8_t)p->cmd.forwardmove_m);ds_u8(b,(uint8_t)p->cmd.sidemove);ds_u16(b,(uint16_t)p->cmd.angleturn);ds_u16(b,(uint16_t)p->cmd.consistancy_m);ds_u8(b,p->cmd.chatchar);ds_u8(b,p->cmd.buttons);
++    ds_i32(b,p->viewz_m);ds_i32(b,p->viewheight_m);ds_i32(b,p->deltaviewheight);ds_i32(b,p->bob);ds_i32(b,p->health);ds_i32(b,p->armorpoints);ds_i32(b,p->armortype);
++    for(i=0;i<NUMPOWERS;i++)ds_i32(b,p->powers[i]);for(i=0;i<NUMCARDS;i++)ds_u8(b,(uint8_t)p->cards[i]);ds_u8(b,(uint8_t)p->backpack);for(i=0;i<MAXPLAYERS;i++)ds_i32(b,p->frags[i]);
++    ds_i32(b,p->readyweapon);ds_i32(b,p->pendingweapon);for(i=0;i<NUMWEAPONS;i++)ds_u8(b,(uint8_t)p->weaponowned[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->ammo[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->maxammo[i]);
 +    ds_i32(b,p->attackdown);ds_i32(b,p->usedown);ds_i32(b,p->cheats);ds_i32(b,p->refire);ds_i32(b,p->killcount);ds_i32(b,p->itemcount);ds_i32(b,p->secretcount);ds_i32(b,p->damagecount);ds_i32(b,p->bonuscount);ds_u32(b,ds_mobj_ref(b,m,n,p->attacker));ds_i32(b,p->extralight_m);ds_i32(b,p->fixedcolormap_m);ds_i32(b,p->colormap);
 +    for(i=0;i<NUMPSPRITES;i++){ds_i32(b,ds_state_ref(b,p->psprites[i].state,0));ds_i32(b,p->psprites[i].tics);ds_i32(b,p->psprites[i].sx);ds_i32(b,p->psprites[i].sy);}ds_u8(b,(uint8_t)p->didsecret);
 +}
@@ -493,20 +688,29 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
 +{
 +    int32_t st;
 +    if (!o) { r->bad = 1; return 0; }
-+    memset(o,0,sizeof(*o));o->x=ds_ri32(r);o->y=ds_ri32(r);o->z=ds_ri32(r);o->angle=ds_r32(r);o->sprite=(spritenum_t)ds_ri32(r);o->frame=ds_ri32(r);o->floorz=ds_ri32(r);o->ceilingz=ds_ri32(r);o->radius=ds_ri32(r);o->height=ds_ri32(r);o->momx=ds_ri32(r);o->momy=ds_ri32(r);o->momz=ds_ri32(r);o->validcount_m=ds_ri32(r);o->type=(mobjtype_t)ds_ri32(r);o->tics=ds_ri32(r);st=ds_ri32(r);o->state=&states[st];o->flags=ds_ri32(r);o->health=ds_ri32(r);o->movedir=ds_ri32(r);o->movecount=ds_ri32(r);*target=ds_r32(r);o->reactiontime=ds_ri32(r);o->threshold=ds_ri32(r);*player=ds_ri32(r);o->lastlook=ds_ri32(r);ds_rmapthing(r,&o->spawnpoint);*tracer=ds_r32(r);o->info=&mobjinfo[o->type];o->thinker.function.acp1=(actionf_p1)P_MobjThinker;P_SetThingPosition(o);P_AddThinker(&o->thinker);return o;
- }
- 
- static int ds_kind(thinker_t *t) { if(t->function.acv==(actionf_v)-1)return 0;if(t->function.acp1==(actionf_p1)P_MobjThinker)return DS_MOBJ;if(t->function.acp1==(actionf_p1)T_MoveCeiling)return DS_CEILING;if(t->function.acp1==(actionf_p1)T_VerticalDoor)return DS_DOOR;if(t->function.acp1==(actionf_p1)T_MoveFloor)return DS_FLOOR;if(t->function.acp1==(actionf_p1)T_PlatRaise)return DS_PLAT;if(t->function.acp1==(actionf_p1)T_LightFlash)return DS_FLASH;if(t->function.acp1==(actionf_p1)T_StrobeFlash)return DS_STROBE;if(t->function.acp1==(actionf_p1)T_Glow)return DS_GLOW;if(t->function.acp1==(actionf_p1)T_FireFlicker)return DS_FIREFLICKER;return 0; }
--static void ds_special(ds_buf_t *b, thinker_t *t, int k) { int32_t sec; ds_u8(b,(uint8_t)k); if(k==DS_CEILING){ceiling_t*x=(ceiling_t*)t;sec=ds_sector_id(x->sector);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->bottomheight);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->direction);ds_i32(b,x->tag);ds_i32(b,x->olddirection);}else if(k==DS_DOOR){vldoor_t*x=(vldoor_t*)t;ds_i32(b,x->type);ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_i32(b,x->direction);ds_i32(b,x->topwait);ds_i32(b,x->topcountdown);}else if(k==DS_FLOOR){floormove_t*x=(floormove_t*)t;ds_i32(b,x->type);ds_u8(b,(uint8_t)x->crush);ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->direction);ds_i32(b,x->newspecial);ds_u16(b,(uint16_t)x->texture);ds_i32(b,x->floordestheight);ds_i32(b,x->speed);}else if(k==DS_PLAT){plat_t*x=(plat_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->speed);ds_i32(b,x->low);ds_i32(b,x->high);ds_i32(b,x->wait);ds_i32(b,x->count);ds_i32(b,x->status);ds_i32(b,x->oldstatus);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->tag);ds_i32(b,x->type);}else if(k==DS_FLASH){lightflash_t*x=(lightflash_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);ds_i32(b,x->maxtime);ds_i32(b,x->mintime);}else if(k==DS_STROBE){strobe_t*x=(strobe_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->darktime);ds_i32(b,x->brighttime);}else if(k==DS_GLOW){glow_t*x=(glow_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->direction);}else {fireflicker_t*x=(fireflicker_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);} }
++    memset(o,0,sizeof(*o));
++    o->x=ds_ri32(r); o->y=ds_ri32(r); o->z=ds_ri32(r);
++    o->angle=ds_r32(r); o->sprite=(spritenum_t)ds_ri32(r);
++    o->frame=ds_ri32(r); o->floorz=ds_ri32(r); o->ceilingz=ds_ri32(r);
++    o->radius=ds_ri32(r); o->height=ds_ri32(r); o->momx=ds_ri32(r);
++    o->momy=ds_ri32(r); o->momz=ds_ri32(r); o->validcount_m=ds_ri32(r);
++    o->type=(mobjtype_t)ds_ri32(r); o->tics=ds_ri32(r); st=ds_ri32(r);
++    o->state=&states[st]; o->flags=ds_ri32(r); o->health=ds_ri32(r);
++    o->movedir=ds_ri32(r); o->movecount=ds_ri32(r);
++    *target=ds_r32(r); o->reactiontime=ds_ri32(r); o->threshold=ds_ri32(r);
++    *player=ds_ri32(r); o->lastlook=ds_ri32(r); ds_rmapthing(r,&o->spawnpoint);
++    *tracer=ds_r32(r); o->info=&mobjinfo[o->type];
++    o->thinker.function.acp1=(actionf_p1)P_MobjThinker;
++    return o;
++}
++
++static int ds_kind(thinker_t *t) { if(t->function.acv==(actionf_v)-1)return 0;if(t->function.acp1==(actionf_p1)P_MobjThinker)return DS_MOBJ;if(t->function.acp1==(actionf_p1)T_MoveCeiling)return DS_CEILING;if(t->function.acp1==(actionf_p1)T_VerticalDoor)return DS_DOOR;if(t->function.acp1==(actionf_p1)T_MoveFloor)return DS_FLOOR;if(t->function.acp1==(actionf_p1)T_PlatRaise)return DS_PLAT;if(t->function.acp1==(actionf_p1)T_LightFlash)return DS_FLASH;if(t->function.acp1==(actionf_p1)T_StrobeFlash)return DS_STROBE;if(t->function.acp1==(actionf_p1)T_Glow)return DS_GLOW;if(t->function.acp1==(actionf_p1)T_FireFlicker)return DS_FIREFLICKER;return 0; }
 +static void ds_special(ds_buf_t *b, thinker_t *t, int k) { int32_t sec; ds_u8(b,(uint8_t)k); if(k==DS_CEILING){ceiling_t*x=(ceiling_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->bottomheight);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->direction);ds_i32(b,x->tag);ds_i32(b,x->olddirection);}else if(k==DS_DOOR){vldoor_t*x=(vldoor_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_i32(b,x->direction);ds_i32(b,x->topwait);ds_i32(b,x->topcountdown);}else if(k==DS_FLOOR){floormove_t*x=(floormove_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,x->type);ds_u8(b,(uint8_t)x->crush);ds_i32(b,sec);ds_i32(b,x->direction);ds_i32(b,x->newspecial);ds_u16(b,(uint16_t)x->texture);ds_i32(b,x->floordestheight);ds_i32(b,x->speed);}else if(k==DS_PLAT){plat_t*x=(plat_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,sec);ds_i32(b,x->speed);ds_i32(b,x->low);ds_i32(b,x->high);ds_i32(b,x->wait);ds_i32(b,x->count);ds_i32(b,x->status);ds_i32(b,x->oldstatus);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->tag);ds_i32(b,x->type);}else if(k==DS_FLASH){lightflash_t*x=(lightflash_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);ds_i32(b,x->maxtime);ds_i32(b,x->mintime);}else if(k==DS_STROBE){strobe_t*x=(strobe_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->count);ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->darktime);ds_i32(b,x->brighttime);}else if(k==DS_GLOW){glow_t*x=(glow_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->direction);}else if(k==DS_FIREFLICKER){fireflicker_t*x=(fireflicker_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);}else b->bad=1; }
- static sector_t *ds_rsector(ds_read_t *r){int32_t n=ds_ri32(r);if(n<0||n>=numsectors){r->bad=1;return 0;}return &sectors[n];}
--static void ds_rspecial(ds_read_t *r,int k) { thinker_t *t; if(k==DS_CEILING){ceiling_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(ceiling_e)ds_ri32(r);x->sector=ds_rsector(r);x->bottomheight=ds_ri32(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->crush=(boolean)ds_r8(r);x->direction=ds_ri32(r);x->tag=ds_ri32(r);x->olddirection=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_MoveCeiling;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActiveCeiling(x);}else if(k==DS_DOOR){vldoor_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(vldoor_e)ds_ri32(r);x->sector=ds_rsector(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->direction=ds_ri32(r);x->topwait=ds_ri32(r);x->topcountdown=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_VerticalDoor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_FLOOR){floormove_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(floor_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->sector=ds_rsector(r);x->direction=ds_ri32(r);x->newspecial=ds_ri32(r);x->texture=(short)ds_r16(r);x->floordestheight=ds_ri32(r);x->speed=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_MoveFloor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_PLAT){plat_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->speed=ds_ri32(r);x->low=ds_ri32(r);x->high=ds_ri32(r);x->wait=ds_ri32(r);x->count=ds_ri32(r);x->status=(plat_e)ds_ri32(r);x->oldstatus=(plat_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->tag=ds_ri32(r);x->type=(plattype_e)ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_PlatRaise;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActivePlat(x);}else if(k==DS_FLASH){lightflash_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->maxtime=ds_ri32(r);x->mintime=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_LightFlash;P_AddThinker(&x->thinker);}else if(k==DS_STROBE){strobe_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->darktime=ds_ri32(r);x->brighttime=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_StrobeFlash;P_AddThinker(&x->thinker);}else if(k==DS_GLOW){glow_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->direction=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_Glow;P_AddThinker(&x->thinker);}else if(k==DS_FIREFLICKER){fireflicker_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_FireFlicker;P_AddThinker(&x->thinker);}else r->bad=1; (void)t; }
-+static void ds_rspecial(ds_read_t *r,int k,void *mem) { if(!mem){r->bad=1;return;} if(k==DS_CEILING){ceiling_t*x=mem;memset(x,0,sizeof(*x));x->type=(ceiling_e)ds_ri32(r);x->sector=ds_rsector(r);x->bottomheight=ds_ri32(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->crush=(boolean)ds_r8(r);x->direction=ds_ri32(r);x->tag=ds_ri32(r);x->olddirection=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_MoveCeiling;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActiveCeiling(x);}else if(k==DS_DOOR){vldoor_t*x=mem;memset(x,0,sizeof(*x));x->type=(vldoor_e)ds_ri32(r);x->sector=ds_rsector(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->direction=ds_ri32(r);x->topwait=ds_ri32(r);x->topcountdown=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_VerticalDoor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_FLOOR){floormove_t*x=mem;memset(x,0,sizeof(*x));x->type=(floor_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->sector=ds_rsector(r);x->direction=ds_ri32(r);x->newspecial=ds_ri32(r);x->texture=(short)ds_r16(r);x->floordestheight=ds_ri32(r);x->speed=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_MoveFloor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_PLAT){plat_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->speed=ds_ri32(r);x->low=ds_ri32(r);x->high=ds_ri32(r);x->wait=ds_ri32(r);x->count=ds_ri32(r);x->status=(plat_e)ds_ri32(r);x->oldstatus=(plat_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->tag=ds_ri32(r);x->type=(plattype_e)ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_PlatRaise;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActivePlat(x);}else if(k==DS_FLASH){lightflash_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->maxtime=ds_ri32(r);x->mintime=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_LightFlash;P_AddThinker(&x->thinker);}else if(k==DS_STROBE){strobe_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->darktime=ds_ri32(r);x->brighttime=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_StrobeFlash;P_AddThinker(&x->thinker);}else if(k==DS_GLOW){glow_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->direction=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_Glow;P_AddThinker(&x->thinker);}else if(k==DS_FIREFLICKER){fireflicker_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_FireFlicker;P_AddThinker(&x->thinker);}else r->bad=1; }
- 
- int DoomStateEncode(uint8_t **image, size_t *image_bytes) {
--    ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, i; int k; memset(&b,0,sizeof(b)); ds_need(&b,DS_HEADER_BYTES);if(b.bad)return -1;memset(b.p,0,DS_HEADER_BYTES);b.used=DS_HEADER_BYTES;
--    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(!k||nr>=DS_MAX_OBJECTS){fprintf(stderr,"DOOM-ST1 unknown thinker %p at %u\n",(void*)t->function.acp1,nr);free(b.p);return -1;}if(k==DS_MOBJ)nm++;else ns++;nr++;}m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;
--    /* mutable game/demo globals */
++static sector_t *ds_rsector(ds_read_t *r){int32_t n=ds_ri32(r);if(n<0||n>=numsectors){r->bad=1;return 0;}return &sectors[n];}
++static void ds_rspecial(ds_read_t *r,int k,void *mem) { if(!mem){r->bad=1;return;} if(k==DS_CEILING){ceiling_t*x=mem;memset(x,0,sizeof(*x));x->type=(ceiling_e)ds_ri32(r);x->sector=ds_rsector(r);x->bottomheight=ds_ri32(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->crush=(boolean)ds_r8(r);x->direction=ds_ri32(r);x->tag=ds_ri32(r);x->olddirection=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_MoveCeiling;}else if(k==DS_DOOR){vldoor_t*x=mem;memset(x,0,sizeof(*x));x->type=(vldoor_e)ds_ri32(r);x->sector=ds_rsector(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->direction=ds_ri32(r);x->topwait=ds_ri32(r);x->topcountdown=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_VerticalDoor;}else if(k==DS_FLOOR){floormove_t*x=mem;memset(x,0,sizeof(*x));x->type=(floor_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->sector=ds_rsector(r);x->direction=ds_ri32(r);x->newspecial=ds_ri32(r);x->texture=(short)ds_r16(r);x->floordestheight=ds_ri32(r);x->speed=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_MoveFloor;}else if(k==DS_PLAT){plat_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->speed=ds_ri32(r);x->low=ds_ri32(r);x->high=ds_ri32(r);x->wait=ds_ri32(r);x->count=ds_ri32(r);x->status=(plat_e)ds_ri32(r);x->oldstatus=(plat_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->tag=ds_ri32(r);x->type=(plattype_e)ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_PlatRaise;}else if(k==DS_FLASH){lightflash_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->maxtime=ds_ri32(r);x->mintime=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_LightFlash;}else if(k==DS_STROBE){strobe_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->darktime=ds_ri32(r);x->brighttime=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_StrobeFlash;}else if(k==DS_GLOW){glow_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->direction=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_Glow;}else if(k==DS_FIREFLICKER){fireflicker_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_FireFlicker;}else r->bad=1; }
++
++static int ds_encode_profile(uint8_t **image, size_t *image_bytes,
++                             unsigned version) {
 +    ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, nceil=0, nplat=0, i; int k; memset(&b,0,sizeof(b)); ds_need(&b,DS_HEADER_BYTES);if(b.bad)return -1;memset(b.p,0,DS_HEADER_BYTES);b.used=DS_HEADER_BYTES;
 +    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(!ds_supported_kind(k)||nr>=DS_MAX_OBJECTS){fprintf(stderr,"DOOM-ST1 unsupported thinker at %u (action table %u)\n",nr,DS_ACTION_TABLE_VERSION);free(b.p);return -1;}if(k==DS_MOBJ)nm++;else {ns++;if(k==DS_CEILING && ++nceil>MAXCEILINGS){free(b.p);return -1;}if(k==DS_PLAT && ++nplat>MAXPLATS){free(b.p);return -1;}}nr++;}if(nm>DS_MAX_OBJECTS||ns>DS_MAX_OBJECTS){free(b.p);return -1;}m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;
      ds_i32(&b,gameskill);ds_i32(&b,gameepisode);ds_i32(&b,gamemap);ds_i32(&b,gamestate);ds_i32(&b,gameaction);ds_i32(&b,gametic);ds_i32(&b,levelstarttic);ds_i32(&b,leveltime);ds_i32(&b,totalkills);ds_i32(&b,totalitems);ds_i32(&b,totalsecret);ds_i32(&b,(DOOM_CTX->consoleplayer));ds_i32(&b,displayplayer);ds_i32(&b,skytexture);ds_i32(&b,skyflatnum);ds_i32(&b,rndindex);ds_i32(&b,prndindex);ds_i32(&b,0);ds_i32(&b,fuzzpos);ds_i32(&b,bodyqueslot);ds_i32(&b,levelTimeCount);
@@ -518,43 +722,241 @@ diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom
      for(i=0;i<(unsigned)(DOOM_CTX->numlines);i++){line_t*x=&lines[i];int j;ds_u16(&b,(uint16_t)x->flags);ds_u16(&b,(uint16_t)x->special);ds_u16(&b,(uint16_t)x->tag);for(j=0;j<2;j++)if(x->sidenum[j]!=-1){side_t*y=&sides[x->sidenum[j]];ds_i32(&b,y->textureoffset);ds_i32(&b,y->rowoffset);ds_u16(&b,(uint16_t)y->toptexture);ds_u16(&b,(uint16_t)y->bottomtexture);ds_u16(&b,(uint16_t)y->midtexture);}ds_i32(&b,0);}
 -    for(i=0;i<=(unsigned)numflats;i++)ds_i32(&b,flattranslation[i]);for(i=0;i<=(unsigned)numtextures;i++)ds_i32(&b,texturetranslation[i]);for(i=0;i<ITEMQUESIZE;i++){ds_mapthing(&b,&itemrespawnque[i]);ds_i32(&b,itemrespawntime[i]);}ds_i32(&b,iquehead);ds_i32(&b,iquetail);for(i=0;i<MAXBUTTONS;i++){button_t*x=&buttonlist[i];ds_i32(&b,ds_line_id(x->line));ds_i32(&b,x->where);ds_i32(&b,x->btexture);ds_i32(&b,x->btimer);ds_u32(&b,ds_mobj_id(m,nm,x->soundorg));}
 -    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(k==DS_MOBJ)ds_mobj(&b,(mobj_t*)t,m,nm,k);else ds_special(&b,t,k);}free(m);if(b.bad){free(b.p);return -1;}
+-    memcpy(b.p,"DOOM-ST1",8);ds_set32(b.p+8,0);ds_set32(b.p+12,DS_HEADER_BYTES);ds_set32(b.p+16,(uint32_t)b.used);ds_set32(b.p+20,(uint32_t)gametic);ds_set32(b.p+24,(uint32_t)(demo_p-demobuffer));ds_set32(b.p+28,nm);ds_set32(b.p+32,ns);ds_set32(b.p+36,(uint32_t)numsectors);ds_set32(b.p+40,(uint32_t)(DOOM_CTX->numlines));ds_set32(b.p+44,(uint32_t)numsides);ds_set32(b.p+48,(uint32_t)numflats);ds_set32(b.p+52,(uint32_t)numtextures);ds_set32(b.p+56,nr);*image=b.p;*image_bytes=b.used;return 0;
 +    for(i=0;i<=(unsigned)numflats;i++)ds_i32(&b,flattranslation[i]);for(i=0;i<=(unsigned)numtextures;i++)ds_i32(&b,texturetranslation[i]);for(i=0;i<ITEMQUESIZE;i++){ds_mapthing(&b,&itemrespawnque[i]);ds_i32(&b,itemrespawntime[i]);}ds_i32(&b,iquehead);ds_i32(&b,iquetail);for(i=0;i<MAXBUTTONS;i++){button_t*x=&buttonlist[i];ds_i32(&b,ds_line_ref(&b,x->line));ds_i32(&b,x->where);ds_i32(&b,x->btexture);ds_i32(&b,x->btimer);ds_u32(&b,ds_mobj_ref(&b,m,nm,x->soundorg));}
 +    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(k==DS_MOBJ)ds_mobj(&b,(mobj_t*)t,m,nm,k);else ds_special(&b,t,k);}free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}
-     memcpy(b.p,"DOOM-ST1",8);ds_set32(b.p+8,0);ds_set32(b.p+12,DS_HEADER_BYTES);ds_set32(b.p+16,(uint32_t)b.used);ds_set32(b.p+20,(uint32_t)gametic);ds_set32(b.p+24,(uint32_t)(demo_p-demobuffer));ds_set32(b.p+28,nm);ds_set32(b.p+32,ns);ds_set32(b.p+36,(uint32_t)numsectors);ds_set32(b.p+40,(uint32_t)(DOOM_CTX->numlines));ds_set32(b.p+44,(uint32_t)numsides);ds_set32(b.p+48,(uint32_t)numflats);ds_set32(b.p+52,(uint32_t)numtextures);ds_set32(b.p+56,nr);*image=b.p;*image_bytes=b.used;return 0;
++    memcpy(b.p,"DOOM-ST1",8);ds_set32(b.p+8,version);ds_set32(b.p+12,DS_HEADER_BYTES);ds_set32(b.p+16,(uint32_t)b.used);ds_set32(b.p+20,(uint32_t)gametic);ds_set32(b.p+24,(uint32_t)(demo_p-demobuffer));ds_set32(b.p+28,nm);ds_set32(b.p+32,ns);ds_set32(b.p+36,(uint32_t)numsectors);ds_set32(b.p+40,(uint32_t)(DOOM_CTX->numlines));ds_set32(b.p+44,(uint32_t)numsides);ds_set32(b.p+48,(uint32_t)numflats);ds_set32(b.p+52,(uint32_t)numtextures);ds_set32(b.p+56,nr);*image=b.p;*image_bytes=b.used;return 0;
  }
  
- int DoomStateDecode(const uint8_t *image,size_t image_bytes) {
+-int DoomStateDecode(const uint8_t *image,size_t image_bytes) {
 -    ds_read_t r; uint32_t nmo, nsp, nrec, pm[MAXPLAYERS], pa[MAXPLAYERS], *body=0, *mtarget=0,*mtracer=0; int32_t *mplayer=0; mobj_t **m=0; unsigned i; memset(&r,0,sizeof(r));r.p=image;r.cap=image_bytes;if(image_bytes<DS_HEADER_BYTES||memcmp(image,"DOOM-ST1",8)||ds_at32(image+8)!=0||ds_at32(image+12)!=DS_HEADER_BYTES||ds_at32(image+16)!=image_bytes||ds_at32(image+36)!=(uint32_t)numsectors||ds_at32(image+40)!=(uint32_t)(DOOM_CTX->numlines)||ds_at32(image+44)!=(uint32_t)numsides||ds_at32(image+48)!=(uint32_t)numflats||ds_at32(image+52)!=(uint32_t)numtextures)return -1;nmo=ds_at32(image+28);nsp=ds_at32(image+32);nrec=ds_at32(image+56);if(nmo>DS_MAX_OBJECTS||nsp>DS_MAX_OBJECTS||nrec!=nmo+nsp)return -1;r.used=DS_HEADER_BYTES;
 -    gameskill=(skill_t)ds_ri32(&r);gameepisode=ds_ri32(&r);gamemap=ds_ri32(&r);gamestate=(gamestate_t)ds_ri32(&r);gameaction=(gameaction_t)ds_ri32(&r);gametic=ds_ri32(&r);levelstarttic=ds_ri32(&r);leveltime=ds_ri32(&r);totalkills=ds_ri32(&r);totalitems=ds_ri32(&r);totalsecret=ds_ri32(&r);(DOOM_CTX->consoleplayer)=ds_ri32(&r);displayplayer=ds_ri32(&r);skytexture=ds_ri32(&r);skyflatnum=ds_ri32(&r);rndindex=ds_ri32(&r);prndindex=ds_ri32(&r);validcount=ds_ri32(&r);fuzzpos=ds_ri32(&r);bodyqueslot=ds_ri32(&r);levelTimeCount=ds_ri32(&r);respawnmonsters=(boolean)ds_r8(&r);(DOOM_CTX->deathmatch)=(boolean)ds_r8(&r);netgame=(boolean)ds_r8(&r);netdemo=(boolean)ds_r8(&r);paused=(boolean)ds_r8(&r);sendpause=(boolean)ds_r8(&r);sendsave=(boolean)ds_r8(&r);usergame=(boolean)ds_r8(&r);demoplayback=(boolean)ds_r8(&r);demorecording=(boolean)ds_r8(&r);secretexit=(boolean)ds_r8(&r);levelTimer=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)playeringame[i]=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)ds_rplayer(&r,&players[i],&pm[i],&pa[i]);body=calloc(DS_BODYQUESIZE,sizeof(*body));if(!body)r.bad=1;for(i=0;i<DS_BODYQUESIZE;i++)body[i]=ds_r32(&r);
 -    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];int j;x->floorheight=ds_ri32(&r);x->ceilingheight=ds_ri32(&r);x->floorpic=(short)ds_r16(&r);x->ceilingpic=(short)ds_r16(&r);x->lightlevel=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);x->soundtraversed=ds_ri32(&r);x->soundtarget=(mobj_t*)(uintptr_t)ds_r32(&r);for(j=0;j<4;j++)x->blockbox[j]=ds_ri32(&r);x->validcount_m=ds_ri32(&r);x->thinglist=0;x->specialdata=0;}
-+    ds_plan_t p; ds_read_t r; unsigned i, mi=0, si=0; memset(&p,0,sizeof(p));
-+    if (ds_preflight(image,image_bytes,&p) || ds_plan_prepare(&p)) return -1;
-+    memset(&r,0,sizeof(r));r.p=image;r.cap=image_bytes;r.used=DS_HEADER_BYTES;
-+    gameskill=(skill_t)ds_ri32(&r);gameepisode=ds_ri32(&r);gamemap=ds_ri32(&r);gamestate=(gamestate_t)ds_ri32(&r);gameaction=(gameaction_t)ds_ri32(&r);gametic=ds_ri32(&r);levelstarttic=ds_ri32(&r);leveltime=ds_ri32(&r);totalkills=ds_ri32(&r);totalitems=ds_ri32(&r);totalsecret=ds_ri32(&r);(DOOM_CTX->consoleplayer)=ds_ri32(&r);displayplayer=ds_ri32(&r);skytexture=ds_ri32(&r);skyflatnum=ds_ri32(&r);rndindex=ds_ri32(&r);prndindex=ds_ri32(&r);validcount=ds_ri32(&r);fuzzpos=ds_ri32(&r);bodyqueslot=ds_ri32(&r);levelTimeCount=ds_ri32(&r);respawnmonsters=(boolean)ds_r8(&r);(DOOM_CTX->deathmatch)=(boolean)ds_r8(&r);netgame=(boolean)ds_r8(&r);netdemo=(boolean)ds_r8(&r);paused=(boolean)ds_r8(&r);sendpause=(boolean)ds_r8(&r);sendsave=(boolean)ds_r8(&r);usergame=(boolean)ds_r8(&r);demoplayback=(boolean)ds_r8(&r);demorecording=(boolean)ds_r8(&r);secretexit=(boolean)ds_r8(&r);levelTimer=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)playeringame[i]=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)ds_rplayer(&r,&players[i],&p.pm[i],&p.pa[i]);for(i=0;i<DS_BODYQUESIZE;i++)ds_r32(&r);
-+    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];int j;x->floorheight=ds_ri32(&r);x->ceilingheight=ds_ri32(&r);x->floorpic=(short)ds_r16(&r);x->ceilingpic=(short)ds_r16(&r);x->lightlevel=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);x->soundtraversed=ds_ri32(&r);x->soundtarget=0;for(j=0;j<4;j++)x->blockbox[j]=ds_ri32(&r);x->validcount_m=ds_ri32(&r);x->thinglist=0;x->specialdata=0;}
-     for(i=0;i<(unsigned)(DOOM_CTX->numlines);i++){line_t*x=&lines[i];int j;x->flags=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);for(j=0;j<2;j++)if(x->sidenum[j]!=-1){side_t*y=&sides[x->sidenum[j]];y->textureoffset=ds_ri32(&r);y->rowoffset=ds_ri32(&r);y->toptexture=(short)ds_r16(&r);y->bottomtexture=(short)ds_r16(&r);y->midtexture=(short)ds_r16(&r);}x->validcount_m=ds_ri32(&r);}
+-    for(i=0;i<(unsigned)(DOOM_CTX->numlines);i++){line_t*x=&lines[i];int j;x->flags=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);for(j=0;j<2;j++)if(x->sidenum[j]!=-1){side_t*y=&sides[x->sidenum[j]];y->textureoffset=ds_ri32(&r);y->rowoffset=ds_ri32(&r);y->toptexture=(short)ds_r16(&r);y->bottomtexture=(short)ds_r16(&r);y->midtexture=(short)ds_r16(&r);}x->validcount_m=ds_ri32(&r);}
 -    for(i=0;i<=(unsigned)numflats;i++)flattranslation[i]=ds_ri32(&r);for(i=0;i<=(unsigned)numtextures;i++)texturetranslation[i]=ds_ri32(&r);for(i=0;i<ITEMQUESIZE;i++){ds_rmapthing(&r,&itemrespawnque[i]);itemrespawntime[i]=ds_ri32(&r);}iquehead=ds_ri32(&r);iquetail=ds_ri32(&r);for(i=0;i<MAXBUTTONS;i++){int32_t li=ds_ri32(&r);buttonlist[i].line=(li<0)?0:((li>=(DOOM_CTX->numlines))?0:&lines[li]);buttonlist[i].where=(bwhere_e)ds_ri32(&r);buttonlist[i].btexture=ds_ri32(&r);buttonlist[i].btimer=ds_ri32(&r);buttonlist[i].soundorg=(mobj_t*)(uintptr_t)ds_r32(&r);}
 -    m=nmo?calloc(nmo,sizeof(*m)):0;mtarget=nmo?calloc(nmo,sizeof(*mtarget)):0;mtracer=nmo?calloc(nmo,sizeof(*mtracer)):0;mplayer=nmo?calloc(nmo,sizeof(*mplayer)):0;if(nmo&&(!m||!mtarget||!mtracer||!mplayer))r.bad=1;memset(activeceilings,0,sizeof(activeceilings));memset(activeplats,0,sizeof(activeplats));memset(blocklinks,0,(size_t)bmapwidth*bmapheight*sizeof(*blocklinks));P_InitThinkers();
 -    for(i=0;i<nrec&&!r.bad;i++){int k=ds_r8(&r);if(k==DS_MOBJ||k==DS_MOBJ_REMOVED){unsigned j=0;while(j<nmo&&m[j])j++;if(j==nmo){r.bad=1;break;}m[j]=ds_rmobj(&r,&mtarget[j],&mtracer[j],&mplayer[j],k==DS_MOBJ_REMOVED);}else ds_rspecial(&r,k);}if(!r.bad){for(i=0;i<nmo;i++){m[i]->target=ds_mobj_at(m,nmo,mtarget[i]);m[i]->tracer=ds_mobj_at(m,nmo,mtracer[i]);if(mplayer[i]>0&&mplayer[i]<=MAXPLAYERS)m[i]->player=&players[mplayer[i]-1];}for(i=0;i<MAXPLAYERS;i++){players[i].mo=ds_mobj_at(m,nmo,pm[i]);players[i].attacker=ds_mobj_at(m,nmo,pa[i]);}for(i=0;i<DS_BODYQUESIZE;i++)bodyque[i]=ds_mobj_at(m,nmo,body[i]);for(i=0;i<(unsigned)numsectors;i++){uint32_t id=(uint32_t)(uintptr_t)sectors[i].soundtarget;sectors[i].soundtarget=ds_mobj_at(m,nmo,id);}for(i=0;i<MAXBUTTONS;i++){uint32_t id=(uint32_t)(uintptr_t)buttonlist[i].soundorg;buttonlist[i].soundorg=ds_mobj_at(m,nmo,id);}if(!demobuffer||ds_at32(image+24)>(uint32_t)W_LumpLength(W_GetNumForName(defdemoname)))r.bad=1;else demo_p=demobuffer+ds_at32(image+24);}
 -    free(body);free(m);free(mtarget);free(mtracer);free(mplayer);if(r.bad||r.used!=r.cap)return -1;return 0;
-+    for(i=0;i<=(unsigned)numflats;i++)flattranslation[i]=ds_ri32(&r);for(i=0;i<=(unsigned)numtextures;i++)texturetranslation[i]=ds_ri32(&r);for(i=0;i<ITEMQUESIZE;i++){ds_rmapthing(&r,&itemrespawnque[i]);itemrespawntime[i]=ds_ri32(&r);}iquehead=ds_ri32(&r);iquetail=ds_ri32(&r);for(i=0;i<MAXBUTTONS;i++){int32_t li=ds_ri32(&r);buttonlist[i].line=(li<0)?0:&lines[li];buttonlist[i].where=(bwhere_e)ds_ri32(&r);buttonlist[i].btexture=ds_ri32(&r);buttonlist[i].btimer=ds_ri32(&r);buttonlist[i].soundorg=0;}
-+    memset(activeceilings,0,sizeof(activeceilings));memset(activeplats,0,sizeof(activeplats));memset(blocklinks,0,(size_t)bmapwidth*bmapheight*sizeof(*blocklinks));P_InitThinkers();
-+    for(i=0;i<p.nrec&&!r.bad;i++){int k=ds_r8(&r);if(k==DS_MOBJ)ds_rmobj(&r,&p.mtarget[mi],&p.mtracer[mi],&p.mplayer[mi],p.mobj_mem[mi++]);else ds_rspecial(&r,k,p.special_mem[si++]);}
-+    if(!r.bad){for(i=0;i<p.nmo;i++){p.mobj_mem[i]->target=ds_mobj_at(p.mobj_mem,p.nmo,p.mtarget[i]);p.mobj_mem[i]->tracer=ds_mobj_at(p.mobj_mem,p.nmo,p.mtracer[i]);if(p.mplayer[i])p.mobj_mem[i]->player=&players[p.mplayer[i]-1];}for(i=0;i<MAXPLAYERS;i++){players[i].mo=ds_mobj_at(p.mobj_mem,p.nmo,p.pm[i]);players[i].attacker=ds_mobj_at(p.mobj_mem,p.nmo,p.pa[i]);}for(i=0;i<DS_BODYQUESIZE;i++)bodyque[i]=ds_mobj_at(p.mobj_mem,p.nmo,p.body[i]);for(i=0;i<(unsigned)numsectors;i++)sectors[i].soundtarget=ds_mobj_at(p.mobj_mem,p.nmo,p.sector_soundtarget[i]);for(i=0;i<MAXBUTTONS;i++)buttonlist[i].soundorg=ds_mobj_at(p.mobj_mem,p.nmo,p.button_soundorg[i]);demo_p=demobuffer+ds_at32(image+24);}
-+    /* Preflight makes the following parse infallible: no allocation, bounds,
-+     * ID, capacity, or action failure remains after publication starts. */
-+    if(r.bad||r.used!=r.cap){ds_plan_release(&p,0);return -1;}ds_plan_release(&p,0);return 0;
++int DoomStateEncode(uint8_t **image, size_t *image_bytes)
++{
++    return ds_encode_profile(image, image_bytes, DS_ST1_V0);
  }
  
++int DoomStateEncodeStrict(uint8_t **image, size_t *image_bytes)
++{
++    return ds_encode_profile(image, image_bytes, DS_ST1_STRICT_V1);
++}
++
++static void ds_commit_plan(ds_plan_t *p, uint32_t demo_cursor)
++{
++    unsigned i, j, mi = 0, si = 0;
++    gameskill = (skill_t)p->globals[0]; gameepisode = p->globals[1];
++    gamemap = p->globals[2]; gamestate = (gamestate_t)p->globals[3];
++    gameaction = (gameaction_t)p->globals[4]; gametic = p->globals[5];
++    levelstarttic = p->globals[6]; leveltime = p->globals[7];
++    totalkills = p->globals[8]; totalitems = p->globals[9];
++    totalsecret = p->globals[10]; (DOOM_CTX->consoleplayer) = p->globals[11];
++    displayplayer = p->globals[12]; skytexture = p->globals[13];
++    skyflatnum = p->globals[14]; rndindex = p->globals[15];
++    prndindex = p->globals[16]; validcount = p->globals[17];
++    fuzzpos = p->globals[18]; bodyqueslot = p->globals[19];
++    levelTimeCount = p->globals[20];
++    respawnmonsters = (boolean)p->booleans[0];
++    (DOOM_CTX->deathmatch) = (boolean)p->booleans[1];
++    netgame = (boolean)p->booleans[2]; netdemo = (boolean)p->booleans[3];
++    paused = (boolean)p->booleans[4]; sendpause = (boolean)p->booleans[5];
++    sendsave = (boolean)p->booleans[6]; usergame = (boolean)p->booleans[7];
++    demoplayback = (boolean)p->booleans[8]; demorecording = (boolean)p->booleans[9];
++    secretexit = (boolean)p->booleans[10]; levelTimer = (boolean)p->booleans[11];
++    for (i = 0; i < MAXPLAYERS; i++)
++    {
++        playeringame[i] = (boolean)p->booleans[12 + i];
++        players[i] = p->player_shadow[i];
++    }
++    for (i = 0; i < (unsigned)numsectors; i++)
++    {
++        ds_sector_shadow_t *s = &p->sector_shadow[i];
++        sectors[i].floorheight = s->floorheight;
++        sectors[i].ceilingheight = s->ceilingheight;
++        sectors[i].floorpic = (short)s->floorpic;
++        sectors[i].ceilingpic = (short)s->ceilingpic;
++        sectors[i].lightlevel = (short)s->lightlevel;
++        sectors[i].special = (short)s->special;
++        sectors[i].tag = (short)s->tag;
++        sectors[i].soundtraversed = s->soundtraversed;
++        sectors[i].soundtarget = 0; sectors[i].thinglist = 0;
++        sectors[i].specialdata = 0;
++        for (j = 0; j < 4; j++) sectors[i].blockbox[j] = s->blockbox[j];
++        sectors[i].validcount_m = s->saved_validcount;
++    }
++    for (i = 0; i < (unsigned)DOOM_CTX->numlines; i++)
++    {
++        ds_line_shadow_t *l = &p->line_shadow[i];
++        lines[i].flags = (short)l->flags; lines[i].special = (short)l->special;
++        lines[i].tag = (short)l->tag; lines[i].validcount_m = l->saved_validcount;
++        for (j = 0; j < 2; j++) if (lines[i].sidenum[j] != -1)
++        {
++            side_t *side = &sides[lines[i].sidenum[j]];
++            side->textureoffset = l->textureoffset[j]; side->rowoffset = l->rowoffset[j];
++            side->toptexture = (short)l->toptexture[j];
++            side->bottomtexture = (short)l->bottomtexture[j];
++            side->midtexture = (short)l->midtexture[j];
++        }
++    }
++    for (i = 0; i <= (unsigned)numflats; i++) flattranslation[i] = p->flat_translation[i];
++    for (i = 0; i <= (unsigned)numtextures; i++) texturetranslation[i] = p->texture_translation[i];
++    for (i = 0; i < ITEMQUESIZE; i++)
++    {
++        itemrespawnque[i] = p->item_shadow[i].thing;
++        itemrespawntime[i] = p->item_shadow[i].time;
++    }
++    iquehead = p->saved_iquehead; iquetail = p->saved_iquetail;
++    for (i = 0; i < MAXBUTTONS; i++)
++    {
++        ds_button_shadow_t *b = &p->button_shadow[i];
++        buttonlist[i].line = b->line < 0 ? 0 : &lines[b->line];
++        buttonlist[i].where = (bwhere_e)b->where; buttonlist[i].btexture = b->btexture;
++        buttonlist[i].btimer = b->btimer; buttonlist[i].soundorg = 0;
++    }
++    ds_release_current_thinkers();
++    memset(activeceilings, 0, sizeof(activeceilings));
++    memset(activeplats, 0, sizeof(activeplats));
++    memset(blocklinks, 0, (size_t)bmapwidth * bmapheight * sizeof(*blocklinks));
++    P_InitThinkers();
++    for (i = 0; i < p->nrec; i++)
++    {
++        unsigned k = p->kinds[i];
++        thinker_t *thinker;
++        if (k == DS_MOBJ)
++        {
++            mobj_t *o = p->mobj_mem[mi++];
++            o->target = ds_mobj_at(p->mobj_mem, p->nmo, p->mtarget[mi - 1]);
++            o->tracer = ds_mobj_at(p->mobj_mem, p->nmo, p->mtracer[mi - 1]);
++            if (p->mplayer[mi - 1]) o->player = &players[p->mplayer[mi - 1] - 1];
++            P_SetThingPosition(o); thinker = &o->thinker;
++        }
++        else
++        {
++            thinker = (thinker_t *)p->special_mem[si];
++            if (k <= DS_PLAT) sectors[p->special_sector[si]].specialdata = thinker;
++            si++;
++        }
++        P_AddThinker(thinker);
++        if (k == DS_CEILING) P_AddActiveCeiling((ceiling_t *)thinker);
++        if (k == DS_PLAT) P_AddActivePlat((plat_t *)thinker);
++    }
++    for (i = 0; i < MAXPLAYERS; i++)
++    {
++        players[i].mo = ds_mobj_at(p->mobj_mem, p->nmo, p->pm[i]);
++        players[i].attacker = ds_mobj_at(p->mobj_mem, p->nmo, p->pa[i]);
++    }
++    for (i = 0; i < DS_BODYQUESIZE; i++) bodyque[i] = ds_mobj_at(p->mobj_mem, p->nmo, p->body[i]);
++    for (i = 0; i < (unsigned)numsectors; i++)
++        sectors[i].soundtarget = ds_mobj_at(p->mobj_mem, p->nmo, p->sector_soundtarget[i]);
++    for (i = 0; i < MAXBUTTONS; i++)
++        buttonlist[i].soundorg = ds_mobj_at(p->mobj_mem, p->nmo, p->button_shadow[i].soundorg);
++    demo_p = demobuffer + demo_cursor;
++}
++
++static int ds_decode_profile(const uint8_t *image,size_t image_bytes,
++                             unsigned profile) {
++    ds_plan_t p; ds_read_t r; unsigned i, j, mi=0, si=0; memset(&p,0,sizeof(p));
++    if (ds_preflight(image,image_bytes,&p,profile) || ds_plan_prepare(&p)) return -1;
++    memset(&r,0,sizeof(r)); r.p=image; r.cap=image_bytes; r.used=DS_HEADER_BYTES;
++    for (i = 0; i < 21; i++) p.globals[i] = ds_ri32(&r);
++    for (i = 0; i < 12 + MAXPLAYERS; i++) p.booleans[i] = ds_r8(&r);
++    for (i = 0; i < MAXPLAYERS; i++) ds_rplayer(&r, &p.player_shadow[i], &p.pm[i], &p.pa[i]);
++    for (i = 0; i < DS_BODYQUESIZE; i++) p.body[i] = ds_r32(&r);
++    for (i = 0; i < (unsigned)numsectors; i++)
++    {
++        ds_sector_shadow_t *s = &p.sector_shadow[i];
++        s->floorheight = ds_ri32(&r); s->ceilingheight = ds_ri32(&r);
++        s->floorpic = ds_r16(&r); s->ceilingpic = ds_r16(&r);
++        s->lightlevel = ds_r16(&r); s->special = ds_r16(&r); s->tag = ds_r16(&r);
++        s->soundtraversed = ds_ri32(&r); p.sector_soundtarget[i] = ds_r32(&r);
++        for (j = 0; j < 4; j++) s->blockbox[j] = ds_ri32(&r);
++        s->saved_validcount = ds_ri32(&r);
++    }
++    for (i = 0; i < (unsigned)DOOM_CTX->numlines; i++)
++    {
++        ds_line_shadow_t *l = &p.line_shadow[i];
++        l->flags = (short)ds_r16(&r); l->special = (short)ds_r16(&r); l->tag = (short)ds_r16(&r);
++        for (j = 0; j < 2; j++) if (lines[i].sidenum[j] != -1)
++        {
++            l->textureoffset[j] = ds_ri32(&r); l->rowoffset[j] = ds_ri32(&r);
++            l->toptexture[j] = (short)ds_r16(&r); l->bottomtexture[j] = (short)ds_r16(&r);
++            l->midtexture[j] = (short)ds_r16(&r);
++        }
++        l->saved_validcount = ds_ri32(&r);
++    }
++    for (i = 0; i <= (unsigned)numflats; i++) p.flat_translation[i] = ds_ri32(&r);
++    for (i = 0; i <= (unsigned)numtextures; i++) p.texture_translation[i] = ds_ri32(&r);
++    for (i = 0; i < ITEMQUESIZE; i++) { ds_rmapthing(&r, &p.item_shadow[i].thing); p.item_shadow[i].time = ds_ri32(&r); }
++    p.saved_iquehead = ds_ri32(&r); p.saved_iquetail = ds_ri32(&r);
++    for (i = 0; i < MAXBUTTONS; i++)
++    {
++        p.button_shadow[i].line = ds_ri32(&r); p.button_shadow[i].where = ds_ri32(&r);
++        p.button_shadow[i].btexture = ds_ri32(&r); p.button_shadow[i].btimer = ds_ri32(&r);
++        p.button_shadow[i].soundorg = ds_r32(&r);
++    }
++    for (i = 0; i < p.nrec && !r.bad; i++)
++    {
++        unsigned k = ds_r8(&r);
++        if (k == DS_MOBJ) { unsigned current = mi++; ds_rmobj(&r, &p.mtarget[current], &p.mtracer[current], &p.mplayer[current], p.mobj_mem[current]); }
++        else ds_rspecial(&r, k, p.special_mem[si++]);
++    }
++    if (r.bad || r.used != r.cap || mi != p.nmo || si != p.nsp)
++    {
++        ds_plan_release(&p, 1); return -1;
++    }
++    ds_commit_plan(&p, ds_at32(image + 24));
++    ds_plan_release(&p, 0);
++    return 0;
++}
++
++int DoomStateDecode(const uint8_t *image, size_t image_bytes)
++{
++    return ds_decode_profile(image, image_bytes, DS_IMPORT_PROFILE_V0);
++}
++
++int DoomStateDecodeStrict(const uint8_t *image, size_t image_bytes)
++{
++    return ds_decode_profile(image, image_bytes, DS_IMPORT_PROFILE_STRICT_V1);
++}
++
  int DoomStateSave(const char *path){uint8_t *p;size_t n;FILE*f;if(DoomStateEncode(&p,&n))return -1;f=fopen(path,"wb");if(!f||fwrite(p,1,n,f)!=n){if(f)fclose(f);free(p);return -1;}fclose(f);free(p);return 0;}
 -int DoomStateLoad(const char *path){uint8_t *p;long n;FILE*f=fopen(path,"rb");int ok;if(!f)return -1;if(fseek(f,0,SEEK_END)||((n=ftell(f))<0)||fseek(f,0,SEEK_SET)){fclose(f);return -1;}p=malloc((size_t)n);if(!p||fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}fclose(f);ok=DoomStateDecode(p,(size_t)n);free(p);return ok;}
-+int DoomStateLoad(const char *path){uint8_t *p;long n;FILE*f=fopen(path,"rb");int ok;if(!f)return -1;if(fseek(f,0,SEEK_END)||((n=ftell(f))<0)||fseek(f,0,SEEK_SET)||n<DS_HEADER_BYTES||n>DS_MAX_IMAGE_BYTES){fclose(f);return -1;}p=malloc((size_t)n);if(!p||fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}fclose(f);ok=DoomStateDecode(p,(size_t)n);free(p);return ok;}
++int DoomStateLoad(const char *path){uint8_t *p;long n;FILE*f=fopen(path,"rb");int ok;unsigned version;if(!f)return -1;if(fseek(f,0,SEEK_END)||((n=ftell(f))<0)||fseek(f,0,SEEK_SET)||n<DS_HEADER_BYTES||n>DS_MAX_IMAGE_BYTES){fclose(f);return -1;}p=malloc((size_t)n);if(!p||fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}fclose(f);version=ds_at32(p+8);ok=(version==DS_ST1_STRICT_V1)?DoomStateDecodeStrict(p,(size_t)n):version==DS_ST1_V0?DoomStateDecode(p,(size_t)n):-1;free(p);return ok;}
  void DoomStateHash(const uint8_t wad[32],const uint8_t *p,size_t n,char out[65]){ds_sha256_t s;uint8_t d[32],v[4]={0,0,0,0};static const char x[]="0123456789abcdef";int i;ds_sha_init(&s);ds_sha_update(&s,"DOOM-ST1",8);ds_sha_update(&s,v,4);ds_sha_update(&s,wad,32);ds_sha_update(&s,p,n);ds_sha_final(&s,d);for(i=0;i<32;i++){out[2*i]=x[d[i]>>4];out[2*i+1]=x[d[i]&15];}out[64]=0;}
  void DoomStateFree(uint8_t *p){free(p);}
-diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/doom_account.c
+--- a/linuxdoom-1.10/headless/doom_state.h
++++ b/linuxdoom-1.10/headless/doom_state.h
+@@ -7,7 +7,12 @@
+ #include <stdint.h>
+ 
+ int DoomStateEncode(uint8_t **image, size_t *image_bytes);
++int DoomStateEncodeStrict(uint8_t **image, size_t *image_bytes);
+ int DoomStateDecode(const uint8_t *image, size_t image_bytes);
++int DoomStateDecodeStrict(const uint8_t *image, size_t image_bytes);
++/* Host fault-injection hook; -1 disables allocation refusal. */
++void DoomStateSetAllocationFailure(long fail_after);
++long DoomStateAllocationCalls(void);
+ int DoomStateSave(const char *path);
+ int DoomStateLoad(const char *path);
+ void DoomStateHash(const uint8_t wad_hash[32], const uint8_t *image,
 --- a/linuxdoom-1.10/headless/doom_account.c
 +++ b/linuxdoom-1.10/headless/doom_account.c
-@@ -167,74 +167,81 @@
+@@ -10,6 +10,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include "doom_account.h"
+ #include "doom_state.h"
+@@ -167,74 +170,81 @@
  
  static void p32(uint8_t *p, uint32_t x) { put32(p, x); }
  static void p16(uint8_t *p, uint16_t x) { p[0] = (uint8_t) x; p[1] = (uint8_t) (x >> 8); }
@@ -568,9 +970,6 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
      for (i = 0; i < n; i++)
 -	if (m[i] == o)
 -	    return i + 1;
--    return 0;
--}
--static int fill_pool(doom_account_t *a)
 +	if (m[i] == o) { *out = i + 1; return 0; }
 +    return -1;
 +}
@@ -592,8 +991,9 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
 +    if (x < base || x - base >= sizeof(players)
 +	|| (x - base) % sizeof(*players)) return -1;
 +    *out = (int32_t)((x - base) / sizeof(*players)) + 1;
-+    return 0;
-+}
+     return 0;
+ }
+-static int fill_pool(doom_account_t *a)
 +static int fill_pool(uint8_t *pool, const doom_account_t *a)
  {
      mobj_t *m[DOOM_ACCOUNT_POOL_SLOTS];
@@ -687,7 +1087,7 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
  	p32(s + 112, (uint32_t) o->lastlook);
  	p16(s + 116, (uint16_t) o->spawnpoint.x);
  	p16(s + 118, (uint16_t) o->spawnpoint.y);
-@@ -242,36 +249,43 @@
+@@ -242,38 +252,162 @@
  	p16(s + 122, (uint16_t) o->spawnpoint.type);
  	p16(s + 124, (uint16_t) o->spawnpoint.options);
      }
@@ -696,7 +1096,8 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
 +}
  
  int DoomAccountBeginLevel(doom_account_t*a,int episode,int map){if(!a||episode!=1||map<1||map>9)return -1;memset(a->level,0,sizeof(a->level));memset(a->pool,0,sizeof(a->pool));a->level_started=1;return 0;}
- int DoomAccountCommitLevel(doom_account_t *a)
+-int DoomAccountCommitLevel(doom_account_t *a)
++static int doom_account_commit_level(doom_account_t *a, unsigned state_version)
  {
 -    uint8_t *image = 0;
 +    uint8_t *image = 0, *next_level = 0, *next_pool = 0;
@@ -718,8 +1119,16 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
 -    p32(a->level + 24, LEVEL_IMAGE_CAP);
 -    p32(a->level + 28, (uint32_t) n);
 -    memcpy(a->level + 32, a->wad_hash, 32);
+-    hash_bytes(image, n, raw);
+-    memcpy(a->level + 64, raw, 32);
+-    p32(a->level + 96, at32(image + 20));
+-    memcpy(a->level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image, n);
+-    DoomStateFree(image);
+-    return fill_pool(a);
 +    if (!a || !a->level_started) return -1;
-+    if (DoomStateEncode(&image, &n) || n > LEVEL_IMAGE_CAP) goto fail;
++    if ((state_version == 0
++            ? DoomStateEncode(&image, &n)
++            : DoomStateEncodeStrict(&image, &n)) || n > LEVEL_IMAGE_CAP) goto fail;
 +    next_level = calloc(1, DOOM_ACCOUNT_LEVEL_BYTES);
 +    next_pool = calloc(1, DOOM_ACCOUNT_POOL_BYTES);
 +    if (!next_level || !next_pool) goto fail;
@@ -731,12 +1140,7 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
 +    p32(next_level + 24, LEVEL_IMAGE_CAP);
 +    p32(next_level + 28, (uint32_t) n);
 +    memcpy(next_level + 32, a->wad_hash, 32);
-     hash_bytes(image, n, raw);
--    memcpy(a->level + 64, raw, 32);
--    p32(a->level + 96, at32(image + 20));
--    memcpy(a->level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image, n);
--    DoomStateFree(image);
--    return fill_pool(a);
++    hash_bytes(image, n, raw);
 +    memcpy(next_level + 64, raw, 32);
 +    p32(next_level + 96, at32(image + 20));
 +    memcpy(next_level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image, n);
@@ -752,17 +1156,251 @@ diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/do
 +    if (image) DoomStateFree(image);
 +    return -1;
  }
++int DoomAccountCommitLevel(doom_account_t *a)
++{
++    return doom_account_commit_level(a, 0);
++}
++int DoomAccountCommitLevelStrict(doom_account_t *a)
++{
++    return doom_account_commit_level(a, 1);
++}
  static int write_image(const char*path,const uint8_t*p,size_t n){FILE*f=fopen(path,"wb");if(!f)return -1;if(fwrite(p,1,n,f)!=n){fclose(f);return -1;}return fclose(f)?-1:0;}
++
++static int write_atomic_bytes(const char *path, const uint8_t *p, size_t n)
++{
++    char tmp[1024];
++    int fd;
++    size_t done = 0;
++    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return -1;
++    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++    if (fd < 0) return -1;
++    while (done < n)
++    {
++        ssize_t wrote = write(fd, p + done, n - done);
++        if (wrote <= 0) { close(fd); unlink(tmp); return -1; }
++        done += (size_t)wrote;
++    }
++    if (fsync(fd) || close(fd) || rename(tmp, path)) { unlink(tmp); return -1; }
++    {
++        char dir[1024]; char *slash = strrchr(path, '/'); int dfd;
++        if (!slash || slash == path || (size_t)(slash - path) >= sizeof(dir)) return -1;
++        memcpy(dir, path, (size_t)(slash - path)); dir[slash - path] = 0;
++        dfd = open(dir, O_RDONLY | O_DIRECTORY);
++        if (dfd < 0 || fsync(dfd) || close(dfd)) return -1;
++    }
++    return 0;
++}
++
++static int read_exact(const char *path, uint8_t *p, size_t n)
++{
++    FILE *f = fopen(path, "rb");
++    int extra;
++    if (!f || fread(p, 1, n, f) != n) { if (f) fclose(f); return -1; }
++    extra = fgetc(f); fclose(f);
++    return extra == EOF ? 0 : -1;
++}
++
++static int generation_path(const char *dir, unsigned generation, int pool,
++                           char *out, size_t cap)
++{
++    return snprintf(out, cap, "%s/generation-%08u-%s.bin", dir, generation,
++                     pool ? "mp1" : "ls1") >= (int)cap ? -1 : 0;
++}
++
++int DoomAccountPublishPair(const doom_account_t *a, const char *dir,
++                           unsigned generation, long fail_after)
++{
++    uint8_t manifest[96], digest[32];
++    char level_path[1024], pool_path[1024], manifest_path[1024];
++    if (!a || !dir || (mkdir(dir, 0755) < 0 && errno != EEXIST)
++        || generation_path(dir, generation, 0, level_path, sizeof(level_path))
++        || generation_path(dir, generation, 1, pool_path, sizeof(pool_path))
++        || snprintf(manifest_path, sizeof(manifest_path), "%s/publication.manifest", dir)
++             >= (int)sizeof(manifest_path)) return -1;
++    if (fail_after == 0) return -1;
++    if (write_atomic_bytes(level_path, a->level, sizeof(a->level))) return -1;
++    if (fail_after == 1) return -1;
++    if (write_atomic_bytes(pool_path, a->pool, sizeof(a->pool))) return -1;
++    if (fail_after == 2) return -1;
++    memset(manifest, 0, sizeof(manifest));
++    memcpy(manifest, "DOOM-PUB1", 8);
++    p32(manifest + 8, 1); p32(manifest + 12, generation);
++    p32(manifest + 16, sizeof(a->level)); p32(manifest + 20, sizeof(a->pool));
++    hash_bytes(a->level, sizeof(a->level), digest); memcpy(manifest + 24, digest, 32);
++    hash_bytes(a->pool, sizeof(a->pool), digest); memcpy(manifest + 56, digest, 32);
++    return write_atomic_bytes(manifest_path, manifest, sizeof(manifest));
++}
++
++int DoomAccountImportPublishedPair(doom_account_t *a, const char *dir)
++{
++    uint8_t manifest[96], level[DOOM_ACCOUNT_LEVEL_BYTES];
++    uint8_t pool[DOOM_ACCOUNT_POOL_BYTES], derived[DOOM_ACCOUNT_POOL_BYTES];
++    uint8_t digest[32], *roundtrip = 0;
++    char level_path[1024], pool_path[1024], manifest_path[1024];
++    uint32_t generation, image_bytes;
++    size_t roundtrip_bytes;
++    if (!a || !dir || snprintf(manifest_path, sizeof(manifest_path),
++            "%s/publication.manifest", dir) >= (int)sizeof(manifest_path)
++        || read_exact(manifest_path, manifest, sizeof(manifest))
++        || memcmp(manifest, "DOOM-PUB1", 8) || at32(manifest + 8) != 1
++        || at32(manifest + 16) != sizeof(level) || at32(manifest + 20) != sizeof(pool)) return -1;
++    generation = at32(manifest + 12);
++    if (generation_path(dir, generation, 0, level_path, sizeof(level_path))
++        || generation_path(dir, generation, 1, pool_path, sizeof(pool_path))
++        || read_exact(level_path, level, sizeof(level)) || read_exact(pool_path, pool, sizeof(pool))) return -1;
++    hash_bytes(level, sizeof(level), digest); if (memcmp(digest, manifest + 24, 32)) return -1;
++    hash_bytes(pool, sizeof(pool), digest); if (memcmp(digest, manifest + 56, 32)) return -1;
++    if (memcmp(level, "DOOM-LS1", 8) || at32(level + 8) != 1
++        || at32(level + 12) != DOOM_ACCOUNT_LEVEL_HEADER_BYTES
++        || at32(level + 16) != sizeof(level) || at32(level + 20) != DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET
++        || at32(level + 24) != LEVEL_IMAGE_CAP || memcmp(level + 32, a->wad_hash, 32)
++        || memcmp(pool, "DOOM-MP1", 8) || at32(pool + 8) != 1
++        || at32(pool + 12) != DOOM_ACCOUNT_POOL_HEADER_BYTES || at32(pool + 16) != sizeof(pool)
++        || memcmp(pool + 36, a->wad_hash, 32)) return -1;
++    image_bytes = at32(level + 28);
++    if (image_bytes > LEVEL_IMAGE_CAP || image_bytes < 64
++        || memcmp(level + 64, (hash_bytes(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET,
++             image_bytes, digest), digest), 32)) return -1;
++    if (DoomStateDecodeStrict(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image_bytes)
++        || DoomStateEncodeStrict(&roundtrip, &roundtrip_bytes)
++        || roundtrip_bytes != image_bytes || memcmp(roundtrip, level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image_bytes)
++        || fill_pool(derived, a) || memcmp(derived, pool, sizeof(pool)))
++    { if (roundtrip) DoomStateFree(roundtrip); return -1; }
++    DoomStateFree(roundtrip);
++    memcpy(a->level, level, sizeof(a->level));
++    memcpy(a->pool, pool, sizeof(a->pool));
++    return 0;
++}
++
  int DoomAccountWriteLevelState(const doom_account_t*a,const char*path){return a?write_image(path,a->level,sizeof(a->level)):-1;}
-diff --git a/linuxdoom-1.10/headless/doom_state.h b/linuxdoom-1.10/headless/doom_state.h
---- a/linuxdoom-1.10/headless/doom_state.h
-+++ b/linuxdoom-1.10/headless/doom_state.h
-@@ -8,6 +8,8 @@
+ int DoomAccountWriteMobjPool(const doom_account_t*a,const char*path){return a?write_image(path,a->pool,sizeof(a->pool)):-1;}
+ const uint8_t*DoomAccountWadHash(const doom_account_t*a){return a?a->wad_hash:0;}
+--- a/linuxdoom-1.10/headless/doom_account.h
++++ b/linuxdoom-1.10/headless/doom_account.h
+@@ -25,6 +25,10 @@
+ int DoomAccountBeginLevel(doom_account_t *account, int episode, int map);
+ int DoomAccountLoadLevel(doom_account_t *account, int episode, int map, int skill);
+ int DoomAccountCommitLevel(doom_account_t *account);
++int DoomAccountCommitLevelStrict(doom_account_t *account);
++int DoomAccountPublishPair(const doom_account_t *account, const char *dir,
++                           unsigned generation, long fail_after);
++int DoomAccountImportPublishedPair(doom_account_t *account, const char *dir);
+ int DoomAccountWriteLevelState(const doom_account_t *account, const char *path);
+ int DoomAccountWriteMobjPool(const doom_account_t *account, const char *path);
+ const uint8_t *DoomAccountLevelState(const doom_account_t *account);
+--- a/linuxdoom-1.10/headless/doom_render.c
++++ b/linuxdoom-1.10/headless/doom_render.c
+@@ -40,9 +40,8 @@
+ static uint32_t g32(const uint8_t*p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
+ static void p32(uint8_t*p,uint32_t x){p[0]=(uint8_t)x;p[1]=(uint8_t)(x>>8);p[2]=(uint8_t)(x>>16);p[3]=(uint8_t)(x>>24);}
+ static uint32_t stamp(const uint8_t*p,size_t n){uint32_t h=2166136261u;while(n--)h=(h^*p++)*16777619u;return h;}
+-static void release_thinkers(void){thinker_t*t=thinkercap.next,*n;if(!t)return;while(t!=&thinkercap){n=t->next;Z_Free(t);t=n;}P_InitThinkers();}
+ void DoomRenderScratchInit(uint8_t*s,size_t n,const doom_account_t*a){if(!s||n<DOOM_RENDER_SCRATCH_BYTES)return;memset(s,0,n);memcpy(s,"DOOM-RS1",8);p32(s+8,1);p32(s+12,DOOM_RENDER_SCRATCH_HEADER_BYTES);p32(s+16,DOOM_RENDER_SCRATCH_BYTES);p32(s+48,0xffffffffu);if(a)memcpy(s+20,DoomAccountWadHash(a),32);}
+-static int DoomRenderStripLocal(unsigned id,const uint8_t*image,size_t bytes,const doom_account_t*a,uint8_t*s,size_t n,uint8_t out[DOOM_RENDER_STRIP_ACCOUNT_BYTES],doom_render_metrics_t*m,uint32_t expected){byte*old[5],*frame;uint64_t b,e;unsigned x,y;uint32_t z;if(id>=8)return DOOM_RENDER_REFUSE_STRIP;if(!s||n<DOOM_RENDER_SCRATCH_BYTES||!out)return DOOM_RENDER_REFUSE_SCRATCH;if(!a||!DoomAccountWadHash(a))return DOOM_RENDER_REFUSE_WAD;if(!image||bytes<24||memcmp(image,"DOOM-ST1",8)||g32(image+8)!=0||g32(image+20)!=expected)return DOOM_RENDER_REFUSE_STATE;z=stamp(image,bytes);if(g32(s+48)!=z){p32(s+72,(uint32_t)fuzzpos);p32(s+76,(uint32_t)validcount);p32(s+80,(uint32_t)rndindex);p32(s+84,(uint32_t)prndindex);p32(s+88,(uint32_t)skytexture);p32(s+92,(uint32_t)framecount);release_thinkers();if(DoomStateDecode(image,bytes))return DOOM_RENDER_REFUSE_STATE;p32(s+48,z);p32(s+52,(uint32_t)fuzzpos);p32(s+56,(uint32_t)validcount);p32(s+60,(uint32_t)rndindex);p32(s+64,(uint32_t)prndindex);p32(s+68,(uint32_t)skytexture);}fuzzpos=(int)g32(s+52);validcount=(int)g32(s+56);rndindex=(int)g32(s+60);prndindex=(int)g32(s+64);skytexture=(int)g32(s+68);validcount=(int)(0x40000000u+id*2u);frame=s+DOOM_RENDER_FRAME_OFFSET;memcpy(old,screens,sizeof(old));memcpy(frame,s+DOOM_RENDER_SEED_OFFSET,DOOM_RENDER_FRAME_BYTES);screens[0]=screens[1]=screens[2]=screens[3]=screens[4]=frame;R_ExecuteSetViewSize();doom_render_fuzz_columns=0;b=ht();R_RenderPlayerView(&players[displayplayer]);e=ht();memset(out,0,DOOM_RENDER_STRIP_ACCOUNT_BYTES);memcpy(out,"DOOM-STRIP1",8);p32(out+8,1);p32(out+12,64);p32(out+16,8192);p32(out+20,id);p32(out+24,expected);memcpy(out+28,DoomAccountWadHash(a),32);for(x=0;x<40;x++)for(y=0;y<200;y++)out[64+x*200+y]=frame[y*320+id*40+x];if(m){m->host_ticks=e-b;m->wall_ns=ns(e)-ns(b);m->drawsegs_m=(unsigned)(ds_p-drawsegs);m->vissprites_m=(unsigned)(vissprite_p-vissprites);m->fuzz_columns=doom_render_fuzz_columns;}memcpy(screens,old,sizeof(old));R_ExecuteSetViewSize();fuzzpos=(int)g32(s+72);validcount=(int)g32(s+76);rndindex=(int)g32(s+80);prndindex=(int)g32(s+84);skytexture=(int)g32(s+88);framecount=(int)g32(s+92);return DOOM_RENDER_OK;}
++static int DoomRenderStripLocal(unsigned id,const uint8_t*image,size_t bytes,const doom_account_t*a,uint8_t*s,size_t n,uint8_t out[DOOM_RENDER_STRIP_ACCOUNT_BYTES],doom_render_metrics_t*m,uint32_t expected){byte*old[5],*frame;uint64_t b,e;unsigned x,y;uint32_t z;if(id>=8)return DOOM_RENDER_REFUSE_STRIP;if(!s||n<DOOM_RENDER_SCRATCH_BYTES||!out)return DOOM_RENDER_REFUSE_SCRATCH;if(!a||!DoomAccountWadHash(a))return DOOM_RENDER_REFUSE_WAD;if(!image||bytes<24||memcmp(image,"DOOM-ST1",8)||g32(image+8)!=0||g32(image+20)!=expected)return DOOM_RENDER_REFUSE_STATE;z=stamp(image,bytes);if(g32(s+48)!=z){p32(s+72,(uint32_t)fuzzpos);p32(s+76,(uint32_t)validcount);p32(s+80,(uint32_t)rndindex);p32(s+84,(uint32_t)prndindex);p32(s+88,(uint32_t)skytexture);p32(s+92,(uint32_t)framecount);if(DoomStateDecode(image,bytes))return DOOM_RENDER_REFUSE_STATE;p32(s+48,z);p32(s+52,(uint32_t)fuzzpos);p32(s+56,(uint32_t)validcount);p32(s+60,(uint32_t)rndindex);p32(s+64,(uint32_t)prndindex);p32(s+68,(uint32_t)skytexture);}fuzzpos=(int)g32(s+52);validcount=(int)g32(s+56);rndindex=(int)g32(s+60);prndindex=(int)g32(s+64);skytexture=(int)g32(s+68);validcount=(int)(0x40000000u+id*2u);frame=s+DOOM_RENDER_FRAME_OFFSET;memcpy(old,screens,sizeof(old));memcpy(frame,s+DOOM_RENDER_SEED_OFFSET,DOOM_RENDER_FRAME_BYTES);screens[0]=screens[1]=screens[2]=screens[3]=screens[4]=frame;R_ExecuteSetViewSize();doom_render_fuzz_columns=0;b=ht();R_RenderPlayerView(&players[displayplayer]);e=ht();memset(out,0,DOOM_RENDER_STRIP_ACCOUNT_BYTES);memcpy(out,"DOOM-STRIP1",8);p32(out+8,1);p32(out+12,64);p32(out+16,8192);p32(out+20,id);p32(out+24,expected);memcpy(out+28,DoomAccountWadHash(a),32);for(x=0;x<40;x++)for(y=0;y<200;y++)out[64+x*200+y]=frame[y*320+id*40+x];if(m){m->host_ticks=e-b;m->wall_ns=ns(e)-ns(b);m->drawsegs_m=(unsigned)(ds_p-drawsegs);m->vissprites_m=(unsigned)(vissprite_p-vissprites);m->fuzz_columns=doom_render_fuzz_columns;}memcpy(screens,old,sizeof(old));R_ExecuteSetViewSize();fuzzpos=(int)g32(s+72);validcount=(int)g32(s+76);rndindex=(int)g32(s+80);prndindex=(int)g32(s+84);skytexture=(int)g32(s+88);framecount=(int)g32(s+92);return DOOM_RENDER_OK;}
+ typedef struct { int rc; uint8_t out[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t metrics; } render_ipc_t;
+ static int io_write(int fd,const void*p,size_t n){const uint8_t*b=p;ssize_t k;while(n){k=write(fd,b,n);if(k<=0)return -1;b+=k;n-=(size_t)k;}return 0;}
+ static int io_read(int fd,void*p,size_t n){uint8_t*b=p;ssize_t k;while(n){k=read(fd,b,n);if(k<=0)return -1;b+=k;n-=(size_t)k;}return 0;}
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -66,10 +66,11 @@
+ static void sha_final(sha256_t *s,uint8_t out[32]) { uint8_t len[8]; int i; for(i=0;i<8;i++)len[7-i]=(uint8_t)(s->bits>>(i*8)); s->block[s->used++]=0x80; if(s->used>56){while(s->used<64)s->block[s->used++]=0;sha_block(s,s->block);s->used=0;}while(s->used<56)s->block[s->used++]=0;memcpy(s->block+56,len,8);sha_block(s,s->block);for(i=0;i<8;i++){out[i*4]=(uint8_t)(s->h[i]>>24);out[i*4+1]=(uint8_t)(s->h[i]>>16);out[i*4+2]=(uint8_t)(s->h[i]>>8);out[i*4+3]=(uint8_t)s->h[i];} }
+ static void hex(const uint8_t *bytes, char out[65]) { static const char d[]="0123456789abcdef"; int i; for(i=0;i<32;i++){out[2*i]=d[bytes[i]>>4];out[2*i+1]=d[bytes[i]&15];}out[64]=0; }
+ static int hash_file(const char *path, uint8_t out[32]) { uint8_t buf[8192]; size_t n; FILE *f=fopen(path,"rb"); sha256_t s; if(!f)return -1;sha_init(&s);while((n=fread(buf,1,sizeof(buf),f))!=0)sha_update(&s,buf,n);if(ferror(f)){fclose(f);return -1;}fclose(f);sha_final(&s,out);return 0; }
++static void hash_bytes(const void *p, size_t n, uint8_t out[32]) { sha256_t s; sha_init(&s); sha_update(&s,p,n); sha_final(&s,out); }
+ static void le32(uint8_t out[4], uint32_t n) {out[0]=n;out[1]=n>>8;out[2]=n>>16;out[3]=n>>24;}
+ static void hash_record(const char *tag,const uint8_t wad[32],uint32_t tic,uint32_t strip,const uint8_t *pixels,size_t n,char out[65]) { sha256_t s;uint8_t x[4],d[32];sha_init(&s);sha_update(&s,tag,strlen(tag));le32(x,0);sha_update(&s,x,4);sha_update(&s,wad,32);le32(x,tic);sha_update(&s,x,4);le32(x,strip);sha_update(&s,x,4);sha_update(&s,pixels,n);sha_final(&s,d);hex(d,out); }
+ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec*1000.0+(double)t.tv_nsec/1000000.0; }
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR]\n",argv0); }
+ static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
+ static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
+ /* One census line per named phase: the non-purgeable zone bytes are the hard
+@@ -77,11 +78,62 @@
+    evicted; the extent is the highest live byte offset in the zone. */
+ static void zone_census(FILE *f,const char *phase) { int fixed=0,purge=0,extent=0,zonesize=0; if(!f)return; Z_Census(&fixed,&purge,&extent,&zonesize); fprintf(f,"{\"phase\":\"%s\",\"fixed_bytes\":%d,\"purgeable_bytes\":%d,\"extent_bytes\":%d,\"zone_bytes\":%d}\n",phase,fixed,purge,extent,zonesize); fflush(f); }
  
- int DoomStateEncode(uint8_t **image, size_t *image_bytes);
- int DoomStateDecode(const uint8_t *image, size_t image_bytes);
-+/* Host fault-injection hook; -1 disables allocation refusal. */
-+void DoomStateSetAllocationFailure(long fail_after);
- int DoomStateSave(const char *path);
- int DoomStateLoad(const char *path);
- void DoomStateHash(const uint8_t wad_hash[32], const uint8_t *image,
++static int read_file_bytes(const char *path, uint8_t **out, size_t *out_bytes)
++{
++  FILE *f; long n; uint8_t *p;
++  if (!path || !out || !out_bytes || !(f=fopen(path,"rb"))) return -1;
++  if (fseek(f,0,SEEK_END) || (n=ftell(f)) < 0 || fseek(f,0,SEEK_SET)
++      || n < 64 || n > 126976) { fclose(f); return -1; }
++  p=malloc((size_t)n); if(!p || fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}
++  fclose(f); *out=p; *out_bytes=(size_t)n; return 0;
++}
++
++static int decoder_gate_load(const char *path, const char *report,
++                             long fail_after, const uint8_t wad_hash[32],
++                             const doom_account_t *account)
++{
++  uint8_t *input=0,*before=0,*after=0, before_account[DOOM_ACCOUNT_LEVEL_BYTES+DOOM_ACCOUNT_POOL_BYTES];
++  size_t input_bytes=0,before_bytes=0,after_bytes=0; uint8_t d[32]; char before_hex[65],after_hex[65];
++  int rc, graph_equal=0, account_equal=1; FILE *f;
++  if (read_file_bytes(path,&input,&input_bytes)) return -1;
++  if (DoomStateEncode(&before,&before_bytes)) {free(input);return -1;}
++  if (account){memcpy(before_account,DoomAccountLevelState(account),DOOM_ACCOUNT_LEVEL_BYTES);memcpy(before_account+DOOM_ACCOUNT_LEVEL_BYTES,DoomAccountMobjPool(account),DOOM_ACCOUNT_POOL_BYTES);}
++  DoomStateSetAllocationFailure(fail_after);
++  rc=(input_bytes>=12 && ((input[8]==1&&input[9]==0&&input[10]==0&&input[11]==0)?DoomStateDecodeStrict(input,input_bytes):DoomStateDecode(input,input_bytes)));
++  long calls=DoomStateAllocationCalls(); DoomStateSetAllocationFailure(-1);
++  if (!DoomStateEncode(&after,&after_bytes)) {graph_equal=before_bytes==after_bytes&&!memcmp(before,after,before_bytes);hash_bytes(before,before_bytes,d);hex(d,before_hex);hash_bytes(after,after_bytes,d);hex(d,after_hex);} else {strcpy(before_hex,"");strcpy(after_hex,"");}
++  if(account) account_equal=!memcmp(before_account,DoomAccountLevelState(account),DOOM_ACCOUNT_LEVEL_BYTES)&&!memcmp(before_account+DOOM_ACCOUNT_LEVEL_BYTES,DoomAccountMobjPool(account),DOOM_ACCOUNT_POOL_BYTES);
++  f=fopen(report,"w"); if(!f){free(input);DoomStateFree(before);DoomStateFree(after);return -1;}
++  fprintf(f,"{\"input_bytes\":%lu,\"input_sha256\":\"",(unsigned long)input_bytes);hash_bytes(input,input_bytes,d);{char h[65];hex(d,h);fprintf(f,"%s",h);}fprintf(f,"\",\"decode_rc\":%d,\"allocation_fail_after\":%ld,\"allocation_calls\":%ld,\"graph_equal\":%s,\"account_equal\":%s,\"pre_graph_sha256\":\"%s\",\"post_graph_sha256\":\"%s\",\"wad_sha256\":\"",rc,fail_after,calls,graph_equal?"true":"false",account_equal?"true":"false",before_hex,after_hex);{char h[65];hex(wad_hash,h);fprintf(f,"%s",h);}fprintf(f,"\"}\n");fclose(f);
++  free(input);DoomStateFree(before);DoomStateFree(after);return rc;
++}
++
++static int decoder_gate_import_pair(const char *dir, const char *report,
++                                    const uint8_t wad_hash[32],
++                                    doom_account_t *account)
++{
++  uint8_t *before=0,*after=0,d[32],before_account[DOOM_ACCOUNT_LEVEL_BYTES+DOOM_ACCOUNT_POOL_BYTES];
++  size_t before_bytes=0,after_bytes=0; int rc,graph_equal=0,account_equal=1; FILE *f; char bh[65]="",ah[65]="";
++  if (DoomStateEncode(&before,&before_bytes)) return -1;
++  memcpy(before_account,DoomAccountLevelState(account),DOOM_ACCOUNT_LEVEL_BYTES);memcpy(before_account+DOOM_ACCOUNT_LEVEL_BYTES,DoomAccountMobjPool(account),DOOM_ACCOUNT_POOL_BYTES);
++  rc=DoomAccountImportPublishedPair(account,dir);
++  if (!DoomStateEncode(&after,&after_bytes)){graph_equal=before_bytes==after_bytes&&!memcmp(before,after,before_bytes);hash_bytes(before,before_bytes,d);hex(d,bh);hash_bytes(after,after_bytes,d);hex(d,ah);}
++  account_equal=!memcmp(before_account,DoomAccountLevelState(account),DOOM_ACCOUNT_LEVEL_BYTES)&&!memcmp(before_account+DOOM_ACCOUNT_LEVEL_BYTES,DoomAccountMobjPool(account),DOOM_ACCOUNT_POOL_BYTES);
++  f=fopen(report,"w");if(!f){DoomStateFree(before);DoomStateFree(after);return -1;}
++  fprintf(f,"{\"pair_import_rc\":%d,\"graph_equal\":%s,\"account_equal\":%s,\"pre_graph_sha256\":\"%s\",\"post_graph_sha256\":\"%s\",\"wad_sha256\":\"",rc,graph_equal?"true":"false",account_equal?"true":"false",bh,ah);{char h[65];hex(wad_hash,h);fprintf(f,"%s",h);}fprintf(f,"\"}\n");fclose(f);DoomStateFree(before);DoomStateFree(after);return rc;
++}
++
+ int main(int argc, char **argv) {
+   char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
++  char *allocation_fail_arg=arg_after(argc,argv,"--allocation-fail"), *decoder_report=arg_after(argc,argv,"--decoder-report"), *publish_dir=arg_after(argc,argv,"--publish-dir"), *publish_fail_arg=arg_after(argc,argv,"--publish-fail-after"), *import_pair_dir=arg_after(argc,argv,"--import-pair-dir");
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000, published=0; long allocation_fail=-1, publish_fail_after=-1; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
+   if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
+   if(max_tics_arg){char *end=0;long v=strtol(max_tics_arg,&end,10);if(!end||*end||v<1||v>1000000){fprintf(stderr,"bad --max-tics\n");return 2;}max_tics=(int)v;}
++  if(decoder_report&&!load&&!import_pair_dir){fprintf(stderr,"--decoder-report requires --load or --import-pair-dir\n");return 2;}
++  if(allocation_fail_arg){char *end=0;long v=strtol(allocation_fail_arg,&end,10);if(!end||*end||v<-1||v>1000000){fprintf(stderr,"bad --allocation-fail\n");return 2;}allocation_fail=v;}
++  if(publish_fail_arg){char *end=0;long v=strtol(publish_fail_arg,&end,10);if(!end||*end||v<-1||v>2){fprintf(stderr,"bad --publish-fail-after\n");return 2;}publish_fail_after=v;}
++  if(import_pair_dir&&load){fprintf(stderr,"--import-pair-dir and --load are mutually exclusive\n");return 2;}
++  if(publish_dir&&!manifest){fprintf(stderr,"--publish-dir requires --account-manifest\n");return 2;}
+   if(save_at_arg){char *end=0;long v=strtol(save_at_arg,&end,10);if(!end||*end||v<0||v>1000000||!save){fprintf(stderr,"bad --save-at/--save\n");return 2;}save_at=(int)v;} else if(save||(resave&&!load)){fprintf(stderr,"--save requires --save-at; --resave requires --load\n");return 2;}
+   if(iwad){if(hash_file(iwad,wad_hash)){fprintf(stderr,"cannot hash %s: %s\n",iwad,strerror(errno));return 2;}}
+   if(mb_used_arg){char *end=0;long v=strtol(mb_used_arg,&end,10);if(!end||*end||v<1||v>256){fprintf(stderr,"bad -mb-used\n");return 2;}mb_used=(int)v;}
+@@ -92,12 +144,13 @@
+   if(account && (demo[2]!=1 || demo[3]<1 || demo[3]>9 || DoomAccountBeginLevel(account,demo[2],demo[3]))){fprintf(stderr,"account loader accepts only E1 shareware DEMO1\n");return 2;}
+   defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo(); zone_census(censusout,"load_level");
+   if(account && DoomAccountCommitLevel(account)){fprintf(stderr,"cannot commit fixed account image\n");return 2;}
++  if(import_pair_dir && (!account || (decoder_report?decoder_gate_import_pair(import_pair_dir,decoder_report,wad_hash,account):DoomAccountImportPublishedPair(account,import_pair_dir)))){fprintf(stderr,"cannot import published LS1/MP1 pair %s\n",import_pair_dir);return 2;}
+   if(account_level && (!account || DoomAccountWriteLevelState(account,account_level))){fprintf(stderr,"cannot write account level_state\n");return 2;}
+   if(account_pool && (!account || DoomAccountWriteMobjPool(account,account_pool))){fprintf(stderr,"cannot write account mobj_pool\n");return 2;}
+   /* G_DoPlayDemo consumes the 13-byte header.  Mutate the forwardmove
+      command at the requested stream tic, not the immutable WAD file. */
+   if(flip_tic>=0){long off=(long)flip_tic*4L;if(off<0||off+4>demo_len-(demo_p-demobuffer)){fprintf(stderr,"flip tic outside one-player demo\n");return 2;}demo_p[off]^=1;}
+-  if(load&&DoomStateLoad(load)){fprintf(stderr,"cannot load DOOM-ST1 %s\n",load);return 2;}
++  if(load){int load_rc=decoder_report?decoder_gate_load(load,decoder_report,allocation_fail,wad_hash,account):DoomStateLoad(load);if(load_rc){fprintf(stderr,"cannot load DOOM-ST1 %s\n",load);return 2;}}
+   if(controller_path){
+     if(!load || max_tics!=1 || DoomControllerRead(controller_path,(uint32_t)gametic,controller_command)
+        || (size_t)(demo_p-demobuffer) > (size_t)demo_len-4
+@@ -115,7 +168,7 @@
+   if(parity_path||probe_path){render_scratch=malloc(DOOM_RENDER_SCRATCH_BYTES);if(!render_scratch){fprintf(stderr,"cannot allocate render scratch\n");return 2;}DoomRenderScratchInit(render_scratch,DOOM_RENDER_SCRATCH_BYTES,account);}
+   if(probe_path){int refusal;uint8_t bad[64],probe[DOOM_RENDER_STRIP_ACCOUNT_BYTES],*p=0;size_t n=0;probeout=fopen(probe_path,"w");DoomStateEncode(&p,&n);memcpy(bad,p,n<sizeof(bad)?n:sizeof(bad));refusal=DoomRenderStrip(8,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"{\"strip_id_8\":%d,",refusal==DOOM_RENDER_REFUSE_STRIP);refusal=DoomRenderStrip(0,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES-1,probe,0,(uint32_t)gametic);fprintf(probeout,"\"short_scratch\":%d,",refusal==DOOM_RENDER_REFUSE_SCRATCH);bad[0]='X';refusal=DoomRenderStrip(0,bad,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"\"bad_state\":%d}\n",refusal==DOOM_RENDER_REFUSE_STATE);DoomStateFree(p);fclose(probeout);}
+   out=fopen(frames,"w");if(!out){fprintf(stderr,"cannot open %s: %s\n",frames,strerror(errno));return 2;}if(statehashes){stateout=fopen(statehashes,"w");if(!stateout){fprintf(stderr,"cannot open %s: %s\n",statehashes,strerror(errno));fclose(out);return 2;}}
+-  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs_m,tic_metrics[strip_id].vissprites_m,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(censusout&&(rendered==1||rendered==100||rendered==1000)){char ph[32];sprintf(ph,"tic_%d",rendered);zone_census(censusout,ph);}if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
++  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(publish_dir&&!published){if(!account||DoomAccountCommitLevelStrict(account)||DoomAccountPublishPair(account,publish_dir,1,publish_fail_after)){fprintf(stderr,"cannot publish successor LS1/MP1 pair %s\n",publish_dir);return 3;}published=1;}if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs_m,tic_metrics[strip_id].vissprites_m,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(censusout&&(rendered==1||rendered==100||rendered==1000)){char ph[32];sprintf(ph,"tic_%d",rendered);zone_census(censusout,ph);}if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
+   zone_census(censusout,"final");if(censusout)fclose(censusout);
+   fclose(out);if(parityout)fclose(parityout);free(render_scratch);if(stateout)fclose(stateout);if(tic==100000){fprintf(stderr,"demo did not terminate\n");return 1;}fprintf(stderr,"doom-headless: tics=%d ms/tic=%.6f ms/render=%.6f\n",rendered,tic_ms/(rendered?rendered:1),render_ms/(rendered?rendered:1));return 0;
+ }
