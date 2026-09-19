@@ -33,6 +33,9 @@ required-features = ["zero-bss-probe"]
 name = "ctx_probe"
 required-features = ["ctx-engine"]
 
+[[bin]]
+name = "headless"
+
 [dependencies]
 doom-sbf = { path = ".." }
 bincode = "=1.3.3"

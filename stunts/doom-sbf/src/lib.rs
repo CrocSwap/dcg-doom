@@ -129,6 +129,10 @@ pub fn process_instruction(
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
     }
+    #[cfg(feature = "ctx-engine")] if instruction_data.starts_with(engine::MAGIC) { return engine::process(_program_id, accounts, instruction_data); }
+
+
+
     if accounts.iter().any(|account| {
         account.is_writable
             && matches!(
@@ -330,3 +334,8 @@ mod tests {
         assert!(strip.windows(2).any(|pair| pair[0] != pair[1]));
     }
 }
+
+// Keep the module declaration at the true end of this file.  The default
+// image's existing panic locations are intentionally left byte-stable while
+// this source-only interface is reviewed; the engine route is feature-gated.
+pub mod engine;

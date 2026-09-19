@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_hotloops.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_platform.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_ctx.c");
+    println!("cargo:rerun-if-changed=src/doom_sbf_engine.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
@@ -145,7 +146,8 @@ fn compile_ctx_engine(target: &str) {
         .flag("doom_ctx.h")
         .flag("-DDOOM_CTX_NO_MACROS")
         .file(tree.join("headless/doom_ctx_init.c"))
-        .file(manifest.join("src/doom_sbf_ctx.c"));
+        .file(manifest.join("src/doom_sbf_ctx.c"))
+        .file(manifest.join("src/doom_sbf_engine.c"));
     platform.file(manifest.join("src/doom_sbf_platform.c"));
     engine.compile("doom_engine_ctx");
     ctx.compile("doom_engine_ctx_state");
