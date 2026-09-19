@@ -1,0 +1,768 @@
+diff --git a/linuxdoom-1.10/headless/doom_state.c b/linuxdoom-1.10/headless/doom_state.c
+--- a/linuxdoom-1.10/headless/doom_state.c
++++ b/linuxdoom-1.10/headless/doom_state.c
+@@ -92,63 +92,512 @@
+ static void ds_mapthing(ds_buf_t *b,const mapthing_t *x){ds_u16(b,(uint16_t)x->x);ds_u16(b,(uint16_t)x->y);ds_u16(b,(uint16_t)x->angle);ds_u16(b,(uint16_t)x->type);ds_u16(b,(uint16_t)x->options);}
+ static void ds_rmapthing(ds_read_t *r,mapthing_t *x){x->x=(short)ds_r16(r);x->y=(short)ds_r16(r);x->angle=(short)ds_r16(r);x->type=(short)ds_r16(r);x->options=(short)ds_r16(r);}
+ 
+-static void ds_player(ds_buf_t *b, const player_t *p, mobj_t **m, unsigned n) {
++
++#define DS_MAX_IMAGE_BYTES 126976u
++#define DS_ACTION_TABLE_VERSION 1u
++
++typedef struct {
++    uint32_t nmo, nsp, nrec;
++    uint32_t pm[MAXPLAYERS], pa[MAXPLAYERS], body[DS_BODYQUESIZE];
++    uint32_t mtarget[DS_MAX_OBJECTS], mtracer[DS_MAX_OBJECTS];
++    int32_t mplayer[DS_MAX_OBJECTS];
++    uint32_t sector_soundtarget_count;
++    uint32_t *sector_soundtarget;
++    int32_t button_line[MAXBUTTONS];
++    uint32_t button_soundorg[MAXBUTTONS];
++    unsigned kinds[DS_MAX_OBJECTS];
++    unsigned special_kinds[DS_MAX_OBJECTS];
++    int32_t special_sector[DS_MAX_OBJECTS];
++    unsigned mobj_actual, special_actual, ceiling_count, plat_count;
++    int32_t gametic;
++    uint8_t *sector_owner;
++    mobj_t *mobj_mem[DS_MAX_OBJECTS];
++    void *special_mem[DS_MAX_OBJECTS];
++} ds_plan_t;
++
++static long ds_alloc_fail_after = -1;
++static long ds_alloc_calls;
++
++/* Test-only host control.  The default is disabled; every native allocation
++ * used by a decode is reserved before the first game global is changed. */
++void DoomStateSetAllocationFailure(long fail_after)
++{
++    ds_alloc_fail_after = fail_after;
++    ds_alloc_calls = 0;
++}
++
++static void *ds_zone_alloc(size_t n)
++{
++    if (ds_alloc_fail_after >= 0
++        && ds_alloc_calls++ >= ds_alloc_fail_after)
++        return 0;
++    if (n > 0x7fffffffU)
++        return 0;
++    return Z_Malloc((int)n, PU_LEVEL, 0);
++}
++
++static void ds_plan_release(ds_plan_t *p, int native)
++{
++    unsigned i;
++    if (native)
++    {
++        for (i = 0; i < p->nmo; i++)
++            if (p->mobj_mem[i])
++                Z_Free(p->mobj_mem[i]);
++        for (i = 0; i < p->nsp; i++)
++            if (p->special_mem[i])
++                Z_Free(p->special_mem[i]);
++    }
++    free(p->sector_owner);
++    free(p->sector_soundtarget);
++    memset(p, 0, sizeof(*p));
++}
++
++static size_t ds_special_size(unsigned k)
++{
++    switch (k)
++    {
++    case DS_CEILING: return sizeof(ceiling_t);
++    case DS_DOOR: return sizeof(vldoor_t);
++    case DS_FLOOR: return sizeof(floormove_t);
++    case DS_PLAT: return sizeof(plat_t);
++    case DS_FLASH: return sizeof(lightflash_t);
++    case DS_STROBE: return sizeof(strobe_t);
++    case DS_GLOW: return sizeof(glow_t);
++    case DS_FIREFLICKER: return sizeof(fireflicker_t);
++    default: return 0;
++    }
++}
++
++static int ds_supported_kind(unsigned k)
++{
++    /* Frozen v0 action table: every dynamic entry is an acp1/actionf_p1
++     * thinker and the removal tombstone is deliberately not supported. */
++    return k >= DS_MOBJ && k <= DS_FIREFLICKER;
++}
++
++static int32_t ds_scan_i32(ds_read_t *r)
++{
++    return ds_ri32(r);
++}
++
++static uint8_t ds_scan_bool(ds_read_t *r)
++{
++    uint8_t x = ds_r8(r);
++    if (x > 1)
++        r->bad = 1;
++    return x;
++}
++
++static void ds_scan_player(ds_read_t *r, uint32_t *mo, uint32_t *attacker)
++{
+     int i;
+-    ds_u32(b,ds_mobj_id(m,n,p->mo)); ds_i32(b,p->playerstate);
++    *mo = ds_r32(r);
++    ds_scan_i32(r);
++    ds_r8(r); ds_r8(r); ds_r16(r); ds_r16(r); ds_r8(r); ds_r8(r);
++    for (i = 0; i < 7; i++) ds_scan_i32(r);
++    for (i = 0; i < NUMPOWERS; i++) ds_scan_i32(r);
++    for (i = 0; i < NUMCARDS; i++) ds_scan_bool(r);
++    ds_scan_bool(r);
++    for (i = 0; i < MAXPLAYERS; i++) ds_scan_i32(r);
++    ds_scan_i32(r); ds_scan_i32(r);
++    for (i = 0; i < NUMWEAPONS; i++) ds_scan_bool(r);
++    for (i = 0; i < NUMAMMO; i++) ds_scan_i32(r);
++    for (i = 0; i < NUMAMMO; i++) ds_scan_i32(r);
++    for (i = 0; i < 9; i++) ds_scan_i32(r);
++    *attacker = ds_r32(r);
++    ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++    for (i = 0; i < NUMPSPRITES; i++)
++    {
++        int32_t state = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        if (state < -1 || state >= NUMSTATES)
++            r->bad = 1;
++    }
++    ds_scan_bool(r);
++}
++
++static void ds_scan_mapthing(ds_read_t *r)
++{
++    ds_r16(r); ds_r16(r); ds_r16(r); ds_r16(r); ds_r16(r);
++}
++
++static int ds_scan_special(ds_read_t *r, ds_plan_t *p, unsigned si,
++                           unsigned k)
++{
++    int32_t sector;
++    switch (k)
++    {
++    case DS_CEILING:
++        ds_scan_i32(r); sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_bool(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_DOOR:
++        ds_scan_i32(r); sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_FLOOR:
++        ds_scan_i32(r); ds_scan_bool(r); sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_r16(r);
++        ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_PLAT:
++        sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_bool(r);
++        ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_FLASH:
++        sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_STROBE:
++        sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_GLOW:
++        sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    case DS_FIREFLICKER:
++        sector = ds_scan_i32(r);
++        ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++        break;
++    default:
++        return -1;
++    }
++    if (sector < 0 || sector >= numsectors || p->sector_owner[sector])
++        return -1;
++    p->sector_owner[sector] = 1;
++    p->special_sector[si] = sector;
++    return 0;
++}
++
++static void ds_scan_mobj(ds_read_t *r, ds_plan_t *p, unsigned mi)
++{
++    int i;
++    int32_t type, state, player;
++    ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_r32(r);
++    for (i = 0; i < 9; i++) ds_scan_i32(r);
++    ds_scan_i32(r);
++    type = ds_scan_i32(r);
++    ds_scan_i32(r);
++    state = ds_scan_i32(r);
++    ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r); ds_scan_i32(r);
++    p->mtarget[mi] = ds_r32(r);
++    ds_scan_i32(r); ds_scan_i32(r);
++    player = ds_scan_i32(r);
++    ds_scan_i32(r); ds_scan_mapthing(r);
++    p->mtracer[mi] = ds_r32(r);
++    p->mplayer[mi] = player;
++    if (type < 0 || type >= NUMMOBJTYPES
++        || state < 0 || state >= NUMSTATES
++        || player < 0 || player > MAXPLAYERS)
++        r->bad = 1;
++}
++
++static int ds_ref_ok(uint32_t id, unsigned n)
++{
++    return id == 0 || id <= n;
++}
++
++static int ds_preflight(const uint8_t *image, size_t image_bytes,
++                        ds_plan_t *p)
++{
++    ds_read_t r;
++    uint32_t nmo, nsp, nrec;
++    unsigned i, j, kind, line_sides;
++    int32_t line;
++    memset(p, 0, sizeof(*p));
++    if (!image || image_bytes < DS_HEADER_BYTES
++        || image_bytes > DS_MAX_IMAGE_BYTES
++        || image_bytes > 0xffffffffU
++        || memcmp(image, "DOOM-ST1", 8)
++        || ds_at32(image + 8) != 0
++        || ds_at32(image + 12) != DS_HEADER_BYTES
++        || ds_at32(image + 16) != (uint32_t)image_bytes
++        || ds_at32(image + 36) != (uint32_t)numsectors
++        || ds_at32(image + 40) != (uint32_t)(DOOM_CTX->numlines)
++        || ds_at32(image + 44) != (uint32_t)numsides
++        || ds_at32(image + 48) != (uint32_t)numflats
++        || ds_at32(image + 52) != (uint32_t)numtextures)
++        return -1;
++    for (i = 60; i < DS_HEADER_BYTES; i++)
++        if (image[i])
++            return -1;
++    nmo = ds_at32(image + 28);
++    nsp = ds_at32(image + 32);
++    nrec = ds_at32(image + 56);
++    if (nmo > DS_MAX_OBJECTS || nsp > DS_MAX_OBJECTS
++        || nrec > DS_MAX_OBJECTS || nmo + nsp != nrec)
++        return -1;
++    p->nmo = nmo; p->nsp = nsp; p->nrec = nrec;
++    p->sector_soundtarget_count = (uint32_t)numsectors;
++    p->sector_owner = numsectors ? calloc((size_t)numsectors, 1) : 0;
++    p->sector_soundtarget = numsectors
++        ? calloc((size_t)numsectors, sizeof(*p->sector_soundtarget)) : 0;
++    if (numsectors && (!p->sector_owner || !p->sector_soundtarget))
++        goto bad;
++    memset(&r, 0, sizeof(r)); r.p = image; r.cap = image_bytes;
++    r.used = DS_HEADER_BYTES;
++    for (i = 0; i < 21; i++)
++    {
++        int32_t value = ds_scan_i32(&r);
++        if (i == 5) p->gametic = value;
++    }
++    for (i = 0; i < 12 + MAXPLAYERS; i++) ds_scan_bool(&r);
++    for (i = 0; i < MAXPLAYERS; i++)
++        ds_scan_player(&r, &p->pm[i], &p->pa[i]);
++    for (i = 0; i < DS_BODYQUESIZE; i++) p->body[i] = ds_r32(&r);
++    for (i = 0; i < (unsigned)numsectors; i++)
++    {
++        int k;
++        for (k = 0; k < 2; k++) ds_scan_i32(&r);
++        for (k = 0; k < 5; k++) ds_r16(&r);
++        ds_scan_i32(&r);
++        p->sector_soundtarget[i] = ds_r32(&r);
++        for (k = 0; k < 5; k++) ds_scan_i32(&r);
++    }
++    for (i = 0; i < (unsigned)(DOOM_CTX->numlines); i++)
++    {
++        ds_r16(&r); ds_r16(&r); ds_r16(&r);
++        for (j = 0, line_sides = 0; j < 2; j++)
++        {
++            if (lines[i].sidenum[j] < -1
++                || lines[i].sidenum[j] >= numsides)
++            { r.bad = 1; continue; }
++            if (lines[i].sidenum[j] != -1) line_sides++;
++        }
++        for (j = 0; j < line_sides; j++)
++        {
++            ds_scan_i32(&r); ds_scan_i32(&r);
++            ds_r16(&r); ds_r16(&r); ds_r16(&r);
++        }
++        ds_scan_i32(&r);
++    }
++    for (i = 0; i <= (unsigned)numflats; i++) ds_scan_i32(&r);
++    for (i = 0; i <= (unsigned)numtextures; i++) ds_scan_i32(&r);
++    for (i = 0; i < ITEMQUESIZE; i++)
++    { ds_scan_mapthing(&r); ds_scan_i32(&r); }
++    ds_scan_i32(&r); ds_scan_i32(&r);
++    for (i = 0; i < MAXBUTTONS; i++)
++    {
++        p->button_line[i] = ds_scan_i32(&r);
++        ds_scan_i32(&r); ds_scan_i32(&r); ds_scan_i32(&r);
++        p->button_soundorg[i] = ds_r32(&r);
++    }
++    for (i = 0; i < nrec && !r.bad; i++)
++    {
++        kind = ds_r8(&r);
++        if (!ds_supported_kind(kind)) goto bad;
++        p->kinds[i] = kind;
++        if (kind == DS_MOBJ)
++        {
++            if (p->mobj_actual >= nmo) goto bad;
++            ds_scan_mobj(&r, p, p->mobj_actual++);
++        }
++        else
++        {
++            if (p->special_actual >= nsp
++                || ds_scan_special(&r, p, p->special_actual, kind))
++                goto bad;
++            if (kind == DS_CEILING && ++p->ceiling_count > MAXCEILINGS)
++                goto bad;
++            if (kind == DS_PLAT && ++p->plat_count > MAXPLATS)
++                goto bad;
++            p->special_kinds[p->special_actual] = kind;
++            p->special_actual++;
++        }
++    }
++    if (r.bad || r.used != r.cap
++        || p->mobj_actual != nmo || p->special_actual != nsp
++        || ds_at32(image + 20) != (uint32_t)p->gametic)
++        goto bad;
++    if (!demobuffer
++        || ds_at32(image + 24) > (uint32_t)W_LumpLength(W_GetNumForName(defdemoname)))
++        goto bad;
++    for (i = 0; i < MAXPLAYERS; i++)
++    {
++        if (!ds_ref_ok(p->pm[i], nmo) || !ds_ref_ok(p->pa[i], nmo)) goto bad;
++    }
++    for (i = 0; i < DS_BODYQUESIZE; i++)
++        if (!ds_ref_ok(p->body[i], nmo)) goto bad;
++    for (i = 0; i < (unsigned)numsectors; i++)
++        if (!ds_ref_ok(p->sector_soundtarget[i], nmo)) goto bad;
++    for (i = 0; i < MAXBUTTONS; i++)
++    {
++        line = p->button_line[i];
++        if (line < -1 || line >= (DOOM_CTX->numlines)
++            || !ds_ref_ok(p->button_soundorg[i], nmo)) goto bad;
++    }
++    for (i = 0; i < nmo; i++)
++    {
++        if (!ds_ref_ok(p->mtarget[i], nmo)
++            || !ds_ref_ok(p->mtracer[i], nmo)) goto bad;
++        if (p->mplayer[i] < 0 || p->mplayer[i] > MAXPLAYERS) goto bad;
++    }
++    for (i = 0; i < nmo; i++)
++        if (p->mplayer[i]
++            && p->pm[p->mplayer[i] - 1] != i + 1) goto bad;
++    for (i = 0; i < MAXPLAYERS; i++)
++        if (p->pm[i]
++            && p->mplayer[p->pm[i] - 1] != (int32_t)i + 1) goto bad;
++    return 0;
++bad:
++    ds_plan_release(p, 0);
++    return -1;
++}
++
++static int ds_plan_prepare(ds_plan_t *p)
++{
++    unsigned i;
++    for (i = 0; i < p->nmo; i++)
++    {
++        p->mobj_mem[i] = ds_zone_alloc(sizeof(mobj_t));
++        if (!p->mobj_mem[i]) goto bad;
++    }
++    for (i = 0; i < p->nsp; i++)
++    {
++        p->special_mem[i] = ds_zone_alloc(ds_special_size(p->special_kinds[i]));
++        if (!p->special_mem[i]) goto bad;
++    }
++    return 0;
++bad:
++    ds_plan_release(p, 1);
++    return -1;
++}
++
++static uint32_t ds_mobj_ref(ds_buf_t *b, mobj_t **m, unsigned n, mobj_t *x)
++{
++    uint32_t id = ds_mobj_id(m, n, x);
++    if (x && !id) b->bad = 1;
++    return id;
++}
++
++static int32_t ds_sector_ref(ds_buf_t *b, sector_t *p, int required)
++{
++    int32_t id = ds_sector_id(p);
++    if ((required && id < 0) || (!required && p && id < 0)) b->bad = 1;
++    return id;
++}
++
++static int32_t ds_line_ref(ds_buf_t *b, line_t *p)
++{
++    int32_t id = ds_line_id(p);
++    if (p && id < 0) b->bad = 1;
++    return id;
++}
++
++static int32_t ds_state_ref(ds_buf_t *b, state_t *p, int required)
++{
++    int32_t id = ds_state_id(p);
++    if ((required && id < 0) || (!required && p && id < 0)) b->bad = 1;
++    return id;
++}
++
++static int32_t ds_player_ref(ds_buf_t *b, player_t *p)
++{
++    uintptr_t x, base;
++    if (!p) return 0;
++    x = (uintptr_t)p; base = (uintptr_t)players;
++    if (x < base || x - base >= sizeof(players)
++        || (x - base) % sizeof(*players)) { b->bad = 1; return 0; }
++    return (int32_t)((x - base) / sizeof(*players)) + 1;
++}
++
++static void ds_rplayer(ds_read_t *r, player_t *p, uint32_t *mo, uint32_t *attacker)
++{
++    int i;
++    memset(p,0,sizeof(*p));
++    *mo=ds_r32(r); p->playerstate=(playerstate_t)ds_ri32(r);
++    p->cmd.forwardmove_m=(char)ds_r8(r); p->cmd.sidemove=(char)ds_r8(r);
++    p->cmd.angleturn=(short)ds_r16(r); p->cmd.consistancy_m=(short)ds_r16(r);
++    p->cmd.chatchar=ds_r8(r); p->cmd.buttons=ds_r8(r);
++    p->viewz_m=ds_ri32(r); p->viewheight=ds_ri32(r); p->deltaviewheight=ds_ri32(r);
++    p->bob=ds_ri32(r); p->health=ds_ri32(r); p->armorpoints=ds_ri32(r); p->armortype=ds_ri32(r);
++    for(i=0;i<NUMPOWERS;i++)p->powers[i]=ds_ri32(r);
++    for(i=0;i<NUMCARDS;i++)p->cards[i]=(boolean)ds_r8(r);
++    p->backpack=(boolean)ds_r8(r);
++    for(i=0;i<MAXPLAYERS;i++)p->frags[i]=ds_ri32(r);
++    p->readyweapon=(weapontype_t)ds_ri32(r); p->pendingweapon=(weapontype_t)ds_ri32(r);
++    for(i=0;i<NUMWEAPONS;i++)p->weaponowned[i]=(boolean)ds_r8(r);
++    for(i=0;i<NUMAMMO;i++)p->ammo[i]=ds_ri32(r);
++    for(i=0;i<NUMAMMO;i++)p->maxammo[i]=ds_ri32(r);
++    p->attackdown=ds_ri32(r); p->usedown=ds_ri32(r); p->cheats=ds_ri32(r); p->refire=ds_ri32(r);
++    p->killcount=ds_ri32(r); p->itemcount=ds_ri32(r); p->secretcount=ds_ri32(r);
++    p->damagecount=ds_ri32(r); p->bonuscount=ds_ri32(r); *attacker=ds_r32(r);
++    p->extralight_m=ds_ri32(r); p->fixedcolormap_m=ds_ri32(r); p->colormap=ds_ri32(r);
++    for(i=0;i<NUMPSPRITES;i++){
++        int32_t st=ds_ri32(r);
++        p->psprites[i].state=(st<0)?0:&states[st];
++        p->psprites[i].tics=ds_ri32(r); p->psprites[i].sx=ds_ri32(r); p->psprites[i].sy=ds_ri32(r);
++    }
++    p->didsecret=(boolean)ds_r8(r);
++}
++
++static void ds_player(ds_buf_t *b, const player_t *p, mobj_t **m, unsigned n)
++{
++    int i;
++    ds_u32(b,ds_mobj_ref(b,m,n,p->mo)); ds_i32(b,p->playerstate);
+     ds_u8(b,(uint8_t)p->cmd.forwardmove_m);ds_u8(b,(uint8_t)p->cmd.sidemove);ds_u16(b,(uint16_t)p->cmd.angleturn);ds_u16(b,(uint16_t)p->cmd.consistancy_m);ds_u8(b,p->cmd.chatchar);ds_u8(b,p->cmd.buttons);
+-    ds_i32(b,p->viewz_m);ds_i32(b,p->viewheight_m);ds_i32(b,p->deltaviewheight);ds_i32(b,p->bob);ds_i32(b,p->health);ds_i32(b,p->armorpoints);ds_i32(b,p->armortype);
++    ds_i32(b,p->viewz_m);ds_i32(b,p->viewheight);ds_i32(b,p->deltaviewheight);ds_i32(b,p->bob);ds_i32(b,p->health);ds_i32(b,p->armorpoints);ds_i32(b,p->armortype);
+     for(i=0;i<NUMPOWERS;i++)ds_i32(b,p->powers[i]);for(i=0;i<NUMCARDS;i++)ds_u8(b,(uint8_t)p->cards[i]);ds_u8(b,(uint8_t)p->backpack);for(i=0;i<MAXPLAYERS;i++)ds_i32(b,p->frags[i]);
+     ds_i32(b,p->readyweapon);ds_i32(b,p->pendingweapon);for(i=0;i<NUMWEAPONS;i++)ds_u8(b,(uint8_t)p->weaponowned[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->ammo[i]);for(i=0;i<NUMAMMO;i++)ds_i32(b,p->maxammo[i]);
+-    ds_i32(b,p->attackdown);ds_i32(b,p->usedown);ds_i32(b,p->cheats);ds_i32(b,p->refire);ds_i32(b,p->killcount);ds_i32(b,p->itemcount);ds_i32(b,p->secretcount);ds_i32(b,p->damagecount);ds_i32(b,p->bonuscount);ds_u32(b,ds_mobj_id(m,n,p->attacker));ds_i32(b,p->extralight_m);ds_i32(b,p->fixedcolormap_m);ds_i32(b,p->colormap);
+-    for(i=0;i<NUMPSPRITES;i++){ds_i32(b,ds_state_id(p->psprites[i].state));ds_i32(b,p->psprites[i].tics);ds_i32(b,p->psprites[i].sx);ds_i32(b,p->psprites[i].sy);}ds_u8(b,(uint8_t)p->didsecret);
+-}
+-static void ds_rplayer(ds_read_t *r, player_t *p, uint32_t *mo, uint32_t *attacker) {
+-    int i; memset(p,0,sizeof(*p));*mo=ds_r32(r);p->playerstate=(playerstate_t)ds_ri32(r);p->cmd.forwardmove_m=(char)ds_r8(r);p->cmd.sidemove=(char)ds_r8(r);p->cmd.angleturn=(short)ds_r16(r);p->cmd.consistancy_m=(short)ds_r16(r);p->cmd.chatchar=ds_r8(r);p->cmd.buttons=ds_r8(r);
+-    p->viewz_m=ds_ri32(r);p->viewheight_m=ds_ri32(r);p->deltaviewheight=ds_ri32(r);p->bob=ds_ri32(r);p->health=ds_ri32(r);p->armorpoints=ds_ri32(r);p->armortype=ds_ri32(r);
+-    for(i=0;i<NUMPOWERS;i++)p->powers[i]=ds_ri32(r);for(i=0;i<NUMCARDS;i++)p->cards[i]=(boolean)ds_r8(r);p->backpack=(boolean)ds_r8(r);for(i=0;i<MAXPLAYERS;i++)p->frags[i]=ds_ri32(r);
+-    p->readyweapon=(weapontype_t)ds_ri32(r);p->pendingweapon=(weapontype_t)ds_ri32(r);for(i=0;i<NUMWEAPONS;i++)p->weaponowned[i]=(boolean)ds_r8(r);for(i=0;i<NUMAMMO;i++)p->ammo[i]=ds_ri32(r);for(i=0;i<NUMAMMO;i++)p->maxammo[i]=ds_ri32(r);
+-    p->attackdown=ds_ri32(r);p->usedown=ds_ri32(r);p->cheats=ds_ri32(r);p->refire=ds_ri32(r);p->killcount=ds_ri32(r);p->itemcount=ds_ri32(r);p->secretcount=ds_ri32(r);p->damagecount=ds_ri32(r);p->bonuscount=ds_ri32(r);*attacker=ds_r32(r);p->extralight_m=ds_ri32(r);p->fixedcolormap_m=ds_ri32(r);p->colormap=ds_ri32(r);
+-    for(i=0;i<NUMPSPRITES;i++){int32_t st=ds_ri32(r);p->psprites[i].state=(st<0||st>=NUMSTATES)?0:&states[st];p->psprites[i].tics=ds_ri32(r);p->psprites[i].sx=ds_ri32(r);p->psprites[i].sy=ds_ri32(r);}p->didsecret=(boolean)ds_r8(r);
+-}
+-
+-static void ds_mobj(ds_buf_t *b,mobj_t *o,mobj_t **m,unsigned n,int kind) {
+-    ds_u8(b,(uint8_t)kind);ds_i32(b,o->x);ds_i32(b,o->y);ds_i32(b,o->z);ds_u32(b,o->angle);ds_i32(b,o->sprite);ds_i32(b,o->frame);ds_i32(b,o->floorz);ds_i32(b,o->ceilingz);ds_i32(b,o->radius);ds_i32(b,o->height);ds_i32(b,o->momx);ds_i32(b,o->momy);ds_i32(b,o->momz);ds_i32(b,0);ds_i32(b,o->type);ds_i32(b,o->tics);ds_i32(b,ds_state_id(o->state));ds_i32(b,o->flags);ds_i32(b,o->health);ds_i32(b,o->movedir);ds_i32(b,o->movecount);ds_u32(b,ds_mobj_id(m,n,o->target));ds_i32(b,o->reactiontime);ds_i32(b,o->threshold);ds_i32(b,o->player?(int32_t)(o->player-players)+1:0);ds_i32(b,o->lastlook);ds_mapthing(b,&o->spawnpoint);ds_u32(b,ds_mobj_id(m,n,o->tracer));
+-}
+-static mobj_t *ds_rmobj(ds_read_t *r,uint32_t *target,uint32_t *tracer,int32_t *player,int removed) {
+-    int32_t st; mobj_t *o=Z_Malloc(sizeof(*o),PU_LEVEL,0);if(!o){r->bad=1;return 0;}memset(o,0,sizeof(*o));o->x=ds_ri32(r);o->y=ds_ri32(r);o->z=ds_ri32(r);o->angle=ds_r32(r);o->sprite=(spritenum_t)ds_ri32(r);o->frame=ds_ri32(r);o->floorz=ds_ri32(r);o->ceilingz=ds_ri32(r);o->radius=ds_ri32(r);o->height=ds_ri32(r);o->momx=ds_ri32(r);o->momy=ds_ri32(r);o->momz=ds_ri32(r);o->validcount_m=ds_ri32(r);o->type=(mobjtype_t)ds_ri32(r);o->tics=ds_ri32(r);st=ds_ri32(r);if(st<0||st>=NUMSTATES){r->bad=1;return 0;}o->state=&states[st];o->flags=ds_ri32(r);o->health=ds_ri32(r);o->movedir=ds_ri32(r);o->movecount=ds_ri32(r);*target=ds_r32(r);o->reactiontime=ds_ri32(r);o->threshold=ds_ri32(r);*player=ds_ri32(r);o->lastlook=ds_ri32(r);ds_rmapthing(r,&o->spawnpoint);*tracer=ds_r32(r);if(o->type<0||o->type>=NUMMOBJTYPES){r->bad=1;return 0;}o->info=&mobjinfo[o->type];if(removed)o->thinker.function.acv=(actionf_v)-1;else {o->thinker.function.acp1=(actionf_p1)P_MobjThinker;P_SetThingPosition(o);}P_AddThinker(&o->thinker);return o;
++    ds_i32(b,p->attackdown);ds_i32(b,p->usedown);ds_i32(b,p->cheats);ds_i32(b,p->refire);ds_i32(b,p->killcount);ds_i32(b,p->itemcount);ds_i32(b,p->secretcount);ds_i32(b,p->damagecount);ds_i32(b,p->bonuscount);ds_u32(b,ds_mobj_ref(b,m,n,p->attacker));ds_i32(b,p->extralight_m);ds_i32(b,p->fixedcolormap_m);ds_i32(b,p->colormap);
++    for(i=0;i<NUMPSPRITES;i++){ds_i32(b,ds_state_ref(b,p->psprites[i].state,0));ds_i32(b,p->psprites[i].tics);ds_i32(b,p->psprites[i].sx);ds_i32(b,p->psprites[i].sy);}ds_u8(b,(uint8_t)p->didsecret);
++}
++
++static void ds_mobj(ds_buf_t *b,mobj_t *o,mobj_t **m,unsigned n,int kind)
++{
++    ds_u8(b,(uint8_t)kind);ds_i32(b,o->x);ds_i32(b,o->y);ds_i32(b,o->z);ds_u32(b,o->angle);ds_i32(b,o->sprite);ds_i32(b,o->frame);ds_i32(b,o->floorz);ds_i32(b,o->ceilingz);ds_i32(b,o->radius);ds_i32(b,o->height);ds_i32(b,o->momx);ds_i32(b,o->momy);ds_i32(b,o->momz);ds_i32(b,0);ds_i32(b,o->type);ds_i32(b,o->tics);ds_i32(b,ds_state_ref(b,o->state,1));ds_i32(b,o->flags);ds_i32(b,o->health);ds_i32(b,o->movedir);ds_i32(b,o->movecount);ds_u32(b,ds_mobj_ref(b,m,n,o->target));ds_i32(b,o->reactiontime);ds_i32(b,o->threshold);ds_i32(b,ds_player_ref(b,o->player));ds_i32(b,o->lastlook);ds_mapthing(b,&o->spawnpoint);ds_u32(b,ds_mobj_ref(b,m,n,o->tracer));
++}
++
++static mobj_t *ds_rmobj(ds_read_t *r,uint32_t *target,uint32_t *tracer,int32_t *player,mobj_t *o)
++{
++    int32_t st;
++    if (!o) { r->bad = 1; return 0; }
++    memset(o,0,sizeof(*o));o->x=ds_ri32(r);o->y=ds_ri32(r);o->z=ds_ri32(r);o->angle=ds_r32(r);o->sprite=(spritenum_t)ds_ri32(r);o->frame=ds_ri32(r);o->floorz=ds_ri32(r);o->ceilingz=ds_ri32(r);o->radius=ds_ri32(r);o->height=ds_ri32(r);o->momx=ds_ri32(r);o->momy=ds_ri32(r);o->momz=ds_ri32(r);o->validcount_m=ds_ri32(r);o->type=(mobjtype_t)ds_ri32(r);o->tics=ds_ri32(r);st=ds_ri32(r);o->state=&states[st];o->flags=ds_ri32(r);o->health=ds_ri32(r);o->movedir=ds_ri32(r);o->movecount=ds_ri32(r);*target=ds_r32(r);o->reactiontime=ds_ri32(r);o->threshold=ds_ri32(r);*player=ds_ri32(r);o->lastlook=ds_ri32(r);ds_rmapthing(r,&o->spawnpoint);*tracer=ds_r32(r);o->info=&mobjinfo[o->type];o->thinker.function.acp1=(actionf_p1)P_MobjThinker;P_SetThingPosition(o);P_AddThinker(&o->thinker);return o;
+ }
+ 
+ static int ds_kind(thinker_t *t) { if(t->function.acv==(actionf_v)-1)return 0;if(t->function.acp1==(actionf_p1)P_MobjThinker)return DS_MOBJ;if(t->function.acp1==(actionf_p1)T_MoveCeiling)return DS_CEILING;if(t->function.acp1==(actionf_p1)T_VerticalDoor)return DS_DOOR;if(t->function.acp1==(actionf_p1)T_MoveFloor)return DS_FLOOR;if(t->function.acp1==(actionf_p1)T_PlatRaise)return DS_PLAT;if(t->function.acp1==(actionf_p1)T_LightFlash)return DS_FLASH;if(t->function.acp1==(actionf_p1)T_StrobeFlash)return DS_STROBE;if(t->function.acp1==(actionf_p1)T_Glow)return DS_GLOW;if(t->function.acp1==(actionf_p1)T_FireFlicker)return DS_FIREFLICKER;return 0; }
+-static void ds_special(ds_buf_t *b, thinker_t *t, int k) { int32_t sec; ds_u8(b,(uint8_t)k); if(k==DS_CEILING){ceiling_t*x=(ceiling_t*)t;sec=ds_sector_id(x->sector);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->bottomheight);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->direction);ds_i32(b,x->tag);ds_i32(b,x->olddirection);}else if(k==DS_DOOR){vldoor_t*x=(vldoor_t*)t;ds_i32(b,x->type);ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_i32(b,x->direction);ds_i32(b,x->topwait);ds_i32(b,x->topcountdown);}else if(k==DS_FLOOR){floormove_t*x=(floormove_t*)t;ds_i32(b,x->type);ds_u8(b,(uint8_t)x->crush);ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->direction);ds_i32(b,x->newspecial);ds_u16(b,(uint16_t)x->texture);ds_i32(b,x->floordestheight);ds_i32(b,x->speed);}else if(k==DS_PLAT){plat_t*x=(plat_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->speed);ds_i32(b,x->low);ds_i32(b,x->high);ds_i32(b,x->wait);ds_i32(b,x->count);ds_i32(b,x->status);ds_i32(b,x->oldstatus);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->tag);ds_i32(b,x->type);}else if(k==DS_FLASH){lightflash_t*x=(lightflash_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);ds_i32(b,x->maxtime);ds_i32(b,x->mintime);}else if(k==DS_STROBE){strobe_t*x=(strobe_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->darktime);ds_i32(b,x->brighttime);}else if(k==DS_GLOW){glow_t*x=(glow_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->direction);}else {fireflicker_t*x=(fireflicker_t*)t;ds_i32(b,ds_sector_id(x->sector));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);} }
++static void ds_special(ds_buf_t *b, thinker_t *t, int k) { int32_t sec; ds_u8(b,(uint8_t)k); if(k==DS_CEILING){ceiling_t*x=(ceiling_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->bottomheight);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->direction);ds_i32(b,x->tag);ds_i32(b,x->olddirection);}else if(k==DS_DOOR){vldoor_t*x=(vldoor_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,x->type);ds_i32(b,sec);ds_i32(b,x->topheight);ds_i32(b,x->speed);ds_i32(b,x->direction);ds_i32(b,x->topwait);ds_i32(b,x->topcountdown);}else if(k==DS_FLOOR){floormove_t*x=(floormove_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,x->type);ds_u8(b,(uint8_t)x->crush);ds_i32(b,sec);ds_i32(b,x->direction);ds_i32(b,x->newspecial);ds_u16(b,(uint16_t)x->texture);ds_i32(b,x->floordestheight);ds_i32(b,x->speed);}else if(k==DS_PLAT){plat_t*x=(plat_t*)t;sec=ds_sector_ref(b,x->sector,1);ds_i32(b,sec);ds_i32(b,x->speed);ds_i32(b,x->low);ds_i32(b,x->high);ds_i32(b,x->wait);ds_i32(b,x->count);ds_i32(b,x->status);ds_i32(b,x->oldstatus);ds_u8(b,(uint8_t)x->crush);ds_i32(b,x->tag);ds_i32(b,x->type);}else if(k==DS_FLASH){lightflash_t*x=(lightflash_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);ds_i32(b,x->maxtime);ds_i32(b,x->mintime);}else if(k==DS_STROBE){strobe_t*x=(strobe_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->count);ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->darktime);ds_i32(b,x->brighttime);}else if(k==DS_GLOW){glow_t*x=(glow_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->minlight);ds_i32(b,x->maxlight);ds_i32(b,x->direction);}else if(k==DS_FIREFLICKER){fireflicker_t*x=(fireflicker_t*)t;ds_i32(b,ds_sector_ref(b,x->sector,1));ds_i32(b,x->count);ds_i32(b,x->maxlight);ds_i32(b,x->minlight);}else b->bad=1; }
+ static sector_t *ds_rsector(ds_read_t *r){int32_t n=ds_ri32(r);if(n<0||n>=numsectors){r->bad=1;return 0;}return &sectors[n];}
+-static void ds_rspecial(ds_read_t *r,int k) { thinker_t *t; if(k==DS_CEILING){ceiling_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(ceiling_e)ds_ri32(r);x->sector=ds_rsector(r);x->bottomheight=ds_ri32(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->crush=(boolean)ds_r8(r);x->direction=ds_ri32(r);x->tag=ds_ri32(r);x->olddirection=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_MoveCeiling;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActiveCeiling(x);}else if(k==DS_DOOR){vldoor_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(vldoor_e)ds_ri32(r);x->sector=ds_rsector(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->direction=ds_ri32(r);x->topwait=ds_ri32(r);x->topcountdown=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_VerticalDoor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_FLOOR){floormove_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->type=(floor_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->sector=ds_rsector(r);x->direction=ds_ri32(r);x->newspecial=ds_ri32(r);x->texture=(short)ds_r16(r);x->floordestheight=ds_ri32(r);x->speed=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_MoveFloor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_PLAT){plat_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->speed=ds_ri32(r);x->low=ds_ri32(r);x->high=ds_ri32(r);x->wait=ds_ri32(r);x->count=ds_ri32(r);x->status=(plat_e)ds_ri32(r);x->oldstatus=(plat_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->tag=ds_ri32(r);x->type=(plattype_e)ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_PlatRaise;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActivePlat(x);}else if(k==DS_FLASH){lightflash_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->maxtime=ds_ri32(r);x->mintime=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_LightFlash;P_AddThinker(&x->thinker);}else if(k==DS_STROBE){strobe_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->darktime=ds_ri32(r);x->brighttime=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_StrobeFlash;P_AddThinker(&x->thinker);}else if(k==DS_GLOW){glow_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->direction=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_Glow;P_AddThinker(&x->thinker);}else if(k==DS_FIREFLICKER){fireflicker_t*x=Z_Malloc(sizeof(*x),PU_LEVEL,0);memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->thinker.function.acp1=(actionf_p1)T_FireFlicker;P_AddThinker(&x->thinker);}else r->bad=1; (void)t; }
++static void ds_rspecial(ds_read_t *r,int k,void *mem) { if(!mem){r->bad=1;return;} if(k==DS_CEILING){ceiling_t*x=mem;memset(x,0,sizeof(*x));x->type=(ceiling_e)ds_ri32(r);x->sector=ds_rsector(r);x->bottomheight=ds_ri32(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->crush=(boolean)ds_r8(r);x->direction=ds_ri32(r);x->tag=ds_ri32(r);x->olddirection=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_MoveCeiling;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActiveCeiling(x);}else if(k==DS_DOOR){vldoor_t*x=mem;memset(x,0,sizeof(*x));x->type=(vldoor_e)ds_ri32(r);x->sector=ds_rsector(r);x->topheight=ds_ri32(r);x->speed=ds_ri32(r);x->direction=ds_ri32(r);x->topwait=ds_ri32(r);x->topcountdown=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_VerticalDoor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_FLOOR){floormove_t*x=mem;memset(x,0,sizeof(*x));x->type=(floor_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->sector=ds_rsector(r);x->direction=ds_ri32(r);x->newspecial=ds_ri32(r);x->texture=(short)ds_r16(r);x->floordestheight=ds_ri32(r);x->speed=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_MoveFloor;x->sector->specialdata=x;P_AddThinker(&x->thinker);}else if(k==DS_PLAT){plat_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->speed=ds_ri32(r);x->low=ds_ri32(r);x->high=ds_ri32(r);x->wait=ds_ri32(r);x->count=ds_ri32(r);x->status=(plat_e)ds_ri32(r);x->oldstatus=(plat_e)ds_ri32(r);x->crush=(boolean)ds_r8(r);x->tag=ds_ri32(r);x->type=(plattype_e)ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_PlatRaise;x->sector->specialdata=x;P_AddThinker(&x->thinker);P_AddActivePlat(x);}else if(k==DS_FLASH){lightflash_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);x->maxtime=ds_ri32(r);x->mintime=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_LightFlash;P_AddThinker(&x->thinker);}else if(k==DS_STROBE){strobe_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->darktime=ds_ri32(r);x->brighttime=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_StrobeFlash;P_AddThinker(&x->thinker);}else if(k==DS_GLOW){glow_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->minlight=ds_ri32(r);x->maxlight=ds_ri32(r);x->direction=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_Glow;P_AddThinker(&x->thinker);}else if(k==DS_FIREFLICKER){fireflicker_t*x=mem;memset(x,0,sizeof(*x));x->sector=ds_rsector(r);x->count=ds_ri32(r);x->maxlight=ds_ri32(r);x->minlight=ds_ri32(r);if(!x->sector){r->bad=1;return;}x->thinker.function.acp1=(actionf_p1)T_FireFlicker;P_AddThinker(&x->thinker);}else r->bad=1; }
+ 
+ int DoomStateEncode(uint8_t **image, size_t *image_bytes) {
+-    ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, i; int k; memset(&b,0,sizeof(b)); ds_need(&b,DS_HEADER_BYTES);if(b.bad)return -1;memset(b.p,0,DS_HEADER_BYTES);b.used=DS_HEADER_BYTES;
+-    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(!k||nr>=DS_MAX_OBJECTS){fprintf(stderr,"DOOM-ST1 unknown thinker %p at %u\n",(void*)t->function.acp1,nr);free(b.p);return -1;}if(k==DS_MOBJ)nm++;else ns++;nr++;}m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;
+-    /* mutable game/demo globals */
++    ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, nceil=0, nplat=0, i; int k; memset(&b,0,sizeof(b)); ds_need(&b,DS_HEADER_BYTES);if(b.bad)return -1;memset(b.p,0,DS_HEADER_BYTES);b.used=DS_HEADER_BYTES;
++    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(!ds_supported_kind(k)||nr>=DS_MAX_OBJECTS){fprintf(stderr,"DOOM-ST1 unsupported thinker at %u (action table %u)\n",nr,DS_ACTION_TABLE_VERSION);free(b.p);return -1;}if(k==DS_MOBJ)nm++;else {ns++;if(k==DS_CEILING && ++nceil>MAXCEILINGS){free(b.p);return -1;}if(k==DS_PLAT && ++nplat>MAXPLATS){free(b.p);return -1;}}nr++;}if(nm>DS_MAX_OBJECTS||ns>DS_MAX_OBJECTS){free(b.p);return -1;}m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;
+     ds_i32(&b,gameskill);ds_i32(&b,gameepisode);ds_i32(&b,gamemap);ds_i32(&b,gamestate);ds_i32(&b,gameaction);ds_i32(&b,gametic);ds_i32(&b,levelstarttic);ds_i32(&b,leveltime);ds_i32(&b,totalkills);ds_i32(&b,totalitems);ds_i32(&b,totalsecret);ds_i32(&b,(DOOM_CTX->consoleplayer));ds_i32(&b,displayplayer);ds_i32(&b,skytexture);ds_i32(&b,skyflatnum);ds_i32(&b,rndindex);ds_i32(&b,prndindex);ds_i32(&b,0);ds_i32(&b,fuzzpos);ds_i32(&b,bodyqueslot);ds_i32(&b,levelTimeCount);
+     ds_u8(&b,(uint8_t)respawnmonsters);ds_u8(&b,(uint8_t)(DOOM_CTX->deathmatch));ds_u8(&b,(uint8_t)netgame);ds_u8(&b,(uint8_t)netdemo);ds_u8(&b,(uint8_t)paused);ds_u8(&b,(uint8_t)sendpause);ds_u8(&b,(uint8_t)sendsave);ds_u8(&b,(uint8_t)usergame);ds_u8(&b,(uint8_t)demoplayback);ds_u8(&b,(uint8_t)demorecording);ds_u8(&b,(uint8_t)secretexit);ds_u8(&b,(uint8_t)levelTimer);for(i=0;i<MAXPLAYERS;i++)ds_u8(&b,(uint8_t)playeringame[i]);
+-    for(i=0;i<MAXPLAYERS;i++)ds_player(&b,&players[i],m,nm);for(i=0;i<DS_BODYQUESIZE;i++)ds_u32(&b,ds_mobj_id(m,nm,bodyque[i]));
+-    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];int j;ds_i32(&b,x->floorheight);ds_i32(&b,x->ceilingheight);ds_u16(&b,(uint16_t)x->floorpic);ds_u16(&b,(uint16_t)x->ceilingpic);ds_u16(&b,(uint16_t)x->lightlevel);ds_u16(&b,(uint16_t)x->special);ds_u16(&b,(uint16_t)x->tag);ds_i32(&b,x->soundtraversed);ds_u32(&b,ds_mobj_id(m,nm,x->soundtarget));for(j=0;j<4;j++)ds_i32(&b,x->blockbox[j]);ds_i32(&b,0);}
++    for(i=0;i<MAXPLAYERS;i++)ds_player(&b,&players[i],m,nm);for(i=0;i<DS_BODYQUESIZE;i++)ds_u32(&b,ds_mobj_ref(&b,m,nm,bodyque[i]));
++    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];int j;ds_i32(&b,x->floorheight);ds_i32(&b,x->ceilingheight);ds_u16(&b,(uint16_t)x->floorpic);ds_u16(&b,(uint16_t)x->ceilingpic);ds_u16(&b,(uint16_t)x->lightlevel);ds_u16(&b,(uint16_t)x->special);ds_u16(&b,(uint16_t)x->tag);ds_i32(&b,x->soundtraversed);ds_u32(&b,ds_mobj_ref(&b,m,nm,x->soundtarget));for(j=0;j<4;j++)ds_i32(&b,x->blockbox[j]);ds_i32(&b,0);}
+     for(i=0;i<(unsigned)(DOOM_CTX->numlines);i++){line_t*x=&lines[i];int j;ds_u16(&b,(uint16_t)x->flags);ds_u16(&b,(uint16_t)x->special);ds_u16(&b,(uint16_t)x->tag);for(j=0;j<2;j++)if(x->sidenum[j]!=-1){side_t*y=&sides[x->sidenum[j]];ds_i32(&b,y->textureoffset);ds_i32(&b,y->rowoffset);ds_u16(&b,(uint16_t)y->toptexture);ds_u16(&b,(uint16_t)y->bottomtexture);ds_u16(&b,(uint16_t)y->midtexture);}ds_i32(&b,0);}
+-    for(i=0;i<=(unsigned)numflats;i++)ds_i32(&b,flattranslation[i]);for(i=0;i<=(unsigned)numtextures;i++)ds_i32(&b,texturetranslation[i]);for(i=0;i<ITEMQUESIZE;i++){ds_mapthing(&b,&itemrespawnque[i]);ds_i32(&b,itemrespawntime[i]);}ds_i32(&b,iquehead);ds_i32(&b,iquetail);for(i=0;i<MAXBUTTONS;i++){button_t*x=&buttonlist[i];ds_i32(&b,ds_line_id(x->line));ds_i32(&b,x->where);ds_i32(&b,x->btexture);ds_i32(&b,x->btimer);ds_u32(&b,ds_mobj_id(m,nm,x->soundorg));}
+-    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(k==DS_MOBJ)ds_mobj(&b,(mobj_t*)t,m,nm,k);else ds_special(&b,t,k);}free(m);if(b.bad){free(b.p);return -1;}
++    for(i=0;i<=(unsigned)numflats;i++)ds_i32(&b,flattranslation[i]);for(i=0;i<=(unsigned)numtextures;i++)ds_i32(&b,texturetranslation[i]);for(i=0;i<ITEMQUESIZE;i++){ds_mapthing(&b,&itemrespawnque[i]);ds_i32(&b,itemrespawntime[i]);}ds_i32(&b,iquehead);ds_i32(&b,iquetail);for(i=0;i<MAXBUTTONS;i++){button_t*x=&buttonlist[i];ds_i32(&b,ds_line_ref(&b,x->line));ds_i32(&b,x->where);ds_i32(&b,x->btexture);ds_i32(&b,x->btimer);ds_u32(&b,ds_mobj_ref(&b,m,nm,x->soundorg));}
++    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(k==DS_MOBJ)ds_mobj(&b,(mobj_t*)t,m,nm,k);else ds_special(&b,t,k);}free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}
+     memcpy(b.p,"DOOM-ST1",8);ds_set32(b.p+8,0);ds_set32(b.p+12,DS_HEADER_BYTES);ds_set32(b.p+16,(uint32_t)b.used);ds_set32(b.p+20,(uint32_t)gametic);ds_set32(b.p+24,(uint32_t)(demo_p-demobuffer));ds_set32(b.p+28,nm);ds_set32(b.p+32,ns);ds_set32(b.p+36,(uint32_t)numsectors);ds_set32(b.p+40,(uint32_t)(DOOM_CTX->numlines));ds_set32(b.p+44,(uint32_t)numsides);ds_set32(b.p+48,(uint32_t)numflats);ds_set32(b.p+52,(uint32_t)numtextures);ds_set32(b.p+56,nr);*image=b.p;*image_bytes=b.used;return 0;
+ }
+ 
+ int DoomStateDecode(const uint8_t *image,size_t image_bytes) {
+-    ds_read_t r; uint32_t nmo, nsp, nrec, pm[MAXPLAYERS], pa[MAXPLAYERS], *body=0, *mtarget=0,*mtracer=0; int32_t *mplayer=0; mobj_t **m=0; unsigned i; memset(&r,0,sizeof(r));r.p=image;r.cap=image_bytes;if(image_bytes<DS_HEADER_BYTES||memcmp(image,"DOOM-ST1",8)||ds_at32(image+8)!=0||ds_at32(image+12)!=DS_HEADER_BYTES||ds_at32(image+16)!=image_bytes||ds_at32(image+36)!=(uint32_t)numsectors||ds_at32(image+40)!=(uint32_t)(DOOM_CTX->numlines)||ds_at32(image+44)!=(uint32_t)numsides||ds_at32(image+48)!=(uint32_t)numflats||ds_at32(image+52)!=(uint32_t)numtextures)return -1;nmo=ds_at32(image+28);nsp=ds_at32(image+32);nrec=ds_at32(image+56);if(nmo>DS_MAX_OBJECTS||nsp>DS_MAX_OBJECTS||nrec!=nmo+nsp)return -1;r.used=DS_HEADER_BYTES;
+-    gameskill=(skill_t)ds_ri32(&r);gameepisode=ds_ri32(&r);gamemap=ds_ri32(&r);gamestate=(gamestate_t)ds_ri32(&r);gameaction=(gameaction_t)ds_ri32(&r);gametic=ds_ri32(&r);levelstarttic=ds_ri32(&r);leveltime=ds_ri32(&r);totalkills=ds_ri32(&r);totalitems=ds_ri32(&r);totalsecret=ds_ri32(&r);(DOOM_CTX->consoleplayer)=ds_ri32(&r);displayplayer=ds_ri32(&r);skytexture=ds_ri32(&r);skyflatnum=ds_ri32(&r);rndindex=ds_ri32(&r);prndindex=ds_ri32(&r);validcount=ds_ri32(&r);fuzzpos=ds_ri32(&r);bodyqueslot=ds_ri32(&r);levelTimeCount=ds_ri32(&r);respawnmonsters=(boolean)ds_r8(&r);(DOOM_CTX->deathmatch)=(boolean)ds_r8(&r);netgame=(boolean)ds_r8(&r);netdemo=(boolean)ds_r8(&r);paused=(boolean)ds_r8(&r);sendpause=(boolean)ds_r8(&r);sendsave=(boolean)ds_r8(&r);usergame=(boolean)ds_r8(&r);demoplayback=(boolean)ds_r8(&r);demorecording=(boolean)ds_r8(&r);secretexit=(boolean)ds_r8(&r);levelTimer=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)playeringame[i]=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)ds_rplayer(&r,&players[i],&pm[i],&pa[i]);body=calloc(DS_BODYQUESIZE,sizeof(*body));if(!body)r.bad=1;for(i=0;i<DS_BODYQUESIZE;i++)body[i]=ds_r32(&r);
+-    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];int j;x->floorheight=ds_ri32(&r);x->ceilingheight=ds_ri32(&r);x->floorpic=(short)ds_r16(&r);x->ceilingpic=(short)ds_r16(&r);x->lightlevel=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);x->soundtraversed=ds_ri32(&r);x->soundtarget=(mobj_t*)(uintptr_t)ds_r32(&r);for(j=0;j<4;j++)x->blockbox[j]=ds_ri32(&r);x->validcount_m=ds_ri32(&r);x->thinglist=0;x->specialdata=0;}
++    ds_plan_t p; ds_read_t r; unsigned i, mi=0, si=0; memset(&p,0,sizeof(p));
++    if (ds_preflight(image,image_bytes,&p) || ds_plan_prepare(&p)) return -1;
++    memset(&r,0,sizeof(r));r.p=image;r.cap=image_bytes;r.used=DS_HEADER_BYTES;
++    gameskill=(skill_t)ds_ri32(&r);gameepisode=ds_ri32(&r);gamemap=ds_ri32(&r);gamestate=(gamestate_t)ds_ri32(&r);gameaction=(gameaction_t)ds_ri32(&r);gametic=ds_ri32(&r);levelstarttic=ds_ri32(&r);leveltime=ds_ri32(&r);totalkills=ds_ri32(&r);totalitems=ds_ri32(&r);totalsecret=ds_ri32(&r);(DOOM_CTX->consoleplayer)=ds_ri32(&r);displayplayer=ds_ri32(&r);skytexture=ds_ri32(&r);skyflatnum=ds_ri32(&r);rndindex=ds_ri32(&r);prndindex=ds_ri32(&r);validcount=ds_ri32(&r);fuzzpos=ds_ri32(&r);bodyqueslot=ds_ri32(&r);levelTimeCount=ds_ri32(&r);respawnmonsters=(boolean)ds_r8(&r);(DOOM_CTX->deathmatch)=(boolean)ds_r8(&r);netgame=(boolean)ds_r8(&r);netdemo=(boolean)ds_r8(&r);paused=(boolean)ds_r8(&r);sendpause=(boolean)ds_r8(&r);sendsave=(boolean)ds_r8(&r);usergame=(boolean)ds_r8(&r);demoplayback=(boolean)ds_r8(&r);demorecording=(boolean)ds_r8(&r);secretexit=(boolean)ds_r8(&r);levelTimer=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)playeringame[i]=(boolean)ds_r8(&r);for(i=0;i<MAXPLAYERS;i++)ds_rplayer(&r,&players[i],&p.pm[i],&p.pa[i]);for(i=0;i<DS_BODYQUESIZE;i++)ds_r32(&r);
++    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];int j;x->floorheight=ds_ri32(&r);x->ceilingheight=ds_ri32(&r);x->floorpic=(short)ds_r16(&r);x->ceilingpic=(short)ds_r16(&r);x->lightlevel=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);x->soundtraversed=ds_ri32(&r);x->soundtarget=0;for(j=0;j<4;j++)x->blockbox[j]=ds_ri32(&r);x->validcount_m=ds_ri32(&r);x->thinglist=0;x->specialdata=0;}
+     for(i=0;i<(unsigned)(DOOM_CTX->numlines);i++){line_t*x=&lines[i];int j;x->flags=(short)ds_r16(&r);x->special=(short)ds_r16(&r);x->tag=(short)ds_r16(&r);for(j=0;j<2;j++)if(x->sidenum[j]!=-1){side_t*y=&sides[x->sidenum[j]];y->textureoffset=ds_ri32(&r);y->rowoffset=ds_ri32(&r);y->toptexture=(short)ds_r16(&r);y->bottomtexture=(short)ds_r16(&r);y->midtexture=(short)ds_r16(&r);}x->validcount_m=ds_ri32(&r);}
+-    for(i=0;i<=(unsigned)numflats;i++)flattranslation[i]=ds_ri32(&r);for(i=0;i<=(unsigned)numtextures;i++)texturetranslation[i]=ds_ri32(&r);for(i=0;i<ITEMQUESIZE;i++){ds_rmapthing(&r,&itemrespawnque[i]);itemrespawntime[i]=ds_ri32(&r);}iquehead=ds_ri32(&r);iquetail=ds_ri32(&r);for(i=0;i<MAXBUTTONS;i++){int32_t li=ds_ri32(&r);buttonlist[i].line=(li<0)?0:((li>=(DOOM_CTX->numlines))?0:&lines[li]);buttonlist[i].where=(bwhere_e)ds_ri32(&r);buttonlist[i].btexture=ds_ri32(&r);buttonlist[i].btimer=ds_ri32(&r);buttonlist[i].soundorg=(mobj_t*)(uintptr_t)ds_r32(&r);}
+-    m=nmo?calloc(nmo,sizeof(*m)):0;mtarget=nmo?calloc(nmo,sizeof(*mtarget)):0;mtracer=nmo?calloc(nmo,sizeof(*mtracer)):0;mplayer=nmo?calloc(nmo,sizeof(*mplayer)):0;if(nmo&&(!m||!mtarget||!mtracer||!mplayer))r.bad=1;memset(activeceilings,0,sizeof(activeceilings));memset(activeplats,0,sizeof(activeplats));memset(blocklinks,0,(size_t)bmapwidth*bmapheight*sizeof(*blocklinks));P_InitThinkers();
+-    for(i=0;i<nrec&&!r.bad;i++){int k=ds_r8(&r);if(k==DS_MOBJ||k==DS_MOBJ_REMOVED){unsigned j=0;while(j<nmo&&m[j])j++;if(j==nmo){r.bad=1;break;}m[j]=ds_rmobj(&r,&mtarget[j],&mtracer[j],&mplayer[j],k==DS_MOBJ_REMOVED);}else ds_rspecial(&r,k);}if(!r.bad){for(i=0;i<nmo;i++){m[i]->target=ds_mobj_at(m,nmo,mtarget[i]);m[i]->tracer=ds_mobj_at(m,nmo,mtracer[i]);if(mplayer[i]>0&&mplayer[i]<=MAXPLAYERS)m[i]->player=&players[mplayer[i]-1];}for(i=0;i<MAXPLAYERS;i++){players[i].mo=ds_mobj_at(m,nmo,pm[i]);players[i].attacker=ds_mobj_at(m,nmo,pa[i]);}for(i=0;i<DS_BODYQUESIZE;i++)bodyque[i]=ds_mobj_at(m,nmo,body[i]);for(i=0;i<(unsigned)numsectors;i++){uint32_t id=(uint32_t)(uintptr_t)sectors[i].soundtarget;sectors[i].soundtarget=ds_mobj_at(m,nmo,id);}for(i=0;i<MAXBUTTONS;i++){uint32_t id=(uint32_t)(uintptr_t)buttonlist[i].soundorg;buttonlist[i].soundorg=ds_mobj_at(m,nmo,id);}if(!demobuffer||ds_at32(image+24)>(uint32_t)W_LumpLength(W_GetNumForName(defdemoname)))r.bad=1;else demo_p=demobuffer+ds_at32(image+24);}
+-    free(body);free(m);free(mtarget);free(mtracer);free(mplayer);if(r.bad||r.used!=r.cap)return -1;return 0;
++    for(i=0;i<=(unsigned)numflats;i++)flattranslation[i]=ds_ri32(&r);for(i=0;i<=(unsigned)numtextures;i++)texturetranslation[i]=ds_ri32(&r);for(i=0;i<ITEMQUESIZE;i++){ds_rmapthing(&r,&itemrespawnque[i]);itemrespawntime[i]=ds_ri32(&r);}iquehead=ds_ri32(&r);iquetail=ds_ri32(&r);for(i=0;i<MAXBUTTONS;i++){int32_t li=ds_ri32(&r);buttonlist[i].line=(li<0)?0:&lines[li];buttonlist[i].where=(bwhere_e)ds_ri32(&r);buttonlist[i].btexture=ds_ri32(&r);buttonlist[i].btimer=ds_ri32(&r);buttonlist[i].soundorg=0;}
++    memset(activeceilings,0,sizeof(activeceilings));memset(activeplats,0,sizeof(activeplats));memset(blocklinks,0,(size_t)bmapwidth*bmapheight*sizeof(*blocklinks));P_InitThinkers();
++    for(i=0;i<p.nrec&&!r.bad;i++){int k=ds_r8(&r);if(k==DS_MOBJ)ds_rmobj(&r,&p.mtarget[mi],&p.mtracer[mi],&p.mplayer[mi],p.mobj_mem[mi++]);else ds_rspecial(&r,k,p.special_mem[si++]);}
++    if(!r.bad){for(i=0;i<p.nmo;i++){p.mobj_mem[i]->target=ds_mobj_at(p.mobj_mem,p.nmo,p.mtarget[i]);p.mobj_mem[i]->tracer=ds_mobj_at(p.mobj_mem,p.nmo,p.mtracer[i]);if(p.mplayer[i])p.mobj_mem[i]->player=&players[p.mplayer[i]-1];}for(i=0;i<MAXPLAYERS;i++){players[i].mo=ds_mobj_at(p.mobj_mem,p.nmo,p.pm[i]);players[i].attacker=ds_mobj_at(p.mobj_mem,p.nmo,p.pa[i]);}for(i=0;i<DS_BODYQUESIZE;i++)bodyque[i]=ds_mobj_at(p.mobj_mem,p.nmo,p.body[i]);for(i=0;i<(unsigned)numsectors;i++)sectors[i].soundtarget=ds_mobj_at(p.mobj_mem,p.nmo,p.sector_soundtarget[i]);for(i=0;i<MAXBUTTONS;i++)buttonlist[i].soundorg=ds_mobj_at(p.mobj_mem,p.nmo,p.button_soundorg[i]);demo_p=demobuffer+ds_at32(image+24);}
++    /* Preflight makes the following parse infallible: no allocation, bounds,
++     * ID, capacity, or action failure remains after publication starts. */
++    if(r.bad||r.used!=r.cap){ds_plan_release(&p,0);return -1;}ds_plan_release(&p,0);return 0;
+ }
+ 
+ int DoomStateSave(const char *path){uint8_t *p;size_t n;FILE*f;if(DoomStateEncode(&p,&n))return -1;f=fopen(path,"wb");if(!f||fwrite(p,1,n,f)!=n){if(f)fclose(f);free(p);return -1;}fclose(f);free(p);return 0;}
+-int DoomStateLoad(const char *path){uint8_t *p;long n;FILE*f=fopen(path,"rb");int ok;if(!f)return -1;if(fseek(f,0,SEEK_END)||((n=ftell(f))<0)||fseek(f,0,SEEK_SET)){fclose(f);return -1;}p=malloc((size_t)n);if(!p||fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}fclose(f);ok=DoomStateDecode(p,(size_t)n);free(p);return ok;}
++int DoomStateLoad(const char *path){uint8_t *p;long n;FILE*f=fopen(path,"rb");int ok;if(!f)return -1;if(fseek(f,0,SEEK_END)||((n=ftell(f))<0)||fseek(f,0,SEEK_SET)||n<DS_HEADER_BYTES||n>DS_MAX_IMAGE_BYTES){fclose(f);return -1;}p=malloc((size_t)n);if(!p||fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}fclose(f);ok=DoomStateDecode(p,(size_t)n);free(p);return ok;}
+ void DoomStateHash(const uint8_t wad[32],const uint8_t *p,size_t n,char out[65]){ds_sha256_t s;uint8_t d[32],v[4]={0,0,0,0};static const char x[]="0123456789abcdef";int i;ds_sha_init(&s);ds_sha_update(&s,"DOOM-ST1",8);ds_sha_update(&s,v,4);ds_sha_update(&s,wad,32);ds_sha_update(&s,p,n);ds_sha_final(&s,d);for(i=0;i<32;i++){out[2*i]=x[d[i]>>4];out[2*i+1]=x[d[i]&15];}out[64]=0;}
+ void DoomStateFree(uint8_t *p){free(p);}
+diff --git a/linuxdoom-1.10/headless/doom_account.c b/linuxdoom-1.10/headless/doom_account.c
+--- a/linuxdoom-1.10/headless/doom_account.c
++++ b/linuxdoom-1.10/headless/doom_account.c
+@@ -167,74 +167,81 @@
+ 
+ static void p32(uint8_t *p, uint32_t x) { put32(p, x); }
+ static void p16(uint8_t *p, uint16_t x) { p[0] = (uint8_t) x; p[1] = (uint8_t) (x >> 8); }
+-static uint32_t slot_of(mobj_t **m, unsigned n, mobj_t *o)
++static int slot_of(mobj_t **m, unsigned n, mobj_t *o, uint32_t *out)
+ {
+     unsigned i;
+-    if (!o)
+-	return 0;
++    if (!o) { *out = 0; return 0; }
+     for (i = 0; i < n; i++)
+-	if (m[i] == o)
+-	    return i + 1;
+-    return 0;
+-}
+-static int fill_pool(doom_account_t *a)
++	if (m[i] == o) { *out = i + 1; return 0; }
++    return -1;
++}
++static int state_of(state_t *state, int32_t *out)
++{
++    uintptr_t x, base;
++    if (!state) return -1;
++    x = (uintptr_t)state; base = (uintptr_t)states;
++    if (x < base || x - base >= sizeof(states)
++	|| (x - base) % sizeof(*states)) return -1;
++    *out = (int32_t)((x - base) / sizeof(*states));
++    return *out >= 0 && *out < NUMSTATES ? 0 : -1;
++}
++static int player_of(player_t *player, int32_t *out)
++{
++    uintptr_t x, base;
++    if (!player) { *out = 0; return 0; }
++    x = (uintptr_t)player; base = (uintptr_t)players;
++    if (x < base || x - base >= sizeof(players)
++	|| (x - base) % sizeof(*players)) return -1;
++    *out = (int32_t)((x - base) / sizeof(*players)) + 1;
++    return 0;
++}
++static int fill_pool(uint8_t *pool, const doom_account_t *a)
+ {
+     mobj_t *m[DOOM_ACCOUNT_POOL_SLOTS];
+     thinker_t *t;
+     unsigned n = 0, i;
+     uint8_t *s;
+-    memset(a->pool, 0, sizeof(a->pool));
+-    memcpy(a->pool, "DOOM-MP1", 8);
+-    p32(a->pool + 8, 1);
+-    p32(a->pool + 12, DOOM_ACCOUNT_POOL_HEADER_BYTES);
+-    p32(a->pool + 16, DOOM_ACCOUNT_POOL_BYTES);
+-    p32(a->pool + 20, DOOM_ACCOUNT_POOL_SLOT_BYTES);
+-    p32(a->pool + 24, DOOM_ACCOUNT_POOL_SLOTS);
++    memset(pool, 0, DOOM_ACCOUNT_POOL_BYTES);
++    memcpy(pool, "DOOM-MP1", 8);
++    p32(pool + 8, 1);
++    p32(pool + 12, DOOM_ACCOUNT_POOL_HEADER_BYTES);
++    p32(pool + 16, DOOM_ACCOUNT_POOL_BYTES);
++    p32(pool + 20, DOOM_ACCOUNT_POOL_SLOT_BYTES);
++    p32(pool + 24, DOOM_ACCOUNT_POOL_SLOTS);
+     for (t = thinkercap.next; t != &thinkercap; t = t->next)
+ 	if (t->function.acp1 == (actionf_p1) P_MobjThinker)
+ 	{
+-	    if (n == DOOM_ACCOUNT_POOL_SLOTS)
+-		return -1;
++	    if (n == DOOM_ACCOUNT_POOL_SLOTS) return -1;
+ 	    m[n++] = (mobj_t *) t;
+ 	}
+-    p32(a->pool + 28, n);
+-    p32(a->pool + 32, n < DOOM_ACCOUNT_POOL_SLOTS ? n : 0xffffffffU);
+-    memcpy(a->pool + 36, a->wad_hash, 32);
++    p32(pool + 28, n);
++    p32(pool + 32, n < DOOM_ACCOUNT_POOL_SLOTS ? n : 0xffffffffU);
++    memcpy(pool + 36, a->wad_hash, 32);
+     for (i = 0; i < n; i++)
+     {
+ 	mobj_t *o = m[i];
+-	int32_t st = o->state ? (int32_t) (o->state - states) : -1;
+-	int32_t pl = o->player ? (int32_t) (o->player - players) + 1 : 0;
+-	s = a->pool + DOOM_ACCOUNT_POOL_HEADER_BYTES
++	int32_t st, pl;
++	uint32_t target, tracer;
++	if (o->type < 0 || o->type >= NUMMOBJTYPES
++	    || state_of(o->state, &st) || player_of(o->player, &pl)
++	    || slot_of(m, n, o->target, &target)
++	    || slot_of(m, n, o->tracer, &tracer)) return -1;
++	s = pool + DOOM_ACCOUNT_POOL_HEADER_BYTES
+ 	    + i * DOOM_ACCOUNT_POOL_SLOT_BYTES;
+-	p32(s + 0, i + 1);
+-	p32(s + 4, 1);
+-	p32(s + 8, slot_of(m, n, o->target));
+-	p32(s + 12, slot_of(m, n, o->tracer));
+-	p32(s + 16, (uint32_t) o->x);
+-	p32(s + 20, (uint32_t) o->y);
+-	p32(s + 24, (uint32_t) o->z);
+-	p32(s + 28, (uint32_t) o->angle);
+-	p32(s + 32, (uint32_t) o->sprite);
+-	p32(s + 36, (uint32_t) o->frame);
+-	p32(s + 40, (uint32_t) o->floorz);
+-	p32(s + 44, (uint32_t) o->ceilingz);
+-	p32(s + 48, (uint32_t) o->radius);
+-	p32(s + 52, (uint32_t) o->height);
+-	p32(s + 56, (uint32_t) o->momx);
+-	p32(s + 60, (uint32_t) o->momy);
+-	p32(s + 64, (uint32_t) o->momz);
+-	p32(s + 68, (uint32_t) o->validcount_m);
+-	p32(s + 72, (uint32_t) o->type);
+-	p32(s + 76, (uint32_t) st);
+-	p32(s + 80, (uint32_t) o->tics);
+-	p32(s + 84, (uint32_t) o->flags);
+-	p32(s + 88, (uint32_t) o->health);
+-	p32(s + 92, (uint32_t) o->movedir);
+-	p32(s + 96, (uint32_t) o->movecount);
+-	p32(s + 100, (uint32_t) o->reactiontime);
+-	p32(s + 104, (uint32_t) o->threshold);
+-	p32(s + 108, (uint32_t) pl);
++	p32(s + 0, i + 1); p32(s + 4, 1);
++	p32(s + 8, target); p32(s + 12, tracer);
++	p32(s + 16, (uint32_t) o->x); p32(s + 20, (uint32_t) o->y);
++	p32(s + 24, (uint32_t) o->z); p32(s + 28, (uint32_t) o->angle);
++	p32(s + 32, (uint32_t) o->sprite); p32(s + 36, (uint32_t) o->frame);
++	p32(s + 40, (uint32_t) o->floorz); p32(s + 44, (uint32_t) o->ceilingz);
++	p32(s + 48, (uint32_t) o->radius); p32(s + 52, (uint32_t) o->height);
++	p32(s + 56, (uint32_t) o->momx); p32(s + 60, (uint32_t) o->momy);
++	p32(s + 64, (uint32_t) o->momz); p32(s + 68, (uint32_t) o->validcount_m);
++	p32(s + 72, (uint32_t) o->type); p32(s + 76, (uint32_t) st);
++	p32(s + 80, (uint32_t) o->tics); p32(s + 84, (uint32_t) o->flags);
++	p32(s + 88, (uint32_t) o->health); p32(s + 92, (uint32_t) o->movedir);
++	p32(s + 96, (uint32_t) o->movecount); p32(s + 100, (uint32_t) o->reactiontime);
++	p32(s + 104, (uint32_t) o->threshold); p32(s + 108, (uint32_t) pl);
+ 	p32(s + 112, (uint32_t) o->lastlook);
+ 	p16(s + 116, (uint16_t) o->spawnpoint.x);
+ 	p16(s + 118, (uint16_t) o->spawnpoint.y);
+@@ -242,36 +249,43 @@
+ 	p16(s + 122, (uint16_t) o->spawnpoint.type);
+ 	p16(s + 124, (uint16_t) o->spawnpoint.options);
+     }
+-return 0;}
++    return 0;
++}
+ 
+ int DoomAccountBeginLevel(doom_account_t*a,int episode,int map){if(!a||episode!=1||map<1||map>9)return -1;memset(a->level,0,sizeof(a->level));memset(a->pool,0,sizeof(a->pool));a->level_started=1;return 0;}
+ int DoomAccountCommitLevel(doom_account_t *a)
+ {
+-    uint8_t *image = 0;
++    uint8_t *image = 0, *next_level = 0, *next_pool = 0;
+     size_t n;
+     uint8_t raw[32];
+-    if (!a || !a->level_started)
+-	return -1;
+-    if (DoomStateEncode(&image, &n) || n > LEVEL_IMAGE_CAP)
+-    {
+-	if (image)
+-	    DoomStateFree(image);
+-	return -1;
+-    }
+-    memcpy(a->level, "DOOM-LS1", 8);
+-    p32(a->level + 8, 1);
+-    p32(a->level + 12, DOOM_ACCOUNT_LEVEL_HEADER_BYTES);
+-    p32(a->level + 16, DOOM_ACCOUNT_LEVEL_BYTES);
+-    p32(a->level + 20, DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET);
+-    p32(a->level + 24, LEVEL_IMAGE_CAP);
+-    p32(a->level + 28, (uint32_t) n);
+-    memcpy(a->level + 32, a->wad_hash, 32);
++    if (!a || !a->level_started) return -1;
++    if (DoomStateEncode(&image, &n) || n > LEVEL_IMAGE_CAP) goto fail;
++    next_level = calloc(1, DOOM_ACCOUNT_LEVEL_BYTES);
++    next_pool = calloc(1, DOOM_ACCOUNT_POOL_BYTES);
++    if (!next_level || !next_pool) goto fail;
++    memcpy(next_level, "DOOM-LS1", 8);
++    p32(next_level + 8, 1);
++    p32(next_level + 12, DOOM_ACCOUNT_LEVEL_HEADER_BYTES);
++    p32(next_level + 16, DOOM_ACCOUNT_LEVEL_BYTES);
++    p32(next_level + 20, DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET);
++    p32(next_level + 24, LEVEL_IMAGE_CAP);
++    p32(next_level + 28, (uint32_t) n);
++    memcpy(next_level + 32, a->wad_hash, 32);
+     hash_bytes(image, n, raw);
+-    memcpy(a->level + 64, raw, 32);
+-    p32(a->level + 96, at32(image + 20));
+-    memcpy(a->level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image, n);
+-    DoomStateFree(image);
+-    return fill_pool(a);
++    memcpy(next_level + 64, raw, 32);
++    p32(next_level + 96, at32(image + 20));
++    memcpy(next_level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image, n);
++    if (fill_pool(next_pool, a)) goto fail;
++    /* ST1 is authoritative.  The pool was derived completely into private
++     * buffers and is published together with the level image only now. */
++    memcpy(a->level, next_level, DOOM_ACCOUNT_LEVEL_BYTES);
++    memcpy(a->pool, next_pool, DOOM_ACCOUNT_POOL_BYTES);
++    free(next_level); free(next_pool); DoomStateFree(image);
++    return 0;
++fail:
++    free(next_level); free(next_pool);
++    if (image) DoomStateFree(image);
++    return -1;
+ }
+ static int write_image(const char*path,const uint8_t*p,size_t n){FILE*f=fopen(path,"wb");if(!f)return -1;if(fwrite(p,1,n,f)!=n){fclose(f);return -1;}return fclose(f)?-1:0;}
+ int DoomAccountWriteLevelState(const doom_account_t*a,const char*path){return a?write_image(path,a->level,sizeof(a->level)):-1;}
+diff --git a/linuxdoom-1.10/headless/doom_state.h b/linuxdoom-1.10/headless/doom_state.h
+--- a/linuxdoom-1.10/headless/doom_state.h
++++ b/linuxdoom-1.10/headless/doom_state.h
+@@ -8,6 +8,8 @@
+ 
+ int DoomStateEncode(uint8_t **image, size_t *image_bytes);
+ int DoomStateDecode(const uint8_t *image, size_t image_bytes);
++/* Host fault-injection hook; -1 disables allocation refusal. */
++void DoomStateSetAllocationFailure(long fail_after);
+ int DoomStateSave(const char *path);
+ int DoomStateLoad(const char *path);
+ void DoomStateHash(const uint8_t wad_hash[32], const uint8_t *image,
