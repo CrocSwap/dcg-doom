@@ -336,6 +336,6 @@ mod tests {
 }
 
 // Keep the module declaration at the true end of this file.  The default
-// image's existing panic locations are intentionally left byte-stable while
-// this source-only interface is reviewed; the engine route is feature-gated.
+// image's byte identity is unverified: the feature-gated route above changes
+// source line layout. Reproducible SBF comparison remains a deferred gate.
 pub mod engine;
