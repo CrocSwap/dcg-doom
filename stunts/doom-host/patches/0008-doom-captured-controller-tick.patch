@@ -1,0 +1,110 @@
+Subject: [PATCH 0008] Add a captured-controller one-tic host gate
+
+The step-6 host gate must consume a controller account derived from the real
+DEMO1 capture, rather than silently relying on the demo stream.  This is a
+host-only adapter for the smallest captured-input validation.  It does not
+change the DOOM-EX1 SBF refusal or claim a DCG integration.
+
+diff --git a/linuxdoom-1.10/headless/Makefile b/linuxdoom-1.10/headless/Makefile
+index 1b2c3d4..b9f4e62 100644
+--- a/linuxdoom-1.10/headless/Makefile
++++ b/linuxdoom-1.10/headless/Makefile
+@@ -8,6 +8,6 @@ LDLIBS ?= -lm
+ 
+ OUT ?= ../doom-headless
+-OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_state.o doom_account.o doom_render.o doom_stubs.o doom_ctx_init.o
++OBJS = $(patsubst ../%.c,%.o,$(SOURCES)) doom_headless.o doom_state.o doom_account.o doom_render.o doom_controller.o doom_stubs.o doom_ctx_init.o
+ SOURCES = \
+  ../doomdef.c ../doomstat.c ../dstrings.c ../d_items.c ../g_game.c \
+  ../m_argv.c ../m_bbox.c ../m_fixed.c ../m_random.c ../m_swap.c \
+@@ -43,5 +43,8 @@
+ clean:
+ 	rm -f $(OBJS) $(OUT)
+ 
++doom_controller.o: doom_controller.c doom_controller.h
++	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu99 -c $< -o $@
++
+ doom_ctx_init.o: doom_ctx_init.c doom_ctx.h
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) -DDOOM_CTX_NO_MACROS -c $< -o $@
+diff --git a/linuxdoom-1.10/headless/doom_controller.h b/linuxdoom-1.10/headless/doom_controller.h
+new file mode 100644
+index 0000000..f27ef15
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_controller.h
+@@ -0,0 +1,11 @@
++#ifndef DOOM_CONTROLLER_H
++#define DOOM_CONTROLLER_H
++
++#include <stdint.h>
++
++/* DOOM-CI1 v1: the four bytes are the captured ticcmd at byte 24. */
++#define DOOM_CONTROLLER_BYTES 64
++
++int DoomControllerRead(const char *, uint32_t, uint8_t[4]);
++
++#endif
+diff --git a/linuxdoom-1.10/headless/doom_controller.c b/linuxdoom-1.10/headless/doom_controller.c
+new file mode 100644
+index 0000000..df3546d
+--- /dev/null
++++ b/linuxdoom-1.10/headless/doom_controller.c
+@@ -0,0 +1,33 @@
++/* Minimal host adapter for one captured DOOM-CI1 command. */
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include "doom_controller.h"
++
++static uint32_t u32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
++        | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++int DoomControllerRead(const char *path, uint32_t expected_gametic, uint8_t out[4])
++{
++    FILE *f;
++    uint8_t b[DOOM_CONTROLLER_BYTES];
++    int extra;
++    if (!path || !out || !(f = fopen(path, "rb")))
++        return -1;
++    if (fread(b, 1, sizeof(b), f) != sizeof(b)) {
++        fclose(f);
++        return -1;
++    }
++    extra = fgetc(f);
++    fclose(f);
++    if (extra != EOF || memcmp(b, "DOOM-CI1", 8)
++        || u32(b + 8) != 1 || u32(b + 12) != 28
++        || u32(b + 16) != DOOM_CONTROLLER_BYTES || u32(b + 20) != expected_gametic
++        || b[28] || memcmp(b + 29, b + 28, sizeof(b) - 29))
++        return -1;
++    memcpy(out, b + 24, 4);
++    return 0;
++}
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+index 4f2e1a9..a4a4d63 100644
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -27,0 +28 @@
++#include "doom_controller.h"
+@@ -71,1 +72,1 @@
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE]\n",argv0); }
+@@ -78,2 +79,3 @@ int main(int argc, char **argv) {
+-  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS];
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller");
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
+@@ -85,2 +86,11 @@
+   if(load&&DoomStateLoad(load)){fprintf(stderr,"cannot load DOOM-ST1 %s\n",load);return 2;}
++  if(controller_path){
++    if(!load || max_tics!=1 || DoomControllerRead(controller_path,(uint32_t)gametic,controller_command)
++       || (size_t)(demo_p-demobuffer) > (size_t)demo_len-4
++       || memcmp(controller_command,demo_p,4)){
++      fprintf(stderr,"refusing controller: it is not the captured command for the loaded one-tic state\n");
++      return 2;
++    }
++    memcpy(demo_p,controller_command,4);
++  }
+   if(s0){if(DoomStateEncode(&state_image,&state_bytes)){fprintf(stderr,"cannot encode S0\n");return 2;}DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);out=fopen(s0,"w");if(!out){fprintf(stderr,"cannot open %s\n",s0);return 2;}fprintf(out,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);fclose(out);}
