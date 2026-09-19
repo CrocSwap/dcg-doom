@@ -598,6 +598,7 @@ def _native_command(
     import_pair_dir: Path | None = None,
     resave: Path | None = None,
     frames: Path | None = None,
+    controller: Path | None = None,
 ) -> list[str]:
     frames = frames or (report or manifest).with_suffix(".frames.jsonl")
     command = [
@@ -606,6 +607,8 @@ def _native_command(
     ]
     if image is not None:
         command += ["--load", str(image)]
+    if controller is not None and image is not None:
+        command += ["--controller", str(controller)]
     if report is not None:
         command += ["--decoder-report", str(report), "--allocation-fail", str(allocation_fail)]
     if publish_dir is not None:
@@ -631,11 +634,13 @@ def _run_native(
     import_pair_dir: Path | None = None,
     resave: Path | None = None,
     frames: Path | None = None,
+    controller: Path | None = None,
 ) -> dict[str, Any]:
     command = _native_command(
         engine, manifest, image, report, allocation_fail=allocation_fail,
         publish_dir=publish_dir, publish_fail_after=publish_fail_after,
         import_pair_dir=import_pair_dir, resave=resave, frames=frames,
+        controller=controller,
     )
     completed = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
     result: dict[str, Any] = {
@@ -658,6 +663,9 @@ def _native_gate(
     wad_hash: bytes,
 ) -> dict[str, Any]:
     manifest = capture_root / "account" / "manifest.json"
+    controller = capture_root.parent / "doom-captured-tick-gate-2026-09-19" / "controller-doom-ci1.bin"
+    if not controller.exists():
+        controller = None
     if engine is None or not engine.exists():
         return {
             "status": "unverified",
@@ -672,7 +680,7 @@ def _native_gate(
         positive.write_bytes((capture_root / "dumped-doom-st1.bin").read_bytes())
         positive_report = scratch / "positive.report.json"
         publication = scratch / "publication"
-        first = _run_native(engine, manifest, positive, positive_report, publish_dir=publication, frames=scratch / "positive.frames.jsonl")
+        first = _run_native(engine, manifest, positive, positive_report, publish_dir=publication, frames=scratch / "positive.frames.jsonl", controller=controller)
         commands = [first]
         positive_result = first.get("report", {})
         if first["returncode"] != 0 or positive_result.get("decode_rc") != 0:
@@ -685,18 +693,20 @@ def _native_gate(
                 publish_dir=failed_publication,
                 publish_fail_after=fail_after,
                 allocation_fail=-1,
-                frames=scratch / f"publication-fail-{fail_after}.frames.jsonl",
+                frames=scratch / f"publication-fail-{fail_after}.frames.jsonl", controller=controller,
             )
             commands.append(run)
+            selected = failed_publication / "publication.manifest"
             publication_failures[str(fail_after)] = (
                 run["returncode"] == 3
-                and not (failed_publication / "publication.manifest").exists()
+                and selected.exists()
+                and u32(selected.read_bytes(), 12) == 0
             )
         allocation_calls = int(positive_result.get("allocation_calls", 0))
         allocations: dict[str, Any] = {}
         for fail_at in range(allocation_calls):
             report = scratch / f"allocation-{fail_at}.json"
-            run = _run_native(engine, manifest, positive, report, allocation_fail=fail_at, frames=scratch / f"allocation-{fail_at}.frames.jsonl")
+            run = _run_native(engine, manifest, positive, report, allocation_fail=fail_at, frames=scratch / f"allocation-{fail_at}.frames.jsonl", controller=controller)
             commands.append(run)
             decoded = run.get("report", {})
             allocations[str(fail_at)] = (
@@ -712,7 +722,7 @@ def _native_gate(
             image_path = scratch / f"{name}.st1"
             image_path.write_bytes(mutated)
             report = scratch / f"{name}.json"
-            run = _run_native(engine, manifest, image_path, report, frames=scratch / f"{name}.frames.jsonl")
+            run = _run_native(engine, manifest, image_path, report, frames=scratch / f"{name}.frames.jsonl", controller=controller)
             commands.append(run)
             decoded = run.get("report", {})
             native_controls[name] = (

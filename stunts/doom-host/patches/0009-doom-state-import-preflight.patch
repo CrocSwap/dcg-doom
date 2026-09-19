@@ -1380,11 +1380,12 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
    if(save_at_arg){char *end=0;long v=strtol(save_at_arg,&end,10);if(!end||*end||v<0||v>1000000||!save){fprintf(stderr,"bad --save-at/--save\n");return 2;}save_at=(int)v;} else if(save||(resave&&!load)){fprintf(stderr,"--save requires --save-at; --resave requires --load\n");return 2;}
    if(iwad){if(hash_file(iwad,wad_hash)){fprintf(stderr,"cannot hash %s: %s\n",iwad,strerror(errno));return 2;}}
    if(mb_used_arg){char *end=0;long v=strtol(mb_used_arg,&end,10);if(!end||*end||v<1||v>256){fprintf(stderr,"bad -mb-used\n");return 2;}mb_used=(int)v;}
-@@ -92,12 +144,13 @@
+@@ -92,12 +144,14 @@
    if(account && (demo[2]!=1 || demo[3]<1 || demo[3]>9 || DoomAccountBeginLevel(account,demo[2],demo[3]))){fprintf(stderr,"account loader accepts only E1 shareware DEMO1\n");return 2;}
    defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo(); zone_census(censusout,"load_level");
    if(account && DoomAccountCommitLevel(account)){fprintf(stderr,"cannot commit fixed account image\n");return 2;}
 +  if(import_pair_dir && (!account || (decoder_report?decoder_gate_import_pair(import_pair_dir,decoder_report,wad_hash,account):DoomAccountImportPublishedPair(account,import_pair_dir)))){fprintf(stderr,"cannot import published LS1/MP1 pair %s\n",import_pair_dir);return 2;}
++  if(publish_dir && (!account || DoomAccountCommitLevelStrict(account) || DoomAccountPublishPair(account,publish_dir,0,-1))){fprintf(stderr,"cannot publish initial LS1/MP1 pair %s\n",publish_dir);return 3;}
    if(account_level && (!account || DoomAccountWriteLevelState(account,account_level))){fprintf(stderr,"cannot write account level_state\n");return 2;}
    if(account_pool && (!account || DoomAccountWriteMobjPool(account,account_pool))){fprintf(stderr,"cannot write account mobj_pool\n");return 2;}
    /* G_DoPlayDemo consumes the 13-byte header.  Mutate the forwardmove
@@ -1395,7 +1396,7 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
    if(controller_path){
      if(!load || max_tics!=1 || DoomControllerRead(controller_path,(uint32_t)gametic,controller_command)
         || (size_t)(demo_p-demobuffer) > (size_t)demo_len-4
-@@ -115,7 +168,7 @@
+@@ -115,7 +169,7 @@
    if(parity_path||probe_path){render_scratch=malloc(DOOM_RENDER_SCRATCH_BYTES);if(!render_scratch){fprintf(stderr,"cannot allocate render scratch\n");return 2;}DoomRenderScratchInit(render_scratch,DOOM_RENDER_SCRATCH_BYTES,account);}
    if(probe_path){int refusal;uint8_t bad[64],probe[DOOM_RENDER_STRIP_ACCOUNT_BYTES],*p=0;size_t n=0;probeout=fopen(probe_path,"w");DoomStateEncode(&p,&n);memcpy(bad,p,n<sizeof(bad)?n:sizeof(bad));refusal=DoomRenderStrip(8,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"{\"strip_id_8\":%d,",refusal==DOOM_RENDER_REFUSE_STRIP);refusal=DoomRenderStrip(0,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES-1,probe,0,(uint32_t)gametic);fprintf(probeout,"\"short_scratch\":%d,",refusal==DOOM_RENDER_REFUSE_SCRATCH);bad[0]='X';refusal=DoomRenderStrip(0,bad,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"\"bad_state\":%d}\n",refusal==DOOM_RENDER_REFUSE_STATE);DoomStateFree(p);fclose(probeout);}
    out=fopen(frames,"w");if(!out){fprintf(stderr,"cannot open %s: %s\n",frames,strerror(errno));return 2;}if(statehashes){stateout=fopen(statehashes,"w");if(!stateout){fprintf(stderr,"cannot open %s: %s\n",statehashes,strerror(errno));fclose(out);return 2;}}
