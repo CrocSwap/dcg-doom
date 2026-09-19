@@ -586,6 +586,46 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _selected_publication_paths(publication: Path) -> tuple[int, Path, Path, bytes]:
+    """Resolve the generation named by the selector; never use directory order."""
+    manifest_path = publication / "publication.manifest"
+    manifest = manifest_path.read_bytes()
+    if len(manifest) != 96 or manifest[:8] != b"DOOM-PUB" or u32(manifest, 8) != 1:
+        raise Refusal("invalid retained publication selector")
+    generation = u32(manifest, 12)
+    level_path = publication / f"generation-{generation:08d}-ls1.bin"
+    pool_path = publication / f"generation-{generation:08d}-mp1.bin"
+    if not level_path.is_file() or not pool_path.is_file():
+        raise Refusal("publication selector names missing generation files")
+    return generation, level_path, pool_path, manifest
+
+
+def _mutate_selected_pool(
+    publication: Path, destination: Path, *, recompute_manifest_hash: bool
+) -> dict[str, Any]:
+    """Make a captured derivative of the manifest-selected MP1 generation."""
+    shutil.copytree(publication, destination)
+    generation, _, pool_path, manifest = _selected_publication_paths(destination)
+    mutated = bytearray(pool_path.read_bytes())
+    mutated[4096 + 16] ^= 1
+    pool_path.write_bytes(mutated)
+    if recompute_manifest_hash:
+        updated = bytearray(manifest)
+        updated[56:88] = hashlib.sha256(mutated).digest()
+        (destination / "publication.manifest").write_bytes(updated)
+    return {
+        "generation": generation,
+        "pool_path": str(pool_path),
+        "pool_sha256": _sha256_bytes(bytes(mutated)),
+        "manifest_pool_sha256": (destination / "publication.manifest").read_bytes()[56:88].hex(),
+        "manifest_hash_recomputed": recompute_manifest_hash,
+    }
+
+
 def _native_command(
     engine: Path,
     manifest: Path,
@@ -599,6 +639,7 @@ def _native_command(
     resave: Path | None = None,
     frames: Path | None = None,
     controller: Path | None = None,
+    probe: Path | None = None,
 ) -> list[str]:
     frames = frames or (report or manifest).with_suffix(".frames.jsonl")
     command = [
@@ -609,6 +650,8 @@ def _native_command(
         command += ["--load", str(image)]
     if controller is not None and image is not None:
         command += ["--controller", str(controller)]
+    if probe is not None:
+        command += ["-probe-refusals", str(probe)]
     if report is not None:
         command += ["--decoder-report", str(report), "--allocation-fail", str(allocation_fail)]
     if publish_dir is not None:
@@ -635,12 +678,13 @@ def _run_native(
     resave: Path | None = None,
     frames: Path | None = None,
     controller: Path | None = None,
+    probe: Path | None = None,
 ) -> dict[str, Any]:
     command = _native_command(
         engine, manifest, image, report, allocation_fail=allocation_fail,
         publish_dir=publish_dir, publish_fail_after=publish_fail_after,
         import_pair_dir=import_pair_dir, resave=resave, frames=frames,
-        controller=controller,
+        controller=controller, probe=probe,
     )
     completed = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
     result: dict[str, Any] = {
@@ -650,6 +694,8 @@ def _run_native(
     }
     if report and report.exists():
         result["report"] = json.loads(report.read_text())
+    if probe and probe.exists():
+        result["probe"] = json.loads(probe.read_text())
     return result
 
 
@@ -671,9 +717,9 @@ def _native_gate(
             "status": "unverified",
             "reason": "BASANOS_DOOM_ENGINE is not set to a built native executable",
             "allocation_failure_commit_unchanged": "unverified",
+            "acceptance": {"all": False, "native_execution": False},
             "commands": [],
         }
-    source_root = engine.parent
     with tempfile.TemporaryDirectory(prefix="doom-decoder-gate-") as scratch_name:
         scratch = Path(scratch_name)
         positive = scratch / "positive.st1"
@@ -685,6 +731,17 @@ def _native_gate(
         positive_result = first.get("report", {})
         if first["returncode"] != 0 or positive_result.get("decode_rc") != 0:
             return {"status": "failed", "commands": commands, "positive": positive_result}
+        v0_resaved_path = scratch / "v0-resaved.st1"
+        v0_resave = _run_native(
+            engine, manifest, positive, None,
+            resave=v0_resaved_path, frames=scratch / "v0-resave.frames.jsonl",
+        )
+        v0_resave["byte_identical"] = (
+            v0_resave.get("returncode") == 0
+            and v0_resaved_path.exists()
+            and v0_resaved_path.read_bytes() == positive.read_bytes()
+        )
+        commands.append(v0_resave)
         publication_failures: dict[str, bool] = {}
         for fail_after in range(3):
             failed_publication = scratch / f"publication-fail-{fail_after}"
@@ -732,27 +789,95 @@ def _native_gate(
                 and decoded.get("account_equal") is True
             )
         publication_import = None
-        publication_pool_mutation = None
+        publication_pool_mutation_old_hash = None
+        publication_pool_mutation_rehashed = None
+        selected_generation = None
         if publication.exists() and (publication / "publication.manifest").exists():
+            selected_generation, _, _, _ = _selected_publication_paths(publication)
             publication_import = _run_native(
                 engine, manifest, None, scratch / "publication-import.json", import_pair_dir=publication,
                 frames=scratch / "publication-import.frames.jsonl",
             )
             commands.append(publication_import)
-            bad_pair = scratch / "publication-pool-mutated"
-            shutil.copytree(publication, bad_pair)
-            mp1 = next(bad_pair.glob("generation-*-mp1.bin"))
-            mutated_pool = bytearray(mp1.read_bytes()); mutated_pool[4096 + 16] ^= 1; mp1.write_bytes(mutated_pool)
-            bad_report = scratch / "publication-pool-mutated.json"
-            publication_pool_mutation = _run_native(
-                engine, manifest, None, bad_report, import_pair_dir=bad_pair,
-                frames=scratch / "publication-pool-mutated.frames.jsonl",
+            old_hash_pair = scratch / "publication-pool-mutated-old-hash"
+            old_hash_info = _mutate_selected_pool(
+                publication, old_hash_pair, recompute_manifest_hash=False
             )
-            commands.append(publication_pool_mutation)
+            old_hash_report = scratch / "publication-pool-mutated-old-hash.json"
+            publication_pool_mutation_old_hash = _run_native(
+                engine, manifest, None, old_hash_report, import_pair_dir=old_hash_pair,
+                frames=scratch / "publication-pool-mutated-old-hash.frames.jsonl",
+            )
+            publication_pool_mutation_old_hash["mutation"] = old_hash_info
+            commands.append(publication_pool_mutation_old_hash)
+            rehashed_pair = scratch / "publication-pool-mutated-rehashed"
+            rehashed_info = _mutate_selected_pool(
+                publication, rehashed_pair, recompute_manifest_hash=True
+            )
+            rehashed_report = scratch / "publication-pool-mutated-rehashed.json"
+            publication_pool_mutation_rehashed = _run_native(
+                engine, manifest, None, rehashed_report, import_pair_dir=rehashed_pair,
+                frames=scratch / "publication-pool-mutated-rehashed.frames.jsonl",
+            )
+            publication_pool_mutation_rehashed["mutation"] = rehashed_info
+            commands.append(publication_pool_mutation_rehashed)
+        render_probe_path = scratch / "render-probe.json"
+        render_probe = _run_native(
+            engine, manifest, None, None, frames=scratch / "render-probe.frames.jsonl",
+            probe=render_probe_path,
+        )
+        commands.append(render_probe)
+        positive_accept = (
+            first["returncode"] == 0
+            and positive_result.get("decode_rc") == 0
+            and positive_result.get("graph_equal") is True
+            and positive_result.get("account_equal") is True
+        )
+        allocation_accept = bool(allocations) and all(allocations.values())
+        malformed_accept = bool(native_controls) and all(native_controls.values())
+        publication_accept = bool(publication_failures) and all(publication_failures.values())
+        v0_accept = v0_resave.get("byte_identical") is True
+        selected_pair_accept = bool(
+            publication_import
+            and publication_import.get("returncode") == 0
+            and publication_import.get("report", {}).get("pair_import_rc") == 0
+            and publication_import.get("report", {}).get("post_graph_sha256")
+        )
+        def pair_refusal(result: dict[str, Any] | None) -> bool:
+            report = (result or {}).get("report", {})
+            return bool(
+                result
+                and result.get("returncode", 0) != 0
+                and report.get("pair_import_rc") != 0
+                and report.get("graph_equal") is True
+                and report.get("account_equal") is True
+            )
+        render_accept = (
+            render_probe.get("returncode") == 0
+            and render_probe.get("probe") == {
+                "strip_id_8": 1,
+                "short_scratch": 1,
+                "bad_state": 1,
+            }
+        )
+        acceptance = {
+            "native_execution": True,
+            "positive_import": positive_accept,
+            "v0_valid_capture_resave": v0_accept,
+            "allocation_failures": allocation_accept,
+            "malformed_controls": malformed_accept,
+            "publication_failures": publication_accept,
+            "selected_pair_import_and_second_tick": selected_pair_accept,
+            "selected_mp1_old_manifest_hash": pair_refusal(publication_pool_mutation_old_hash),
+            "selected_mp1_recomputed_manifest_hash": pair_refusal(publication_pool_mutation_rehashed),
+            "render_caller_refusals": render_accept,
+        }
+        acceptance["all"] = all(acceptance.values())
         exe_hash = _sha256_path(engine)
         return {
             "status": "measured",
             "positive": positive_result,
+            "v0_resave": v0_resave,
             "allocation_failure_commit_unchanged": {
                 "failure_points": allocation_calls,
                 "all_unchanged": all(allocations.values()),
@@ -760,8 +885,12 @@ def _native_gate(
             },
             "negative_controls_refused": native_controls,
             "publication_import": publication_import,
-            "publication_pool_mutation": publication_pool_mutation,
+            "selected_generation": selected_generation,
+            "publication_pool_mutation_old_hash": publication_pool_mutation_old_hash,
+            "publication_pool_mutation_rehashed": publication_pool_mutation_rehashed,
             "publication_failure_between_writes": publication_failures,
+            "render_caller_probe": render_probe,
+            "acceptance": acceptance,
             "commands": commands,
             "executable_sha256": exe_hash,
             "wad_sha256": wad_hash.hex(),
@@ -769,7 +898,12 @@ def _native_gate(
         }
 
 
-def run_gate(capture_root: Path, *, engine: Path | None = None) -> dict[str, Any]:
+def run_gate(
+    capture_root: Path,
+    *,
+    engine: Path | None = None,
+    require_native: bool = False,
+) -> dict[str, Any]:
     account_dir = capture_root / "account"
     wad = _parse_wad_accounts(account_dir)
     episode, map_number = _demo_identity(wad)
@@ -815,8 +949,10 @@ def run_gate(capture_root: Path, *, engine: Path | None = None) -> dict[str, Any
         mismatched_shape_refused = True
     else:
         mismatched_shape_refused = False
-    native = _native_gate(capture_root, wad_line_sides, demo_bytes, controls,
-                          engine=engine or (Path(os.environ["BASANOS_DOOM_ENGINE"]) if os.environ.get("BASANOS_DOOM_ENGINE") else None), wad_hash=wad_hash)
+    native = _native_gate(
+        capture_root, wad_line_sides, demo_bytes, controls,
+        engine=engine, wad_hash=wad_hash,
+    )
     root = Path(__file__).resolve().parents[3]
     patch_path = root / "stunts/doom-host/patches/0009-doom-state-import-preflight.patch"
     return {
@@ -845,15 +981,21 @@ def run_gate(capture_root: Path, *, engine: Path | None = None) -> dict[str, Any
         "negative_controls_refused": refused,
         "lighting_coexistence_accepted": lighting_coexistence_accepted,
         "native": native,
+        "native_required": require_native,
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-root", type=Path, required=True)
+    parser.add_argument("--engine", type=Path, help="built native doom-headless executable")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    result = run_gate(args.capture_root)
+    engine = args.engine or (
+        Path(os.environ["BASANOS_DOOM_ENGINE"])
+        if os.environ.get("BASANOS_DOOM_ENGINE") else None
+    )
+    result = run_gate(args.capture_root, engine=engine, require_native=True)
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -871,12 +1013,10 @@ def main() -> int:
     if result["native"].get("status") == "measured" and not all(result["native"]["publication_failure_between_writes"].values()):
         return 1
     if result["native"].get("status") == "measured":
-        imported = result["native"].get("publication_import") or {}
-        mutated = result["native"].get("publication_pool_mutation") or {}
-        if imported.get("returncode") != 0 or mutated.get("returncode") == 0:
+        if result["native"].get("acceptance", {}).get("all") is not True:
             return 1
-        if mutated.get("report", {}).get("graph_equal") is not True or mutated.get("report", {}).get("account_equal") is not True:
-            return 1
+    elif result.get("native_required"):
+        return 1
     return 0
 
 

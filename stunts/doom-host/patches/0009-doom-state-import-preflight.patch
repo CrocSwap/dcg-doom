@@ -1339,7 +1339,7 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
  static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
  static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
  /* One census line per named phase: the non-purgeable zone bytes are the hard
-@@ -77,11 +78,62 @@
+@@ -77,11 +78,64 @@
     evicted; the extent is the highest live byte offset in the zone. */
  static void zone_census(FILE *f,const char *phase) { int fixed=0,purge=0,extent=0,zonesize=0; if(!f)return; Z_Census(&fixed,&purge,&extent,&zonesize); fprintf(f,"{\"phase\":\"%s\",\"fixed_bytes\":%d,\"purgeable_bytes\":%d,\"extent_bytes\":%d,\"zone_bytes\":%d}\n",phase,fixed,purge,extent,zonesize); fflush(f); }
  
@@ -1348,7 +1348,9 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
 +  FILE *f; long n; uint8_t *p;
 +  if (!path || !out || !out_bytes || !(f=fopen(path,"rb"))) return -1;
 +  if (fseek(f,0,SEEK_END) || (n=ftell(f)) < 0 || fseek(f,0,SEEK_SET)
-+      || n < 64 || n > 126976) { fclose(f); return -1; }
++      || n < 1 || n > 126976) { fclose(f); return -1; }
++  /* Keep short non-empty images on the decoder path so the gate can record
++     the refusal and pre/post graph/account bytes. */
 +  p=malloc((size_t)n); if(!p || fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return -1;}
 +  fclose(f); *out=p; *out_bytes=(size_t)n; return 0;
 +}
