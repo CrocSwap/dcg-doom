@@ -956,7 +956,15 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
  
  #include "doom_account.h"
  #include "doom_state.h"
-@@ -167,74 +170,81 @@
+@@ -47,6 +50,7 @@
+ static int hexval(int c){if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;}
+ static int hex32(const char*s,uint8_t out[32]){int i,a,b;for(i=0;i<32;i++){a=hexval((unsigned char)s[2*i]);b=hexval((unsigned char)s[2*i+1]);if(a<0||b<0)return -1;out[i]=(uint8_t)((a<<4)|b);}return s[64]==0?0:-1;}
+ static int hash_bytes(const void*p,size_t n,uint8_t out[32]){sha256_t s;shi(&s);shu(&s,p,n);shf(&s,out);return 0;}
++static int zero_bytes(const uint8_t *p, size_t n){size_t i;for(i=0;i<n;i++)if(p[i])return 0;return 1;}
+ static int hex_equal(const uint8_t a[32],const char*b){uint8_t x[32];return !hex32(b,x)&&!memcmp(a,x,32);}
+ 
+ struct doom_account_s { uint8_t *wad; size_t wad_bytes; uint8_t wad_hash[32]; uint8_t palette_hash[32]; uint8_t level[DOOM_ACCOUNT_LEVEL_BYTES]; uint8_t pool[DOOM_ACCOUNT_POOL_BYTES]; int level_started; };
+@@ -167,74 +171,81 @@
  
  static void p32(uint8_t *p, uint32_t x) { put32(p, x); }
  static void p16(uint8_t *p, uint16_t x) { p[0] = (uint8_t) x; p[1] = (uint8_t) (x >> 8); }
@@ -1087,7 +1095,7 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
  	p32(s + 112, (uint32_t) o->lastlook);
  	p16(s + 116, (uint16_t) o->spawnpoint.x);
  	p16(s + 118, (uint16_t) o->spawnpoint.y);
-@@ -242,38 +252,162 @@
+@@ -242,38 +253,177 @@
  	p16(s + 122, (uint16_t) o->spawnpoint.type);
  	p16(s + 124, (uint16_t) o->spawnpoint.options);
      }
@@ -1235,15 +1243,16 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
 +{
 +    uint8_t manifest[96], level[DOOM_ACCOUNT_LEVEL_BYTES];
 +    uint8_t pool[DOOM_ACCOUNT_POOL_BYTES], derived[DOOM_ACCOUNT_POOL_BYTES];
-+    uint8_t digest[32], *roundtrip = 0;
++    uint8_t digest[32], *roundtrip = 0, *before_image = 0;
 +    char level_path[1024], pool_path[1024], manifest_path[1024];
 +    uint32_t generation, image_bytes;
-+    size_t roundtrip_bytes;
++    size_t roundtrip_bytes, before_bytes;
 +    if (!a || !dir || snprintf(manifest_path, sizeof(manifest_path),
 +            "%s/publication.manifest", dir) >= (int)sizeof(manifest_path)
 +        || read_exact(manifest_path, manifest, sizeof(manifest))
 +        || memcmp(manifest, "DOOM-PUB1", 8) || at32(manifest + 8) != 1
-+        || at32(manifest + 16) != sizeof(level) || at32(manifest + 20) != sizeof(pool)) return -1;
++        || at32(manifest + 16) != sizeof(level) || at32(manifest + 20) != sizeof(pool)
++        || !zero_bytes(manifest + 88, 8)) return -1;
 +    generation = at32(manifest + 12);
 +    if (generation_path(dir, generation, 0, level_path, sizeof(level_path))
 +        || generation_path(dir, generation, 1, pool_path, sizeof(pool_path))
@@ -1253,23 +1262,37 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
 +    if (memcmp(level, "DOOM-LS1", 8) || at32(level + 8) != 1
 +        || at32(level + 12) != DOOM_ACCOUNT_LEVEL_HEADER_BYTES
 +        || at32(level + 16) != sizeof(level) || at32(level + 20) != DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET
-+        || at32(level + 24) != LEVEL_IMAGE_CAP || memcmp(level + 32, a->wad_hash, 32)
++        || at32(level + 24) != LEVEL_IMAGE_CAP || !zero_bytes(level + 100, 28)
++        || memcmp(level + 32, a->wad_hash, 32)
 +        || memcmp(pool, "DOOM-MP1", 8) || at32(pool + 8) != 1
 +        || at32(pool + 12) != DOOM_ACCOUNT_POOL_HEADER_BYTES || at32(pool + 16) != sizeof(pool)
++        || !zero_bytes(pool + 68, DOOM_ACCOUNT_POOL_HEADER_BYTES - 68)
 +        || memcmp(pool + 36, a->wad_hash, 32)) return -1;
 +    image_bytes = at32(level + 28);
 +    if (image_bytes > LEVEL_IMAGE_CAP || image_bytes < 64
++        || at32(level + 28) != at32(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET + 16)
++        || at32(level + 96) != at32(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET + 20)
 +        || memcmp(level + 64, (hash_bytes(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET,
 +             image_bytes, digest), digest), 32)) return -1;
-+    if (DoomStateDecodeStrict(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image_bytes)
-+        || DoomStateEncodeStrict(&roundtrip, &roundtrip_bytes)
++    if (DoomStateEncodeStrict(&before_image, &before_bytes)) return -1;
++    if (DoomStateDecodeStrict(level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image_bytes)) goto restore;
++    if (DoomStateEncodeStrict(&roundtrip, &roundtrip_bytes)
 +        || roundtrip_bytes != image_bytes || memcmp(roundtrip, level + DOOM_ACCOUNT_LEVEL_IMAGE_OFFSET, image_bytes)
 +        || fill_pool(derived, a) || memcmp(derived, pool, sizeof(pool)))
-+    { if (roundtrip) DoomStateFree(roundtrip); return -1; }
++        goto restore;
 +    DoomStateFree(roundtrip);
++    DoomStateFree(before_image);
 +    memcpy(a->level, level, sizeof(a->level));
 +    memcpy(a->pool, pool, sizeof(a->pool));
 +    return 0;
++restore:
++    if (roundtrip) DoomStateFree(roundtrip);
++    if (before_image)
++    {
++        (void)DoomStateDecodeStrict(before_image, before_bytes);
++        DoomStateFree(before_image);
++    }
++    return -1;
 +}
 +
  int DoomAccountWriteLevelState(const doom_account_t*a,const char*path){return a?write_image(path,a->level,sizeof(a->level)):-1;}
