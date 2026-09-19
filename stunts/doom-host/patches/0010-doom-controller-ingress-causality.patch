@@ -1,0 +1,119 @@
+Subject: [PATCH 0010] Add bounded controller ingress at G_Ticker
+
+The prior DOOM-CI1 adapter checked its bytes against the queued DEMO1
+command. Keep that legacy path for the captured-tick receipt, but add an
+explicitly versioned DOOM-CI2 one-shot ingress that supplies ticcmd_t at the
+actual G_Ticker command boundary. The host harness bounds it to one loaded
+state and one player; it is not an interactive or chain interface.
+
+diff --git a/linuxdoom-1.10/g_game.c b/linuxdoom-1.10/g_game.c
+--- a/linuxdoom-1.10/g_game.c
++++ b/linuxdoom-1.10/g_game.c
+@@ -71,4 +71,5 @@
+ #include "g_game.h"
+ 
++#include "doom_controller.h"
+ 
+ #define SAVEGAMESIZE	0x2c000
+@@ -586,1 +586,1 @@
+-	    if (demoplayback) 
++	    if (!DoomControllerApplyTiccmd(cmd) && demoplayback)
+diff --git a/linuxdoom-1.10/headless/doom_controller.h b/linuxdoom-1.10/headless/doom_controller.h
+--- a/linuxdoom-1.10/headless/doom_controller.h
++++ b/linuxdoom-1.10/headless/doom_controller.h
+@@ -4,6 +4,12 @@
+ #include <stdint.h>
++#include "d_ticcmd.h"
+ 
+ /* DOOM-CI1 v1: the four bytes are the captured ticcmd at byte 24. */
+ #define DOOM_CONTROLLER_BYTES 64
+ 
+ int DoomControllerRead(const char *, uint32_t, uint8_t[4]);
++
++/* DOOM-CI2 v1 is an explicit one-shot runtime ingress. Its four command
++ * bytes have the same LMP encoding, but are not compared with demo_p. */
++int DoomControllerReadIngress(const char *, uint32_t, uint8_t[4]);
++int DoomControllerArm(const uint8_t[4]);
++int DoomControllerApplyTiccmd(ticcmd_t *);
+diff --git a/linuxdoom-1.10/headless/doom_controller.c b/linuxdoom-1.10/headless/doom_controller.c
+--- a/linuxdoom-1.10/headless/doom_controller.c
++++ b/linuxdoom-1.10/headless/doom_controller.c
+@@ -2,4 +2,5 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <string.h>
++#include "d_ticcmd.h"
+ #include "doom_controller.h"
+@@ -13,1 +13,2 @@
+-int DoomControllerRead(const char *path, uint32_t expected_gametic, uint8_t out[4])
++static int read_account(const char *path, const char magic[8],
++                        uint32_t expected_gametic, uint8_t out[4])
+@@ -26,1 +26,1 @@
+-    if (extra != EOF || memcmp(b, "DOOM-CI1", 8)
++    if (extra != EOF || memcmp(b, magic, 8)
+@@ -31,3 +35,34 @@
+     memcpy(out, b + 24, 4);
+     return 0;
+ }
++
++int DoomControllerRead(const char *path, uint32_t expected_gametic, uint8_t out[4])
++{
++    return read_account(path, "DOOM-CI1", expected_gametic, out);
++}
++
++int DoomControllerReadIngress(const char *path, uint32_t expected_gametic,
++                              uint8_t out[4])
++{
++    return read_account(path, "DOOM-CI2", expected_gametic, out);
++}
++
++static int controller_armed;
++static uint8_t controller_command[4];
++
++int DoomControllerArm(const uint8_t command[4])
++{
++    if (!command)
++        return -1;
++    memcpy(controller_command, command, sizeof(controller_command));
++    controller_armed = 1;
++    return 0;
++}
++
++int DoomControllerApplyTiccmd(ticcmd_t *cmd)
++{
++    if (!controller_armed || !cmd)
++        return 0;
++    cmd->forwardmove_m = (char)controller_command[0];
++    cmd->sidemove = (char)controller_command[1];
++    cmd->angleturn = ((unsigned char)controller_command[2]) << 8;
++    cmd->consistancy_m = 0;
++    cmd->chatchar = 0;
++    cmd->buttons = controller_command[3];
++    controller_armed = 0;
++    return 1;
++}
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -73,1 +73,1 @@
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--controller-ingress FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR]\n",argv0); }
+@@ -129,1 +129,1 @@
+-  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller");
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller"), *controller_ingress_path=arg_after(argc,argv,"--controller-ingress");
+@@ -165,1 +165,11 @@
+   }
++  if(has_arg(argc,argv,"--controller-ingress") && !controller_ingress_path){
++    fprintf(stderr,"--controller-ingress requires a DOOM-CI2 account path\n");
++    return 2;
++  }
++  if(controller_path && controller_ingress_path){
++    fprintf(stderr,"--controller and --controller-ingress are mutually exclusive\n");
++    return 2;
++  }
++  if(controller_ingress_path){
++    if(!load || max_tics!=1 || DoomControllerReadIngress(controller_ingress_path,(uint32_t)gametic,controller_command) || DoomControllerArm(controller_command)){
++      fprintf(stderr,"refusing controller ingress: bounded DOOM-CI2 input is invalid\n");
++      return 2;
++    }
++  }

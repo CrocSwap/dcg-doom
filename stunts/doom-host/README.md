@@ -59,3 +59,16 @@ scratch reserves its 128-B header, a 64,000-B full-frame seed, and a 64,000-B
 private render framebuffer. The host call forks a copy-on-write child so
 vanilla renderer globals and decoded thinker allocations cannot alter the
 ordinary replay; this is a host parity/cost tool, not an SBF measurement.
+
+Patch `0010` adds the bounded native controller-causality harness. The legacy
+`--controller`/`DOOM-CI1` path remains a captured-command equality check for
+the retained tick receipt. The new `--controller-ingress` path accepts only a
+producer-emitted `DOOM-CI2` v1 account, arms one command, and supplies its
+`ticcmd_t` at the real `G_Ticker` ingress for exactly one loaded tic. The
+producer is `tools/doom_controller_producer.py`; it derives the base command
+from the retained DEMO1 lump and can emit a controlled signed forward-move
+variant. `scripts/doom_controller_causality_gate.py` retains the controller
+bytes, state/frame hashes, saved states, executable hash, and ordered patch
+hashes while checking same-input repeatability, changed-input effect, and
+absent/malformed refusal. This is a host-only gameplay/control capability
+demonstration, not an interactive, SBF, validator, chain, or DCG claim.

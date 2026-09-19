@@ -22,7 +22,7 @@ git -C "$src" checkout --detach --force a77dfb96cb91780ca334d0d4cfd86957558007e0
 git -C "$src" clean -fdx -- linuxdoom-1.10/headless linuxdoom-1.10/doom_wrap.h
 for patch in "$root"/stunts/doom-host/patches/*.patch; do
   case "$patch" in
-    *0005-doom-reentrant-strips.patch|*0008-doom-captured-controller-tick.patch)
+    *0005-doom-reentrant-strips.patch|*0008-doom-captured-controller-tick.patch|*0010-doom-controller-ingress-causality.patch)
       git -C "$src" apply --check --unidiff-zero --recount "$patch"
       git -C "$src" apply --unidiff-zero --recount "$patch"
       ;;
