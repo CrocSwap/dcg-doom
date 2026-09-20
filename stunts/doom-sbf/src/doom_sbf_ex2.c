@@ -309,6 +309,13 @@ extern int doom_sbf_bind_arena(void *base, unsigned long bytes,
 extern int doom_sbf_arena_exhausted(void);
 extern unsigned long doom_sbf_arena_high_water(void);
 
+#ifdef DOOM_SBF_PHASE_PROFILE
+extern void doom_sbf_phase_marker(unsigned long phase);
+#define DOOM_PHASE(phase) doom_sbf_phase_marker((unsigned long)(phase))
+#else
+#define DOOM_PHASE(phase) ((void)0)
+#endif
+
 static int ex2_sbf_u32(const uint8_t *p)
 {
     return (int)((uint32_t)p[0] | ((uint32_t)p[1] << 8)
@@ -404,12 +411,15 @@ int doom_engine_ex2_sbf_tic_entry(
     /* The Rust side places a bounded low-arena carrier immediately after the
      * copied WAD.  The arena is rebound before any engine allocator call, and
      * all subsequent malloc/realloc/free operations are context-local. */
+    DOOM_PHASE(10); /* context/bootstrap reset begins */
     memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+    DOOM_PHASE(11); /* context reset complete */
     doom_ctx_init();
     if (!doom_sbf_bind_arena(bootstrap, bootstrap_bytes, DOOM_ZONE_BYTES))
 	return EX2_REFUSE_ARENA;
     low_arena = (uint8_t *)calloc(1, EX2_LOW_ARENA_BYTES);
     if (!low_arena) return EX2_REFUSE_RESOURCE;
+    DOOM_PHASE(12); /* one-megabyte bootstrap carrier zeroed */
     if (!doom_sbf_bind_arena(low_arena, EX2_LOW_ARENA_BYTES, DOOM_ZONE_BYTES))
 	return EX2_REFUSE_ARENA;
     gamemode = shareware;
@@ -421,21 +431,29 @@ int doom_engine_ex2_sbf_tic_entry(
     myargc = 0;
     myargv = 0;
     Z_Init();
+    DOOM_PHASE(20);
     W_InitAccountImage(wad_image, (int)wad_bytes);
+    DOOM_PHASE(30);
     V_Init();
     R_Init();
+    DOOM_PHASE(40);
     R_ExecuteSetViewSize();
+    DOOM_PHASE(45);
     P_Init();
+    DOOM_PHASE(50);
     lump = W_GetNumForName("DEMO1");
     demo_len = W_LumpLength(lump);
     if (demo_len < 17) return EX2_REFUSE_RESOURCE;
     demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+    DOOM_PHASE(60);
     defdemoname = "DEMO1";
     demobuffer = demo;
     demo_p = demo;
     G_DoPlayDemo();
+    DOOM_PHASE(70);
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
     if (DoomStateDecode(state, (size_t)state_len)) return EX2_REFUSE_STATE;
+    DOOM_PHASE(80);
     if (DoomControllerArmV2(controller + 24)) return EX2_REFUSE_CONTROLLER;
 
     derived = (uint8_t *)malloc(EX2_POOL_BYTES);
@@ -444,12 +462,14 @@ int doom_engine_ex2_sbf_tic_entry(
         return EX2_REFUSE_POOL;
     if (DoomControllerValidateCapturedDemoCursor(demo_p))
         return EX2_REFUSE_CONTROLLER;
+    DOOM_PHASE(85);
 
     /* This is the smallest real continuation: imported ST1, reconstructed
      * thinker graph, captured MP1 recheck, producer CI2, then actual G_Ticker.
      * There is intentionally no renderer call in this boundary. */
     G_Ticker();
     gametic++;
+    DOOM_PHASE(90);
     if (doom_sbf_arena_exhausted())
         return EX2_REFUSE_ARENA;
     if (DoomStateEncode(&encoded, &encoded_bytes)
@@ -463,6 +483,7 @@ int doom_engine_ex2_sbf_tic_entry(
     *state_out_len = encoded_bytes;
     *mirror_out_len = EX2_POOL_BYTES;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    DOOM_PHASE(100);
     return EX2_OK;
 }
 

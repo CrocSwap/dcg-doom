@@ -391,6 +391,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZERO_BSS_PROBE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DIAGNOSTIC_PROFILE");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=AR");
@@ -504,9 +505,26 @@ fn compile_ctx_engine(target: &str) {
     // untouched -- changing its codegen would silently shift the retained
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
+    let diagnostic_profile = is_sbf && env::var("CARGO_FEATURE_DIAGNOSTIC_PROFILE").is_ok();
     let out_dir =
         PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
-    write_identity(&manifest, &out_dir, Some(&tree), target, is_sbf, common);
+    let identity_flags: Vec<&str> = if diagnostic_profile {
+        common
+            .iter()
+            .copied()
+            .chain(["-DDOOM_SBF_PHASE_PROFILE"])
+            .collect()
+    } else {
+        common.to_vec()
+    };
+    write_identity(
+        &manifest,
+        &out_dir,
+        Some(&tree),
+        target,
+        is_sbf,
+        &identity_flags,
+    );
     let mut engine = cc::Build::new();
     let mut ctx = cc::Build::new();
     let mut platform = cc::Build::new();
@@ -661,6 +679,9 @@ fn compile_ctx_engine(target: &str) {
             .file(controller)
             .file(manifest.join("src/doom_sbf_account_pool.c"))
             .file(manifest.join("src/doom_sbf_ex2.c"));
+        if diagnostic_profile {
+            codec.define("DOOM_SBF_PHASE_PROFILE", None);
+        }
         codec.compile("doom_engine_ctx_codec");
         println!(
             "cargo:rerun-if-changed={}",

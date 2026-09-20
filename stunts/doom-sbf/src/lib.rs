@@ -57,6 +57,32 @@ pub const CTX_GUARD_REFUSED: u32 = 199;
 #[cfg(feature = "ctx-engine")]
 pub const CTX_MIN_BYTES: usize = 3_440_920 + 24;
 
+/// Numeric phase-log magic used only by the bounded diagnostic SBF image.
+/// The feature changes the image identity; no normal or positive qualification
+/// run may use this instrumentation.
+#[cfg(feature = "diagnostic-profile")]
+const DIAGNOSTIC_PHASE_MAGIC: u64 = 0x444f_4f4d_5048_4153;
+
+#[cfg(feature = "diagnostic-profile")]
+#[no_mangle]
+pub extern "C" fn doom_sbf_phase_marker(phase: u64) {
+    solana_program::log::sol_log_64(
+        DIAGNOSTIC_PHASE_MAGIC,
+        phase,
+        solana_program::compute_units::sol_remaining_compute_units(),
+        0,
+        0,
+    );
+}
+
+#[inline(always)]
+pub(crate) fn diagnostic_phase(phase: u64) {
+    #[cfg(feature = "diagnostic-profile")]
+    doom_sbf_phase_marker(phase);
+    #[cfg(not(feature = "diagnostic-profile"))]
+    let _ = phase;
+}
+
 unsafe extern "C" {
     fn doom_draw_columns(framebuffer: *mut u8, state: *mut u8);
     fn doom_draw_spans(framebuffer: *mut u8, state: *mut u8);

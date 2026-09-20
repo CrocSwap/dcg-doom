@@ -172,6 +172,19 @@ impl<'a> Envelope<'a> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Envelope<'_>, DecodeError> {
+    decode_with_identity(bytes, &IMAGE_ID, &ABI_ID)
+}
+
+/// Decode a retained envelope against an explicitly pinned capture identity.
+/// This is used only by the diagnostic runner when the runner source itself
+/// changed after the native capture was made. It does not rewrite the
+/// envelope or relax any structural check; callers pin the capture image and
+/// ABI IDs separately.
+pub fn decode_with_identity<'a>(
+    bytes: &'a [u8],
+    expected_image_id: &[u8; 32],
+    expected_abi_id: &[u8; 32],
+) -> Result<Envelope<'a>, DecodeError> {
     if bytes.len() < STATE_OFFSET || &bytes[..8] != MAGIC {
         return Err(if bytes.len() < STATE_OFFSET {
             DecodeError::Short
@@ -195,7 +208,7 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope<'_>, DecodeError> {
     if u32_at(bytes, 24) != SCHEMA {
         return Err(DecodeError::Schema);
     }
-    if bytes[32..64] != IMAGE_ID || bytes[64..96] != ABI_ID {
+    if bytes[32..64] != expected_image_id[..] || bytes[64..96] != expected_abi_id[..] {
         return Err(DecodeError::Identity);
     }
     if bytes[136..256].iter().any(|&b| b != 0)

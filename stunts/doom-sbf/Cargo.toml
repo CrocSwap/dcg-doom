@@ -32,6 +32,10 @@ zero-bss-probe = []
 # compile-time constant DOOM_CTX (guarded).  Needs DOOM_SCRATCH pointing at
 # the build.sh tree (doom-src at patches 0001-0007) at build time.
 ctx-engine = []
+# Adds bounded numeric phase markers to the SBF image. This is diagnostic
+# instrumentation only: it changes the image identity and must never be used
+# for a positive qualification claim.
+diagnostic-profile = []
 
 [dependencies]
 solana-program = "=2.3.0"

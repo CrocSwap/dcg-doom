@@ -43,6 +43,12 @@ const WAD_ACCOUNT_SHA256: [&str; ex2_sbf::WAD_ACCOUNT_COUNT] = [
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
 const INPUT_EX2_SHA256: &str = "00fd78617ee51a925b7300db46c3c0452324c3ff362f2f6f6dda6bbc96fca327";
 const OUTPUT_EX2_SHA256: &str = "9cd2e3d4df76dc49e6a6d2ccd3a0a9e9a20a2419c84940bbe70bde720ce2014b";
+// The native oracle predates this diagnostic source edit. Keep its identity
+// explicit rather than silently accepting the current host identity.
+const NATIVE_CAPTURE_IMAGE_ID: &str =
+    "bdf2568ce2d9aa82f2437d20a5734323896d88477fd1d12f71c2cac7afc0c204";
+const NATIVE_CAPTURE_ABI_ID: &str =
+    "75d6d58d0e122f8d58483740015f98deb7b32887253f6945a7df2e29c3eba365";
 
 const DRIVER_SOURCE: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ex2_sbf.rs"));
@@ -162,14 +168,18 @@ fn receipt_json(
     diagnostic_units: Option<u64>,
     control: &str,
     normal_error: Option<&str>,
+    diagnostic_error: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let normal_error = normal_error
+        .map(|error| format!("{error:?}"))
+        .unwrap_or_else(|| "null".to_owned());
+    let diagnostic_error = diagnostic_error
         .map(|error| format!("{error:?}"))
         .unwrap_or_else(|| "null".to_owned());
     fs::write(
         receipt.join("report.json"),
         format!(
-            "{{\n  \"status\": {:?},\n  \"acceptance\": \"state-only-real-tic\",\n  \"first_blocker\": {:?},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"normal_units\": {:?},\n  \"normal_error\": {},\n  \"diagnostic_limit\": {},\n  \"diagnostic_units\": {:?},\n  \"malformed_controller_refusal\": {:?},\n  \"identity\": \"identity.json\",\n  \"positive_fixture\": \"retained native EX2 receipt plus retained WAD account images\"\n}}\n",
+            "{{\n  \"status\": {:?},\n  \"acceptance\": \"state-only-real-tic\",\n  \"first_blocker\": {:?},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"normal_units\": {:?},\n  \"normal_error\": {},\n  \"diagnostic_limit\": {},\n  \"diagnostic_units\": {:?},\n  \"diagnostic_error\": {},\n  \"malformed_controller_refusal\": {:?},\n  \"identity\": \"identity.json\",\n  \"positive_fixture\": \"retained native EX2 receipt plus retained WAD account images\"\n}}\n",
             status,
             first_blocker,
             NORMAL_LIMIT,
@@ -178,6 +188,7 @@ fn receipt_json(
             normal_error,
             DIAGNOSTIC_LIMIT,
             diagnostic_units,
+            diagnostic_error,
             control,
         ),
     )?;
@@ -336,6 +347,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sbf_manifest_bytes = read(&expected_manifest_path)?;
     let actual_manifest_sha256 = digest_hex(&sbf_manifest_bytes);
     let sbf_manifest = std::str::from_utf8(&sbf_manifest_bytes)?;
+    let diagnostic_profile = sbf_manifest.contains("-DDOOM_SBF_PHASE_PROFILE");
+    if diagnostic_profile && env::var_os("DOOM_SBF_ALLOW_DIAGNOSTIC_PROFILE").is_none() {
+        return Err(
+            "refusing diagnostic-profile SBF image without DOOM_SBF_ALLOW_DIAGNOSTIC_PROFILE=1"
+                .into(),
+        );
+    }
     let expected_abi_descriptor = format!("\"sbf_abi_descriptor\": {:?}", ex2::SBF_ABI_DESCRIPTOR);
     if expected_manifest_sha256 != actual_manifest_sha256
         || !sbf_manifest.contains("\"sbf\": true")
@@ -379,8 +397,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let input = ex2::decode(&input_wire)?;
-    let expected = ex2::decode(&output_wire)?;
+    let native_capture_image_id = parse_digest(NATIVE_CAPTURE_IMAGE_ID, "native capture image ID")?;
+    let native_capture_abi_id = parse_digest(NATIVE_CAPTURE_ABI_ID, "native capture ABI ID")?;
+    let input = ex2::decode_with_identity(
+        &input_wire,
+        &native_capture_image_id,
+        &native_capture_abi_id,
+    )?;
+    let expected = ex2::decode_with_identity(
+        &output_wire,
+        &native_capture_image_id,
+        &native_capture_abi_id,
+    )?;
     if input.state.len() > ex2_sbf::STATE_MAX_BYTES
         || input.mirror.len() != ex2_sbf::MIRROR_BYTES
         || input.controller.len() != ex2_sbf::CONTROLLER_BYTES
@@ -461,14 +489,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let (mut client, payer, _) = bank.start().await;
 
-    let bad = execute(
-        &mut client,
-        &payer,
-        BAD_CONTROLLER,
-        &request,
-        NORMAL_LIMIT,
-    )
-    .await?;
+    let bad = execute(&mut client, &payer, BAD_CONTROLLER, &request, NORMAL_LIMIT).await?;
     let control = format!("{bad:?}");
     if !control.contains("InvalidAccountData") {
         receipt_json(
@@ -478,6 +499,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None,
             None,
             &control,
+            None,
             None,
         )?;
         return Err(format!("malformed controller was not refused: {control}").into());
@@ -491,18 +513,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("malformed-controller control changed state bytes".into());
     }
 
-    let normal = execute(
-        &mut client,
-        &payer,
-        CONTROLLER,
-        &request,
-        NORMAL_LIMIT,
-    )
-    .await?;
+    let normal = execute(&mut client, &payer, CONTROLLER, &request, NORMAL_LIMIT).await?;
     let normal_units = normal
         .metadata
         .as_ref()
         .map(|metadata| metadata.compute_units_consumed);
+    if diagnostic_profile && normal.result.is_ok() {
+        receipt_json(
+            &receipt,
+            "failed-diagnostic-profile-positive-disallowed",
+            "diagnostic-profile-image-is-ineligible-for-qualification",
+            normal_units,
+            None,
+            &control,
+            None,
+            None,
+        )?;
+        return Err(
+            "diagnostic-profile SBF image produced output; no positive qualification is allowed"
+                .into(),
+        );
+    }
     if normal.result.is_ok() {
         let state = client
             .get_account(STATE)
@@ -524,6 +555,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 None,
                 &control,
                 None,
+                None,
             )?;
             return Err("real SBF tic output differs from retained native output".into());
         }
@@ -535,6 +567,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 None,
                 None,
                 &control,
+                None,
                 None,
             )?;
             return Err("normal transaction succeeded without consumed-CU metadata".into());
@@ -548,6 +581,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 None,
                 &control,
                 None,
+                None,
             )?;
             return Err(format!(
                 "real SBF tic exceeded qualification threshold: {units} > {QUALIFICATION_MAX_UNITS} CU"
@@ -555,7 +589,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         let status = "measured-accepted-normal-budget";
-        receipt_json(&receipt, status, "none", Some(units), None, &control, None)?;
+        receipt_json(
+            &receipt,
+            status,
+            "none",
+            Some(units),
+            None,
+            &control,
+            None,
+            None,
+        )?;
         fs::write(receipt.join("output-state.st1"), output_state)?;
         fs::write(receipt.join("output-mirror.mp1"), &mirror)?;
         println!(
@@ -599,6 +642,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             units,
             &control,
             Some(&normal_error),
+            Some(&format!("{diagnostic:?}")),
         )?;
         Some(units.unwrap_or(0))
     } else {
@@ -610,6 +654,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None,
             &control,
             Some(&normal_error),
+            None,
         )?;
         None
     };

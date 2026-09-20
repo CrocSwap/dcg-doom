@@ -47,6 +47,42 @@ pub const WAD_IMAGE_OFFSET: usize = super::CTX_MIN_BYTES;
 pub const BOOTSTRAP_OFFSET: usize = align16_const(WAD_IMAGE_OFFSET + WAD_IMAGE_BYTES);
 pub const CONTEXT_BYTES: usize = BOOTSTRAP_OFFSET + BOOTSTRAP_BYTES;
 
+// Rust/account-side phases. C-side phases use the same numeric log contract;
+// the experiment report maps these IDs to names and uses remaining-CU deltas.
+pub const PHASE_RUST_VALIDATION_START: u64 = 1;
+pub const PHASE_RUST_WAD_PADDING_DONE: u64 = 2;
+pub const PHASE_RUST_WAD_COPY_START: u64 = 3;
+pub const PHASE_RUST_WAD_COPY_DONE: u64 = 4;
+pub const PHASE_C_ENTRY: u64 = 5;
+pub const PHASE_RUST_ACCOUNT_SHAPE_DONE: u64 = 6;
+pub const PHASE_RUST_STATE_MIRROR_DONE: u64 = 7;
+pub const PHASE_RUST_CONTROLLER_DONE: u64 = 8;
+pub const PHASE_RUST_WAD_ACCOUNT_0_DONE: u64 = 13;
+pub const PHASE_RUST_WAD_ACCOUNT_1_DONE: u64 = 14;
+pub const PHASE_RUST_WAD_ACCOUNT_2_DONE: u64 = 15;
+pub const PHASE_RUST_WAD_ACCOUNT_3_DONE: u64 = 16;
+pub const PHASE_RUST_WAD_ACCOUNT_4_DONE: u64 = 17;
+pub const PHASE_RUST_WAD_VALIDATION_DONE: u64 = 18;
+pub const PHASE_CTX_MEMZERO_START: u64 = 10;
+pub const PHASE_CTX_MEMZERO_DONE: u64 = 11;
+pub const PHASE_BOOTSTRAP_MEMZERO_DONE: u64 = 12;
+pub const PHASE_Z_INIT_DONE: u64 = 20;
+pub const PHASE_WAD_BIND_DONE: u64 = 30;
+pub const PHASE_R_INIT_DONE: u64 = 40;
+pub const PHASE_VIEW_SIZE_DONE: u64 = 45;
+pub const PHASE_P_INIT_DONE: u64 = 50;
+pub const PHASE_WAD_LOOKUP_DONE: u64 = 60;
+pub const PHASE_G_DO_PLAY_DEMO_DONE: u64 = 70;
+pub const PHASE_DECODE_DONE: u64 = 80;
+pub const PHASE_POOL_CHECK_DONE: u64 = 85;
+pub const PHASE_G_TICKER_DONE: u64 = 90;
+pub const PHASE_EXPORT_DONE: u64 = 100;
+pub const PHASE_RUST_WAD_COPY_ACCOUNT_0_DONE: u64 = 110;
+pub const PHASE_RUST_WAD_COPY_ACCOUNT_1_DONE: u64 = 111;
+pub const PHASE_RUST_WAD_COPY_ACCOUNT_2_DONE: u64 = 112;
+pub const PHASE_RUST_WAD_COPY_ACCOUNT_3_DONE: u64 = 113;
+pub const PHASE_RUST_WAD_COPY_ACCOUNT_4_DONE: u64 = 114;
+
 const CONTROLLER_HEADER_BYTES: usize = 28;
 
 const fn align16_const(value: usize) -> usize {
@@ -110,6 +146,17 @@ fn expected_bytes(index: usize) -> usize {
     }
 }
 
+fn has_nonzero_byte(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(8);
+    if chunks
+        .by_ref()
+        .any(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) != 0)
+    {
+        return true;
+    }
+    chunks.remainder().iter().any(|&byte| byte != 0)
+}
+
 fn validate_wad_account(account: &AccountInfo, ordinal: usize) -> ProgramResult {
     let data = account.try_borrow_data()?;
     if &data[..8] != b"DOOM-WC1"
@@ -122,13 +169,29 @@ fn validate_wad_account(account: &AccountInfo, ordinal: usize) -> ProgramResult 
     }
     let payload_bytes = u32_at(&data, 24) as usize;
     if payload_bytes > WAD_ACCOUNT_BYTES - WAD_HEADER_BYTES
-        || data[WAD_HEADER_BYTES + payload_bytes..]
-            .iter()
-            .any(|&byte| byte != 0)
+        || has_nonzero_byte(&data[WAD_HEADER_BYTES + payload_bytes..])
     {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_nonzero_byte;
+
+    #[test]
+    fn zero_padding_guard_checks_words_and_tail() {
+        assert!(!has_nonzero_byte(&[0; 24]));
+
+        let mut word = [0; 24];
+        word[15] = 1;
+        assert!(has_nonzero_byte(&word));
+
+        let mut tail = [0; 23];
+        tail[22] = 1;
+        assert!(has_nonzero_byte(&tail));
+    }
 }
 
 fn validate_state(account: &AccountInfo, expected_len: usize) -> ProgramResult {
@@ -197,8 +260,10 @@ fn validate_accounts(
             return Err(ProgramError::InvalidAccountData);
         }
     }
+    super::diagnostic_phase(PHASE_RUST_ACCOUNT_SHAPE_DONE);
     validate_state(&accounts[STATE_ACCOUNT], request.state_len)?;
     validate_mirror(&accounts[MIRROR_ACCOUNT])?;
+    super::diagnostic_phase(PHASE_RUST_STATE_MIRROR_DONE);
     let state = accounts[STATE_ACCOUNT].try_borrow_data()?;
     let gametic = u32_at(&state, 20);
     drop(state);
@@ -207,9 +272,12 @@ fn validate_accounts(
     // bounded under the normal CU request; valid inputs still receive the
     // full account-image and padding validation below.
     validate_controller(&accounts[CONTROLLER_ACCOUNT], gametic)?;
+    super::diagnostic_phase(PHASE_RUST_CONTROLLER_DONE);
     for ordinal in 0..WAD_ACCOUNT_COUNT {
         validate_wad_account(&accounts[WAD_FIRST_ACCOUNT + ordinal], ordinal)?;
+        super::diagnostic_phase(13 + ordinal as u64);
     }
+    super::diagnostic_phase(PHASE_RUST_WAD_VALIDATION_DONE);
     Ok(())
 }
 
@@ -244,7 +312,9 @@ pub fn process(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let request = Request::decode(instruction_data)?;
+    super::diagnostic_phase(PHASE_RUST_VALIDATION_START);
     validate_accounts(program, accounts, request)?;
+    super::diagnostic_phase(PHASE_RUST_WAD_PADDING_DONE);
 
     let mut context = accounts[CONTEXT_ACCOUNT].try_borrow_mut_data()?;
     let wad_start = WAD_IMAGE_OFFSET;
@@ -259,16 +329,19 @@ pub fn process(
         return Err(ProgramError::InvalidAccountData);
     }
     let mut cursor = wad_start;
+    super::diagnostic_phase(PHASE_RUST_WAD_COPY_START);
     for ordinal in 0..WAD_ACCOUNT_COUNT {
         let source = accounts[WAD_FIRST_ACCOUNT + ordinal].try_borrow_data()?;
         let payload_len = u32_at(&source, 24) as usize;
         context[cursor..cursor + payload_len]
             .copy_from_slice(&source[WAD_HEADER_BYTES..WAD_HEADER_BYTES + payload_len]);
         cursor += payload_len;
+        super::diagnostic_phase(110 + ordinal as u64);
     }
     if cursor != wad_end {
         return Err(ProgramError::InvalidAccountData);
     }
+    super::diagnostic_phase(PHASE_RUST_WAD_COPY_DONE);
     let (_, context_tail) = context.split_at_mut(wad_start);
     let (wad_image, after_wad) = context_tail.split_at_mut(request.wad_bytes);
     let (_alignment_gap, bootstrap_tail) = after_wad.split_at_mut(bootstrap_start - wad_end);
@@ -283,6 +356,7 @@ pub fn process(
     let mut state_out_len = 0usize;
     let mut mirror_out_len = 0usize;
     let mut arena_high_water = 0usize;
+    super::diagnostic_phase(PHASE_C_ENTRY);
     let rc = unsafe {
         doom_engine_ex2_sbf_tic_entry(
             context_ptr,
