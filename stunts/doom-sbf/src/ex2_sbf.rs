@@ -208,7 +208,7 @@ fn validate_accounts(
     validate_controller(&accounts[CONTROLLER_ACCOUNT], gametic)
 }
 
-#[cfg(feature = "ctx-engine")]
+#[cfg(all(feature = "ctx-engine", target_os = "solana"))]
 unsafe extern "C" {
     fn doom_engine_ex2_sbf_tic_entry(
         context: *const u8,
@@ -232,7 +232,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-#[cfg(feature = "ctx-engine")]
+#[cfg(all(feature = "ctx-engine", target_os = "solana"))]
 pub fn process(
     program: &Pubkey,
     accounts: &[AccountInfo],
@@ -323,4 +323,19 @@ pub fn process(
     context[CTX_STRUCT_BYTES..CTX_STRUCT_BYTES + 8]
         .copy_from_slice(&(arena_high_water as u64).to_le_bytes());
     Ok(())
+}
+
+/// The ProgramTest driver is a host binary and must never execute this seam
+/// through a native processor.  Keep the host library linkable while making
+/// that accidental path an explicit legacy refusal; the real implementation
+/// above is compiled only for the SBF target and is reached by loader
+/// dispatch.  `prefer_bpf(true)` in `driver/src/bin/ex2_sbf.rs` is therefore a
+/// required part of the positive gate, not an optimization hint.
+#[cfg(all(feature = "ctx-engine", not(target_os = "solana")))]
+pub fn process(
+    _program: &Pubkey,
+    _accounts: &[AccountInfo],
+    _instruction_data: &[u8],
+) -> ProgramResult {
+    Err(ProgramError::Custom(231))
 }

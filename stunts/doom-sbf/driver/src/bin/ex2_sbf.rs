@@ -41,8 +41,8 @@ const WAD_ACCOUNT_SHA256: [&str; ex2_sbf::WAD_ACCOUNT_COUNT] = [
     "ef64b046aaf61eeab85b3d9f10edc564f9b4b640c341d10afc6a9dd67dddd6ca",
 ];
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-const INPUT_EX2_SHA256: &str = "52aefef5e630ab2dfeee575afaa4040973820a53c060010665d1ae307d20f182";
-const OUTPUT_EX2_SHA256: &str = "4c31ef6b17f79fe4f3df688afa516f6dfcdae899ba3e5fe2037d4a01ec72b02c";
+const INPUT_EX2_SHA256: &str = "e9e35b86c720f0a6027388a0e7195081011d56699e2f9482d1535c35bdcaf9d7";
+const OUTPUT_EX2_SHA256: &str = "87ee98710fa3f3492b162067ee481c170451cf866d53641544cdd8a14218f307";
 
 const DRIVER_SOURCE: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ex2_sbf.rs"));
@@ -212,6 +212,8 @@ fn write_identity(
     expected_image_sha256: &str,
     actual_image_sha256: &str,
     expected_manifest_sha256: &str,
+    actual_manifest_sha256: &str,
+    manifest_path: &Path,
     expected_sbf_abi_id: &str,
     expected_driver_sha256: &str,
     wad_hashes: &[String],
@@ -237,7 +239,8 @@ fn write_identity(
     fs::write(
         receipt.join("identity.json"),
         format!(
-            "{{\n  \"image_sha256_expected\": \"{expected_image_sha256}\",\n  \"image_sha256_actual\": \"{actual_image_sha256}\",\n  \"source_manifest_sha256_expected\": \"{expected_manifest_sha256}\",\n  \"source_manifest_sha256_actual\": \"{}\",\n  \"sbf_abi_id_expected\": \"{expected_sbf_abi_id}\",\n  \"sbf_abi_id_actual\": \"{}\",\n  \"sbf_abi_descriptor\": {:?},\n  \"driver_source_sha256_expected\": \"{expected_driver_sha256}\",\n  \"driver_source_sha256_actual\": \"{}\",\n  \"account_manifest_sha256\": \"{ACCOUNT_MANIFEST_SHA256}\",\n  \"wad_accounts\": [\n{wad_rows}  ],\n  \"wad_concat_sha256\": \"{wad_concat_sha256}\",\n  \"native_input_ex2_sha256\": \"{input_sha256}\",\n  \"native_output_ex2_sha256\": \"{output_sha256}\",\n  \"capture_mirror_mp1_sha256\": \"{capture_mirror_sha256}\"\n}}\n",
+            "{{\n  \"image_sha256_expected\": \"{expected_image_sha256}\",\n  \"image_sha256_actual\": \"{actual_image_sha256}\",\n  \"source_manifest_sha256_expected\": \"{expected_manifest_sha256}\",\n  \"source_manifest_sha256_actual\": \"{actual_manifest_sha256}\",\n  \"source_manifest_path\": {:?},\n  \"driver_compiled_host_source_manifest_sha256\": \"{}\",\n  \"sbf_abi_id_expected\": \"{expected_sbf_abi_id}\",\n  \"sbf_abi_id_actual\": \"{}\",\n  \"sbf_abi_descriptor\": {:?},\n  \"driver_source_sha256_expected\": \"{expected_driver_sha256}\",\n  \"driver_source_sha256_actual\": \"{}\",\n  \"account_manifest_sha256\": \"{ACCOUNT_MANIFEST_SHA256}\",\n  \"wad_accounts\": [\n{wad_rows}  ],\n  \"wad_concat_sha256\": \"{wad_concat_sha256}\",\n  \"native_input_ex2_sha256\": \"{input_sha256}\",\n  \"native_output_ex2_sha256\": \"{output_sha256}\",\n  \"capture_mirror_mp1_sha256\": \"{capture_mirror_sha256}\"\n}}\n",
+            manifest_path.display(),
             ex2::SOURCE_MANIFEST_SHA256,
             digest_array_hex(&ex2_sbf::ABI_ID),
             ex2::SBF_ABI_DESCRIPTOR,
@@ -252,7 +255,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let capture =
         PathBuf::from(args.next().ok_or(
-            "usage: ex2_sbf ACCOUNT_CAPTURE_ROOT RECEIPT_DIR doom_sbf.so EXPECTED_IMAGE_SHA256 EXPECTED_SOURCE_MANIFEST_SHA256 EXPECTED_SBF_ABI_ID EXPECTED_DRIVER_SOURCE_SHA256 NATIVE_RECEIPT_DIR",
+            "usage: ex2_sbf ACCOUNT_CAPTURE_ROOT RECEIPT_DIR doom_sbf.so EXPECTED_IMAGE_SHA256 EXPECTED_SOURCE_MANIFEST_SHA256 EXPECTED_SOURCE_MANIFEST_PATH EXPECTED_SBF_ABI_ID EXPECTED_DRIVER_SOURCE_SHA256 NATIVE_RECEIPT_DIR",
         )?)
         .canonicalize()?;
     let receipt = PathBuf::from(args.next().ok_or("missing receipt dir")?);
@@ -267,6 +270,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("missing expected source-manifest SHA-256")?
         .into_string()
         .map_err(|_| "expected source-manifest SHA-256 is not UTF-8")?;
+    let expected_manifest_path =
+        PathBuf::from(args.next().ok_or("missing expected source-manifest path")?)
+            .canonicalize()?;
     let expected_sbf_abi_id = args
         .next()
         .ok_or("missing expected SBF ABI id")?
@@ -298,12 +304,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if expected_manifest_sha256 != ex2::SOURCE_MANIFEST_SHA256
-        || digest_hex(ex2::BUILD_SOURCE_MANIFEST.as_bytes()) != ex2::SOURCE_MANIFEST_SHA256
+    let sbf_manifest_bytes = read(&expected_manifest_path)?;
+    let actual_manifest_sha256 = digest_hex(&sbf_manifest_bytes);
+    let sbf_manifest = std::str::from_utf8(&sbf_manifest_bytes)?;
+    let expected_abi_descriptor = format!("\"sbf_abi_descriptor\": {:?}", ex2::SBF_ABI_DESCRIPTOR);
+    if expected_manifest_sha256 != actual_manifest_sha256
+        || !sbf_manifest.contains("\"sbf\": true")
+        || !sbf_manifest.contains("\"target\": \"sbpf-solana-solana\"")
+        || !sbf_manifest.contains(&expected_abi_descriptor)
     {
         return Err(format!(
-            "source manifest identity mismatch: expected {expected_manifest_sha256}, compiled {}",
-            ex2::SOURCE_MANIFEST_SHA256
+            "SBF source manifest identity mismatch: expected {expected_manifest_sha256}, actual {actual_manifest_sha256}, path {}",
+            expected_manifest_path.display()
         )
         .into());
     }
@@ -379,7 +391,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if input.mirror[36..68] != Sha256::digest(&wad_payload).as_slice() {
+    if &input.mirror[36..68] != Sha256::digest(&wad_payload).as_slice() {
         return Err("native MP1 WAD binding differs from the pinned concatenated WAD".into());
     }
     let state_len = input.state.len();
@@ -398,6 +410,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &expected_image_sha256,
         &actual_image_sha256,
         &expected_manifest_sha256,
+        &actual_manifest_sha256,
+        &expected_manifest_path,
         &expected_sbf_abi_id,
         &expected_driver_sha256,
         &wad_hashes,
