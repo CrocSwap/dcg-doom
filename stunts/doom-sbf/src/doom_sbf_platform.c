@@ -37,6 +37,7 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Local twin of sbfinc/stdio.h's FILE: including that header would also pull
  * its variadic printf declarations into conflict with the fixed-arity
@@ -152,6 +153,44 @@ void P_ArchiveMap(void) {} void P_UnArchiveMap(void) {}
 /* Freestanding libc subset                                            */
 /* ------------------------------------------------------------------ */
 
+#ifdef DOOM_SBF_BUILD
+/* v1.51's SVM memory builtins are the actual runtime operations, not C
+ * wrappers that expand to one instruction per byte.  Keep the standard C
+ * contracts at this boundary: memcpy is only used for non-overlapping spans,
+ * memmove is the overlap-safe variant, memset writes the low byte of value,
+ * and memcmp returns the builtin's signed comparison result.  These syscalls
+ * accept the account/arena pointers at their existing alignment; the separate
+ * sixteen-byte carrier guard remains required by the Doom allocator. */
+extern void sol_memcpy_(void *dst, const void *src, uint64_t n);
+extern void sol_memmove_(void *dst, const void *src, uint64_t n);
+extern void sol_memset_(void *dst, uint8_t value, uint64_t n);
+extern void sol_memcmp_(const void *a, const void *b, uint64_t n, int32_t *result);
+
+void *memset(void *dst, int value, size_t n)
+{
+    sol_memset_(dst, (uint8_t)value, (uint64_t)n);
+    return dst;
+}
+
+void *memcpy(void *dst, const void *src, size_t n)
+{
+    sol_memcpy_(dst, src, (uint64_t)n);
+    return dst;
+}
+
+void *memmove(void *dst, const void *src, size_t n)
+{
+    sol_memmove_(dst, src, (uint64_t)n);
+    return dst;
+}
+
+int memcmp(const void *a, const void *b, size_t n)
+{
+    int32_t result = 0;
+    sol_memcmp_(a, b, (uint64_t)n, &result);
+    return (int)result;
+}
+#else
 void *memset(void *dst, int value, size_t n)
 {
     byte_t *p = (byte_t *)dst;
@@ -197,6 +236,7 @@ int memcmp(const void *a, const void *b, size_t n)
 	    return p[i] < q[i] ? -1 : 1;
     return 0;
 }
+#endif
 
 size_t strlen(const char *s)
 {

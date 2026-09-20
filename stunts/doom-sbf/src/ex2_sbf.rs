@@ -9,7 +9,7 @@
 
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, msg, program_error::ProgramError,
-    pubkey::Pubkey,
+    program_memory::sol_memcpy, pubkey::Pubkey,
 };
 
 pub const MAGIC: &[u8; 8] = b"DOOM-E2S";
@@ -157,6 +157,18 @@ fn has_nonzero_byte(bytes: &[u8]) -> bool {
     chunks.remainder().iter().any(|&byte| byte != 0)
 }
 
+/// Copy one already-bounded, non-overlapping account span through the SVM
+/// memory builtin.  `copy_from_slice` lowers to the local freestanding C
+/// `memcpy` in the SBF image; that implementation is intentionally retained
+/// for the host build, but its byte loop is too expensive at this boundary.
+/// The account layout and the cursor bounds below establish the builtin's
+/// required non-overlap precondition before this helper is called.
+#[inline(always)]
+fn copy_nonoverlapping(dst: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len());
+    sol_memcpy(dst, src, dst.len());
+}
+
 fn validate_wad_account(account: &AccountInfo, ordinal: usize) -> ProgramResult {
     let data = account.try_borrow_data()?;
     if &data[..8] != b"DOOM-WC1"
@@ -178,7 +190,7 @@ fn validate_wad_account(account: &AccountInfo, ordinal: usize) -> ProgramResult 
 
 #[cfg(test)]
 mod tests {
-    use super::has_nonzero_byte;
+    use super::{copy_nonoverlapping, has_nonzero_byte};
 
     #[test]
     fn zero_padding_guard_checks_words_and_tail() {
@@ -191,6 +203,14 @@ mod tests {
         let mut tail = [0; 23];
         tail[22] = 1;
         assert!(has_nonzero_byte(&tail));
+    }
+
+    #[test]
+    fn svm_copy_preserves_the_entire_bounded_span() {
+        let source = [0x5a; 32];
+        let mut destination = [0u8; 32];
+        copy_nonoverlapping(&mut destination, &source);
+        assert_eq!(destination, source);
     }
 }
 
@@ -333,8 +353,10 @@ pub fn process(
     for ordinal in 0..WAD_ACCOUNT_COUNT {
         let source = accounts[WAD_FIRST_ACCOUNT + ordinal].try_borrow_data()?;
         let payload_len = u32_at(&source, 24) as usize;
-        context[cursor..cursor + payload_len]
-            .copy_from_slice(&source[WAD_HEADER_BYTES..WAD_HEADER_BYTES + payload_len]);
+        copy_nonoverlapping(
+            &mut context[cursor..cursor + payload_len],
+            &source[WAD_HEADER_BYTES..WAD_HEADER_BYTES + payload_len],
+        );
         cursor += payload_len;
         super::diagnostic_phase(110 + ordinal as u64);
     }
@@ -399,8 +421,11 @@ pub fn process(
     // The fixed probe scratch is retained as a bounded diagnostic counter for
     // the next experiment.  It is outside the generated context struct and
     // does not participate in ST1/MP1 consensus bytes.
-    context[CTX_STRUCT_BYTES..CTX_STRUCT_BYTES + 8]
-        .copy_from_slice(&(arena_high_water as u64).to_le_bytes());
+    let arena_high_water_bytes = (arena_high_water as u64).to_le_bytes();
+    copy_nonoverlapping(
+        &mut context[CTX_STRUCT_BYTES..CTX_STRUCT_BYTES + arena_high_water_bytes.len()],
+        &arena_high_water_bytes,
+    );
     Ok(())
 }
 

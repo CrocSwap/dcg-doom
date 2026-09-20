@@ -41,12 +41,11 @@ const WAD_ACCOUNT_SHA256: [&str; ex2_sbf::WAD_ACCOUNT_COUNT] = [
     "ef64b046aaf61eeab85b3d9f10edc564f9b4b640c341d10afc6a9dd67dddd6ca",
 ];
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-const INPUT_EX2_SHA256: &str = "00fd78617ee51a925b7300db46c3c0452324c3ff362f2f6f6dda6bbc96fca327";
-const OUTPUT_EX2_SHA256: &str = "9cd2e3d4df76dc49e6a6d2ccd3a0a9e9a20a2419c84940bbe70bde720ce2014b";
-// The native oracle predates this diagnostic source edit. Keep its identity
-// explicit rather than silently accepting the current host identity.
+const INPUT_EX2_SHA256: &str = "5a6c7e38f39b866e01beca48e29a5b616a3f7375747c72ae717b46b0ee5f56a2";
+const OUTPUT_EX2_SHA256: &str = "0080ed8ae8ead6eedb21240f9f158b6355f25c824868c010446a71c25e4427c4";
+// This oracle was produced from the same source tree as the SBF image.
 const NATIVE_CAPTURE_IMAGE_ID: &str =
-    "bdf2568ce2d9aa82f2437d20a5734323896d88477fd1d12f71c2cac7afc0c204";
+    "71f4beae612322e277b3577c6b437f44471d191edcd512d515e830186db3e1e4";
 const NATIVE_CAPTURE_ABI_ID: &str =
     "75d6d58d0e122f8d58483740015f98deb7b32887253f6945a7df2e29c3eba365";
 
