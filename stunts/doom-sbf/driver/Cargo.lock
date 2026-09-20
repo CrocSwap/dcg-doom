@@ -1202,6 +1202,7 @@ dependencies = [
  "doom-sbf",
  "solana-account",
  "solana-banks-client",
+ "solana-banks-interface",
  "solana-compute-budget-interface",
  "solana-hash",
  "solana-instruction",

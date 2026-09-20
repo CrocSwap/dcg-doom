@@ -20,6 +20,7 @@ zero-bss-probe = ["doom-sbf/zero-bss-probe"]
 # `ctx-engine` runs DOOM-CX1 against the engine image: guarded context
 # write/read plus the moved-position refusal control.
 ctx-engine = ["doom-sbf/ctx-engine"]
+ex2-sbf = ["doom-sbf/ctx-engine"]
 
 [[bin]]
 name = "static_probe"
@@ -32,6 +33,10 @@ required-features = ["zero-bss-probe"]
 [[bin]]
 name = "ctx_probe"
 required-features = ["ctx-engine"]
+
+[[bin]]
+name = "ex2_sbf"
+required-features = ["ex2-sbf"]
 
 [[bin]]
 name = "headless"
@@ -51,4 +56,5 @@ solana-signer = "=2.2.1"
 solana-transaction = "=2.2.3"
 solana-transaction-error = "=2.2.1"
 solana-banks-client = "=2.3.9"
+solana-banks-interface = "=2.3.9"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }

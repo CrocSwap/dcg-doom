@@ -11,6 +11,8 @@ use solana_program::{
 
 pub mod bring_up;
 pub mod ex2;
+#[cfg(feature = "ctx-engine")]
+pub mod ex2_sbf;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
@@ -130,9 +132,14 @@ pub fn process_instruction(
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
     }
-    #[cfg(feature = "ctx-engine")] if instruction_data.starts_with(engine::MAGIC) { return engine::process(_program_id, accounts, instruction_data); }
-
-
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.starts_with(ex2_sbf::MAGIC) {
+        return ex2_sbf::process(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.starts_with(engine::MAGIC) {
+        return engine::process(_program_id, accounts, instruction_data);
+    }
 
     if accounts.iter().any(|account| {
         account.is_writable

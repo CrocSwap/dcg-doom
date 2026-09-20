@@ -17,6 +17,7 @@ const ENGINE_TUS: &[&str] = &[
 ];
 
 const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC/2|schema=2|roles=12|state=ST1/v0|mirror=MP1/v1|controller=CI2/v1|frame=FB1/64000|role-map=00..0b";
+const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734120|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -93,7 +94,14 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
         }
     });
     let overflow_checks = env_value("CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS", "false");
-    let lto = env_value("CARGO_PROFILE_RELEASE_LTO", "true");
+    // cargo-build-sbf warns that the crate's simultaneous `cdylib` + `lib`
+    // types disable LTO. Record the effective SBF setting rather than the
+    // profile request so the emitted identity cannot overclaim optimization.
+    let lto = if is_sbf {
+        "false".to_owned()
+    } else {
+        env_value("CARGO_PROFILE_RELEASE_LTO", "true")
+    };
     let codegen_units = env_value("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
     format!(
         "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}}\n}}",
@@ -266,6 +274,11 @@ fn source_manifest(
     )
     .unwrap();
     writeln!(&mut manifest, "  \"abi_descriptor\": \"{ABI_DESCRIPTOR}\",").unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"sbf_abi_descriptor\": \"{SBF_ABI_DESCRIPTOR}\","
+    )
+    .unwrap();
     writeln!(&mut manifest, "  \"build_metadata\": {metadata},").unwrap();
     writeln!(&mut manifest, "  \"compiler_flags\": [").unwrap();
     for (index, flag) in common_flags.iter().enumerate() {
@@ -312,6 +325,7 @@ fn write_identity(
     let metadata = build_metadata(target, is_sbf);
     let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags, &metadata);
     let abi_id = digest(format!("DOOM-EX2-ABI-ID\0{ABI_DESCRIPTOR}").as_bytes());
+    let sbf_abi_id = digest(format!("DOOM-E2S-ABI-ID\0{SBF_ABI_DESCRIPTOR}").as_bytes());
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
     let image_id = digest(&image_input);
@@ -321,13 +335,47 @@ fn write_identity(
     let generated = format!(
         "pub const IMAGE_ID: [u8; 32] = [{}];\n\
          pub const ABI_ID: [u8; 32] = [{}];\n\
+         pub const SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const SOURCE_MANIFEST_SHA256: &str = \"{manifest_id}\";\n\
          pub const ABI_DESCRIPTOR: &str = {ABI_DESCRIPTOR:?};\n\
+         pub const SBF_ABI_DESCRIPTOR: &str = {SBF_ABI_DESCRIPTOR:?};\n\
          pub const BUILD_SOURCE_MANIFEST: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/doom_ex2_source_manifest.json\"));\n",
-        rust_array(&image_id), rust_array(&abi_id),
+        rust_array(&image_id), rust_array(&abi_id), rust_array(&sbf_abi_id),
     );
     fs::write(out_dir.join("doom_ex2_build_identity.rs"), generated)
         .expect("write Doom EX2 build identity");
+}
+
+fn write_sbf_codec_source(
+    out_dir: &Path,
+    tree: &Path,
+    relative: &str,
+    needle: &str,
+    replacement: &str,
+    name: &str,
+) -> PathBuf {
+    let source_path = tree.join(relative);
+    let source = fs::read_to_string(&source_path).unwrap_or_else(|err| {
+        panic!(
+            "cannot read SBF codec source {}: {err}",
+            source_path.display()
+        )
+    });
+    assert_eq!(
+        source.matches(needle).count(),
+        1,
+        "SBF codec rewrite must match exactly one source block in {relative}"
+    );
+    let rewritten = source.replacen(needle, replacement, 1);
+    let generated = out_dir.join(name);
+    fs::write(&generated, rewritten).unwrap_or_else(|err| {
+        panic!(
+            "cannot write generated SBF codec {}: {err}",
+            generated.display()
+        )
+    });
+    println!("cargo:rerun-if-changed={}", source_path.display());
+    generated
 }
 
 fn main() {
@@ -501,14 +549,128 @@ fn compile_ctx_engine(target: &str) {
         .file(manifest.join("src/doom_sbf_engine.c"));
     platform.file(manifest.join("src/doom_sbf_platform.c"));
     engine.compile("doom_engine_ctx");
-    ctx.compile("doom_engine_ctx_state");
     platform.compile("doom_sbf_platform");
+    ctx.compile("doom_engine_ctx_state");
 
-    // EX2 is deliberately native-only.  It reuses the retained host state
-    // and account codecs and therefore must never enter an SBF image.  The
-    // C bridge is linked only for the host ctx-engine feature; SBF receives
-    // the explicit refusal symbol in doom_sbf_engine.c instead.
-    if !is_sbf {
+    if is_sbf {
+        // The state codec is the retained pointer-free ST1 implementation.
+        // Its host allocation-failure counters are test controls only; on
+        // SBF they occupy existing context fields so the image carries no
+        // writable static state.  The controller's host globals are likewise
+        // relocated into context fields by an exact, source-checked rewrite.
+        let state = write_sbf_codec_source(
+            &out_dir,
+            &tree,
+            "headless/doom_state.c",
+            "static long ds_alloc_fail_after = -1;\nstatic long ds_alloc_calls;",
+            "#ifdef DOOM_SBF_BUILD\n#undef doom_render_fuzz_columns\n#define ds_alloc_fail_after DOOM_CTX->doom_ctx_probe_cell\n#define ds_alloc_calls DOOM_CTX->doom_render_fuzz_columns\n#else\nstatic long ds_alloc_fail_after = -1;\nstatic long ds_alloc_calls;\n#endif",
+            "doom_state_sbf.c",
+        );
+        // The retained decoder keeps a large fixed plan on the C stack. SBF
+        // permits only a 4 KiB frame, so move that plan into the bounded Doom
+        // allocator for the SBF codec copy. This is a mechanical rewrite of
+        // the existing decoder body; host ST1 behavior remains unchanged.
+        let mut state_source =
+            fs::read_to_string(&state).expect("read generated SBF state source");
+        let profile_start = state_source
+            .find("static int ds_decode_profile")
+            .expect("find generated SBF decoder");
+        let profile_end = profile_start
+            + state_source[profile_start..]
+                .find("\nint DoomStateDecode")
+                .expect("find generated SBF decoder end");
+        let mut profile = state_source[profile_start..profile_end].to_owned();
+        let plan_decl = "ds_plan_t p; ds_read_t r; unsigned i, j, mi=0, si=0; memset(&p,0,sizeof(p));";
+        assert_eq!(
+            profile.matches(plan_decl).count(),
+            1,
+            "SBF decoder plan rewrite must match exactly one stack plan"
+        );
+        profile = profile.replacen(
+            plan_decl,
+            "ds_plan_t *p = ds_alloc_bytes(sizeof(*p), 1); ds_read_t r; unsigned i, j, mi=0, si=0; if (!p) return -1; memset(p,0,sizeof(*p));",
+            1,
+        );
+        profile = profile.replace("p.", "p->");
+        profile = profile.replace(
+            "ds_preflight(image,image_bytes,&p,profile)",
+            "ds_preflight(image,image_bytes,p,profile)",
+        );
+        profile = profile.replace("ds_plan_prepare(&p)", "ds_plan_prepare(p)");
+        profile = profile.replace("ds_plan_release(&p, 1);", "ds_plan_release(p, 1); free(p);");
+        profile = profile.replace("ds_commit_plan(&p,", "ds_commit_plan(p,");
+        profile = profile.replace("ds_plan_release(&p, 0);", "ds_plan_release(p, 0); free(p);");
+        assert!(
+            !profile.contains("ds_plan_t p;"),
+            "SBF decoder plan rewrite left a stack plan reference"
+        );
+        state_source.replace_range(profile_start..profile_end, &profile);
+        fs::write(&state, state_source).expect("write SBF state source");
+        let controller = write_sbf_codec_source(
+            &out_dir,
+            &tree,
+            "headless/doom_controller.c",
+            "static int controller_armed;\nstatic int controller_v2_armed;\nstatic uint8_t controller_command[4];\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;",
+            "#endif\n#ifdef DOOM_SBF_BUILD\n#undef doom_sbf_demo_done\n#undef doom_error_latched\n#undef demobuffer\n#undef demoend\n#define controller_armed DOOM_CTX->doom_sbf_demo_done\n#define controller_v2_armed DOOM_CTX->doom_error_latched\n#define controller_command ((uint8_t *)&DOOM_CTX->doom_ctx_probe_cell)\n#define captured_demo_begin DOOM_CTX->demobuffer\n#define captured_demo_end DOOM_CTX->demoend\n#else\nstatic int controller_armed;\nstatic int controller_v2_armed;\nstatic uint8_t controller_command[4];\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;\n#endif",
+            "doom_controller_sbf.c",
+        );
+        // The retained controller source also contains the host filesystem
+        // CI1/CI2 reader. The SBF entry receives already-validated CI2 bytes
+        // from an account, so keep only the shared in-engine arm/apply path;
+        // compiling fopen/fread/fgetc here would create a false libc
+        // dependency and hide the actual engine boundary behind a shim.
+        let mut controller_source = fs::read_to_string(&controller)
+            .expect("read generated SBF controller source");
+        let controller_host_needle = "static int read_account(";
+        assert_eq!(
+            controller_source.matches(controller_host_needle).count(),
+            1,
+            "SBF controller host-reader rewrite must match exactly one block"
+        );
+        controller_source = controller_source.replacen(
+            controller_host_needle,
+            "#ifndef DOOM_SBF_BUILD\nstatic int read_account(",
+            1,
+        );
+        assert_eq!(
+            controller_source.matches("sizeof(controller_command)").count(),
+            2,
+            "SBF controller command-size rewrite must match both copies"
+        );
+        controller_source = controller_source.replace("sizeof(controller_command)", "4u");
+        fs::write(&controller, controller_source).expect("write SBF controller source");
+        let mut codec = cc::Build::new();
+        for f in common {
+            codec.flag(f);
+        }
+        codec
+            .include(&tree)
+            .include(tree.join("headless"))
+            .include(manifest.join("sbfinc"))
+            .flag("-include")
+            .flag("doom_ctx.h")
+            .flag("-DDOOM_SBF_BUILD")
+            .flag("-ffreestanding")
+            .flag("-fno-stack-protector")
+            .flag("-fno-builtin")
+            .flag("-fno-asynchronous-unwind-tables")
+            .flag("-fno-unwind-tables")
+            .compiler(env::var("CC").expect("ctx-engine SBF build needs CC"))
+            .archiver(env::var("AR").expect("ctx-engine SBF build needs AR"))
+            .file(state)
+            .file(controller)
+            .file(manifest.join("src/doom_sbf_account_pool.c"))
+            .file(manifest.join("src/doom_sbf_ex2.c"));
+        codec.compile("doom_engine_ctx_codec");
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest.join("src/doom_sbf_account_pool.c").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest.join("src/doom_sbf_ex2.c").display()
+        );
+    } else {
         let mut native = cc::Build::new();
         for f in common {
             native.flag(f);

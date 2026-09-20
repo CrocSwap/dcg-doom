@@ -1,11 +1,14 @@
 /*
- * DOOM-EX2 native bridge.
+ * DOOM-EX2 native bridge and the first SBF engine entry.
  *
- * This file is compiled only in the host ctx-engine archive.  It imports the
- * real retained ST1 state into a freshly initialized context, derives/checks
- * the real MP1 pool, consumes one producer-emitted CI2 command through the
- * retained controlled-reentry path, and exports ST1/MP1/frame after an actual
- * G_Ticker and R_RenderPlayerView.  No pointer or native struct is emitted.
+ * The host bridge imports the real retained ST1 state into a freshly
+ * initialized context, derives/checks the real MP1 pool, consumes one
+ * producer-emitted CI2 command through the retained controlled-reentry path,
+ * and exports ST1/MP1/frame after an actual G_Ticker and R_RenderPlayerView.
+ * The SBF bridge uses the same engine and pointer-free codecs, but stops after
+ * the first state tic.  Renderer setup is a separate, later gate because the
+ * first accepted SBF seam must measure the actual state continuation rather
+ * than hide an init or render failure behind a hash-only wrapper.
  */
 
 #include <stdint.h>
@@ -28,11 +31,15 @@
 extern void R_ExecuteSetViewSize(void);
 extern void doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
 
-/* Keep the exact retained native account pool codec in this translation unit.
- * Its fill_pool helper is static by design; including the source here avoids
- * copying or weakening its field mapping while keeping the bridge independent
- * of the file-oriented manifest loader. */
+/* Keep the exact retained native account pool codec in this translation unit
+ * only for the host bridge.  SBF uses the Doom-local mirror codec compiled
+ * from src/doom_sbf_account_pool.c; importing the manifest/file adapter into
+ * the image would add an unsupported host boundary. */
+#ifndef DOOM_SBF_BUILD
 #include "doom_account.c"
+#else
+extern int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32]);
+#endif
 
 #define EX2_OK 0
 #define EX2_REFUSE_STATE 232
@@ -42,6 +49,7 @@ extern void doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long z
 #define EX2_REFUSE_ROLE 236
 #define EX2_REFUSE_CONTROLLER 237
 #define EX2_REFUSE_OUTPUT 238
+#define EX2_REFUSE_ARENA 239
 
 #define EX2_WAD_COUNT 5
 #define EX2_WAD_ACCOUNT_BYTES 1048576u
@@ -51,6 +59,8 @@ extern void doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long z
 #define EX2_FRAME_BYTES (320u * 200u)
 #define EX2_STATE_MAX 126976u
 #define EX2_LOW_ARENA_BYTES (1024u * 1024u)
+
+#ifndef DOOM_SBF_BUILD
 
 static const uint8_t ex2_pinned_wad[32] = {
     0x1d, 0x7d, 0x43, 0xbe, 0x50, 0x1e, 0x67, 0xd9,
@@ -284,3 +294,173 @@ int doom_engine_ex2_entry(
     free(wad);
     return EX2_OK;
 }
+
+#else
+
+/* SBF EX2/1 is deliberately a different ABI from the native host envelope.
+ * The Rust instruction validates the five account images and binds their
+ * payload bytes into the context-account tail.  C sees only disjoint,
+ * length-bounded spans and never imports a native account struct. */
+extern int doom_ctx_guard(const void *data);
+extern unsigned long doom_ctx_size(void);
+extern void doom_ctx_init(void);
+extern void doom_sbf_bind_arena(void *base, unsigned long bytes,
+                                unsigned long zone_bytes);
+extern int doom_sbf_arena_exhausted(void);
+extern unsigned long doom_sbf_arena_high_water(void);
+
+static int ex2_sbf_u32(const uint8_t *p)
+{
+    return (int)((uint32_t)p[0] | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+static int ex2_sbf_zero(const uint8_t *p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) if (p[i]) return 0;
+    return 1;
+}
+
+static int ex2_sbf_state_shape(const uint8_t *state, size_t bytes)
+{
+    return state && bytes >= 64 && bytes <= EX2_STATE_MAX
+        && !memcmp(state, "DOOM-ST1", 8)
+        && ex2_sbf_u32(state + 8) == 0
+        && ex2_sbf_u32(state + 12) == 64
+        && (size_t)(uint32_t)ex2_sbf_u32(state + 16) == bytes;
+}
+
+static int ex2_sbf_mirror_shape(const uint8_t *mirror, size_t bytes,
+                                const uint8_t wad_hash[32])
+{
+    return mirror && bytes == EX2_POOL_BYTES
+        && !memcmp(mirror, "DOOM-MP1", 8)
+        && ex2_sbf_u32(mirror + 8) == 1
+        && ex2_sbf_u32(mirror + 12) == 4096
+        && ex2_sbf_u32(mirror + 16) == EX2_POOL_BYTES
+        && ex2_sbf_u32(mirror + 20) == 160
+        && ex2_sbf_u32(mirror + 24) == 384
+        && ex2_sbf_u32(mirror + 28) <= 384
+        && !ex2_sbf_zero(mirror + 68, 4096 - 68)
+        && !memcmp(mirror + 36, wad_hash, 32);
+}
+
+static int ex2_sbf_controller_shape(const uint8_t *controller, size_t bytes,
+                                    uint32_t expected_tic)
+{
+    return controller && bytes == 64
+        && !memcmp(controller, "DOOM-CI2", 8)
+        && ex2_sbf_u32(controller + 8) == 1
+        && ex2_sbf_u32(controller + 12) == 28
+        && ex2_sbf_u32(controller + 16) == 64
+        && ex2_sbf_u32(controller + 20) == expected_tic
+        && !ex2_sbf_zero(controller + 28, 36);
+}
+
+int doom_engine_ex2_sbf_tic_entry(
+    const void *context,
+    const uint8_t *wad_image, unsigned long wad_bytes,
+    void *bootstrap, unsigned long bootstrap_bytes,
+    const uint8_t *state, unsigned long state_len,
+    const uint8_t *mirror, unsigned long mirror_len,
+    const uint8_t *controller, unsigned long controller_len,
+    uint8_t *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    uint8_t *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
+    unsigned long *arena_high_water_out)
+{
+    uint8_t *low_arena;
+    uint8_t *encoded = 0;
+    uint8_t *derived = 0;
+    uint8_t *demo;
+    uint8_t wad_hash[32];
+    size_t encoded_bytes = 0;
+    uint32_t input_tic;
+    int lump;
+    int demo_len;
+
+    if (doom_ctx_guard(context)) return 199;
+    if (!wad_image || !wad_bytes || wad_bytes > 5u * EX2_WAD_PAYLOAD_BYTES
+        || !bootstrap || bootstrap_bytes < EX2_LOW_ARENA_BYTES
+        || !ex2_sbf_state_shape(state, state_len)
+        || !mirror || mirror_len != EX2_POOL_BYTES
+        || !controller || controller_len != 64
+        || !state_out || !mirror_out || !state_out_len || !mirror_out_len
+        || state_cap < EX2_STATE_MAX || mirror_cap < EX2_POOL_BYTES) {
+        return EX2_REFUSE_RESOURCE;
+    }
+    input_tic = (uint32_t)ex2_sbf_u32(state + 20);
+    if (!ex2_sbf_controller_shape(controller, controller_len, input_tic))
+        return EX2_REFUSE_CONTROLLER;
+    /* The full WAD digest was already captured and bound into MP1.  Rehashing
+     * four megabytes in the first SBF tic would measure the account transport,
+     * not the continuation.  MP1 remains the authoritative captured binding;
+     * W_InitAccountImage below still checks the real lump directory. */
+    memcpy(wad_hash, mirror + 36, sizeof(wad_hash));
+    if (!ex2_sbf_mirror_shape(mirror, mirror_len, wad_hash))
+        return EX2_REFUSE_POOL;
+
+    /* The Rust side places a bounded low-arena carrier immediately after the
+     * copied WAD.  The arena is rebound before any engine allocator call, and
+     * all subsequent malloc/realloc/free operations are context-local. */
+    memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+    doom_ctx_init();
+    doom_sbf_bind_arena(bootstrap, bootstrap_bytes, DOOM_ZONE_BYTES);
+    low_arena = (uint8_t *)calloc(1, EX2_LOW_ARENA_BYTES);
+    if (!low_arena) return EX2_REFUSE_RESOURCE;
+    doom_sbf_bind_arena(low_arena, EX2_LOW_ARENA_BYTES, DOOM_ZONE_BYTES);
+    gamemode = shareware;
+    gamemission = doom;
+    language = english;
+    DOOM_CTX->deathmatch = 0;
+    DOOM_CTX->consoleplayer = 0;
+    displayplayer = 0;
+    myargc = 0;
+    myargv = 0;
+    Z_Init();
+    W_InitAccountImage(wad_image, (int)wad_bytes);
+    V_Init();
+    R_Init();
+    R_ExecuteSetViewSize();
+    P_Init();
+    lump = W_GetNumForName("DEMO1");
+    demo_len = W_LumpLength(lump);
+    if (demo_len < 17) return EX2_REFUSE_RESOURCE;
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+    defdemoname = "DEMO1";
+    demobuffer = demo;
+    demo_p = demo;
+    G_DoPlayDemo();
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    if (DoomStateDecode(state, (size_t)state_len)) return EX2_REFUSE_STATE;
+    if (DoomControllerArmV2(controller + 24)) return EX2_REFUSE_CONTROLLER;
+
+    derived = (uint8_t *)malloc(EX2_POOL_BYTES);
+    if (!derived || doom_sbf_fill_pool(derived, wad_hash)
+        || memcmp(derived, mirror, EX2_POOL_BYTES))
+        return EX2_REFUSE_POOL;
+    if (DoomControllerValidateCapturedDemoCursor(demo_p))
+        return EX2_REFUSE_CONTROLLER;
+
+    /* This is the smallest real continuation: imported ST1, reconstructed
+     * thinker graph, captured MP1 recheck, producer CI2, then actual G_Ticker.
+     * There is intentionally no renderer call in this boundary. */
+    G_Ticker();
+    gametic++;
+    if (doom_sbf_arena_exhausted())
+        return EX2_REFUSE_ARENA;
+    if (DoomStateEncode(&encoded, &encoded_bytes)
+        || encoded_bytes > EX2_STATE_MAX || encoded_bytes > state_cap
+        || encoded_bytes < 64) {
+        return EX2_REFUSE_OUTPUT;
+    }
+    if (doom_sbf_fill_pool(derived, wad_hash)) return EX2_REFUSE_POOL;
+    memcpy(state_out, encoded, encoded_bytes);
+    memcpy(mirror_out, derived, EX2_POOL_BYTES);
+    *state_out_len = encoded_bytes;
+    *mirror_out_len = EX2_POOL_BYTES;
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    return EX2_OK;
+}
+
+#endif
