@@ -397,7 +397,7 @@ int doom_engine_ex2_sbf_tic_entry(
         return EX2_REFUSE_RESOURCE;
     }
     input_tic = (uint32_t)ex2_sbf_u32(state + 20);
-    if (!ex2_sbf_controller_shape(controller, controller_len, input_tic))
+    if (ex2_sbf_controller_shape(controller, controller_len, input_tic))
         return EX2_REFUSE_CONTROLLER;
     /* The host driver has pinned the retained WAD account files and their
      * concatenated payload before starting ProgramTest.  This SBF boundary is
@@ -405,7 +405,7 @@ int doom_engine_ex2_sbf_tic_entry(
      * would measure account transport, so MP1 remains the captured binding;
      * W_InitAccountImage below parses the actual supplied lump directory. */
     memcpy(wad_hash, mirror + 36, sizeof(wad_hash));
-    if (!ex2_sbf_mirror_shape(mirror, mirror_len, wad_hash))
+    if (ex2_sbf_mirror_shape(mirror, mirror_len, wad_hash))
         return EX2_REFUSE_POOL;
 
     /* The Rust side places a bounded low-arena carrier immediately after the

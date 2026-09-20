@@ -41,11 +41,11 @@ const WAD_ACCOUNT_SHA256: [&str; ex2_sbf::WAD_ACCOUNT_COUNT] = [
     "ef64b046aaf61eeab85b3d9f10edc564f9b4b640c341d10afc6a9dd67dddd6ca",
 ];
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-const INPUT_EX2_SHA256: &str = "5a6c7e38f39b866e01beca48e29a5b616a3f7375747c72ae717b46b0ee5f56a2";
-const OUTPUT_EX2_SHA256: &str = "0080ed8ae8ead6eedb21240f9f158b6355f25c824868c010446a71c25e4427c4";
+const INPUT_EX2_SHA256: &str = "c6f6eb99cb1e3c38ef9cb72afe9432b98068a7fbd28b20bd9b45828ec5e7b58a";
+const OUTPUT_EX2_SHA256: &str = "bf9309475127f45c6595c5d977b8446afdeaa14c6e172950ddaac20e73ca811b";
 // This oracle was produced from the same source tree as the SBF image.
 const NATIVE_CAPTURE_IMAGE_ID: &str =
-    "71f4beae612322e277b3577c6b437f44471d191edcd512d515e830186db3e1e4";
+    "627cdd1012ca9accd84ca7423f35c27a4432f6011c71c59ff09f335c32adf265";
 const NATIVE_CAPTURE_ABI_ID: &str =
     "75d6d58d0e122f8d58483740015f98deb7b32887253f6945a7df2e29c3eba365";
 
@@ -71,6 +71,10 @@ fn digest_hex(bytes: &[u8]) -> String {
 
 fn digest_array_hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("JSON string serialization cannot fail")
 }
 
 fn parse_digest(value: &str, label: &str) -> Result<[u8; 32], Box<dyn Error>> {
@@ -170,17 +174,23 @@ fn receipt_json(
     diagnostic_error: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let normal_error = normal_error
-        .map(|error| format!("{error:?}"))
+        .map(|error| json_string(&format!("{error:?}")))
         .unwrap_or_else(|| "null".to_owned());
     let diagnostic_error = diagnostic_error
-        .map(|error| format!("{error:?}"))
+        .map(|error| json_string(&format!("{error:?}")))
+        .unwrap_or_else(|| "null".to_owned());
+    let normal_units = normal_units
+        .map(|units| units.to_string())
+        .unwrap_or_else(|| "null".to_owned());
+    let diagnostic_units = diagnostic_units
+        .map(|units| units.to_string())
         .unwrap_or_else(|| "null".to_owned());
     fs::write(
         receipt.join("report.json"),
         format!(
-            "{{\n  \"status\": {:?},\n  \"acceptance\": \"state-only-real-tic\",\n  \"first_blocker\": {:?},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"normal_units\": {:?},\n  \"normal_error\": {},\n  \"diagnostic_limit\": {},\n  \"diagnostic_units\": {:?},\n  \"diagnostic_error\": {},\n  \"malformed_controller_refusal\": {:?},\n  \"identity\": \"identity.json\",\n  \"positive_fixture\": \"retained native EX2 receipt plus retained WAD account images\"\n}}\n",
-            status,
-            first_blocker,
+            "{{\n  \"status\": {},\n  \"acceptance\": \"state-only-real-tic\",\n  \"first_blocker\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"normal_units\": {},\n  \"normal_error\": {},\n  \"diagnostic_limit\": {},\n  \"diagnostic_units\": {},\n  \"diagnostic_error\": {},\n  \"malformed_controller_refusal\": {},\n  \"identity\": \"identity.json\",\n  \"positive_fixture\": \"retained native EX2 receipt plus retained WAD account images\"\n}}\n",
+            json_string(status),
+            json_string(first_blocker),
             NORMAL_LIMIT,
             QUALIFICATION_MAX_UNITS,
             normal_units,
@@ -188,7 +198,7 @@ fn receipt_json(
             DIAGNOSTIC_LIMIT,
             diagnostic_units,
             diagnostic_error,
-            control,
+            json_string(control),
         ),
     )?;
     Ok(())

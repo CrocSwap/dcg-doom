@@ -1200,6 +1200,8 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "doom-sbf",
+ "serde_json",
+ "sha2 0.10.9",
  "solana-account",
  "solana-banks-client",
  "solana-banks-interface",
@@ -1213,7 +1215,6 @@ dependencies = [
  "solana-signer",
  "solana-transaction",
  "solana-transaction-error",
- "sha2 0.10.9",
  "tokio",
 ]
 

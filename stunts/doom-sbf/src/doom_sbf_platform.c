@@ -174,6 +174,19 @@ void *memset(void *dst, int value, size_t n)
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
+    /* sol_memcpy_ is the fast path for account/arena spans.  The engine also
+     * copies tiny account-backed records into stack locals while parsing the
+     * WAD directory; keep those mixed-address copies in the freestanding
+     * layer because the v1.51 syscall does not accept the stack as an account
+     * source/destination pair. */
+    if (n <= 32u) {
+	byte_t *d = (byte_t *)dst;
+	const byte_t *s = (const byte_t *)src;
+	size_t i;
+	for (i = 0; i < n; i++)
+	    d[i] = s[i];
+	return dst;
+    }
     sol_memcpy_(dst, src, (uint64_t)n);
     return dst;
 }

@@ -561,8 +561,54 @@ fn compile_ctx_engine(target: &str) {
     engine.flag("-include").flag("doom_ctx.h");
     ctx.flag("-include")
         .flag("doom_ctx.h")
-        .flag("-DDOOM_CTX_NO_MACROS")
-        .file(tree.join("headless/doom_ctx_init.c"))
+        .flag("-DDOOM_CTX_NO_MACROS");
+    let ctx_init = if is_sbf {
+        let original = tree.join("headless/doom_ctx_init.c");
+        let mut source = fs::read_to_string(&original)
+            .unwrap_or_else(|err| panic!("read SBF ctx initializer {}: {err}", original.display()));
+        if diagnostic_profile {
+            source = format!(
+                "extern void sol_log_64_(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long);\nextern unsigned long sol_remaining_compute_units(void);\n{source}"
+            );
+        }
+        source = format!(
+            "static void doom_sbf_init_copy(void *dst, const void *src, unsigned long n) {{ unsigned long i; unsigned char *d = (unsigned char *)dst; const unsigned char *s = (const unsigned char *)src; for (i = 0; i < n; i++) d[i] = s[i]; }}\n{source}"
+        );
+        for (needle, phase) in [
+            ("memcpy(DOOM_CTX->angleturn, doom_ctx_init_angleturn, sizeof(DOOM_CTX->angleturn));", 0x64u64),
+            ("memcpy(DOOM_CTX->forwardmove, doom_ctx_init_forwardmove, sizeof(DOOM_CTX->forwardmove));", 0x65u64),
+            ("memcpy(DOOM_CTX->mobjinfo, doom_ctx_init_mobjinfo, sizeof(DOOM_CTX->mobjinfo));", 0x66u64),
+            ("memcpy(DOOM_CTX->sidemove, doom_ctx_init_sidemove, sizeof(DOOM_CTX->sidemove));", 0x67u64),
+            ("memcpy(DOOM_CTX->states, doom_ctx_init_states, sizeof(DOOM_CTX->states));", 0x68u64),
+        ] {
+            assert_eq!(source.matches(needle).count(), 1, "SBF ctx initializer rewrite must match once");
+            let call = match needle {
+                "memcpy(DOOM_CTX->angleturn, doom_ctx_init_angleturn, sizeof(DOOM_CTX->angleturn));" => "doom_sbf_init_copy(DOOM_CTX->angleturn, doom_ctx_init_angleturn, sizeof(DOOM_CTX->angleturn));",
+                "memcpy(DOOM_CTX->forwardmove, doom_ctx_init_forwardmove, sizeof(DOOM_CTX->forwardmove));" => "doom_sbf_init_copy(DOOM_CTX->forwardmove, doom_ctx_init_forwardmove, sizeof(DOOM_CTX->forwardmove));",
+                "memcpy(DOOM_CTX->mobjinfo, doom_ctx_init_mobjinfo, sizeof(DOOM_CTX->mobjinfo));" => "doom_sbf_init_copy(DOOM_CTX->mobjinfo, doom_ctx_init_mobjinfo, sizeof(DOOM_CTX->mobjinfo));",
+                "memcpy(DOOM_CTX->sidemove, doom_ctx_init_sidemove, sizeof(DOOM_CTX->sidemove));" => "doom_sbf_init_copy(DOOM_CTX->sidemove, doom_ctx_init_sidemove, sizeof(DOOM_CTX->sidemove));",
+                "memcpy(DOOM_CTX->states, doom_ctx_init_states, sizeof(DOOM_CTX->states));" => "doom_sbf_init_copy(DOOM_CTX->states, doom_ctx_init_states, sizeof(DOOM_CTX->states));",
+                _ => unreachable!(),
+            };
+            let replacement = if diagnostic_profile {
+                format!("{call} sol_log_64_(0x444f4f4d494e4954, {phase}, sol_remaining_compute_units(), 0, 0);")
+            } else {
+                call.to_owned()
+            };
+            source = source.replacen(needle, &replacement, 1);
+        }
+        let generated = out_dir.join(if diagnostic_profile {
+            "doom_ctx_init_diagnostic.c"
+        } else {
+            "doom_ctx_init_sbf.c"
+        });
+        fs::write(&generated, source)
+            .unwrap_or_else(|err| panic!("write SBF ctx initializer {}: {err}", generated.display()));
+        generated
+    } else {
+        tree.join("headless/doom_ctx_init.c")
+    };
+    ctx.file(ctx_init)
         .file(manifest.join("src/doom_sbf_ctx.c"))
         .file(manifest.join("src/doom_sbf_engine.c"));
     platform.file(manifest.join("src/doom_sbf_platform.c"));

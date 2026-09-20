@@ -21,6 +21,10 @@
 typedef unsigned char byte_t;
 typedef unsigned long u64_t;
 
+#ifdef DOOM_SBF_BUILD
+extern void sol_memset_(void *dst, uint8_t value, uint64_t n);
+#endif
+
 void doom_sbf_panic(void);
 void *memcpy(void *dst, const void *src, size_t n);
 
@@ -216,14 +220,21 @@ int I_GetHeapSize(void)
 byte_t *I_ZoneBase(int *size)
 {
     int want = DOOM_CTX->mb_used * 1024 * 1024;
-    unsigned i;
     byte_t *z;
     if (want > DOOM_ZONE_BYTES)
 	want = DOOM_ZONE_BYTES;
     *size = want;
     z = DOOM_CTX->zone.bytes;
-    for (i = 0; i < (unsigned)want; i++)
-	z[i] = 0;
+#ifdef DOOM_SBF_BUILD
+    if (want > 0)
+	sol_memset_(z, 0, (uint64_t)want);
+#else
+    {
+	unsigned i;
+	for (i = 0; i < (unsigned)want; i++)
+	    z[i] = 0;
+    }
+#endif
     return z;
 }
 
@@ -233,8 +244,13 @@ byte_t *I_AllocLow(int length)
     int i;
     if (!p)
 	return p;
+#ifdef DOOM_SBF_BUILD
+    if (length > 0)
+	sol_memset_(p, 0, (uint64_t)length);
+#else
     for (i = 0; i < length; i++)
 	p[i] = 0;
+#endif
     return p;
 }
 
@@ -247,10 +263,8 @@ void *calloc(size_t n, size_t size)
 {
     u64_t total = (u64_t)n * (u64_t)size;
     byte_t *p = (byte_t *)arena_take(total);
-    u64_t i;
     if (p)
-	for (i = 0; i < total; i++)
-	    p[i] = 0;
+	sol_memset_(p, 0, total);
     return p;
 }
 /* The engine's only realloc is w_wad.c's lumpinfo growth, which happens once
