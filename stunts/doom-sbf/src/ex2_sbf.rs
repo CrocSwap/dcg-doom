@@ -197,15 +197,20 @@ fn validate_accounts(
             return Err(ProgramError::InvalidAccountData);
         }
     }
-    for ordinal in 0..WAD_ACCOUNT_COUNT {
-        validate_wad_account(&accounts[WAD_FIRST_ACCOUNT + ordinal], ordinal)?;
-    }
     validate_state(&accounts[STATE_ACCOUNT], request.state_len)?;
     validate_mirror(&accounts[MIRROR_ACCOUNT])?;
     let state = accounts[STATE_ACCOUNT].try_borrow_data()?;
     let gametic = u32_at(&state, 20);
     drop(state);
-    validate_controller(&accounts[CONTROLLER_ACCOUNT], gametic)
+    // Reject a malformed controller before scanning the five megabyte-scale
+    // WAD account images.  This keeps the unchanged-input refusal control
+    // bounded under the normal CU request; valid inputs still receive the
+    // full account-image and padding validation below.
+    validate_controller(&accounts[CONTROLLER_ACCOUNT], gametic)?;
+    for ordinal in 0..WAD_ACCOUNT_COUNT {
+        validate_wad_account(&accounts[WAD_FIRST_ACCOUNT + ordinal], ordinal)?;
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "ctx-engine", target_os = "solana"))]

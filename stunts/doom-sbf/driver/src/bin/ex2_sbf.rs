@@ -41,8 +41,8 @@ const WAD_ACCOUNT_SHA256: [&str; ex2_sbf::WAD_ACCOUNT_COUNT] = [
     "ef64b046aaf61eeab85b3d9f10edc564f9b4b640c341d10afc6a9dd67dddd6ca",
 ];
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-const INPUT_EX2_SHA256: &str = "e9e35b86c720f0a6027388a0e7195081011d56699e2f9482d1535c35bdcaf9d7";
-const OUTPUT_EX2_SHA256: &str = "87ee98710fa3f3492b162067ee481c170451cf866d53641544cdd8a14218f307";
+const INPUT_EX2_SHA256: &str = "00fd78617ee51a925b7300db46c3c0452324c3ff362f2f6f6dda6bbc96fca327";
+const OUTPUT_EX2_SHA256: &str = "9cd2e3d4df76dc49e6a6d2ccd3a0a9e9a20a2419c84940bbe70bde720ce2014b";
 
 const DRIVER_SOURCE: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ex2_sbf.rs"));
@@ -205,6 +205,35 @@ async fn execute(
         blockhash,
     );
     Ok(client.process_transaction_with_metadata(tx).await?)
+}
+
+fn program_test(
+    image: &Path,
+    limit: u32,
+    wad_accounts: &[Vec<u8>],
+    state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    bad_controller: &[u8],
+) -> ProgramTest {
+    env::set_var("BPF_OUT_DIR", image.parent().unwrap());
+    env::set_var("SBF_OUT_DIR", image.parent().unwrap());
+    let mut bank = ProgramTest::default();
+    bank.prefer_bpf(true);
+    bank.set_compute_max_units(limit as u64);
+    bank.add_program("doom_sbf", PROGRAM, None);
+    bank.add_account(CONTEXT, account(vec![0; ex2_sbf::CONTEXT_BYTES]));
+    for ordinal in 0..ex2_sbf::WAD_ACCOUNT_COUNT {
+        bank.add_account(
+            Pubkey::new_from_array([0xd0 + ordinal as u8; 32]),
+            account(wad_accounts[ordinal].clone()),
+        );
+    }
+    bank.add_account(STATE, account(padded_state(state)));
+    bank.add_account(MIRROR, account(mirror.to_vec()));
+    bank.add_account(CONTROLLER, account(controller.to_vec()));
+    bank.add_account(BAD_CONTROLLER, account(bad_controller.to_vec()));
+    bank
 }
 
 fn write_identity(
@@ -421,29 +450,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &capture_mirror_sha256,
     )?;
 
-    env::set_var("BPF_OUT_DIR", so.parent().unwrap());
-    env::set_var("SBF_OUT_DIR", so.parent().unwrap());
-    let mut bank = ProgramTest::default();
-    bank.prefer_bpf(true);
-    bank.set_compute_max_units(DIAGNOSTIC_LIMIT as u64);
-    bank.add_program("doom_sbf", PROGRAM, None);
-    bank.add_account(CONTEXT, account(vec![0; ex2_sbf::CONTEXT_BYTES]));
-    for ordinal in 0..ex2_sbf::WAD_ACCOUNT_COUNT {
-        bank.add_account(
-            Pubkey::new_from_array([0xd0 + ordinal as u8; 32]),
-            account(wad_accounts[ordinal].clone()),
-        );
-    }
-    bank.add_account(STATE, account(padded_state(input.state)));
-    bank.add_account(MIRROR, account(input.mirror.to_vec()));
-    bank.add_account(CONTROLLER, account(input.controller.to_vec()));
-    bank.add_account(BAD_CONTROLLER, account(bad_controller));
-    let mut context = bank.start_with_context().await;
-    let mut client = context.banks_client;
+    let bank = program_test(
+        &so,
+        NORMAL_LIMIT,
+        &wad_accounts,
+        input.state,
+        input.mirror,
+        input.controller,
+        &bad_controller,
+    );
+    let (mut client, payer, _) = bank.start().await;
 
     let bad = execute(
         &mut client,
-        &context.payer,
+        &payer,
         BAD_CONTROLLER,
         &request,
         NORMAL_LIMIT,
@@ -473,7 +493,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let normal = execute(
         &mut client,
-        &context.payer,
+        &payer,
         CONTROLLER,
         &request,
         NORMAL_LIMIT,
@@ -547,9 +567,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let normal_error = format!("{normal:?}");
     let diagnostic_units = if env::var_os("DOOM_SBF_RUN_DIAGNOSTIC").is_some() {
+        drop(client);
+        drop(payer);
+        let diagnostic_bank = program_test(
+            &so,
+            DIAGNOSTIC_LIMIT,
+            &wad_accounts,
+            input.state,
+            input.mirror,
+            input.controller,
+            &bad_controller,
+        );
+        let (mut diagnostic_client, diagnostic_payer, _) = diagnostic_bank.start().await;
         let diagnostic = execute(
-            &mut client,
-            &context.payer,
+            &mut diagnostic_client,
+            &diagnostic_payer,
             CONTROLLER,
             &request,
             DIAGNOSTIC_LIMIT,
