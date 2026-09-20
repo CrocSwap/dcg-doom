@@ -65,7 +65,13 @@ def retained_command(capture: Path, tic: int) -> tuple[bytes, str, str]:
     return demo[offset : offset + 4], hashlib.sha256(demo).hexdigest(), manifest["wad_sha256"]
 
 
-def produce(capture: Path, output: Path, tic: int, forwardmove_delta: int) -> dict[str, object]:
+def produce(
+    capture: Path,
+    output: Path,
+    tic: int,
+    forwardmove_delta: int,
+    expected_gametic: int | None = None,
+) -> dict[str, object]:
     if output.exists():
         raise ProducerRefusal(f"refusing to overwrite existing output: {output}")
     if not -128 <= forwardmove_delta <= 127:
@@ -76,7 +82,8 @@ def produce(capture: Path, output: Path, tic: int, forwardmove_delta: int) -> di
     if not -128 <= changed_forward <= 127:
         raise ProducerRefusal("derived forwardmove is outside the signed byte range")
     command = bytes((changed_forward & 0xFF, *source_command[1:]))
-    account = controller_account(tic, command)
+    account_gametic = tic if expected_gametic is None else expected_gametic
+    account = controller_account(account_gametic, command)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(account)
     return {
@@ -87,6 +94,7 @@ def produce(capture: Path, output: Path, tic: int, forwardmove_delta: int) -> di
         "wad_sha256": wad_sha256,
         "demo1_sha256": demo_sha256,
         "tic": tic,
+        "expected_gametic": account_gametic,
         "source_command_hex": source_command.hex(),
         "forwardmove_delta": forwardmove_delta,
         "emitted_command_hex": command.hex(),
@@ -102,13 +110,21 @@ def parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--tic", type=int, default=0)
     parser.add_argument("--forwardmove-delta", type=int, default=0)
+    parser.add_argument(
+        "--expected-gametic",
+        type=int,
+        help="controller header gametic; defaults to the source DEMO1 tic",
+    )
     return parser
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
-        result = produce(args.capture.resolve(), args.out.resolve(), args.tic, args.forwardmove_delta)
+        result = produce(
+            args.capture.resolve(), args.out.resolve(), args.tic,
+            args.forwardmove_delta, args.expected_gametic,
+        )
     except (ProducerRefusal, OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "refused", "error": str(exc)}))
         return 2

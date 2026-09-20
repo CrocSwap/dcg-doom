@@ -1,0 +1,13 @@
+Subject: [PATCH 0011] Permit CI2 ingress on selected-pair re-entry
+
+DOOM-HOST-CREENTRY-1 keeps the existing DOOM-CI2 v1 account wire format and
+the strict DOOM-PUB1 selector/pair contract. It only permits a fresh host
+process that imported the selector-selected pair to arm one CI2 command.
+This is a host harness execution-mode change, not a DOOM-EX2 or chain ABI.
+
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -175,1 +175,1 @@
+-    if(!load || max_tics!=1 || DoomControllerReadIngress(controller_ingress_path,(uint32_t)gametic,controller_command) || DoomControllerArm(controller_command)){
++    if((!load && !import_pair_dir) || max_tics!=1 || DoomControllerReadIngress(controller_ingress_path,(uint32_t)gametic,controller_command) || DoomControllerArm(controller_command)){

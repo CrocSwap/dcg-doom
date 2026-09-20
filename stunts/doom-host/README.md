@@ -72,3 +72,15 @@ bytes, state/frame hashes, saved states, executable hash, and ordered patch
 hashes while checking same-input repeatability, changed-input effect, and
 absent/malformed refusal. This is a host-only gameplay/control capability
 demonstration, not an interactive, SBF, validator, chain, or DCG claim.
+
+Patch `0011` is the explicit `DOOM-HOST-CREENTRY-1` host execution-mode
+boundary. It permits the same DOOM-CI2 v1 account to arm one command after a
+fresh process imports the selector-selected strict `DOOM-PUB1` pair; it does
+not change any account wire format or create `DOOM-EX2`. Run
+`scripts/doom_controlled_reentry_gate.py` with the retained account-image
+capture and a real `doom-headless` executable to check two-command re-entry,
+strict LS1-authoritative/MP1-derived publication, selector-directed import,
+changed-second-command effects, mutation refusal, and interrupted successor
+publication. The gate compares to an uninterrupted two-tic host run when the
+native executable supports it. It remains host-only and does not establish SBF,
+chain, multiplayer, long-playback, or DCG behavior.
