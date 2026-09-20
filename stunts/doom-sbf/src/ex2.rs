@@ -4,6 +4,11 @@
 //! retained ST1/MP1/CI2 payloads to an explicit image, ABI, and role map, then
 //! lets the native C bridge perform one real engine entry.
 
+#[cfg(feature = "ctx-engine")]
+use sha2::{Digest, Sha256};
+
+include!(concat!(env!("OUT_DIR"), "/doom_ex2_build_identity.rs"));
+
 pub const MAGIC: &[u8; 8] = b"DOOM-EX2";
 pub const VERSION: u32 = 2;
 pub const HEADER_BYTES: usize = 256;
@@ -18,16 +23,6 @@ pub const MIRROR_BYTES: usize = 65_536;
 pub const CONTROLLER_BYTES: usize = 64;
 pub const FRAME_BYTES: usize = 320 * 200;
 
-pub const IMAGE_ID: [u8; 32] = [
-    0xd0, 0xb2, 0xc5, 0x80, 0x70, 0xbf, 0xb2, 0x88, 0xef, 0xf0, 0x78, 0x6d, 0x5f, 0x26,
-    0x0b, 0xf9, 0xf1, 0x12, 0x24, 0x37, 0xd5, 0xb3, 0xca, 0x3c, 0x98, 0x0d, 0x32, 0x42,
-    0x71, 0xec, 0x35, 0x2e,
-];
-pub const ABI_ID: [u8; 32] = [
-    0xe1, 0x36, 0x29, 0x98, 0xbe, 0x7f, 0xdd, 0x8e, 0xe7, 0xa3, 0x81, 0x48, 0x3c, 0x9b,
-    0x86, 0xd9, 0x28, 0xfc, 0x58, 0xa5, 0xa0, 0xcf, 0xd1, 0x5a, 0x9d, 0x64, 0xd6, 0x68,
-    0xb5, 0xf5, 0x3d, 0x9c,
-];
 pub const ROLE_MAP: [u8; ROLE_MAP_BYTES] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +86,9 @@ impl<'a> Envelope<'a> {
     }
 
     fn validate(self) -> Result<Self, DecodeError> {
-        if self.state.len() < 64 || self.state.len() > STATE_MAX_BYTES || &self.state[..8] != b"DOOM-ST1"
+        if self.state.len() < 64
+            || self.state.len() > STATE_MAX_BYTES
+            || &self.state[..8] != b"DOOM-ST1"
             || u32_at(self.state, 8) != 0
             || u32_at(self.state, 12) != 64
             || u32_at(self.state, 16) as usize != self.state.len()
@@ -212,9 +209,21 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope<'_>, DecodeError> {
             DecodeError::Roles
         });
     }
-    let state = range(bytes, u32_at(bytes, 96) as usize, u32_at(bytes, 100) as usize)?;
-    let mirror = range(bytes, u32_at(bytes, 104) as usize, u32_at(bytes, 108) as usize)?;
-    let controller = range(bytes, u32_at(bytes, 112) as usize, u32_at(bytes, 116) as usize)?;
+    let state = range(
+        bytes,
+        u32_at(bytes, 96) as usize,
+        u32_at(bytes, 100) as usize,
+    )?;
+    let mirror = range(
+        bytes,
+        u32_at(bytes, 104) as usize,
+        u32_at(bytes, 108) as usize,
+    )?;
+    let controller = range(
+        bytes,
+        u32_at(bytes, 112) as usize,
+        u32_at(bytes, 116) as usize,
+    )?;
     let frame_len = u32_at(bytes, 124) as usize;
     let frame = if frame_len == 0 {
         if u32_at(bytes, 120) != 0 {
@@ -240,7 +249,10 @@ fn validate_ranges(bytes: &[u8], envelope: &Envelope<'_>) -> Result<(), DecodeEr
         (ROLE_MAP_OFFSET, ROLE_MAP_OFFSET + ROLE_MAP_BYTES),
         (state_offset, state_offset + envelope.state.len()),
         (mirror_offset, mirror_offset + envelope.mirror.len()),
-        (controller_offset, controller_offset + envelope.controller.len()),
+        (
+            controller_offset,
+            controller_offset + envelope.controller.len(),
+        ),
         (0, 0),
     ];
     let count = if let Some(frame) = envelope.frame {
@@ -256,7 +268,11 @@ fn validate_ranges(bytes: &[u8], envelope: &Envelope<'_>) -> Result<(), DecodeEr
         4
     };
     for &(start, end) in &ranges[..count] {
-        if start < HEADER_BYTES || end < start || end > bytes.len() || start % 8 != 0 && start != ROLE_MAP_OFFSET {
+        if start < HEADER_BYTES
+            || end < start
+            || end > bytes.len()
+            || start % 8 != 0 && start != ROLE_MAP_OFFSET
+        {
             return Err(DecodeError::Bounds);
         }
     }
@@ -332,19 +348,6 @@ unsafe extern "C" {
         frame_cap: usize,
         frame_out_len: *mut usize,
     ) -> i32;
-    fn DoomStateHash(
-        wad_hash: *const u8,
-        state: *const u8,
-        state_len: usize,
-        out: *mut u8,
-    );
-    fn doom_engine_ex2_frame_hash(
-        wad_hash: *const u8,
-        gametic: u32,
-        frame: *const u8,
-        frame_len: usize,
-        out: *mut u8,
-    );
 }
 
 #[cfg(feature = "ctx-engine")]
@@ -417,9 +420,8 @@ pub fn native_state_hash(wad_hash: &[u8], state: &[u8]) -> Result<String, Decode
     if wad_hash.len() != 32 || state.is_empty() {
         return Err(DecodeError::Bounds);
     }
-    let mut out = [0u8; 65];
-    unsafe { DoomStateHash(wad_hash.as_ptr(), state.as_ptr(), state.len(), out.as_mut_ptr()) };
-    Ok(String::from_utf8_lossy(&out[..64]).into_owned())
+    let version = 0u32.to_le_bytes();
+    Ok(hex_digest(&[b"DOOM-ST1", &version, wad_hash, state]))
 }
 
 #[cfg(feature = "ctx-engine")]
@@ -431,19 +433,31 @@ pub fn native_frame_hash(
     if wad_hash.len() != 32 || frame.len() != FRAME_BYTES {
         return Err(DecodeError::Bounds);
     }
-    let mut out = [0u8; 65];
-    unsafe {
-        doom_engine_ex2_frame_hash(
-            wad_hash.as_ptr(),
-            gametic,
-            frame.as_ptr(),
-            frame.len(),
-            out.as_mut_ptr(),
-        )
-    };
-    Ok(String::from_utf8_lossy(&out[..64]).into_owned())
+    let version = 0u32.to_le_bytes();
+    let tic = gametic.to_le_bytes();
+    let strip = 0u32.to_le_bytes();
+    Ok(hex_digest(&[
+        b"DOOM-FB1-FRAME",
+        &version,
+        wad_hash,
+        &tic,
+        &strip,
+        frame,
+    ]))
 }
 
+#[cfg(feature = "ctx-engine")]
+fn hex_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -471,7 +485,11 @@ mod tests {
     fn canonical_roundtrip_and_explicit_frame() {
         let (state, mirror, controller) = fixture();
         let envelope = Envelope::new(&state, &mirror, &controller).unwrap();
-        let bytes = envelope.with_frame(&[0u8; FRAME_BYTES]).unwrap().encode().unwrap();
+        let bytes = envelope
+            .with_frame(&[0u8; FRAME_BYTES])
+            .unwrap()
+            .encode()
+            .unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.state, state);
         assert_eq!(decoded.mirror, mirror);
@@ -483,7 +501,10 @@ mod tests {
     #[test]
     fn rejects_identity_roles_and_truncated_ranges() {
         let (state, mirror, controller) = fixture();
-        let base = Envelope::new(&state, &mirror, &controller).unwrap().encode().unwrap();
+        let base = Envelope::new(&state, &mirror, &controller)
+            .unwrap()
+            .encode()
+            .unwrap();
         let mut bad = base.clone();
         bad[32] ^= 1;
         assert_eq!(decode(&bad), Err(DecodeError::Identity));
@@ -492,6 +513,9 @@ mod tests {
         assert_eq!(decode(&bad), Err(DecodeError::Roles));
         let mut bad = base;
         bad.truncate(bad.len() - 1);
-        assert!(matches!(decode(&bad), Err(DecodeError::Total | DecodeError::Bounds)));
+        assert!(matches!(
+            decode(&bad),
+            Err(DecodeError::Total | DecodeError::Bounds)
+        ));
     }
 }

@@ -45,6 +45,7 @@ zeroize = "=1.8.1"
 
 [build-dependencies]
 cc = "=1.2.58"
+sha2 = { version = "=0.10.9", default-features = false, features = ["compress"] }
 
 [profile.release]
 overflow-checks = false

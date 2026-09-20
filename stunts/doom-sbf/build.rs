@@ -1,4 +1,9 @@
+use sha2::{Digest, Sha256};
 use std::env;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// The 41 patch-0007 engine translation units (mkctx TUS): the whole engine
 /// cut that runs on the host goldens, compiled for SBF with the context
@@ -11,6 +16,188 @@ const ENGINE_TUS: &[&str] = &[
     "r_data", "r_draw", "r_main", "r_plane", "r_segs", "r_sky", "r_things",
 ];
 
+const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC/2|schema=2|roles=12|state=ST1/v0|mirror=MP1/v1|controller=CI2/v1|frame=FB1/64000|role-map=00..0b";
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn rust_array(bytes: &[u8; 32]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("0x{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn collect_inputs(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let mut children = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("cannot read external Doom source {}: {err}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    children.sort();
+    for path in children {
+        if path.is_dir() {
+            collect_inputs(root, &path, out);
+        } else if matches!(
+            path.extension().and_then(|x| x.to_str()),
+            Some("c" | "h" | "inc")
+        ) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((format!("external/{rel}"), path));
+        }
+    }
+}
+
+fn git_commit(tree: &Path) -> String {
+    let output = Command::new("git")
+        .args(["-C", tree.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => "unavailable".to_owned(),
+    }
+}
+
+fn source_manifest(
+    crate_root: &Path,
+    tree: Option<&Path>,
+    target: &str,
+    is_sbf: bool,
+    common_flags: &[&str],
+) -> String {
+    let mut inputs = Vec::<(String, PathBuf)>::new();
+    let local_names = [
+        "build.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/ex2.rs",
+        "src/lib.rs",
+        "src/doom_hotloops.c",
+        "src/doom_sbf_ctx.c",
+        "src/doom_sbf_engine.c",
+        "src/doom_sbf_ex2.c",
+        "src/doom_sbf_platform.c",
+    ];
+    for name in local_names {
+        inputs.push((
+            format!("repo/stunts/doom-sbf/{name}"),
+            crate_root.join(name),
+        ));
+    }
+    let patch_dir = crate_root.join("../doom-host/patches");
+    let mut patches = fs::read_dir(&patch_dir)
+        .unwrap_or_else(|err| {
+            panic!(
+                "cannot read Doom patch directory {}: {err}",
+                patch_dir.display()
+            )
+        })
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("patch"))
+        .collect::<Vec<_>>();
+    patches.sort();
+    for path in patches {
+        let name = path.file_name().unwrap().to_string_lossy();
+        inputs.push((format!("repo/stunts/doom-host/patches/{name}"), path));
+    }
+    let upstream_commit = tree
+        .map(git_commit)
+        .unwrap_or_else(|| "not-enabled".to_owned());
+    if let Some(tree) = tree {
+        collect_inputs(tree, tree, &mut inputs);
+    }
+    inputs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut manifest = String::new();
+    writeln!(&mut manifest, "{{").unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"schema\": \"DOOM-EX2-NATIVE-SOURCE-MANIFEST/1\","
+    )
+    .unwrap();
+    writeln!(&mut manifest, "  \"target\": \"{target}\",").unwrap();
+    writeln!(&mut manifest, "  \"sbf\": {is_sbf},").unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"upstream_commit\": \"{upstream_commit}\","
+    )
+    .unwrap();
+    writeln!(&mut manifest, "  \"abi_descriptor\": \"{ABI_DESCRIPTOR}\",").unwrap();
+    writeln!(&mut manifest, "  \"compiler_flags\": [").unwrap();
+    for (index, flag) in common_flags.iter().enumerate() {
+        writeln!(
+            &mut manifest,
+            "    \"{}\"{}",
+            flag,
+            if index + 1 == common_flags.len() {
+                ""
+            } else {
+                ","
+            }
+        )
+        .unwrap();
+    }
+    writeln!(&mut manifest, "  ],").unwrap();
+    writeln!(&mut manifest, "  \"inputs\": [").unwrap();
+    for (index, (name, path)) in inputs.iter().enumerate() {
+        let bytes = fs::read(path)
+            .unwrap_or_else(|err| panic!("cannot read build input {}: {err}", path.display()));
+        let sha = hex(&digest(&bytes));
+        writeln!(
+            &mut manifest,
+            "    {{\"path\": \"{name}\", \"bytes\": {}, \"sha256\": \"{sha}\"}}{}",
+            bytes.len(),
+            if index + 1 == inputs.len() { "" } else { "," }
+        )
+        .unwrap();
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    writeln!(&mut manifest, "  ]").unwrap();
+    writeln!(&mut manifest, "}}\n").unwrap();
+    manifest
+}
+
+fn write_identity(
+    crate_root: &Path,
+    out_dir: &Path,
+    tree: Option<&Path>,
+    target: &str,
+    is_sbf: bool,
+    common_flags: &[&str],
+) {
+    let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags);
+    let abi_id = digest(format!("DOOM-EX2-ABI-ID\0{ABI_DESCRIPTOR}").as_bytes());
+    let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
+    image_input.extend_from_slice(manifest.as_bytes());
+    let image_id = digest(&image_input);
+    let manifest_id = hex(&digest(manifest.as_bytes()));
+    fs::write(out_dir.join("doom_ex2_source_manifest.json"), &manifest)
+        .expect("write Doom EX2 source manifest");
+    let generated = format!(
+        "pub const IMAGE_ID: [u8; 32] = [{}];\n\
+         pub const ABI_ID: [u8; 32] = [{}];\n\
+         pub const SOURCE_MANIFEST_SHA256: &str = \"{manifest_id}\";\n\
+         pub const ABI_DESCRIPTOR: &str = {ABI_DESCRIPTOR:?};\n\
+         pub const BUILD_SOURCE_MANIFEST: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/doom_ex2_source_manifest.json\"));\n",
+        rust_array(&image_id), rust_array(&abi_id),
+    );
+    fs::write(out_dir.join("doom_ex2_build_identity.rs"), generated)
+        .expect("write Doom EX2 build identity");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=src/doom_hotloops.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_platform.c");
@@ -19,6 +206,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_sbf_ex2.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
+    let out_dir =
+        PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZERO_BSS_PROBE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
@@ -53,6 +242,15 @@ fn main() {
 
     if env::var("CARGO_FEATURE_CTX_ENGINE").is_ok() {
         compile_ctx_engine(&target);
+    } else {
+        write_identity(
+            &std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()),
+            &out_dir,
+            None,
+            &target,
+            false,
+            &[],
+        );
     }
 }
 
@@ -60,8 +258,8 @@ fn main() {
 /// context-mode platform layer into the program image.
 ///
 /// The engine sources live outside git (fetched by stunts/doom-host/build.sh
-/// into $DOOM_SCRATCH with patches 0001-0007 applied), so this resolves the
-/// tree from the environment and fails loudly when patch 0007 is missing.
+/// into $DOOM_SCRATCH with the ordered host patches applied), so this resolves
+/// the tree from the environment and fails loudly when patch 0007 is missing.
 /// Three archives.  The engine TUs use the bare-name macros; doom_ctx_init.c
 /// and doom_sbf_ctx.c spell DOOM_CTX->field explicitly and compile with
 /// -DDOOM_CTX_NO_MACROS; doom_sbf_platform.c compiles WITHOUT -include
@@ -71,12 +269,16 @@ fn compile_ctx_engine(target: &str) {
     let manifest = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let scratch = env::var("DOOM_SCRATCH").expect(
         "ctx-engine needs DOOM_SCRATCH=<dir> with the build.sh layout \
-         (doom-src/linuxdoom-1.10 at patches 0001-0007)",
+         (doom-src/linuxdoom-1.10 with the ordered host patches)",
     );
     let scratch_path = std::path::PathBuf::from(&scratch);
     let nested_tree = scratch_path.join("doom-src/linuxdoom-1.10");
     let direct_tree = scratch_path.join("linuxdoom-1.10");
-    let tree = if nested_tree.is_dir() { nested_tree } else { direct_tree };
+    let tree = if nested_tree.is_dir() {
+        nested_tree
+    } else {
+        direct_tree
+    };
     let ctx_h = tree.join("headless/doom_ctx.h");
     assert!(
         ctx_h.is_file(),
@@ -114,6 +316,9 @@ fn compile_ctx_engine(target: &str) {
     // untouched -- changing its codegen would silently shift the retained
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
+    let out_dir =
+        PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
+    write_identity(&manifest, &out_dir, Some(&tree), target, is_sbf, common);
     let mut engine = cc::Build::new();
     let mut ctx = cc::Build::new();
     let mut platform = cc::Build::new();
