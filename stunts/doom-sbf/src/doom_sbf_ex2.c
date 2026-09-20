@@ -29,7 +29,7 @@
 #include "doom_controller.h"
 
 extern void R_ExecuteSetViewSize(void);
-extern void doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
+extern int doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
 
 /* Keep the exact retained native account pool codec in this translation unit
  * only for the host bridge.  SBF uses the Doom-local mirror codec compiled
@@ -304,8 +304,8 @@ int doom_engine_ex2_entry(
 extern int doom_ctx_guard(const void *data);
 extern unsigned long doom_ctx_size(void);
 extern void doom_ctx_init(void);
-extern void doom_sbf_bind_arena(void *base, unsigned long bytes,
-                                unsigned long zone_bytes);
+extern int doom_sbf_bind_arena(void *base, unsigned long bytes,
+                               unsigned long zone_bytes);
 extern int doom_sbf_arena_exhausted(void);
 extern unsigned long doom_sbf_arena_high_water(void);
 
@@ -392,10 +392,11 @@ int doom_engine_ex2_sbf_tic_entry(
     input_tic = (uint32_t)ex2_sbf_u32(state + 20);
     if (!ex2_sbf_controller_shape(controller, controller_len, input_tic))
         return EX2_REFUSE_CONTROLLER;
-    /* The full WAD digest was already captured and bound into MP1.  Rehashing
-     * four megabytes in the first SBF tic would measure the account transport,
-     * not the continuation.  MP1 remains the authoritative captured binding;
-     * W_InitAccountImage below still checks the real lump directory. */
+    /* The host driver has pinned the retained WAD account files and their
+     * concatenated payload before starting ProgramTest.  This SBF boundary is
+     * still not on-chain WAD authentication: rehashing four megabytes here
+     * would measure account transport, so MP1 remains the captured binding;
+     * W_InitAccountImage below parses the actual supplied lump directory. */
     memcpy(wad_hash, mirror + 36, sizeof(wad_hash));
     if (!ex2_sbf_mirror_shape(mirror, mirror_len, wad_hash))
         return EX2_REFUSE_POOL;
@@ -405,10 +406,12 @@ int doom_engine_ex2_sbf_tic_entry(
      * all subsequent malloc/realloc/free operations are context-local. */
     memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
     doom_ctx_init();
-    doom_sbf_bind_arena(bootstrap, bootstrap_bytes, DOOM_ZONE_BYTES);
+    if (!doom_sbf_bind_arena(bootstrap, bootstrap_bytes, DOOM_ZONE_BYTES))
+	return EX2_REFUSE_ARENA;
     low_arena = (uint8_t *)calloc(1, EX2_LOW_ARENA_BYTES);
     if (!low_arena) return EX2_REFUSE_RESOURCE;
-    doom_sbf_bind_arena(low_arena, EX2_LOW_ARENA_BYTES, DOOM_ZONE_BYTES);
+    if (!doom_sbf_bind_arena(low_arena, EX2_LOW_ARENA_BYTES, DOOM_ZONE_BYTES))
+	return EX2_REFUSE_ARENA;
     gamemode = shareware;
     gamemission = doom;
     language = english;

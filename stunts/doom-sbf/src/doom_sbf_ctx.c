@@ -16,6 +16,7 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef unsigned char byte_t;
 typedef unsigned long u64_t;
@@ -31,6 +32,7 @@ void *memcpy(void *dst, const void *src, size_t n);
  * account at a moved position must observe exactly this, not a generic
  * loader or validation error.  Mirrored as CTX_GUARD_REFUSED in src/lib.rs. */
 #define DOOM_CTX_GUARD_REFUSED 199
+#define DOOM_SBF_ALLOC_ALIGNMENT 16u
 
 /* The context account's data must map at the pinned address (M1021: the
  * first account's data at a fixed layout).  Any other mapping means the
@@ -145,14 +147,24 @@ int doom_ctx_probe(const void *seen, unsigned long value, unsigned long *out)
  * malloc/I_AllocLow calls the WAD/init paths make; the zone itself always
  * comes from DOOM_CTX->zone (see I_ZoneBase), never from this carrier.  An
  * unbound carrier fails closed: every take returns NULL. */
-void doom_sbf_bind_arena(void *base, u64_t bytes, u64_t zone_bytes)
+int doom_sbf_bind_arena(void *base, u64_t bytes, u64_t zone_bytes)
 {
+    if (!base || ((uintptr_t)base & (DOOM_SBF_ALLOC_ALIGNMENT - 1u)) != 0) {
+	DOOM_CTX->arena_base = (byte_t *)0;
+	DOOM_CTX->arena_bytes = 0;
+	DOOM_CTX->arena_used = 0;
+	DOOM_CTX->arena_zone_bytes = zone_bytes;
+	DOOM_CTX->arena_exhausted = 1;
+	DOOM_CTX->arena_high_water = 0;
+	return 0;
+    }
     DOOM_CTX->arena_base = (byte_t *)base;
     DOOM_CTX->arena_bytes = bytes;
     DOOM_CTX->arena_used = 0;
     DOOM_CTX->arena_zone_bytes = zone_bytes;
     DOOM_CTX->arena_exhausted = 0;
     DOOM_CTX->arena_high_water = 0;
+    return 1;
 }
 
 u64_t doom_sbf_arena_high_water(void)
@@ -168,6 +180,12 @@ int doom_sbf_arena_exhausted(void)
 static void *arena_take(u64_t bytes)
 {
     u64_t start = (DOOM_CTX->arena_used + 15u) & ~(u64_t)15u;
+	if (DOOM_CTX->arena_base &&
+	    ((uintptr_t)DOOM_CTX->arena_base & (DOOM_SBF_ALLOC_ALIGNMENT - 1u)))
+	{
+	    DOOM_CTX->arena_exhausted = 1;
+	    return (void *)0;
+	}
     if (!DOOM_CTX->arena_base || bytes > DOOM_CTX->arena_bytes ||
 	start > DOOM_CTX->arena_bytes - bytes)
     {

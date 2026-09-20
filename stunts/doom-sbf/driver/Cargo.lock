@@ -1213,6 +1213,7 @@ dependencies = [
  "solana-signer",
  "solana-transaction",
  "solana-transaction-error",
+ "sha2 0.10.9",
  "tokio",
 ]
 

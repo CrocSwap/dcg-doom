@@ -27,6 +27,10 @@ pub const WAD_HEADER_BYTES: usize = 32;
 /// input, while each account header and padding is checked here.
 pub const WAD_IMAGE_BYTES: usize = 4_196_020;
 pub const BOOTSTRAP_BYTES: usize = 2 * 1024 * 1024;
+/// The C carrier serves malloc/calloc/realloc and requires a sixteen-byte
+/// aligned base for this SBF engine cut. The runtime checks below also reject
+/// an account mapping whose actual base does not satisfy this contract.
+pub const ALLOC_ALIGNMENT: usize = 16;
 
 pub const CONTEXT_ACCOUNT: usize = 0;
 pub const WAD_FIRST_ACCOUNT: usize = 1;
@@ -40,13 +44,13 @@ pub const MIRROR_BYTES: usize = super::ex2::MIRROR_BYTES;
 pub const CONTROLLER_BYTES: usize = super::ex2::CONTROLLER_BYTES;
 pub const CTX_STRUCT_BYTES: usize = super::CTX_MIN_BYTES - 24;
 pub const WAD_IMAGE_OFFSET: usize = super::CTX_MIN_BYTES;
-pub const BOOTSTRAP_OFFSET: usize = align8_const(WAD_IMAGE_OFFSET + WAD_IMAGE_BYTES);
+pub const BOOTSTRAP_OFFSET: usize = align16_const(WAD_IMAGE_OFFSET + WAD_IMAGE_BYTES);
 pub const CONTEXT_BYTES: usize = BOOTSTRAP_OFFSET + BOOTSTRAP_BYTES;
 
 const CONTROLLER_HEADER_BYTES: usize = 28;
 
-const fn align8_const(value: usize) -> usize {
-    (value + 7) & !7
+const fn align16_const(value: usize) -> usize {
+    (value + (ALLOC_ALIGNMENT - 1)) & !(ALLOC_ALIGNMENT - 1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +250,9 @@ pub fn process(
         return Err(ProgramError::InvalidAccountData);
     }
     let context_ptr = context.as_mut_ptr();
+    if (context_ptr as usize) % ALLOC_ALIGNMENT != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let mut cursor = wad_start;
     for ordinal in 0..WAD_ACCOUNT_COUNT {
         let source = accounts[WAD_FIRST_ACCOUNT + ordinal].try_borrow_data()?;
@@ -261,6 +268,9 @@ pub fn process(
     let (wad_image, after_wad) = context_tail.split_at_mut(request.wad_bytes);
     let (_alignment_gap, bootstrap_tail) = after_wad.split_at_mut(bootstrap_start - wad_end);
     let bootstrap = &mut bootstrap_tail[..BOOTSTRAP_BYTES];
+    if (bootstrap.as_mut_ptr() as usize) % ALLOC_ALIGNMENT != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     let mut state = accounts[STATE_ACCOUNT].try_borrow_mut_data()?;
     let mut mirror = accounts[MIRROR_ACCOUNT].try_borrow_mut_data()?;

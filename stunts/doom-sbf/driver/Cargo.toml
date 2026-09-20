@@ -57,4 +57,5 @@ solana-transaction = "=2.2.3"
 solana-transaction-error = "=2.2.1"
 solana-banks-client = "=2.3.9"
 solana-banks-interface = "=2.3.9"
+sha2 = "=0.10.9"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }

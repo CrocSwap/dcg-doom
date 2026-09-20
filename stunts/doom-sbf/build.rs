@@ -17,7 +17,7 @@ const ENGINE_TUS: &[&str] = &[
 ];
 
 const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC/2|schema=2|roles=12|state=ST1/v0|mirror=MP1/v1|controller=CI2/v1|frame=FB1/64000|role-map=00..0b";
-const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734120|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
+const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
