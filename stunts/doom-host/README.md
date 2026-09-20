@@ -73,14 +73,20 @@ hashes while checking same-input repeatability, changed-input effect, and
 absent/malformed refusal. This is a host-only gameplay/control capability
 demonstration, not an interactive, SBF, validator, chain, or DCG claim.
 
-Patch `0011` is the explicit `DOOM-HOST-CREENTRY-1` host execution-mode
-boundary. It permits the same DOOM-CI2 v1 account to arm one command after a
-fresh process imports the selector-selected strict `DOOM-PUB1` pair; it does
-not change any account wire format or create `DOOM-EX2`. Run
+Patch `0011` remains the legacy `DOOM-HOST-CREENTRY-1` execution mode. Its
+receipts are retained as a measured mechanics demonstration, but its
+two-process continuation is failed: it publishes before the host counter and
+does not consume the captured DEMO1 slot when CI2 supplies the command.
+
+Patch `0012` adds the explicit `DOOM-HOST-CREENTRY-2` mode. It preserves the
+CI1/CI2 v1 bytes and uses `--controller-ingress-v2 FILE` to validate and
+consume one four-byte DEMO1 slot (including real-lump bounds and the 0x80
+marker check) at `G_Ticker`. V2 increments the host gametic before strict
+LS1-authoritative/MP1-derived publication, so the next CI2 header must carry
+the imported counter; it does not use the legacy expected-gametic override.
+It remains host-only and does not establish SBF, chain, multiplayer,
+long-playback, or DCG behavior. Run
 `scripts/doom_controlled_reentry_gate.py` with the retained account-image
-capture and a real `doom-headless` executable to check two-command re-entry,
-strict LS1-authoritative/MP1-derived publication, selector-directed import,
-changed-second-command effects, mutation refusal, and interrupted successor
-publication. The gate compares to an uninterrupted two-tic host run when the
-native executable supports it. It remains host-only and does not establish SBF,
-chain, multiplayer, long-playback, or DCG behavior.
+capture and the rebuilt native executable to exercise base/base and
+base/changed equality against uninterrupted native rows, selector-directed
+import, mutation refusal, and 0/1/2-write publication atomicity.

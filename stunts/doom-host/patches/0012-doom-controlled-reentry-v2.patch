@@ -1,0 +1,207 @@
+Subject: [PATCH 0012] Add explicit Doom host continuation v2
+
+DOOM-HOST-CREENTRY-2 preserves the legacy CI1/CI2/ST1/MP1/PUB1/EX1
+behavior and introduces a separate CI2 ingress option. V2 consumes one
+validated captured DEMO1 command slot at G_Ticker and publishes the strict
+successor only after the host gametic advances; it is host-only.
+
+diff --git a/linuxdoom-1.10/headless/doom_controller.h b/linuxdoom-1.10/headless/doom_controller.h
+--- a/linuxdoom-1.10/headless/doom_controller.h
++++ b/linuxdoom-1.10/headless/doom_controller.h
+@@ -2,6 +2,7 @@
+ #define DOOM_CONTROLLER_H
+ 
+ #include <stdint.h>
++#include <stddef.h>
+ #include "d_ticcmd.h"
+ 
+ /* DOOM-CI1 v1: the four bytes are the captured ticcmd at byte 24. */
+@@ -15,4 +16,12 @@
+ int DoomControllerArm(const uint8_t[4]);
+ int DoomControllerApplyTiccmd(ticcmd_t *);
+ 
++/* DOOM-HOST-CREENTRY-2 uses the same CI2 bytes but advances the captured
++ * DEMO1 cursor for the supplied command.  The bound is the real lump bound,
++ * not the allocator bound used by the legacy demo loader. */
++void DoomControllerSetCapturedDemoBounds(const uint8_t *, size_t);
++int DoomControllerValidateCapturedDemoCursor(const uint8_t *);
++int DoomControllerArmV2(const uint8_t[4]);
++int DoomControllerApplyTiccmdV2(ticcmd_t *, uint8_t **);
++
+ #endif
+diff --git a/linuxdoom-1.10/headless/doom_controller.c b/linuxdoom-1.10/headless/doom_controller.c
+--- a/linuxdoom-1.10/headless/doom_controller.c
++++ b/linuxdoom-1.10/headless/doom_controller.c
+@@ -46,8 +46,21 @@
+ }
+ 
+ static int controller_armed;
++static int controller_v2_armed;
+ static uint8_t controller_command[4];
++static const uint8_t *captured_demo_begin;
++static const uint8_t *captured_demo_end;
+ 
++static void apply_command(ticcmd_t *cmd)
++{
++    cmd->forwardmove_m = (char)controller_command[0];
++    cmd->sidemove = (char)controller_command[1];
++    cmd->angleturn = ((unsigned char)controller_command[2]) << 8;
++    cmd->consistancy_m = 0;
++    cmd->chatchar = 0;
++    cmd->buttons = controller_command[3];
++}
++
+ int DoomControllerArm(const uint8_t command[4])
+ {
+     if (!command)
+@@ -57,16 +70,50 @@
+     return 0;
+ }
+ 
++void DoomControllerSetCapturedDemoBounds(const uint8_t *begin, size_t bytes)
++{
++    captured_demo_begin = begin;
++    captured_demo_end = begin ? begin + bytes : 0;
++}
++
++int DoomControllerValidateCapturedDemoCursor(const uint8_t *cursor)
++{
++    return cursor && captured_demo_begin && captured_demo_end
++        && cursor >= captured_demo_begin && cursor <= captured_demo_end
++        && (size_t)(captured_demo_end - cursor) >= 4
++        && *cursor != 0x80 ? 0 : -1;
++}
++
++int DoomControllerArmV2(const uint8_t command[4])
++{
++    if (!command || !captured_demo_begin || !captured_demo_end
++        || captured_demo_end < captured_demo_begin)
++        return -1;
++    memcpy(controller_command, command, sizeof(controller_command));
++    controller_v2_armed = 1;
++    return 0;
++}
++
+ int DoomControllerApplyTiccmd(ticcmd_t *cmd)
+ {
+     if (!controller_armed || !cmd)
+         return 0;
+-    cmd->forwardmove_m = (char)controller_command[0];
+-    cmd->sidemove = (char)controller_command[1];
+-    cmd->angleturn = ((unsigned char)controller_command[2]) << 8;
+-    cmd->consistancy_m = 0;
+-    cmd->chatchar = 0;
+-    cmd->buttons = controller_command[3];
++    apply_command(cmd);
+     controller_armed = 0;
+     return 1;
+ }
++
++int DoomControllerApplyTiccmdV2(ticcmd_t *cmd, uint8_t **cursor)
++{
++    if (!controller_v2_armed)
++        return 0;
++    if (!cmd || !cursor || !*cursor
++        || DoomControllerValidateCapturedDemoCursor(*cursor)) {
++        controller_v2_armed = 0;
++        return -1;
++    }
++    *cursor += 4;
++    apply_command(cmd);
++    controller_v2_armed = 0;
++    return 1;
++}
+diff --git a/linuxdoom-1.10/g_game.c b/linuxdoom-1.10/g_game.c
+--- a/linuxdoom-1.10/g_game.c
++++ b/linuxdoom-1.10/g_game.c
+@@ -528,6 +528,7 @@
+     int		i;
+     int		buf; 
+     ticcmd_t*	cmd;
++    int		controller_v2_applied;
+     
+     // do player reborns if needed
+     for (i=0 ; i<MAXPLAYERS ; i++) 
+@@ -584,8 +585,11 @@
+  
+ 	    memcpy (cmd, &netcmds[i][buf], sizeof(ticcmd_t)); 
+  
+-	    if (!DoomControllerApplyTiccmd(cmd) && demoplayback)
+-		G_ReadDemoTiccmd (cmd); 
++	    controller_v2_applied = DoomControllerApplyTiccmdV2(cmd, &demo_p);
++	    if (controller_v2_applied < 0)
++		I_Error ("captured DEMO1 command slot is out of bounds or marked done");
++	    else if (!controller_v2_applied && !DoomControllerApplyTiccmd(cmd) && demoplayback)
++		G_ReadDemoTiccmd (cmd);
+ 	    if (demorecording) 
+ 		G_WriteDemoTiccmd (cmd);
+ 	    
+diff --git a/linuxdoom-1.10/headless/doom_headless.c b/linuxdoom-1.10/headless/doom_headless.c
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -70,7 +70,7 @@
+ static void le32(uint8_t out[4], uint32_t n) {out[0]=n;out[1]=n>>8;out[2]=n>>16;out[3]=n>>24;}
+ static void hash_record(const char *tag,const uint8_t wad[32],uint32_t tic,uint32_t strip,const uint8_t *pixels,size_t n,char out[65]) { sha256_t s;uint8_t x[4],d[32];sha_init(&s);sha_update(&s,tag,strlen(tag));le32(x,0);sha_update(&s,x,4);sha_update(&s,wad,32);le32(x,tic);sha_update(&s,x,4);le32(x,strip);sha_update(&s,x,4);sha_update(&s,pixels,n);sha_final(&s,d);hex(d,out); }
+ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec*1000.0+(double)t.tv_nsec/1000000.0; }
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--controller-ingress FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--controller-ingress FILE] [--controller-ingress-v2 FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR]\n",argv0); }
+ static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
+ static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
+ /* One census line per named phase: the non-purgeable zone bytes are the hard
+@@ -126,9 +126,9 @@
+ }
+ 
+ int main(int argc, char **argv) {
+-  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller"), *controller_ingress_path=arg_after(argc,argv,"--controller-ingress");
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller"), *controller_ingress_path=arg_after(argc,argv,"--controller-ingress"), *controller_ingress_v2_path=arg_after(argc,argv,"--controller-ingress-v2");
+   char *allocation_fail_arg=arg_after(argc,argv,"--allocation-fail"), *decoder_report=arg_after(argc,argv,"--decoder-report"), *publish_dir=arg_after(argc,argv,"--publish-dir"), *publish_fail_arg=arg_after(argc,argv,"--publish-fail-after"), *import_pair_dir=arg_after(argc,argv,"--import-pair-dir");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000, published=0; long allocation_fail=-1, publish_fail_after=-1; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000, published=0, continuation_v2=0; long allocation_fail=-1, publish_fail_after=-1; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
+   if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
+   if(max_tics_arg){char *end=0;long v=strtol(max_tics_arg,&end,10);if(!end||*end||v<1||v>1000000){fprintf(stderr,"bad --max-tics\n");return 2;}max_tics=(int)v;}
+   if(decoder_report&&!load&&!import_pair_dir){fprintf(stderr,"--decoder-report requires --load or --import-pair-dir\n");return 2;}
+@@ -144,7 +144,7 @@
+   Z_Init(); zone_census(censusout,"z_init"); if(manifest){if(DoomAccountOpenManifest(manifest,&account)){fprintf(stderr,"refusing account manifest %s\n",manifest);return 2;}memcpy(wad_hash,DoomAccountWadHash(account),32);}else W_InitFile(iwad); V_Init(); zone_census(censusout,"wad_open"); R_Init(); R_ExecuteSetViewSize(); P_Init(); zone_census(censusout,"engine_init");
+   demo_len=W_LumpLength(W_GetNumForName(demo_name)); demo=W_CacheLumpName(demo_name,PU_STATIC); if(demo_len<14){fprintf(stderr,"demo too short\n");return 2;}
+   if(account && (demo[2]!=1 || demo[3]<1 || demo[3]>9 || DoomAccountBeginLevel(account,demo[2],demo[3]))){fprintf(stderr,"account loader accepts only E1 shareware DEMO1\n");return 2;}
+-  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo(); zone_census(censusout,"load_level");
++  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo(); DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len); zone_census(censusout,"load_level");
+   if(account && DoomAccountCommitLevel(account)){fprintf(stderr,"cannot commit fixed account image\n");return 2;}
+   if(import_pair_dir && (!account || (decoder_report?decoder_gate_import_pair(import_pair_dir,decoder_report,wad_hash,account):DoomAccountImportPublishedPair(account,import_pair_dir)))){fprintf(stderr,"cannot import published LS1/MP1 pair %s\n",import_pair_dir);return 2;}
+   if(publish_dir && (!account || DoomAccountCommitLevelStrict(account) || DoomAccountPublishPair(account,publish_dir,0,-1))){fprintf(stderr,"cannot publish initial LS1/MP1 pair %s\n",publish_dir);return 3;}
+@@ -167,7 +167,7 @@
+     fprintf(stderr,"--controller-ingress requires a DOOM-CI2 account path\n");
+     return 2;
+   }
+-  if(controller_path && controller_ingress_path){
++  if((controller_path && controller_ingress_path) || (controller_path && controller_ingress_v2_path) || (controller_ingress_path && controller_ingress_v2_path)){
+     fprintf(stderr,"--controller and --controller-ingress are mutually exclusive\n");
+     return 2;
+   }
+@@ -177,6 +177,17 @@
+       return 2;
+     }
+   }
++  if(has_arg(argc,argv,"--controller-ingress-v2") && !controller_ingress_v2_path){
++    fprintf(stderr,"--controller-ingress-v2 requires a DOOM-CI2 account path\n");
++    return 2;
++  }
++  if(controller_ingress_v2_path){
++    if((!load && !import_pair_dir) || max_tics!=1 || DoomControllerReadIngress(controller_ingress_v2_path,(uint32_t)gametic,controller_command) || DoomControllerArmV2(controller_command) || DoomControllerValidateCapturedDemoCursor(demo_p)){
++      fprintf(stderr,"refusing controller ingress v2: bounded DOOM-CI2 input is invalid\n");
++      return 2;
++    }
++    continuation_v2=1;
++  }
+   if(s0){if(DoomStateEncode(&state_image,&state_bytes)){fprintf(stderr,"cannot encode S0\n");return 2;}DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);out=fopen(s0,"w");if(!out){fprintf(stderr,"cannot open %s\n",s0);return 2;}fprintf(out,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);fclose(out);}
+   if(resave){if(DoomStateSave(resave)){fprintf(stderr,"cannot resave %s\n",resave);return 2;}return 0;}
+   if(save_at==0){if(DoomStateSave(save)){fprintf(stderr,"cannot save %s\n",save);return 2;}return 0;}
+@@ -185,7 +196,7 @@
+   if(parity_path||probe_path){render_scratch=malloc(DOOM_RENDER_SCRATCH_BYTES);if(!render_scratch){fprintf(stderr,"cannot allocate render scratch\n");return 2;}DoomRenderScratchInit(render_scratch,DOOM_RENDER_SCRATCH_BYTES,account);}
+   if(probe_path){int refusal;uint8_t bad[64],probe[DOOM_RENDER_STRIP_ACCOUNT_BYTES],*p=0;size_t n=0;probeout=fopen(probe_path,"w");DoomStateEncode(&p,&n);memcpy(bad,p,n<sizeof(bad)?n:sizeof(bad));refusal=DoomRenderStrip(8,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"{\"strip_id_8\":%d,",refusal==DOOM_RENDER_REFUSE_STRIP);refusal=DoomRenderStrip(0,p,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES-1,probe,0,(uint32_t)gametic);fprintf(probeout,"\"short_scratch\":%d,",refusal==DOOM_RENDER_REFUSE_SCRATCH);bad[0]='X';refusal=DoomRenderStrip(0,bad,n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,probe,0,(uint32_t)gametic);fprintf(probeout,"\"bad_state\":%d}\n",refusal==DOOM_RENDER_REFUSE_STATE);DoomStateFree(p);fclose(probeout);}
+   out=fopen(frames,"w");if(!out){fprintf(stderr,"cannot open %s: %s\n",frames,strerror(errno));return 2;}if(statehashes){stateout=fopen(statehashes,"w");if(!stateout){fprintf(stderr,"cannot open %s: %s\n",statehashes,strerror(errno));fclose(out);return 2;}}
+-  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(publish_dir&&!published){if(!account||DoomAccountCommitLevelStrict(account)||DoomAccountPublishPair(account,publish_dir,1,publish_fail_after)){fprintf(stderr,"cannot publish successor LS1/MP1 pair %s\n",publish_dir);return 3;}published=1;}if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs_m,tic_metrics[strip_id].vissprites_m,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(censusout&&(rendered==1||rendered==100||rendered==1000)){char ph[32];sprintf(ph,"tic_%d",rendered);zone_census(censusout,ph);}if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
++  for(tic=0;!doom_headless_demo_done && tic<max_tics;tic++){int strip_id,x,y;double started=now_ms(),render_started;G_Ticker();if(!continuation_v2&&publish_dir&&!published){if(!account||DoomAccountCommitLevelStrict(account)||DoomAccountPublishPair(account,publish_dir,1,publish_fail_after)){fprintf(stderr,"cannot publish successor LS1/MP1 pair %s\n",publish_dir);return 3;}published=1;}if(doom_headless_demo_done)break;if(parityout){uint8_t *img=0;size_t img_n=0;int equal=1;unsigned fuzz=0;if(DoomStateEncode(&img,&img_n))return 1;render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;memcpy(full_frame,screens[0],sizeof(full_frame));hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(parityout,"{\"gametic\":%u,\"full_sha256\":\"%s\",\"strip_sha256\":[",(unsigned)gametic,digest);memset(assembled,0,sizeof(assembled));for(strip_id=0;strip_id<STRIPS;strip_id++){int rr=DoomRenderStrip(strip_id,img,img_n,account,render_scratch,DOOM_RENDER_SCRATCH_BYTES,strip_account,&tic_metrics[strip_id],(uint32_t)gametic);if(rr)return 1;if(strip_id)fputc(',',parityout);hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip_account+64,DOOM_RENDER_STRIP_PIXELS,digest);fprintf(parityout,"\"%s\"",digest);for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++){byte q=strip_account[64+x*200+y];assembled[y*FB_WIDTH+strip_id*40+x]=q;if(q!=full_frame[y*FB_WIDTH+strip_id*40+x])equal=0;}if(strip_id==0)fuzz=tic_metrics[0].fuzz_columns;}DoomStateFree(img);hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,assembled,sizeof(assembled),digest);fprintf(parityout,"],\"assembled_sha256\":\"%s\",\"byte_equal\":%s,\"fuzz_columns\":%u,\"cost\":[",digest,equal?"true":"false",fuzz);for(strip_id=0;strip_id<STRIPS;strip_id++){if(strip_id)fputc(',',parityout);fprintf(parityout,"{\"strip_id\":%d,\"wall_ns\":%llu,\"host_ticks\":%llu,\"drawsegs\":%u,\"vissprites\":%u,\"fuzz_columns\":%u}",strip_id,(unsigned long long)tic_metrics[strip_id].wall_ns,(unsigned long long)tic_metrics[strip_id].host_ticks,tic_metrics[strip_id].drawsegs_m,tic_metrics[strip_id].vissprites_m,tic_metrics[strip_id].fuzz_columns);}fprintf(parityout,"]}\n");DoomStateFree(0);for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=assembled[y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,full_frame,sizeof(full_frame),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}else{render_started=now_ms();R_RenderPlayerView(&players[displayplayer]);render_ms+=now_ms()-render_started;for(strip_id=0;strip_id<STRIPS;strip_id++){for(x=0;x<STRIP_WIDTH;x++)for(y=0;y<FB_HEIGHT;y++)strip[x*200+y]=screens[0][y*320+strip_id*40+x];hash_record("DOOM-FB1",wad_hash,(uint32_t)gametic,(uint32_t)strip_id,strip,sizeof(strip),digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":%d,\"sha256\":\"%s\"}\n",(unsigned)gametic,strip_id,digest);}hash_record("DOOM-FB1-FRAME",wad_hash,(uint32_t)gametic,0,screens[0],FB_WIDTH*FB_HEIGHT,digest);fprintf(out,"{\"gametic\":%u,\"strip_id\":-1,\"sha256\":\"%s\"}\n",(unsigned)gametic,digest);}gametic++;if(continuation_v2&&publish_dir&&!published){if(!account||DoomAccountCommitLevelStrict(account)||DoomAccountPublishPair(account,publish_dir,1,publish_fail_after)){fprintf(stderr,"cannot publish successor LS1/MP1 pair %s\n",publish_dir);return 3;}published=1;}if(stateout){if(DoomStateEncode(&state_image,&state_bytes))return 1;DoomStateHash(wad_hash,state_image,state_bytes,digest);DoomStateFree(state_image);fprintf(stateout,"{\"gametic\":%u,\"sha256\":\"%s\"}\n",(unsigned)(gametic-1),digest);}tic_ms+=now_ms()-started;rendered++;if(censusout&&(rendered==1||rendered==100||rendered==1000)){char ph[32];sprintf(ph,"tic_%d",rendered);zone_census(censusout,ph);}if(save_at==rendered){if(DoomStateSave(save))return 1;break;}}
+   zone_census(censusout,"final");if(censusout)fclose(censusout);
+   fclose(out);if(parityout)fclose(parityout);free(render_scratch);if(stateout)fclose(stateout);if(tic==100000){fprintf(stderr,"demo did not terminate\n");return 1;}fprintf(stderr,"doom-headless: tics=%d ms/tic=%.6f ms/render=%.6f\n",rendered,tic_ms/(rendered?rendered:1),render_ms/(rendered?rendered:1));return 0;
+ }
