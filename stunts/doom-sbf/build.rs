@@ -36,6 +36,116 @@ fn rust_array(bytes: &[u8; 32]) -> String {
         .join(", ")
 }
 
+fn json_string(value: &str) -> String {
+    let mut escaped = String::from("\"");
+    for byte in value.bytes() {
+        match byte {
+            b'\\' => escaped.push_str("\\\\"),
+            b'\"' => escaped.push_str("\\\""),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            0x00..=0x1f => write!(&mut escaped, "\\u{byte:04x}").unwrap(),
+            _ => escaped.push(byte as char),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn command_version(path: &Path) -> String {
+    match Command::new(path).arg("--version").output() {
+        Ok(output) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !output.stderr.is_empty() {
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            text.trim().to_owned()
+        }
+        Err(error) => format!("unavailable: {error}"),
+    }
+}
+
+fn env_value(name: &str, fallback: &str) -> String {
+    env::var(name).unwrap_or_else(|_| fallback.to_owned())
+}
+
+fn build_metadata(target: &str, is_sbf: bool) -> String {
+    let mut compiler_probe = cc::Build::new();
+    if is_sbf {
+        let cc = env::var("CC").expect("ctx-engine SBF build needs CC from cargo-build-sbf");
+        compiler_probe.compiler(cc);
+    }
+    let compiler = compiler_probe.get_compiler();
+    let cc_path = compiler.path().to_string_lossy().into_owned();
+    let cc_version = command_version(compiler.path());
+    let rustc_path = PathBuf::from(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
+    let cargo_path = PathBuf::from(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let ar_path = PathBuf::from(env::var_os("AR").unwrap_or_else(|| "ar".into()));
+    let profile = env_value("PROFILE", "unknown");
+    let opt_level = env_value("OPT_LEVEL", "unknown");
+    let debug = env_value("DEBUG", "unknown");
+    let debug_assertions = env::var("DEBUG_ASSERTIONS").unwrap_or_else(|_| {
+        if profile == "release" {
+            "false".to_owned()
+        } else {
+            "unknown".to_owned()
+        }
+    });
+    let overflow_checks = env_value("CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS", "false");
+    let lto = env_value("CARGO_PROFILE_RELEASE_LTO", "true");
+    let codegen_units = env_value("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+    format!(
+        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}}\n}}",
+        json_string(target),
+        json_string(&rustc_path.to_string_lossy()),
+        json_string(&command_version(&rustc_path)),
+        json_string(&cargo_path.to_string_lossy()),
+        json_string(&command_version(&cargo_path)),
+        json_string(&cc_path),
+        json_string(&cc_version),
+        json_string(&ar_path.to_string_lossy()),
+        json_string(&command_version(&ar_path)),
+        json_string(&profile),
+        json_string(&opt_level),
+        json_string(&debug),
+        json_string(&debug_assertions),
+        json_string(&overflow_checks),
+        json_string(&lto),
+        json_string(&codegen_units),
+    )
+}
+
+fn collect_repo_inputs(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    extensions: &[&str],
+    out: &mut Vec<(String, PathBuf)>,
+) {
+    let mut children = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("cannot read local build inputs {}: {err}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    children.sort();
+    for path in children {
+        if path.is_dir() {
+            collect_repo_inputs(root, &path, prefix, extensions, out);
+        } else if path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|extension| extensions.contains(&extension))
+        {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((format!("{prefix}/{rel}"), path));
+        }
+    }
+}
+
 fn collect_inputs(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let mut children = fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("cannot read external Doom source {}: {err}", dir.display()))
@@ -77,25 +187,45 @@ fn source_manifest(
     target: &str,
     is_sbf: bool,
     common_flags: &[&str],
+    metadata: &str,
 ) -> String {
     let mut inputs = Vec::<(String, PathBuf)>::new();
-    let local_names = [
-        "build.rs",
-        "Cargo.toml",
-        "Cargo.lock",
-        "src/ex2.rs",
-        "src/lib.rs",
-        "src/doom_hotloops.c",
-        "src/doom_sbf_ctx.c",
-        "src/doom_sbf_engine.c",
-        "src/doom_sbf_ex2.c",
-        "src/doom_sbf_platform.c",
-    ];
-    for name in local_names {
+    for name in ["build.rs", "Cargo.toml", "Cargo.lock"] {
         inputs.push((
             format!("repo/stunts/doom-sbf/{name}"),
             crate_root.join(name),
         ));
+    }
+    collect_repo_inputs(
+        crate_root,
+        &crate_root.join("src"),
+        "repo/stunts/doom-sbf",
+        &["c", "h", "inc", "rs"],
+        &mut inputs,
+    );
+    collect_repo_inputs(
+        crate_root,
+        &crate_root.join("sbfinc"),
+        "repo/stunts/doom-sbf",
+        &["h"],
+        &mut inputs,
+    );
+    for name in [
+        "driver/Cargo.toml",
+        "driver/Cargo.lock",
+        "driver/src/bin/ex2_native.rs",
+        "../doom-host/build.sh",
+        "../doom-host/tools/doom_controller_producer.py",
+        "../doom-host/tools/doom_account_image.py",
+    ] {
+        let path = crate_root.join(name);
+        let display = name.strip_prefix("../").unwrap_or(name);
+        let manifest_name = if name.starts_with("../") {
+            format!("repo/stunts/{display}")
+        } else {
+            format!("repo/stunts/doom-sbf/{name}")
+        };
+        inputs.push((manifest_name, path));
     }
     let patch_dir = crate_root.join("../doom-host/patches");
     let mut patches = fs::read_dir(&patch_dir)
@@ -136,6 +266,7 @@ fn source_manifest(
     )
     .unwrap();
     writeln!(&mut manifest, "  \"abi_descriptor\": \"{ABI_DESCRIPTOR}\",").unwrap();
+    writeln!(&mut manifest, "  \"build_metadata\": {metadata},").unwrap();
     writeln!(&mut manifest, "  \"compiler_flags\": [").unwrap();
     for (index, flag) in common_flags.iter().enumerate() {
         writeln!(
@@ -178,7 +309,8 @@ fn write_identity(
     is_sbf: bool,
     common_flags: &[&str],
 ) {
-    let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags);
+    let metadata = build_metadata(target, is_sbf);
+    let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags, &metadata);
     let abi_id = digest(format!("DOOM-EX2-ABI-ID\0{ABI_DESCRIPTOR}").as_bytes());
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
@@ -212,6 +344,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZERO_BSS_PROBE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=AR");
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-env-changed=CARGO");
+    println!("cargo:rerun-if-env-changed=PROFILE");
+    println!("cargo:rerun-if-env-changed=OPT_LEVEL");
+    println!("cargo:rerun-if-env-changed=DEBUG");
+    println!("cargo:rerun-if-env-changed=DEBUG_ASSERTIONS");
 
     let mut build = cc::Build::new();
     build.file("src/doom_hotloops.c");

@@ -26,7 +26,7 @@ fn read(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 fn producer(
-    repo: &Path,
+    source_root: &Path,
     capture: &Path,
     receipt: &Path,
     tic: u32,
@@ -34,9 +34,17 @@ fn producer(
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let output = receipt.join(format!("controller-tic{tic}-delta{delta}.bin"));
     let python = env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
+    let producer_script = source_root.join("stunts/doom-host/tools/doom_controller_producer.py");
+    if !producer_script.is_file() {
+        return Err(format!(
+            "producer script is missing under source root {}",
+            source_root.display()
+        )
+        .into());
+    }
     let status = Command::new(python)
-        .current_dir(repo)
-        .arg("stunts/doom-host/tools/doom_controller_producer.py")
+        .current_dir(source_root)
+        .arg(&producer_script)
         .args([
             "--capture",
             capture.to_str().ok_or("non-UTF8 capture path")?,
@@ -94,8 +102,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.next()
             .ok_or("usage: ex2_native CAPTURE_ROOT RECEIPT_DIR")?,
     );
+    let source_root = args
+        .next()
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("DOOM_EX2_SOURCE_ROOT").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve native source root: {error}"))?;
     if args.next().is_some() {
-        return Err("usage: ex2_native CAPTURE_ROOT RECEIPT_DIR".into());
+        return Err(
+            "usage: ex2_native CAPTURE_ROOT RECEIPT_DIR [SOURCE_ROOT] (or DOOM_EX2_SOURCE_ROOT)"
+                .into(),
+        );
     }
     if !capture.join("account/manifest.json").is_file() {
         return Err(format!("missing retained manifest under {}", capture.display()).into());
@@ -111,15 +129,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(
         receipt.join("identity.json"),
         format!(
-            "{{\n  \"image_id\": \"{}\",\n  \"abi_id\": \"{}\",\n  \"source_manifest_sha256\": \"{}\",\n  \"identity_rule\": \"sha256(domain || canonical source manifest); executable bytes are not input\"\n}}\n",
+            "{{\n  \"image_id\": \"{}\",\n  \"abi_id\": \"{}\",\n  \"source_manifest_sha256\": \"{}\",\n  \"source_root\": {:?},\n  \"identity_rule\": \"image_id = sha256(DOOM-EX2-IMAGE-ID\\u0000 || canonical source manifest); executable bytes are not input\",\n  \"executable_hash\": \"recorded by the Python gate as sha256(raw binary bytes), outside image_id\"\n}}\n",
             hex(&ex2::IMAGE_ID),
             hex(&ex2::ABI_ID),
             ex2::SOURCE_MANIFEST_SHA256,
+            source_root.display().to_string(),
         ),
     )?;
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()?;
     let state0 = read(&capture.join("dumped-doom-st1.bin"))?;
     let mirror0 = read(&capture.join("mobj_pool.bin"))?;
     let mut wad_accounts: [Vec<u8>; 5] = std::array::from_fn(|_| Vec::new());
@@ -127,10 +143,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         *account = read(&capture.join(format!("account/wad-{i:03}.bin")))?;
     }
     let wad_refs = std::array::from_fn(|i| wad_accounts[i].as_slice());
-    let ci0 = producer(&repo, &capture, &receipt, 0, 0)?;
-    let ci1 = producer(&repo, &capture, &receipt, 1, 0)?;
-    let ci1_changed = producer(&repo, &capture, &receipt, 1, 1)?;
-    let ci2 = producer(&repo, &capture, &receipt, 2, 0)?;
+    let ci0 = producer(&source_root, &capture, &receipt, 0, 0)?;
+    let ci1 = producer(&source_root, &capture, &receipt, 1, 0)?;
+    let ci1_changed = producer(&source_root, &capture, &receipt, 1, 1)?;
+    let ci2 = producer(&source_root, &capture, &receipt, 2, 0)?;
 
     let input0_wire = Envelope::new(&state0, &mirror0, &ci0)?.encode()?;
     fs::write(receipt.join("entry-0-input.ex2"), &input0_wire)?;
