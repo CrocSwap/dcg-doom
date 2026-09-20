@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_sbf_platform.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_ctx.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_engine.c");
+    println!("cargo:rerun-if-changed=src/doom_sbf_ex2.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
@@ -72,12 +73,17 @@ fn compile_ctx_engine(target: &str) {
         "ctx-engine needs DOOM_SCRATCH=<dir> with the build.sh layout \
          (doom-src/linuxdoom-1.10 at patches 0001-0007)",
     );
-    let tree = std::path::PathBuf::from(&scratch).join("doom-src/linuxdoom-1.10");
+    let scratch_path = std::path::PathBuf::from(&scratch);
+    let nested_tree = scratch_path.join("doom-src/linuxdoom-1.10");
+    let direct_tree = scratch_path.join("linuxdoom-1.10");
+    let tree = if nested_tree.is_dir() { nested_tree } else { direct_tree };
     let ctx_h = tree.join("headless/doom_ctx.h");
     assert!(
         ctx_h.is_file(),
-        "ctx-engine needs patch 0007 in {}/doom-src (missing headless/doom_ctx.h); \
-         run DOOM_SCRATCH=<dir> sh stunts/doom-host/build.sh first",
+        "ctx-engine needs patch 0007 in {}/doom-src or {}/linuxdoom-1.10 \
+         (missing headless/doom_ctx.h); run DOOM_SCRATCH=<dir> \
+         sh stunts/doom-host/build.sh first",
+        scratch,
         scratch
     );
     println!("cargo:rerun-if-changed={}", ctx_h.display());
@@ -152,4 +158,24 @@ fn compile_ctx_engine(target: &str) {
     engine.compile("doom_engine_ctx");
     ctx.compile("doom_engine_ctx_state");
     platform.compile("doom_sbf_platform");
+
+    // EX2 is deliberately native-only.  It reuses the retained host state
+    // and account codecs and therefore must never enter an SBF image.  The
+    // C bridge is linked only for the host ctx-engine feature; SBF receives
+    // the explicit refusal symbol in doom_sbf_engine.c instead.
+    if !is_sbf {
+        let mut native = cc::Build::new();
+        for f in common {
+            native.flag(f);
+        }
+        native
+            .include(&tree)
+            .include(tree.join("headless"))
+            .flag("-include")
+            .flag("doom_ctx.h")
+            .file(tree.join("headless/doom_state.c"))
+            .file(tree.join("headless/doom_controller.c"))
+            .file(manifest.join("src/doom_sbf_ex2.c"));
+        native.compile("doom_engine_ex2_native");
+    }
 }

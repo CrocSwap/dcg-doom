@@ -10,6 +10,7 @@ use solana_program::{
 };
 
 pub mod bring_up;
+pub mod ex2;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
