@@ -17,6 +17,10 @@ pub const TIC: u8 = 2;
 pub const INSTRUCTION_BYTES: usize = 32;
 pub const ABI_ID: [u8; 32] = super::ex2::RESOURCE_SBF_ABI_ID;
 pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = super::ex2::RESOURCE_SBF_ABI_DESCRIPTOR;
+pub const RI2_VERSION: u32 = 2;
+pub const RI2_ABI_ID: [u8; 32] = super::ex2::RESOURCE_RI2_SBF_ABI_ID;
+pub const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str =
+    super::ex2::RESOURCE_RI2_SBF_ABI_DESCRIPTOR;
 
 pub const RESOURCE_ACCOUNT: usize = 1;
 pub const RESOURCE_ACCOUNT_BYTES: usize = 197_664;
@@ -37,6 +41,12 @@ pub const STATE_ACCOUNT: usize = 7;
 pub const MIRROR_ACCOUNT: usize = 8;
 pub const CONTROLLER_ACCOUNT: usize = 9;
 pub const ACCOUNT_COUNT: usize = 10;
+
+pub const RI2_RESOURCE_ACCOUNT_BYTES: usize = 334_384;
+pub const RI2_RESOURCE_IMAGE_BYTES: usize = RI2_RESOURCE_ACCOUNT_BYTES;
+pub const RI2_FRAME_ACCOUNT: usize = 10;
+pub const RI2_ACCOUNT_COUNT: usize = 11;
+pub const RI2_FRAME_BYTES: usize = 320 * 200;
 
 pub const STATE_MAX_BYTES: usize = super::ex2::STATE_MAX_BYTES;
 pub const MIRROR_BYTES: usize = super::ex2::MIRROR_BYTES;
@@ -134,6 +144,54 @@ impl Request {
     }
 }
 
+/// Additive DOOM-E2R/2 instruction.  The version is explicit so the frozen
+/// E2R/1 account ABI remains decodable and reproducible forever.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ri2Request {
+    pub resource_bytes: usize,
+    pub state_len: usize,
+    pub wad_bytes: usize,
+    pub frame_bytes: usize,
+}
+
+impl Ri2Request {
+    pub fn decode(data: &[u8]) -> Result<Self, ProgramError> {
+        if data.len() != INSTRUCTION_BYTES
+            || &data[..8] != MAGIC
+            || u32_at(data, 8) != RI2_VERSION
+            || data[12] != TIC
+            || data[13..16].iter().any(|&byte| byte != 0)
+            || data[28..32].iter().any(|&byte| byte != 0)
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let request = Self {
+            resource_bytes: u32_at(data, 16) as usize,
+            state_len: u32_at(data, 20) as usize,
+            wad_bytes: u32_at(data, 24) as usize,
+            frame_bytes: RI2_FRAME_BYTES,
+        };
+        if request.resource_bytes != RI2_RESOURCE_IMAGE_BYTES
+            || !(64..=STATE_MAX_BYTES).contains(&request.state_len)
+            || request.wad_bytes != WAD_IMAGE_BYTES
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Ok(request)
+    }
+
+    pub fn encode(self) -> [u8; INSTRUCTION_BYTES] {
+        let mut out = [0u8; INSTRUCTION_BYTES];
+        out[..8].copy_from_slice(MAGIC);
+        out[8..12].copy_from_slice(&RI2_VERSION.to_le_bytes());
+        out[12] = TIC;
+        out[16..20].copy_from_slice(&(self.resource_bytes as u32).to_le_bytes());
+        out[20..24].copy_from_slice(&(self.state_len as u32).to_le_bytes());
+        out[24..28].copy_from_slice(&(self.wad_bytes as u32).to_le_bytes());
+        out
+    }
+}
+
 fn u32_at(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
@@ -150,6 +208,26 @@ fn expected_bytes(index: usize) -> usize {
         STATE_ACCOUNT => STATE_MAX_BYTES,
         MIRROR_ACCOUNT => MIRROR_BYTES,
         CONTROLLER_ACCOUNT => CONTROLLER_BYTES,
+        _ => 0,
+    }
+}
+
+fn expected_writable_ri2(index: usize) -> bool {
+    matches!(
+        index,
+        CONTEXT_ACCOUNT | STATE_ACCOUNT | MIRROR_ACCOUNT | RI2_FRAME_ACCOUNT
+    )
+}
+
+fn expected_bytes_ri2(index: usize) -> usize {
+    match index {
+        CONTEXT_ACCOUNT => CONTEXT_BYTES,
+        RESOURCE_ACCOUNT => RI2_RESOURCE_ACCOUNT_BYTES,
+        WAD_FIRST_ACCOUNT..=6 => WAD_ACCOUNT_BYTES,
+        STATE_ACCOUNT => STATE_MAX_BYTES,
+        MIRROR_ACCOUNT => MIRROR_BYTES,
+        CONTROLLER_ACCOUNT => CONTROLLER_BYTES,
+        RI2_FRAME_ACCOUNT => RI2_FRAME_BYTES,
         _ => 0,
     }
 }
@@ -210,6 +288,24 @@ fn validate_resource_header(account: &AccountInfo, expected_bytes: usize) -> Pro
         || u32_at(&data, 80) as usize != RESOURCE_HEADER_BYTES
     {
         return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+fn validate_resource_header_ri2(account: &AccountInfo, expected_bytes: usize) -> ProgramResult {
+    let data = account.try_borrow_data()?;
+    if data.len() != expected_bytes
+        || &data[..8] != b"DOOM-RI2"
+        || u32_at(&data, 8) != RI2_VERSION
+        || u32_at(&data, 12) as usize != RESOURCE_HEADER_BYTES
+        || u32_at(&data, 16) as usize != expected_bytes
+        || u32_at(&data, 20) != 2
+        || u32_at(&data, 24) != 1
+        || u32_at(&data, 28) != 5
+        || u32_at(&data, 32) != 5
+        || u32_at(&data, 36) as usize != RESOURCE_HEADER_BYTES
+    {
+        return Err(ProgramError::Custom(240));
     }
     Ok(())
 }
@@ -305,6 +401,46 @@ fn validate_account_contents(
     Ok(())
 }
 
+fn validate_account_shape_ri2(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    if accounts.len() != RI2_ACCOUNT_COUNT {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    for (index, account) in accounts.iter().enumerate() {
+        if account.owner != program
+            || account.data_len() != expected_bytes_ri2(index)
+            || account.is_writable != expected_writable_ri2(index)
+            || account.is_signer
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if accounts[..index]
+            .iter()
+            .any(|previous| previous.key == account.key)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    Ok(())
+}
+
+fn validate_account_contents_ri2(
+    accounts: &[AccountInfo],
+    request: Ri2Request,
+    zeroes: &[u8],
+) -> ProgramResult {
+    validate_state(&accounts[STATE_ACCOUNT], request.state_len)?;
+    validate_mirror(&accounts[MIRROR_ACCOUNT])?;
+    let state = accounts[STATE_ACCOUNT].try_borrow_data()?;
+    let gametic = u32_at(&state, 20);
+    drop(state);
+    validate_controller(&accounts[CONTROLLER_ACCOUNT], gametic)?;
+    validate_resource_header_ri2(&accounts[RESOURCE_ACCOUNT], request.resource_bytes)?;
+    for ordinal in 0..WAD_ACCOUNT_COUNT {
+        validate_wad_account(&accounts[WAD_FIRST_ACCOUNT + ordinal], ordinal, zeroes)?;
+    }
+    Ok(())
+}
+
 #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
 unsafe extern "C" {
     fn doom_engine_ex2_resource_sbf_tic_entry(
@@ -329,6 +465,139 @@ unsafe extern "C" {
         mirror_out_len: *mut usize,
         arena_high_water: *mut usize,
     ) -> i32;
+    fn doom_engine_ex2_resource_sbf_ri2_tic_entry(
+        context: *mut u8,
+        resource: *const u8,
+        resource_bytes: usize,
+        wad_image: *const u8,
+        wad_bytes: usize,
+        bootstrap: *mut u8,
+        bootstrap_bytes: usize,
+        state: *const u8,
+        state_len: usize,
+        mirror: *const u8,
+        mirror_len: usize,
+        controller: *const u8,
+        controller_len: usize,
+        frame_out: *mut u8,
+        frame_cap: usize,
+        state_out: *mut u8,
+        state_cap: usize,
+        state_out_len: *mut usize,
+        mirror_out: *mut u8,
+        mirror_cap: usize,
+        mirror_out_len: *mut usize,
+        frame_out_len: *mut usize,
+        arena_high_water: *mut usize,
+    ) -> i32;
+}
+
+#[cfg(all(feature = "ctx-engine", target_os = "solana"))]
+fn process_ri2(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let request = Ri2Request::decode(instruction_data)?;
+    validate_account_shape_ri2(program, accounts)?;
+    super::diagnostic_phase(401);
+
+    let mut context = accounts[CONTEXT_ACCOUNT].try_borrow_mut_data()?;
+    let zeroes_end = WAD_IMAGE_OFFSET + WAD_MAX_TAIL_BYTES;
+    if zeroes_end > context.len() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // A bounded comparator is enough for the account padding scan and keeps
+    // the Rust entry below the SBF 4 KiB frame limit.  The C consumer has its
+    // own complete RI2 preflight before any output mutation.
+    let zeroes = [0u8; 256];
+    validate_account_contents_ri2(accounts, request, &zeroes)?;
+    super::diagnostic_phase(402);
+    let wad_start = WAD_IMAGE_OFFSET;
+    let wad_end = wad_start + request.wad_bytes;
+    let bootstrap_start = BOOTSTRAP_OFFSET;
+    let bootstrap_end = bootstrap_start + BOOTSTRAP_BYTES;
+    if wad_end > bootstrap_start || bootstrap_end > context.len() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut cursor = wad_start;
+    for ordinal in 0..WAD_ACCOUNT_COUNT {
+        let source = accounts[WAD_FIRST_ACCOUNT + ordinal].try_borrow_data()?;
+        let payload_len = u32_at(&source, 24) as usize;
+        copy_nonoverlapping(
+            &mut context[cursor..cursor + payload_len],
+            &source[WAD_HEADER_BYTES..WAD_HEADER_BYTES + payload_len],
+        );
+        cursor += payload_len;
+    }
+    if cursor != wad_end {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    super::diagnostic_phase(403);
+    let context_ptr = context.as_mut_ptr();
+    if (context_ptr as usize) % ALLOC_ALIGNMENT != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (_, context_tail) = context.split_at_mut(wad_start);
+    let (wad_image, after_wad) = context_tail.split_at_mut(request.wad_bytes);
+    let (_gap, bootstrap_tail) = after_wad.split_at_mut(bootstrap_start - wad_end);
+    let bootstrap = &mut bootstrap_tail[..BOOTSTRAP_BYTES];
+    let resource = accounts[RESOURCE_ACCOUNT].try_borrow_data()?;
+    let mut state = accounts[STATE_ACCOUNT].try_borrow_mut_data()?;
+    let mut mirror = accounts[MIRROR_ACCOUNT].try_borrow_mut_data()?;
+    let controller = accounts[CONTROLLER_ACCOUNT].try_borrow_data()?;
+    let mut frame = accounts[RI2_FRAME_ACCOUNT].try_borrow_mut_data()?;
+    let mut state_out_len = 0usize;
+    let mut mirror_out_len = 0usize;
+    let mut frame_out_len = 0usize;
+    let mut arena_high_water = 0usize;
+    let rc = unsafe {
+        doom_engine_ex2_resource_sbf_ri2_tic_entry(
+            context_ptr,
+            resource.as_ptr(),
+            resource.len(),
+            wad_image.as_ptr(),
+            wad_image.len(),
+            bootstrap.as_mut_ptr(),
+            bootstrap.len(),
+            state.as_ptr(),
+            request.state_len,
+            mirror.as_ptr(),
+            mirror.len(),
+            controller.as_ptr(),
+            controller.len(),
+            frame.as_mut_ptr(),
+            frame.len(),
+            state.as_mut_ptr(),
+            state.len(),
+            &mut state_out_len,
+            mirror.as_mut_ptr(),
+            mirror.len(),
+            &mut mirror_out_len,
+            &mut frame_out_len,
+            &mut arena_high_water,
+        )
+    };
+    if rc != 0 {
+        msg!(
+            "DOOM-E2R2 rc={} arena_high_water={} state_len={} mirror_len={} frame_len={}",
+            rc,
+            arena_high_water,
+            state_out_len,
+            mirror_out_len,
+            frame_out_len
+        );
+        return Err(ProgramError::Custom(rc as u32));
+    }
+    if state_out_len < 64
+        || state_out_len > state.len()
+        || mirror_out_len != MIRROR_BYTES
+        || frame_out_len != RI2_FRAME_BYTES
+        || u32_at(&state, 16) as usize != state_out_len
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
@@ -337,6 +606,9 @@ pub fn process(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    if instruction_data.len() >= 12 && u32_at(instruction_data, 8) == RI2_VERSION {
+        return process_ri2(program, accounts, instruction_data);
+    }
     let request = Request::decode(instruction_data)?;
     super::diagnostic_phase(PHASE_E2R_C_ENTRY);
     super::diagnostic_phase(PHASE_E2R_RUST_VALIDATION_START);

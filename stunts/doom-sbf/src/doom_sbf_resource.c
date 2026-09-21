@@ -262,6 +262,23 @@ static int e2r_controller_shape(const uint8_t *controller, size_t bytes, uint32_
         e2r_zero(controller+28,36);
 }
 
+/* RI2/2 reuses the frozen RI1 graph payload.  Keep these small adapters in
+ * the SBF image rather than linking the host resource producer: the only
+ * contract here is validation and pointer reconstruction into the fresh
+ * invocation's level zone. */
+int doom_resource_ri1_validate_graph(const uint8_t *image, size_t image_bytes)
+{
+    e2r_section_t sections[RI_SECTION_COUNT];
+    return e2r_validate(image, image_bytes, sections);
+}
+
+int doom_sbf_resource_import_graph(const uint8_t *image, unsigned long image_bytes)
+{
+    e2r_section_t sections[RI_SECTION_COUNT];
+    if (e2r_validate(image, (size_t)image_bytes, sections)) return -1;
+    return e2r_import_graph(image, sections);
+}
+
 int doom_engine_ex2_resource_sbf_tic_entry(
     const void *context, const uint8_t *resource, unsigned long resource_bytes,
     const uint8_t *wad_image, unsigned long wad_bytes, void *bootstrap, unsigned long bootstrap_bytes,

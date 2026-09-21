@@ -43,6 +43,10 @@ name = "resource_native"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "resource_ri2_sbf"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "headless"
 
 [dependencies]

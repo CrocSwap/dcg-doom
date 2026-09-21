@@ -19,6 +19,7 @@ const ENGINE_TUS: &[&str] = &[
 const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC/2|schema=2|roles=12|state=ST1/v0|mirror=MP1/v1|controller=CI2/v1|frame=FB1/64000|role-map=00..0b";
 const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
 const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
+const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -285,6 +286,11 @@ fn source_manifest(
         "  \"resource_sbf_abi_descriptor\": \"{RESOURCE_SBF_ABI_DESCRIPTOR}\","
     )
     .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"resource_ri2_sbf_abi_descriptor\": \"{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}\","
+    )
+    .unwrap();
     writeln!(&mut manifest, "  \"build_metadata\": {metadata},").unwrap();
     writeln!(&mut manifest, "  \"compiler_flags\": [").unwrap();
     for (index, flag) in common_flags.iter().enumerate() {
@@ -335,6 +341,9 @@ fn write_identity(
     let resource_sbf_abi_id = digest(
         format!("DOOM-E2R-ABI-ID\0{RESOURCE_SBF_ABI_DESCRIPTOR}").as_bytes(),
     );
+    let resource_ri2_sbf_abi_id = digest(
+        format!("DOOM-E2R2-ABI-ID\0{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}").as_bytes(),
+    );
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
     let image_id = digest(&image_input);
@@ -346,15 +355,18 @@ fn write_identity(
          pub const ABI_ID: [u8; 32] = [{}];\n\
          pub const SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const RESOURCE_SBF_ABI_ID: [u8; 32] = [{}];\n\
+         pub const RESOURCE_RI2_SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const SOURCE_MANIFEST_SHA256: &str = \"{manifest_id}\";\n\
          pub const ABI_DESCRIPTOR: &str = {ABI_DESCRIPTOR:?};\n\
          pub const SBF_ABI_DESCRIPTOR: &str = {SBF_ABI_DESCRIPTOR:?};\n\
          pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_SBF_ABI_DESCRIPTOR:?};\n\
+         pub const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_RI2_SBF_ABI_DESCRIPTOR:?};\n\
          pub const BUILD_SOURCE_MANIFEST: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/doom_ex2_source_manifest.json\"));\n",
         rust_array(&image_id),
         rust_array(&abi_id),
         rust_array(&sbf_abi_id),
         rust_array(&resource_sbf_abi_id),
+        rust_array(&resource_ri2_sbf_abi_id),
     );
     fs::write(out_dir.join("doom_ex2_build_identity.rs"), generated)
         .expect("write Doom EX2 build identity");
@@ -392,6 +404,61 @@ fn write_sbf_codec_source(
     generated
 }
 
+/// Generate only the source-matched RI2/2 preflight and canonical table
+/// importer for SBF.  The native file also contains the producer and the
+/// setup-based predecessor reader; those sections are intentionally absent
+/// from the deployable image.  The generated translation unit appends the
+/// explicit no-setup SBF entry from doom_sbf_resource_ri2.c.
+fn write_sbf_ri2_source(out_dir: &Path, manifest: &Path) -> PathBuf {
+    let native = manifest.join("src/doom_resource_ri2.c");
+    let source = fs::read_to_string(&native).expect("read source-matched RI2 codec");
+    let take = |start: &str, end: &str| -> String {
+        let begin = source.find(start).expect("RI2 SBF source start marker");
+        let finish = source[begin..]
+            .find(end)
+            .map(|offset| begin + offset)
+            .expect("RI2 SBF source end marker");
+        source[begin..finish].to_owned()
+    };
+    let mut generated = String::from(
+        "/* generated from src/doom_resource_ri2.c; do not edit */\n",
+    );
+    generated.push_str(&take(
+        "/*\n * DOOM-RI2/2 initialized-resource capture",
+        "#define R2_SCALAR",
+    ));
+    generated.push_str(&take("static int r2_apply_scalar", "static int r2_apply_relocs"));
+    generated.push_str(&take(
+        "typedef struct {\n    uint32_t scalar[64];",
+        "static int r2_v2_commit",
+    ));
+    // The canonical relocation preflight uses a 64x256 duplicate detector.
+    // Keep that bounded scratch in the caller-provided bootstrap plan rather
+    // than the 4 KiB SBF stack.  This is storage-only; validation order and
+    // predicates remain source-matched.
+    let plan_decl = "    uint32_t table_bytes[64];\n} r2_v2_plan_t;";
+    assert_eq!(generated.matches(plan_decl).count(), 1);
+    generated = generated.replace(
+        plan_decl,
+        "    uint32_t table_bytes[64];\n    uint8_t reloc_seen[64][256];\n} r2_v2_plan_t;",
+    );
+    let reloc_seen = "    uint8_t seen[64][256] = {{0}}, zone_seen[64] = {0};";
+    assert_eq!(generated.matches(reloc_seen).count(), 1);
+    generated = generated.replace(
+        reloc_seen,
+        "    uint8_t (*seen)[256] = plan->reloc_seen, zone_seen[64] = {0};\n    memset(seen, 0, sizeof(plan->reloc_seen));",
+    );
+    generated.push_str("#include \"doom_sbf_resource_ri2.c\"\n");
+    let generated_path = out_dir.join("doom_sbf_resource_ri2_generated.c");
+    fs::write(&generated_path, generated).expect("write generated SBF RI2 codec");
+    println!("cargo:rerun-if-changed={}", native.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("src/doom_sbf_resource_ri2.c").display()
+    );
+    generated_path
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=src/doom_hotloops.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_platform.c");
@@ -401,6 +468,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_sbf_resource.c");
     println!("cargo:rerun-if-changed=src/doom_resource.c");
     println!("cargo:rerun-if-changed=src/doom_resource_ri2.c");
+    println!("cargo:rerun-if-changed=src/doom_sbf_resource_ri2.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
     let out_dir =
@@ -831,6 +899,7 @@ fn compile_ctx_engine(target: &str) {
             .include(&tree)
             .include(tree.join("headless"))
             .include(manifest.join("sbfinc"))
+            .include(manifest.join("src"))
             .flag("-include")
             .flag("doom_ctx.h")
             .flag("-DDOOM_SBF_BUILD")
@@ -846,6 +915,8 @@ fn compile_ctx_engine(target: &str) {
             .file(manifest.join("src/doom_sbf_account_pool.c"))
             .file(manifest.join("src/doom_sbf_ex2.c"))
             .file(manifest.join("src/doom_sbf_resource.c"));
+        let ri2_source = write_sbf_ri2_source(&out_dir, &manifest);
+        codec.file(ri2_source);
         if diagnostic_profile {
             codec.define("DOOM_SBF_PHASE_PROFILE", None);
         }
