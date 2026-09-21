@@ -421,7 +421,7 @@ fn write_sbf_ri2_source(out_dir: &Path, manifest: &Path) -> PathBuf {
         source[begin..finish].to_owned()
     };
     let mut generated = String::from(
-        "/* generated from src/doom_resource_ri2.c; do not edit */\n",
+        "/* generated from src/doom_resource_ri2.c; do not edit */\n#include \"doom_sbf_plan_layout.h\"\n",
     );
     generated.push_str(&take(
         "/*\n * DOOM-RI2/2 initialized-resource capture",
@@ -455,6 +455,10 @@ fn write_sbf_ri2_source(out_dir: &Path, manifest: &Path) -> PathBuf {
     println!(
         "cargo:rerun-if-changed={}",
         manifest.join("src/doom_sbf_resource_ri2.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("sbfinc/doom_sbf_plan_layout.h").display()
     );
     generated_path
 }
@@ -724,6 +728,7 @@ fn compile_ctx_engine(target: &str) {
         // the existing decoder body; host ST1 behavior remains unchanged.
         let mut state_source =
             fs::read_to_string(&state).expect("read generated SBF state source");
+        state_source = format!("#include \"doom_sbf_plan_layout.h\"\n{state_source}");
         // libc realloc cannot express the old allocation length, and the
         // monotonic SBF arena places the larger replacement immediately after
         // the old block.  The source codec only needs its live prefix, so the
@@ -930,6 +935,10 @@ fn compile_ctx_engine(target: &str) {
             "static ds_plan_t *doom_state_split_plan(void) {{\n    if (!DOOM_CTX->arena_base || DOOM_CTX->arena_bytes <= sizeof(ds_plan_t) + 4096u) return 0;\n    return (ds_plan_t *)((uint8_t *)DOOM_CTX->arena_base + DOOM_CTX->arena_bytes - sizeof(ds_plan_t) - 4096u);\n}}\n\nint DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_bytes) {{\n    ds_plan_t *p = doom_state_split_plan();\n    if (!p) return -1;\n    memset(p, 0, sizeof(*p));\n    return ds_preflight(image, image_bytes, p, DS_IMPORT_PROFILE_V0);\n}}\n\nint DoomStateDecodeSplitPrepare(void) {{\n    ds_plan_t *p = doom_state_split_plan();\n    return p ? ds_plan_prepare(p) : -1;\n}}\n\nstatic int ds_decode_split_parse(const uint8_t *image, size_t image_bytes, unsigned profile) {{\n    ds_plan_t *p = doom_state_split_plan();\n    ds_read_t r; unsigned i, j, mi = 0, si = 0;\n    if (!p) return -1;{}\n\nint DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes) {{\n    return ds_decode_split_parse(image, image_bytes, DS_IMPORT_PROFILE_V0);\n}}\n",
             split_body
         );
+        let old_split_plan = "static ds_plan_t *doom_state_split_plan(void) {\n    if (!DOOM_CTX->arena_base || DOOM_CTX->arena_bytes <= sizeof(ds_plan_t) + 4096u) return 0;\n    return (ds_plan_t *)((uint8_t *)DOOM_CTX->arena_base + DOOM_CTX->arena_bytes - sizeof(ds_plan_t) - 4096u);\n}";
+let new_split_plan = "_Static_assert(sizeof(ds_plan_t) <= RI2_SPLIT_DECODER_PLAN_RESERVE, \"decoder plan exceeds its reserved tail slice\");\nstatic ds_plan_t *doom_state_split_plan(void) {\n    if (!arena_base || arena_bytes == 0) return 0;\n    /* arena_bytes ends exactly at the decoder slice; the RI2 plan occupies\n     * the final 64 KiB of the 256 KiB reserved tail. */\n    return (ds_plan_t *)((uint8_t *)arena_base + arena_bytes);\n}";
+        assert_eq!(split_decoder.matches(old_split_plan).count(), 1);
+        let split_decoder = split_decoder.replace(old_split_plan, new_split_plan);
         state_source.push_str(&split_decoder);
         fs::write(&state, state_source).expect("write SBF state source");
         let controller = write_sbf_codec_source(

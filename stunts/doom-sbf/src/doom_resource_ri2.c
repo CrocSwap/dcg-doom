@@ -1252,7 +1252,7 @@ static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
                         const uint8_t hash[32],
                         const uint8_t *state, size_t state_len, const uint8_t *controller,
                         uint8_t **state_out, size_t *state_out_len, uint8_t *mirror_out,
-                        uint8_t *frame_out, uintptr_t *anchor)
+                        uint8_t *frame_out, uintptr_t *anchor, int run_tic)
 {
     uint8_t *carrier = 0, *frame = 0, *encoded = 0, *derived = 0, *demo; size_t encoded_bytes = 0;
     int lump, demo_len, rc;
@@ -1295,19 +1295,22 @@ static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
     pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
-    G_Ticker(); clipangle = xtoviewangle[0]; fixedcolormap = 0; R_RenderPlayerView(&players[displayplayer]); gametic++;
+    if (run_tic) {
+        G_Ticker(); clipangle = xtoviewangle[0]; fixedcolormap = 0; R_RenderPlayerView(&players[displayplayer]); gametic++;
+    }
     derived = (uint8_t *)malloc(RI2_MIRROR_BYTES); if (!derived || doom_engine_ex2_fill_mirror(derived, wad, wad_bytes, hash) || DoomStateEncode(&encoded, &encoded_bytes) || encoded_bytes > RI2_STATE_MAX) { free(derived); free(encoded); free(frame); free(carrier); return 238; }
     memcpy(*state_out, encoded, encoded_bytes); *state_out_len = encoded_bytes; memcpy(mirror_out, derived, RI2_MIRROR_BYTES); memcpy(frame_out, screens[0], RI2_FRAME_BYTES);
     DoomStateFree(encoded); free(derived); free(frame); free(carrier); return 0;
 }
 
-int doom_resource_import_initialized_tic(
+static int doom_resource_import_initialized_common(
     const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
     const unsigned char *image, unsigned long image_len, const unsigned char *state, unsigned long state_len,
     const unsigned char *mirror, unsigned long mirror_len, const unsigned char *controller, unsigned long controller_len,
     unsigned char *state_out, unsigned long state_cap, unsigned long *state_out_len,
     unsigned char *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
-    unsigned char *frame_out, unsigned long frame_cap, unsigned long *frame_out_len, unsigned long *graph_anchor)
+    unsigned char *frame_out, unsigned long frame_cap, unsigned long *frame_out_len, unsigned long *graph_anchor,
+    int run_tic)
 {
     r2_section_t s[5]; r2_v2_plan_t plan; uint8_t *wad = 0, hash[32]; size_t wad_bytes = 0, out_len = 0; uintptr_t anchor = 0; int rc;
     if (!image || image_len > RI2_MAX_BYTES || image_len < 12u ||
@@ -1318,8 +1321,39 @@ int doom_resource_import_initialized_tic(
         return doom_resource_import_initialized_tic_v1(wad_accounts, wad_lens, image, image_len, state, state_len, mirror, mirror_len, controller, controller_len, state_out, state_cap, state_out_len, mirror_out, mirror_cap, mirror_out_len, frame_out, frame_cap, frame_out_len, graph_anchor);
     if (r2_u32(image + 8) != RI2_VERSION || r2_v2_preflight(image, image_len, s, &plan)) return 240;
     if (doom_engine_ex2_make_wad(wad_accounts, wad_lens, &wad, &wad_bytes, hash) || memcmp(hash, r2_wad_hash, 32)) { free(wad); return 234; }
-    rc = r2_v2_commit(&plan, &s, image, wad, wad_bytes, hash, state, state_len, controller, &state_out, &out_len, mirror_out, frame_out, &anchor);
+    rc = r2_v2_commit(&plan, &s, image, wad, wad_bytes, hash, state, state_len, controller, &state_out, &out_len, mirror_out, frame_out, &anchor, run_tic);
     if (rc) { free(wad); return rc; }
     *state_out_len = out_len; *mirror_out_len = RI2_MIRROR_BYTES; *frame_out_len = RI2_FRAME_BYTES; if (graph_anchor) *graph_anchor = (unsigned long)anchor;
     free(wad); return 0;
+}
+
+int doom_resource_import_initialized_tic(
+    const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
+    const unsigned char *image, unsigned long image_len, const unsigned char *state, unsigned long state_len,
+    const unsigned char *mirror, unsigned long mirror_len, const unsigned char *controller, unsigned long controller_len,
+    unsigned char *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    unsigned char *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
+    unsigned char *frame_out, unsigned long frame_cap, unsigned long *frame_out_len, unsigned long *graph_anchor)
+{
+    return doom_resource_import_initialized_common(
+        wad_accounts, wad_lens, image, image_len, state, state_len, mirror, mirror_len,
+        controller, controller_len, state_out, state_cap, state_out_len, mirror_out,
+        mirror_cap, mirror_out_len, frame_out, frame_cap, frame_out_len, graph_anchor, 1);
+}
+
+/* Host-only oracle for the bounded E2R/4 seam.  It runs the same source-matched
+ * reconstruction and codec as the actual tic path, but stops immediately
+ * before G_Ticker/render, matching the seam's declared open boundary. */
+int doom_resource_import_initialized_no_tic(
+    const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
+    const unsigned char *image, unsigned long image_len, const unsigned char *state, unsigned long state_len,
+    const unsigned char *mirror, unsigned long mirror_len, const unsigned char *controller, unsigned long controller_len,
+    unsigned char *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    unsigned char *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
+    unsigned char *frame_out, unsigned long frame_cap, unsigned long *frame_out_len, unsigned long *graph_anchor)
+{
+    return doom_resource_import_initialized_common(
+        wad_accounts, wad_lens, image, image_len, state, state_len, mirror, mirror_len,
+        controller, controller_len, state_out, state_cap, state_out_len, mirror_out,
+        mirror_cap, mirror_out_len, frame_out, frame_cap, frame_out_len, graph_anchor, 0);
 }

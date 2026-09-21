@@ -244,8 +244,13 @@ fn import_initialized_child(
     let image = read(image_path)?;
     let refs = std::array::from_fn(|index| accounts[index].as_slice());
     resource::reset_full_setup_counter();
-    let imported = resource::import_initialized_tic(refs, &image, &state, &mirror, &controller)
-        .map_err(|rc| format!("RI2 consumer refused with {rc}"))?;
+    let pre_tic = env::var_os("DOOM_NATIVE_PRE_TIC").is_some();
+    let imported = if pre_tic {
+        resource::import_initialized_no_tic(refs, &image, &state, &mirror, &controller)
+    } else {
+        resource::import_initialized_tic(refs, &image, &state, &mirror, &controller)
+    }
+    .map_err(|rc| format!("RI2 consumer refused with {rc}"))?;
     write(&receipt.join("imported-state.st1"), &imported.state)?;
     write(&receipt.join("imported-mirror.mp1"), &imported.mirror)?;
     write(&receipt.join("imported-frame.fb1"), &imported.frame)?;
@@ -256,6 +261,16 @@ fn import_initialized_child(
             std::process::id(), imported.graph_anchor, imported.state.len(),
             sha256(&imported.state), sha256(&imported.mirror), sha256(&imported.frame),
             resource::full_setup_counter()
+        )
+        .as_bytes(),
+    )?;
+    write(
+        &receipt.join("report.json"),
+        format!(
+            "{{\n  \"status\": \"measured\",\n  \"profile\": \"DOOM-RI2-INITIALIZED-NATIVE{}\",\n  \"source_matched_native_pre_tic\": {},\n  \"tic_render\": {}\n}}\n",
+            if pre_tic { "-PRE-TIC" } else { "" },
+            pre_tic,
+            if pre_tic { "\"open\"" } else { "\"executed\"" },
         )
         .as_bytes(),
     )?;
@@ -421,12 +436,17 @@ fn run_initialized_gate(
     let image_path = receipt.join("resource-image.ri2");
     let encode_pid = parse_meta(&receipt.join("encode-initialized.json"), "pid")?;
     let encode_anchor = parse_meta(&receipt.join("encode-initialized.json"), "graph_anchor")?;
-    let encode_setup_calls = parse_meta(&receipt.join("encode-initialized.json"), "full_setup_calls")?;
+    let encode_setup_calls =
+        parse_meta(&receipt.join("encode-initialized.json"), "full_setup_calls")?;
     run_child(
         &exe,
         &child_args("malformed-initialized", &capture, receipt, &[&image_path]),
     )?;
-    if parse_meta(&receipt.join("malformed-initialized.json"), "full_setup_calls")? != 0 {
+    if parse_meta(
+        &receipt.join("malformed-initialized.json"),
+        "full_setup_calls",
+    )? != 0
+    {
         return Err("malformed RI2 path called full setup".into());
     }
     run_child(
@@ -435,12 +455,17 @@ fn run_initialized_gate(
     )?;
     let import_pid = parse_meta(&receipt.join("import-initialized.json"), "pid")?;
     let import_anchor = parse_meta(&receipt.join("import-initialized.json"), "graph_anchor")?;
-    let import_setup_calls = parse_meta(&receipt.join("import-initialized.json"), "full_setup_calls")?;
+    let import_setup_calls =
+        parse_meta(&receipt.join("import-initialized.json"), "full_setup_calls")?;
     if encode_pid == import_pid || encode_anchor == import_anchor {
         return Err("RI2 consumer did not run with a distinct process/address".into());
     }
     if encode_setup_calls == 0 || import_setup_calls != 0 {
-        return Err(format!("RI2 setup counter violation: producer={} consumer={}", encode_setup_calls, import_setup_calls).into());
+        return Err(format!(
+            "RI2 setup counter violation: producer={} consumer={}",
+            encode_setup_calls, import_setup_calls
+        )
+        .into());
     }
     let expected_state = read(&oracle_state)?;
     let expected_mirror = read(&oracle_mirror)?;

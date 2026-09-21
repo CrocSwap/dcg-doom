@@ -103,6 +103,28 @@ unsafe extern "C" {
         frame_out_len: *mut usize,
         graph_anchor: *mut usize,
     ) -> i32;
+    fn doom_resource_import_initialized_no_tic(
+        wad_accounts: *const *const u8,
+        wad_lens: *const usize,
+        image: *const u8,
+        image_len: usize,
+        state: *const u8,
+        state_len: usize,
+        mirror: *const u8,
+        mirror_len: usize,
+        controller: *const u8,
+        controller_len: usize,
+        state_out: *mut u8,
+        state_cap: usize,
+        state_out_len: *mut usize,
+        mirror_out: *mut u8,
+        mirror_cap: usize,
+        mirror_out_len: *mut usize,
+        frame_out: *mut u8,
+        frame_cap: usize,
+        frame_out_len: *mut usize,
+        graph_anchor: *mut usize,
+    ) -> i32;
     fn doom_resource_test_reset_setup_counter();
     fn doom_resource_test_setup_counter() -> usize;
 }
@@ -266,6 +288,29 @@ pub fn import_initialized_tic(
     mirror: &[u8],
     controller: &[u8],
 ) -> Result<InitializedTic, i32> {
+    import_initialized_mode(wad_accounts, image, state, mirror, controller, true)
+}
+
+/// Import the initialized RI2 image through the same source-matched native
+/// engine, stopping before the tic/render boundary used by E2R/4.
+pub fn import_initialized_no_tic(
+    wad_accounts: [&[u8]; 5],
+    image: &[u8],
+    state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+) -> Result<InitializedTic, i32> {
+    import_initialized_mode(wad_accounts, image, state, mirror, controller, false)
+}
+
+fn import_initialized_mode(
+    wad_accounts: [&[u8]; 5],
+    image: &[u8],
+    state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    run_tic: bool,
+) -> Result<InitializedTic, i32> {
     if image.is_empty() || image.len() > IMAGE_MAX_BYTES {
         return Err(240);
     }
@@ -278,7 +323,12 @@ pub fn import_initialized_tic(
     let mut frame_len = 0usize;
     let mut graph_anchor = 0usize;
     let rc = unsafe {
-        doom_resource_import_initialized_tic(
+        let import = if run_tic {
+            doom_resource_import_initialized_tic
+        } else {
+            doom_resource_import_initialized_no_tic
+        };
+        import(
             pointers.as_ptr(),
             lengths.as_ptr(),
             image.as_ptr(),

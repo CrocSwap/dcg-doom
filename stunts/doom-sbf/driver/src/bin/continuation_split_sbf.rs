@@ -14,12 +14,12 @@ use std::{
 use doom_sbf::continuation_split_sbf::{self, Request};
 use doom_sbf::resource_sbf;
 use sha2::{Digest, Sha256};
-use solana_account::Account;
+use solana_account::{Account, AccountSharedData};
 use solana_banks_interface::BanksTransactionResultWithMetadata;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::{account_meta::AccountMeta, Instruction};
 use solana_message::Message;
-use solana_program_test::ProgramTest;
+use solana_program_test::{ProgramTest, ProgramTestContext};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_system_interface::{instruction::create_account, program as system_program};
@@ -51,6 +51,7 @@ const STATE: Pubkey = Pubkey::new_from_array([0xe2; 32]);
 const MIRROR: Pubkey = Pubkey::new_from_array([0xe3; 32]);
 const CONTROLLER: Pubkey = Pubkey::new_from_array([0xe4; 32]);
 const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
+const PREFIX: Pubkey = Pubkey::new_from_array([0xea; 32]);
 const BAD_RESOURCE: Pubkey = Pubkey::new_from_array([0xe6; 32]);
 const BAD_CONTROLLER: Pubkey = Pubkey::new_from_array([0xe7; 32]);
 const BAD_STATE: Pubkey = Pubkey::new_from_array([0xe8; 32]);
@@ -147,6 +148,18 @@ fn instruction(
     }
 }
 
+fn moved_context_instruction() -> Instruction {
+    Instruction {
+        program_id: PROGRAM,
+        accounts: vec![meta(PREFIX, false, false), meta(CONTEXT, true, false)],
+        data: [
+            b"DOOM-CX1".as_slice(),
+            &0x0123_4567_89ab_cdefu64.to_le_bytes(),
+        ]
+        .concat(),
+    }
+}
+
 async fn execute(
     client: &mut solana_banks_client::BanksClient,
     payer: &solana_keypair::Keypair,
@@ -214,6 +227,7 @@ fn program_test(
     bank.add_account(BAD_CONTROLLER, account(bad_controller.to_vec()));
     bank.add_account(BAD_CONTROLLER_KEY, account(bad_controller_key.to_vec()));
     bank.add_account(FRAME, account(vec![0; continuation_split_sbf::FRAME_BYTES]));
+    bank.add_account(PREFIX, account(vec![0; 4096]));
     bank.add_account(
         authority,
         Account {
@@ -225,6 +239,58 @@ fn program_test(
         },
     );
     bank
+}
+
+async fn start_prepared(
+    resource: &[u8],
+    bad_resource: &[u8],
+    wad: &[Vec<u8>],
+    state: &[u8],
+    bad_state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    bad_controller: &[u8],
+    bad_controller_key: &[u8],
+    authority: &solana_keypair::Keypair,
+    compute_limit: u32,
+) -> Result<(ProgramTestContext, solana_keypair::Keypair), Box<dyn Error>> {
+    let bank = program_test(
+        resource,
+        bad_resource,
+        wad,
+        state,
+        bad_state,
+        mirror,
+        controller,
+        bad_controller,
+        bad_controller_key,
+        authority.pubkey(),
+        compute_limit,
+    );
+    let mut context = bank.start_with_context().await;
+    let continuation = solana_keypair::Keypair::new();
+    create_continuation(&mut context.banks_client, &context.payer, &continuation).await?;
+    let result = execute(
+        &mut context.banks_client,
+        &context.payer,
+        authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation.pubkey(),
+        Request {
+            operation: continuation_split_sbf::PREPARE,
+            state_len: u32_at(state, 16) as usize,
+            cursor: 0,
+            fault: 0,
+        },
+    )
+    .await?;
+    if result.result.is_err() {
+        return Err(format!("control PREPARE failed: {:?}", result.result).into());
+    }
+    Ok((context, continuation))
 }
 
 async fn account_data(
@@ -249,7 +315,6 @@ async fn create_continuation(
         Message::new_with_blockhash(
             &[create_account(
                 &payer.pubkey(),
-                &payer.pubkey(),
                 &continuation.pubkey(),
                 100_000_000_000,
                 continuation_split_sbf::CONTINUATION_BYTES as u64,
@@ -261,6 +326,153 @@ async fn create_continuation(
         blockhash,
     );
     client.process_transaction(tx).await?;
+    Ok(())
+}
+
+async fn moved_context_control(compute_limit: u32) -> Result<(), Box<dyn Error>> {
+    let mut bank = ProgramTest::default();
+    bank.prefer_bpf(true);
+    bank.set_compute_max_units(compute_limit as u64);
+    bank.add_program("doom_sbf", PROGRAM, None);
+    bank.add_account(PREFIX, account(vec![0; 4096]));
+    bank.add_account(CONTEXT, account(vec![0; doom_sbf::CTX_MIN_BYTES]));
+    let context = bank.start_with_context().await;
+    let blockhash = context.banks_client.get_latest_blockhash().await?;
+    let tx = Transaction::new(
+        &[&context.payer],
+        Message::new(
+            &[moved_context_instruction()],
+            Some(&context.payer.pubkey()),
+        ),
+        blockhash,
+    );
+    let result = context
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await?;
+    require_refusal(&result, "Custom(199)")
+}
+
+async fn same_key_refusal_control(
+    label: &str,
+    target: Pubkey,
+    mutate: fn(&mut Vec<u8>),
+    expected: &str,
+    resource: &[u8],
+    bad_resource: &[u8],
+    wad: &[Vec<u8>],
+    state: &[u8],
+    bad_state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    bad_controller: &[u8],
+    bad_controller_key: &[u8],
+    authority: &solana_keypair::Keypair,
+    compute_limit: u32,
+) -> Result<(), Box<dyn Error>> {
+    let (mut context, continuation) = start_prepared(
+        resource,
+        bad_resource,
+        wad,
+        state,
+        bad_state,
+        mirror,
+        controller,
+        bad_controller,
+        bad_controller_key,
+        authority,
+        compute_limit,
+    )
+    .await?;
+    let before_cont = account_data(&context.banks_client, continuation.pubkey()).await?;
+    let before_mirror = account_data(&context.banks_client, MIRROR).await?;
+    let before_frame = account_data(&context.banks_client, FRAME).await?;
+    let mut changed = account_data(&context.banks_client, target).await?;
+    mutate(&mut changed);
+    context.set_account(&target, &AccountSharedData::from(account(changed.clone())));
+    let refusal = execute(
+        &mut context.banks_client,
+        &context.payer,
+        authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation.pubkey(),
+        Request {
+            operation: continuation_split_sbf::STEP,
+            state_len: u32_at(state, 16) as usize,
+            cursor: 1,
+            fault: 0,
+        },
+    )
+    .await?;
+    require_refusal(&refusal, expected)?;
+    if account_data(&context.banks_client, continuation.pubkey()).await? != before_cont
+        || account_data(&context.banks_client, MIRROR).await? != before_mirror
+        || account_data(&context.banks_client, FRAME).await? != before_frame
+        || account_data(&context.banks_client, target).await? != changed
+    {
+        return Err(format!("{label} refusal did not preserve same-key state").into());
+    }
+    Ok(())
+}
+
+async fn same_key_wad_payload_control(
+    resource: &[u8],
+    bad_resource: &[u8],
+    wad: &[Vec<u8>],
+    state: &[u8],
+    bad_state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    bad_controller: &[u8],
+    bad_controller_key: &[u8],
+    authority: &solana_keypair::Keypair,
+    compute_limit: u32,
+) -> Result<(), Box<dyn Error>> {
+    let (mut context, continuation) = start_prepared(
+        resource,
+        bad_resource,
+        wad,
+        state,
+        bad_state,
+        mirror,
+        controller,
+        bad_controller,
+        bad_controller_key,
+        authority,
+        compute_limit,
+    )
+    .await?;
+    let wad_key = Pubkey::new_from_array([0xf4; 32]);
+    let mut changed = account_data(&context.banks_client, wad_key).await?;
+    changed[resource_sbf::WAD_HEADER_BYTES] ^= 1;
+    context.set_account(&wad_key, &AccountSharedData::from(account(changed)));
+    let accepted = execute(
+        &mut context.banks_client,
+        &context.payer,
+        authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation.pubkey(),
+        Request {
+            operation: continuation_split_sbf::STEP,
+            state_len: u32_at(state, 16) as usize,
+            cursor: 1,
+            fault: 0,
+        },
+    )
+    .await?;
+    if accepted.result.is_err() {
+        return Err(format!(
+            "same-key WAD payload control unexpectedly refused: {:?}",
+            accepted.result
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -288,14 +500,13 @@ fn logs(result: &BanksTransactionResultWithMetadata) -> String {
     result
         .metadata
         .as_ref()
-        .and_then(|m| m.log_messages.as_ref())
-        .map(|l| l.join("\n") + "\n")
+        .map(|m| m.log_messages.join("\n") + "\n")
         .unwrap_or_default()
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
-    let capture = PathBuf::from(args.next().ok_or("usage: continuation_split_sbf CAPTURE RECEIPT IMAGE EXPECTED_IMAGE_SHA MANIFEST EXPECTED_MANIFEST_SHA ABI DRIVER RESOURCE_IMAGE CONTROLLER")?).canonicalize()?;
+    let capture = PathBuf::from(args.next().ok_or("usage: continuation_split_sbf CAPTURE RECEIPT IMAGE EXPECTED_IMAGE_SHA MANIFEST EXPECTED_MANIFEST_SHA ABI DRIVER RESOURCE_IMAGE CONTROLLER NATIVE_RECEIPT")?).canonicalize()?;
     let receipt = PathBuf::from(args.next().ok_or("missing receipt")?);
     let image = PathBuf::from(args.next().ok_or("missing image")?).canonicalize()?;
     let expected_image = args
@@ -321,6 +532,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|_| "driver SHA is not UTF-8")?;
     let resource_path = PathBuf::from(args.next().ok_or("missing RI2 resource")?).canonicalize()?;
     let controller_path = PathBuf::from(args.next().ok_or("missing CI2")?).canonicalize()?;
+    let native = PathBuf::from(args.next().ok_or("missing native RI2 receipt")?).canonicalize()?;
     if args.next().is_some() {
         return Err("too many arguments".into());
     }
@@ -371,6 +583,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = padded_state(&state_capture);
     let mirror = read(&capture.join("mobj_pool.bin"))?;
     let controller = read(&controller_path)?;
+    let expected_state = read(&native.join("imported-state.st1"))?;
+    let expected_mirror = read(&native.join("imported-mirror.mp1"))?;
+    let expected_frame = read(&native.join("imported-frame.fb1"))?;
+    let native_report = String::from_utf8(read(&native.join("report.json"))?)?;
+    if !native_report.contains("\"status\": \"measured\"")
+        || !native_report.contains("\"source_matched_native_pre_tic\": true")
+        || expected_state.len() != state_capture.len()
+        || expected_mirror.len() != continuation_split_sbf::MIRROR_BYTES
+        || expected_frame.len() != continuation_split_sbf::FRAME_BYTES
+    {
+        return Err("retained native RI2 receipt is not a measured oracle".into());
+    }
     if state_capture.len() < 64
         || &state_capture[..8] != b"DOOM-ST1"
         || u32_at(&state_capture, 16) as usize != state_capture.len()
@@ -397,8 +621,79 @@ async fn main() -> Result<(), Box<dyn Error>> {
         operation: continuation_split_sbf::PREPARE,
         state_len: state_capture.len(),
         cursor: 0,
+        fault: 0,
     };
     let authority = solana_keypair::Keypair::new();
+
+    moved_context_control(compute_limit).await?;
+    same_key_refusal_control(
+        "same-key ST1",
+        STATE,
+        |bytes| bytes[64] ^= 1,
+        "Custom(242)",
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
+    same_key_refusal_control(
+        "same-key RI2",
+        RESOURCE,
+        |bytes| bytes[104] ^= 1,
+        "Custom(242)",
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
+    same_key_refusal_control(
+        "same-key CI2",
+        CONTROLLER,
+        |bytes| bytes[24] ^= 1,
+        "Custom(242)",
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
+    same_key_wad_payload_control(
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
     let continuation = solana_keypair::Keypair::new();
     let bank = program_test(
         &resource,
@@ -433,6 +728,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             operation: continuation_split_sbf::STEP,
             state_len: state_capture.len(),
             cursor: 1,
+            fault: 0,
         },
     )
     .await?;
@@ -462,10 +758,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::write(receipt.join("prepare.logs"), logs(&prepare))?;
     let prepared = account_data(&client, continuation_key).await?;
-    for (label, resource_key, state_key, controller_key) in [
-        ("changed_st1_key", RESOURCE, BAD_STATE, CONTROLLER),
-        ("changed_ri2_key", BAD_RESOURCE, STATE, CONTROLLER),
-        ("changed_ci2_key", RESOURCE, STATE, BAD_CONTROLLER_KEY),
+    for (label, resource_key, state_key, controller_key, expected) in [
+        (
+            "changed_st1_key",
+            RESOURCE,
+            BAD_STATE,
+            CONTROLLER,
+            "Custom(242)",
+        ),
+        (
+            "changed_ri2_key",
+            BAD_RESOURCE,
+            STATE,
+            CONTROLLER,
+            "Custom(242)",
+        ),
+        (
+            "changed_ci2_key",
+            RESOURCE,
+            STATE,
+            BAD_CONTROLLER_KEY,
+            "Custom(242)",
+        ),
+        (
+            "malformed_ci2",
+            RESOURCE,
+            STATE,
+            BAD_CONTROLLER,
+            "InvalidAccountData",
+        ),
     ] {
         let refusal = execute(
             &mut client,
@@ -480,10 +801,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 operation: continuation_split_sbf::STEP,
                 state_len: state_capture.len(),
                 cursor: 1,
+                fault: 0,
             },
         )
         .await?;
-        require_refusal(&refusal, "Custom(242)")?;
+        require_refusal(&refusal, expected)?;
         if account_data(&client, continuation_key).await? != prepared
             || account_data(&client, STATE).await? != before_state
             || account_data(&client, MIRROR).await? != before_mirror
@@ -493,6 +815,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut phase_units = Vec::new();
+    let mut phase_high_water = vec![0u64];
     for cursor in 1..=6u32 {
         let step = execute(
             &mut client,
@@ -507,6 +830,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 operation: continuation_split_sbf::STEP,
                 state_len: state_capture.len(),
                 cursor,
+                fault: 0,
             },
         )
         .await?;
@@ -517,15 +841,97 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("phase {cursor} failed {:?} CU={cu}", step.result).into());
         }
         phase_units.push(cu);
+        let context_after = account_data(&client, CONTEXT).await?;
+        phase_high_water.push(u32_at(
+            &context_after,
+            continuation_split_sbf::CONTEXT_CHECKPOINT_OFFSET + 92,
+        ) as u64);
     }
+    let before_finalize_context = account_data(&client, CONTEXT).await?;
+    let before_finalize_continuation = account_data(&client, continuation_key).await?;
+    let before_finalize_state = account_data(&client, STATE).await?;
+    let before_finalize_mirror = account_data(&client, MIRROR).await?;
+    let before_finalize_frame = account_data(&client, FRAME).await?;
+    let injected_finalize = execute(
+        &mut client,
+        &payer,
+        &authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation_key,
+        Request {
+            operation: continuation_split_sbf::STEP,
+            state_len: state_capture.len(),
+            cursor: 7,
+            fault: 1,
+        },
+    )
+    .await?;
+    let injected_finalize_units = units(&injected_finalize)?;
+    require_refusal(&injected_finalize, "Custom(243)")?;
+    if account_data(&client, CONTEXT).await? != before_finalize_context
+        || account_data(&client, continuation_key).await? != before_finalize_continuation
+        || account_data(&client, STATE).await? != before_finalize_state
+        || account_data(&client, MIRROR).await? != before_finalize_mirror
+        || account_data(&client, FRAME).await? != before_finalize_frame
+    {
+        return Err("injected finalizer refusal mutated durable accounts".into());
+    }
+    fs::write(
+        receipt.join("finalizer-fault.logs"),
+        logs(&injected_finalize),
+    )?;
+    let step = execute(
+        &mut client,
+        &payer,
+        &authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation_key,
+        Request {
+            operation: continuation_split_sbf::STEP,
+            state_len: state_capture.len(),
+            cursor: 7,
+            fault: 0,
+        },
+    )
+    .await?;
+    let cu = units(&step)?;
+    fs::write(receipt.join("phase-7.logs"), logs(&step))?;
+    if step.result.is_err() {
+        fs::write(receipt.join("phase-failure.txt"), failure_text(&step))?;
+        return Err(format!("phase 7 failed {:?} CU={cu}", step.result).into());
+    }
+    phase_units.push(cu);
+    let context_after = account_data(&client, CONTEXT).await?;
+    phase_high_water.push(u32_at(
+        &context_after,
+        continuation_split_sbf::CONTEXT_CHECKPOINT_OFFSET + 92,
+    ) as u64);
     let output_state = account_data(&client, STATE).await?;
     let output_mirror = account_data(&client, MIRROR).await?;
     let output_frame = account_data(&client, FRAME).await?;
-    if output_state != state
-        || output_mirror != mirror
-        || output_frame != vec![0; continuation_split_sbf::FRAME_BYTES]
-    {
-        return Err("split output is not oracle-equal captured input".into());
+    // Persist comparison material before failing so a source-matched diagnostic
+    // run can identify which durable output diverged from the retained oracle.
+    fs::write(receipt.join("output-state.st1"), &output_state)?;
+    fs::write(receipt.join("output-mirror.mp1"), &output_mirror)?;
+    fs::write(receipt.join("output-frame.fb1"), &output_frame)?;
+    let oracle_state_equal = output_state[..expected_state.len()] == expected_state
+        && output_state[expected_state.len()..].iter().all(|&b| b == 0);
+    let oracle_mirror_equal = output_mirror == expected_mirror;
+    let oracle_frame_equal = output_frame == expected_frame;
+    if !oracle_state_equal || !oracle_mirror_equal || !oracle_frame_equal {
+        fs::write(
+            receipt.join("oracle-compare.json"),
+            format!(
+                "{{\n  \"state_equal\": {oracle_state_equal},\n  \"mirror_equal\": {oracle_mirror_equal},\n  \"frame_equal\": {oracle_frame_equal}\n}}\n"
+            ),
+        )?;
+        return Err("split output is not equal to the retained native oracle".into());
     }
     let replay = execute(
         &mut client,
@@ -539,7 +945,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Request {
             operation: continuation_split_sbf::STEP,
             state_len: state_capture.len(),
-            cursor: 6,
+            cursor: 7,
+            fault: 0,
         },
     )
     .await?;
@@ -593,9 +1000,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mutated_wad[4],
     )?;
 
-    fs::write(receipt.join("output-state.st1"), &output_state)?;
-    fs::write(receipt.join("output-mirror.mp1"), &output_mirror)?;
-    fs::write(receipt.join("output-frame.fb1"), &output_frame)?;
     fs::write(
         receipt.join("continuation-published.bin"),
         account_data(&client, continuation_key).await?,
@@ -607,12 +1011,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         r#"{
   "out_of_order_step": {"refused": true, "outputs_preserved": true},
   "replay_step": {"refused": true, "outputs_preserved": true},
-  "same_key_wad_mutation": {"mutation": "WC1 ordinal header", "refused": true, "continuation_preserved": true}
+  "same_key_st1": {"refused": true, "code": "Custom(242)", "outputs_preserved": true},
+  "same_key_ri2": {"refused": true, "code": "Custom(242)", "outputs_preserved": true},
+  "same_key_ci2": {"refused": true, "code": "Custom(242)", "outputs_preserved": true},
+  "malformed_ci2": {"refused": true, "code": "InvalidAccountData", "outputs_preserved": true},
+  "moved_context": {"refused": true, "code": "Custom(199)"},
+  "same_key_wad_payload": {"accepted": true, "content_bound": false},
+  "same_key_wad_header": {"refused": true, "code": "InvalidAccountData", "continuation_preserved": true},
+  "injected_finalizer_mismatch": {"refused": true, "code": "Custom(243)", "outputs_preserved": true, "rollback_verified": true}
 }
 "#,
     )?;
-    fs::write(receipt.join("identity.json"), format!("{{\n  \"profile\": \"DOOM-E2R/4-BOUNDED-SPLIT\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"prepare_units\": {},\n  \"phase_units\": {:?},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"oracle_equal\": true,\n  \"tic_render\": \"not-run; split stops after pre-tic decode/encode\"\n}}\n", json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), prepare_units, phase_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS))?;
-    fs::write(receipt.join("run.json"), format!("{{\n  \"compute_limit\": {compute_limit},\n  \"prepare_units\": {prepare_units},\n  \"phase_units\": {:?},\n  \"qualification\": {qualification},\n  \"separate_transactions\": true\n}}\n", phase_units))?;
+    fs::write(receipt.join("identity.json"), format!("{{\n  \"profile\": \"DOOM-E2R/4-BOUNDED-SPLIT\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"prepare_units\": {},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"oracle_equal\": true,\n  \"oracle_scope\": \"source-matched native pre-tic reconstruction; tic/render open\",\n  \"wad_payload_content_bound\": false,\n  \"tic_render\": \"not-run; split stops after pre-tic decode/encode\"\n}}\n", json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), prepare_units, phase_units, phase_high_water, injected_finalize_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS))?;
+    fs::write(receipt.join("run.json"), format!("{{\n  \"compute_limit\": {compute_limit},\n  \"prepare_units\": {prepare_units},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {injected_finalize_units},\n  \"qualification\": {qualification},\n  \"separate_transactions\": true\n}}\n", phase_units, phase_high_water))?;
     println!("DOOM-E2R/4 bounded split passed: prepare_cu={prepare_units} phase_cu={phase_units:?} qualification={qualification} receipt={}", receipt.display());
     Ok(())
 }

@@ -24,6 +24,7 @@
 #include "z_zone.h"
 #include "doom_state.h"
 #include "doom_controller.h"
+#include "doom_sbf_plan_layout.h"
 
 extern int doom_ctx_guard(const void *data);
 extern void doom_ctx_init(void);
@@ -62,7 +63,6 @@ extern void doom_sbf_phase_marker(unsigned long phase);
 #define RI2_MIRROR_SLOT_BYTES 160u
 #define RI2_MIRROR_SLOTS 384u
 #define RI2_CONTROLLER_BYTES 64u
-#define RI2_SPLIT_PLAN_RESERVE (256u * 1024u)
 
 static const uint8_t ri2_wad_hash[32] = {
     0x1d,0x7d,0x43,0xbe,0x50,0x1e,0x67,0xd9,0x27,0xe4,0x15,0xe0,0xb8,0xf3,0xe2,0x9c,
@@ -114,6 +114,12 @@ static unsigned long ri2_split_arena_bytes(unsigned long bootstrap_bytes)
 {
     return bootstrap_bytes > RI2_SPLIT_PLAN_RESERVE
         ? bootstrap_bytes - RI2_SPLIT_PLAN_RESERVE : 0;
+}
+
+static int ri2_split_arena_ok(unsigned long bootstrap_bytes)
+{
+    return !doom_sbf_arena_exhausted() &&
+        doom_sbf_arena_high_water() <= ri2_split_arena_bytes(bootstrap_bytes);
 }
 
 /* The full RI2 preflight is authenticated in E2R/4 cursor 1.  Cursor 2
@@ -347,6 +353,8 @@ int doom_engine_ex2_resource_sbf_ri2_split_preflight(
     unsigned long *arena_high_water_out)
 {
     r2_section_t sections[5];
+    _Static_assert(sizeof(r2_v2_plan_t) <= RI2_SPLIT_RI2_PLAN_RESERVE,
+                   "RI2 plan exceeds its reserved tail slice");
     if (doom_ctx_guard(context)) return 199;
     if (!resource || resource_bytes < RI2_HEADER_BYTES ||
         !bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
@@ -376,8 +384,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup(
 {
     r2_section_t sections[5];
     r2_v2_plan_t *plan;
-    uint8_t *frame = 0, *demo;
-    int lump, demo_len, rc;
+    int rc;
     uint32_t input_tic;
 
     if (doom_ctx_guard(context)) return 199;
@@ -412,6 +419,43 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup(
     RI2_PHASE(521);
     W_InitAccountImage(wad_image, (int)wad_bytes);
     RI2_PHASE(522);
+    if (!ri2_split_arena_ok(bootstrap_bytes))
+        return RI2_REFUSE_ARENA;
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    return 0;
+}
+
+int doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
+    uint8_t *context, const uint8_t *resource, unsigned long resource_bytes,
+    uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    const uint8_t *state, unsigned long state_len,
+    const uint8_t *mirror, unsigned long mirror_len,
+    const uint8_t *controller, unsigned long controller_len,
+    unsigned long *arena_high_water_out)
+{
+    r2_section_t sections[5];
+    r2_v2_plan_t *plan;
+    uint8_t *frame = 0, *demo;
+    int lump, demo_len, rc;
+    uint32_t input_tic;
+
+    if (doom_ctx_guard(context)) return 199;
+    if (!resource || resource_bytes < RI2_HEADER_BYTES ||
+        !bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+        !state || !mirror || !controller ||
+        !ri2_state_shape(state, (size_t)state_len) ||
+        !ri2_mirror_shape(mirror, (size_t)mirror_len)) return RI2_REFUSE_RESOURCE;
+    input_tic = ri2_u32(state + 20);
+    if (!ri2_controller_shape(controller, (size_t)controller_len, input_tic))
+        return RI2_REFUSE_CONTROLLER;
+    if (((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_bytes(bootstrap_bytes) ||
+        !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
+        return RI2_REFUSE_ARENA;
+    plan = (r2_v2_plan_t *)(bootstrap + bootstrap_bytes - sizeof(*plan));
+    if (((uintptr_t)plan & 15u) != 0) return RI2_REFUSE_ARENA;
+    if (ri2_rebind_plan(resource, (size_t)resource_bytes, sections, plan))
+        return RI2_REFUSE_IMAGE;
     if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
                                        sections[R2_GRAPH].bytes))
         return RI2_REFUSE_IMAGE;
@@ -454,7 +498,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup(
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
     DoomStateSetAllocationFailure(-1);
     RI2_PHASE(560); /* setup is now durable in the pinned context */
-    if (doom_sbf_arena_high_water() > ri2_split_arena_bytes(bootstrap_bytes))
+    if (!ri2_split_arena_ok(bootstrap_bytes))
         return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
@@ -491,7 +535,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_decode_preflight(
     if (rc || DoomStateDecodeSplitPreflight(state, (size_t)state_len))
         return rc ? rc : RI2_REFUSE_STATE;
     RI2_PHASE(571);
-    if (doom_sbf_arena_exhausted()) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
 }
@@ -507,7 +551,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_decode_prepare(
     if (rc || DoomStateDecodeSplitPrepare())
         return rc ? rc : RI2_REFUSE_STATE;
     RI2_PHASE(572);
-    if (doom_sbf_arena_exhausted()) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
 }
@@ -533,7 +577,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_decode_parse(
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
     setsizeneeded = false;
-    if (doom_sbf_arena_exhausted()) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
 }
@@ -556,7 +600,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_finalize(
     if (!ri2_split_arena_bytes(bootstrap_bytes) ||
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
-    if (doom_sbf_arena_exhausted()) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     derived = (uint8_t *)malloc(RI2_MIRROR_BYTES);
     if (!derived || doom_sbf_fill_pool(derived, ri2_wad_hash) ||
         DoomStateEncode(&encoded, &encoded_bytes) ||

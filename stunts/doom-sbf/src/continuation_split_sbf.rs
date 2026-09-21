@@ -22,7 +22,7 @@ pub const VERSION: u32 = 4;
 pub const PREPARE: u8 = 5;
 pub const STEP: u8 = 6;
 pub const INSTRUCTION_BYTES: usize = 32;
-pub const ABI_DESCRIPTOR: &str = "DOOM-E2R/4|instruction=32|operations=PREPARE/5+STEP/6|accounts=13|continuation=262144|payload=ST1+MP1+CI2+FB1|relocations=typed-offsets|context=DOOM-CT4-pinned-live-engine|phases=setup+decode+finalize";
+pub const ABI_DESCRIPTOR: &str = "DOOM-E2R/4|instruction=32|operations=PREPARE/5+STEP/6|accounts=13|continuation=262144|payload=ST1+MP1+CI2+FB1|relocations=typed-offsets|context=DOOM-CT4-pinned-live-engine|phases=setup-part1+setup-part2+decode+finalize|fault=byte24-cursor7-only";
 
 pub const CONTINUATION_ACCOUNT: usize = 11;
 pub const AUTHORITY_ACCOUNT: usize = 12;
@@ -42,14 +42,17 @@ pub const RELOC_COUNT: usize = 3;
 pub const CONTINUATION_BYTES: usize = 262_144;
 pub const CONTEXT_CHECKPOINT_OFFSET: usize = resource_sbf::CONTEXT_BYTES - 128;
 pub const CONTEXT_CHECKPOINT_BYTES: usize = 128;
+const SPLIT_PLAN_RESERVE: usize = 256 * 1024;
+const ACTIVE_ARENA_BYTES: usize = resource_sbf::BOOTSTRAP_BYTES - SPLIT_PLAN_RESERVE;
 
 const PHASE_PREPARED: u32 = 1;
 const PHASE_PREFLIGHT: u32 = 2;
 const PHASE_SETUP: u32 = 3;
-const PHASE_DECODE_PREFLIGHT: u32 = 4;
-const PHASE_DECODE_PREPARED: u32 = 5;
-const PHASE_DECODED: u32 = 6;
-const PHASE_PUBLISHED: u32 = 7;
+const PHASE_SETUP_COMPLETE: u32 = 4;
+const PHASE_DECODE_PREFLIGHT: u32 = 5;
+const PHASE_DECODE_PREPARED: u32 = 6;
+const PHASE_DECODED: u32 = 7;
+const PHASE_PUBLISHED: u32 = 8;
 const DOMAIN_ROOT: &[u8] = b"DOOM-E2R/4-ROOT\0";
 const DOMAIN_ACCOUNTS: &[u8] = b"DOOM-E2R/4-ACCOUNTS\0";
 const DOMAIN_PROTOCOL: &[u8] = b"DOOM-E2R/4-PROTOCOL\0";
@@ -96,6 +99,10 @@ pub struct Request {
     pub operation: u8,
     pub state_len: usize,
     pub cursor: u32,
+    /// Diagnostic-only finalizer fault injection.  It is accepted only on
+    /// STEP/cursor 7 and forces the post-finalizer oracle check to refuse;
+    /// it is never set by a positive run.
+    pub fault: u8,
 }
 
 impl Request {
@@ -105,7 +112,7 @@ impl Request {
             || u32_at(data, 8) != VERSION
             || !matches!(data[12], PREPARE | STEP)
             || data[13..16].iter().any(|&byte| byte != 0)
-            || data[24..32].iter().any(|&byte| byte != 0)
+            || data[25..32].iter().any(|&byte| byte != 0)
         {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -114,7 +121,9 @@ impl Request {
             return Err(ProgramError::InvalidInstructionData);
         }
         let cursor = u32_at(data, 20);
-        if (data[12] == PREPARE && cursor != 0) || (data[12] == STEP && !(1..=6).contains(&cursor))
+        if (data[12] == PREPARE && cursor != 0)
+            || (data[12] == STEP && !(1..=7).contains(&cursor))
+            || (data[24] != 0 && (data[12] != STEP || cursor != 7 || data[24] != 1))
         {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -122,6 +131,7 @@ impl Request {
             operation: data[12],
             state_len,
             cursor,
+            fault: data[24],
         })
     }
 
@@ -132,6 +142,7 @@ impl Request {
         out[12] = self.operation;
         out[16..20].copy_from_slice(&(self.state_len as u32).to_le_bytes());
         out[20..24].copy_from_slice(&self.cursor.to_le_bytes());
+        out[24] = self.fault;
         out
     }
 }
@@ -366,6 +377,7 @@ fn fill_checkpoint(
     cursor: u32,
     state_root: &[u8; 32],
     accounts_root: &[u8; 32],
+    arena_high_water: usize,
 ) {
     let checkpoint = &mut context
         [CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES];
@@ -378,6 +390,7 @@ fn fill_checkpoint(
     set_hash(checkpoint, 52, accounts_root);
     put_u32(checkpoint, 84, 0);
     put_u32(checkpoint, 88, CONTEXT_CHECKPOINT_OFFSET as u32);
+    put_u32(checkpoint, 92, arena_high_water as u32);
 }
 
 fn check_checkpoint(
@@ -395,8 +408,25 @@ fn check_checkpoint(
         || u32_at(checkpoint, 16) != cursor
         || u32_at(checkpoint, 84) != 0
         || u32_at(checkpoint, 88) as usize != CONTEXT_CHECKPOINT_OFFSET
+        || u32_at(checkpoint, 92) as usize > ACTIVE_ARENA_BYTES
         || &checkpoint[20..52] != state_root
         || &checkpoint[52..84] != accounts_root
+    {
+        return Err(ProgramError::Custom(241));
+    }
+    Ok(())
+}
+
+fn check_checkpoint_order(context: &[u8], phase: u32, cursor: u32) -> ProgramResult {
+    let checkpoint =
+        &context[CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES];
+    if &checkpoint[..8] != b"DOOM-CT4"
+        || u32_at(checkpoint, 8) != VERSION
+        || u32_at(checkpoint, 12) != phase
+        || u32_at(checkpoint, 16) != cursor
+        || u32_at(checkpoint, 84) != 0
+        || u32_at(checkpoint, 88) as usize != CONTEXT_CHECKPOINT_OFFSET
+        || u32_at(checkpoint, 92) as usize > ACTIVE_ARENA_BYTES
     {
         return Err(ProgramError::Custom(241));
     }
@@ -587,7 +617,7 @@ fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request)
     }
     let root = root_hash(&state, &mirror, &controller, &frame);
     let accounts_root = account_set_hash(program, accounts);
-    fill_checkpoint(&mut context, PHASE_PREPARED, 1, &root, &accounts_root);
+    fill_checkpoint(&mut context, PHASE_PREPARED, 1, &root, &accounts_root, 0);
     fill_header(
         &mut continuation,
         program,
@@ -618,6 +648,20 @@ unsafe extern "C" {
         resource_bytes: usize,
         wad_image: *const u8,
         wad_bytes: usize,
+        bootstrap: *mut u8,
+        bootstrap_bytes: usize,
+        state: *const u8,
+        state_len: usize,
+        mirror: *const u8,
+        mirror_len: usize,
+        controller: *const u8,
+        controller_len: usize,
+        arena_high_water: *mut usize,
+    ) -> i32;
+    fn doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
+        context: *mut u8,
+        resource: *const u8,
+        resource_bytes: usize,
         bootstrap: *mut u8,
         bootstrap_bytes: usize,
         state: *const u8,
@@ -703,6 +747,8 @@ fn run_phase(
     cursor: u32,
     state_len: usize,
     saved: &[u8],
+    fault: u8,
+    arena_high_water_out: &mut usize,
 ) -> ProgramResult {
     let mut context = accounts[0].try_borrow_mut_data()?;
     let resource = accounts[1].try_borrow_data()?;
@@ -710,8 +756,8 @@ fn run_phase(
     let mirror = accounts[8].try_borrow_data()?;
     let controller = accounts[9].try_borrow_data()?;
     let mut arena_high_water = 0usize;
-    let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
     let rc = if cursor == 1 {
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
             doom_engine_ex2_resource_sbf_ri2_split_preflight(
                 context_ptr,
@@ -740,6 +786,7 @@ fn run_phase(
         if at != wad_end {
             return Err(ProgramError::InvalidAccountData);
         }
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
             doom_engine_ex2_resource_sbf_ri2_split_setup(
                 context_ptr,
@@ -759,6 +806,25 @@ fn run_phase(
             )
         }
     } else if cursor == 3 {
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
+        unsafe {
+            doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
+                context_ptr,
+                resource.as_ptr(),
+                resource.len(),
+                bootstrap_ptr,
+                bootstrap_len,
+                state.as_ptr(),
+                state_len,
+                mirror.as_ptr(),
+                mirror.len(),
+                controller.as_ptr(),
+                controller.len(),
+                &mut arena_high_water,
+            )
+        }
+    } else if cursor == 4 {
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
             doom_engine_ex2_resource_sbf_ri2_split_decode_preflight(
                 context_ptr,
@@ -771,7 +837,8 @@ fn run_phase(
                 &mut arena_high_water,
             )
         }
-    } else if cursor == 4 {
+    } else if cursor == 5 {
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
             doom_engine_ex2_resource_sbf_ri2_split_decode_prepare(
                 context_ptr,
@@ -784,7 +851,8 @@ fn run_phase(
                 &mut arena_high_water,
             )
         }
-    } else if cursor == 5 {
+    } else if cursor == 6 {
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
             doom_engine_ex2_resource_sbf_ri2_split_decode_parse(
                 context_ptr,
@@ -798,6 +866,7 @@ fn run_phase(
             )
         }
     } else {
+        let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         drop(state);
         drop(mirror);
         drop(controller);
@@ -825,7 +894,8 @@ fn run_phase(
             )
         };
         if rc == 0
-            && (state_out_len != u32_at(saved, H_STATE_LEN) as usize
+            && (fault != 0
+                || state_out_len != u32_at(saved, H_STATE_LEN) as usize
                 || mirror_out_len != MIRROR_BYTES
                 || frame_out_len != FRAME_BYTES
                 || state_out[..STATE_BYTES] != saved[STATE_OFFSET..STATE_OFFSET + STATE_BYTES]
@@ -839,7 +909,10 @@ fn run_phase(
     if rc != 0 {
         return Err(ProgramError::Custom(rc as u32));
     }
-    let _ = arena_high_water;
+    *arena_high_water_out = arena_high_water;
+    if arena_high_water > ACTIVE_ARENA_BYTES {
+        return Err(ProgramError::Custom(239));
+    }
     Ok(())
 }
 
@@ -849,6 +922,8 @@ fn run_phase(
     _cursor: u32,
     _state_len: usize,
     _saved: &[u8],
+    _fault: u8,
+    _arena_high_water_out: &mut usize,
 ) -> ProgramResult {
     Err(ProgramError::Custom(244))
 }
@@ -885,18 +960,13 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         1 => PHASE_PREPARED,
         2 => PHASE_PREFLIGHT,
         3 => PHASE_SETUP,
-        4 => PHASE_DECODE_PREFLIGHT,
-        5 => PHASE_DECODE_PREPARED,
-        6 => PHASE_DECODED,
+        4 => PHASE_SETUP_COMPLETE,
+        5 => PHASE_DECODE_PREFLIGHT,
+        6 => PHASE_DECODE_PREPARED,
+        7 => PHASE_DECODED,
         _ => unreachable!(),
     };
-    check_checkpoint(
-        &context,
-        phase,
-        expected_phase,
-        &expected_root,
-        &accounts_root,
-    )?;
+    check_checkpoint_order(&context, phase, expected_phase)?;
     let continuation = accounts[CONTINUATION_ACCOUNT].try_borrow_data()?;
     validate_header(
         &continuation,
@@ -911,23 +981,42 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         &controller,
         &frame,
     )?;
-    let saved = continuation.to_vec();
-    drop(continuation);
+    // Validate the live account bytes and key set before comparing the
+    // checkpoint's root.  A same-key mutation must reach validate_header and
+    // refuse as the authenticated-input control (242), rather than being
+    // misclassified as a stale phase/context marker (241).
+    check_checkpoint(
+        &context,
+        phase,
+        expected_phase,
+        &expected_root,
+        &accounts_root,
+    )?;
     drop(frame);
     drop(controller);
     drop(mirror);
     drop(state);
     drop(resource);
     drop(context);
-    run_phase(accounts, request.cursor, request.state_len, &saved)?;
+    let mut arena_high_water = 0usize;
+    run_phase(
+        accounts,
+        request.cursor,
+        request.state_len,
+        &continuation,
+        request.fault,
+        &mut arena_high_water,
+    )?;
+    drop(continuation);
 
     let next_phase = match request.cursor {
         1 => PHASE_PREFLIGHT,
         2 => PHASE_SETUP,
-        3 => PHASE_DECODE_PREFLIGHT,
-        4 => PHASE_DECODE_PREPARED,
-        5 => PHASE_DECODED,
-        6 => PHASE_PUBLISHED,
+        3 => PHASE_SETUP_COMPLETE,
+        4 => PHASE_DECODE_PREFLIGHT,
+        5 => PHASE_DECODE_PREPARED,
+        6 => PHASE_DECODED,
+        7 => PHASE_PUBLISHED,
         _ => unreachable!(),
     };
     let next_cursor = request.cursor + 1;
@@ -938,6 +1027,7 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         next_cursor,
         &expected_root,
         &accounts_root,
+        arena_high_water,
     );
     let mut continuation = accounts[CONTINUATION_ACCOUNT].try_borrow_mut_data()?;
     put_u32(&mut continuation, H_OPERATION, STEP as u32);
@@ -971,6 +1061,7 @@ mod tests {
             operation: STEP,
             state_len: 12_345,
             cursor: 6,
+            fault: 0,
         };
         assert_eq!(Request::decode(&request.encode()), Ok(request));
     }
@@ -981,6 +1072,7 @@ mod tests {
             operation: STEP,
             state_len: 64,
             cursor: 7,
+            fault: 0,
         };
         assert_eq!(
             Request::decode(&request.encode()),
