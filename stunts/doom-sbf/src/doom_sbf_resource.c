@@ -57,6 +57,13 @@ extern void R_ExecuteSetViewSize(void);
 #define RI_LOW_ARENA_BYTES (1024u * 1024u)
 #define RI_ZONE_BYTES (3u * 1024u * 1024u)
 
+#ifdef DOOM_SBF_PHASE_PROFILE
+extern void doom_sbf_phase_marker(unsigned long phase);
+#define E2R_PHASE(phase) doom_sbf_phase_marker((unsigned long)(phase))
+#else
+#define E2R_PHASE(phase) ((void)0)
+#endif
+
 enum {
     RI_VERTEXES = 0, RI_SECTORS = 1, RI_SIDES = 2, RI_LINES = 3,
     RI_SEGS = 4, RI_SUBSECTORS = 5, RI_NODES = 6, RI_BLOCKMAP = 7,
@@ -266,35 +273,63 @@ int doom_engine_ex2_resource_sbf_tic_entry(
     e2r_section_t sections[RI_SECTION_COUNT]; uint8_t *low_arena, *encoded=0, *derived=0, *demo;
     uint8_t wad_hash[32]; size_t encoded_bytes=0; uint32_t input_tic; int lump, demo_len;
     if (doom_ctx_guard(context)) return 199;
+    E2R_PHASE(300); /* context guard passed */
     if (!resource || resource_bytes < RI_HEADER_BYTES ||
         !wad_image || wad_bytes != RI_WAD_BYTES || !bootstrap || bootstrap_bytes < RI_LOW_ARENA_BYTES ||
         !e2r_state_shape(state,state_len) || !mirror || mirror_len != RI_MIRROR_BYTES ||
         !controller || controller_len != 64 || !state_out || !state_out_len || !mirror_out ||
         !mirror_out_len || state_cap < RI_STATE_MAX || mirror_cap < RI_MIRROR_BYTES) return E2R_REFUSE_RESOURCE;
+    E2R_PHASE(301); /* pointer/length preflight passed */
     if (e2r_validate(resource,resource_bytes,sections)) return E2R_REFUSE_IMAGE;
+    E2R_PHASE(302); /* RI1 bounds and graph references passed */
     input_tic=e2r_u32(state+20);
     if(!e2r_controller_shape(controller,controller_len,input_tic)) return E2R_REFUSE_CONTROLLER;
+    E2R_PHASE(303); /* canonical CI2 shape passed */
     memcpy(wad_hash,resource+RI_WAD_HASH_OFFSET,32);
     if(!e2r_mirror_shape(mirror,mirror_len,wad_hash)) return E2R_REFUSE_POOL;
+    E2R_PHASE(304); /* canonical MP1 shape and WAD binding passed */
     memset((void *)DOOM_CTX,0,sizeof(doom_ctx_t)); doom_ctx_init();
+    E2R_PHASE(310); /* runtime context reset and tables initialized */
     if(!doom_sbf_bind_arena(bootstrap,bootstrap_bytes,RI_ZONE_BYTES)) return E2R_REFUSE_ARENA;
     low_arena=(uint8_t *)calloc(1,RI_LOW_ARENA_BYTES); if(!low_arena) return E2R_REFUSE_RESOURCE;
     if(!doom_sbf_bind_arena(low_arena,RI_LOW_ARENA_BYTES,RI_ZONE_BYTES)) return E2R_REFUSE_ARENA;
+    E2R_PHASE(311); /* bootstrap and low arena bound */
     gamemode=shareware; gamemission=doom; language=english; DOOM_CTX->deathmatch=0; DOOM_CTX->consoleplayer=0; displayplayer=0; myargc=0; myargv=0;
-    Z_Init(); W_InitAccountImage(wad_image,(int)wad_bytes); V_Init(); R_Init(); R_ExecuteSetViewSize(); P_Init();
+    Z_Init();
+    E2R_PHASE(320);
+    W_InitAccountImage(wad_image,(int)wad_bytes);
+    E2R_PHASE(321);
+    V_Init();
+    E2R_PHASE(322);
+    R_Init();
+    E2R_PHASE(323);
+    R_ExecuteSetViewSize();
+    E2R_PHASE(324);
+    P_Init();
+    E2R_PHASE(325);
     lump=W_GetNumForName("DEMO1"); demo_len=W_LumpLength(lump); if(demo_len<17) return E2R_REFUSE_RESOURCE;
     demo=(uint8_t *)W_CacheLumpNum(lump,PU_STATIC); defdemoname="DEMO1"; demobuffer=demo; demo_p=demo; G_DoPlayDemo();
+    E2R_PHASE(330); /* DEMO1 located, cached, and play state installed */
     DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len);
     if(e2r_import_graph(resource,sections)) return E2R_REFUSE_IMAGE;
+    E2R_PHASE(340); /* RI1 scalar graph imported and pointers rebound */
     if(DoomStateDecode(state,(size_t)state_len)) return E2R_REFUSE_STATE;
+    E2R_PHASE(350); /* ST1 decoded */
     if(DoomControllerArmV2(controller+24)) return E2R_REFUSE_CONTROLLER;
+    E2R_PHASE(360); /* CI2 command armed */
     derived=(uint8_t *)malloc(RI_MIRROR_BYTES); if(!derived || doom_sbf_fill_pool(derived,wad_hash) || memcmp(derived,mirror,RI_MIRROR_BYTES)) return E2R_REFUSE_POOL;
+    E2R_PHASE(370); /* pre-tic MP1 derived and checked */
     if(DoomControllerValidateCapturedDemoCursor(demo_p)) return E2R_REFUSE_CONTROLLER;
+    E2R_PHASE(380); /* captured DEMO1 cursor checked */
     G_Ticker(); gametic++;
+    E2R_PHASE(390); /* real one-tic engine continuation complete */
     if(doom_sbf_arena_exhausted()) return E2R_REFUSE_ARENA;
     if(DoomStateEncode(&encoded,&encoded_bytes)||encoded_bytes>RI_STATE_MAX||encoded_bytes>state_cap||encoded_bytes<64) return E2R_REFUSE_OUTPUT;
+    E2R_PHASE(400); /* next ST1 encoded */
     if(doom_sbf_fill_pool(derived,wad_hash)) return E2R_REFUSE_POOL;
+    E2R_PHASE(410); /* next MP1 derived */
     memcpy(state_out,encoded,encoded_bytes); memcpy(mirror_out,derived,RI_MIRROR_BYTES); *state_out_len=encoded_bytes; *mirror_out_len=RI_MIRROR_BYTES;
+    E2R_PHASE(420); /* output writeback complete */
     if(arena_high_water_out) *arena_high_water_out=doom_sbf_arena_high_water();
     return 0;
 }

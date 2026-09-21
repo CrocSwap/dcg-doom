@@ -27,6 +27,10 @@ use solana_transaction::Transaction;
 
 const PROGRAM: Pubkey = Pubkey::new_from_array([0xda; 32]);
 const NORMAL_LIMIT: u32 = 1_400_000;
+/// Diagnostic-only ceiling; never used by the qualification path. It is
+/// deliberately high enough to expose the post-initialization boundaries;
+/// `run-mode.json` still labels the run ineligible for qualification.
+const DIAGNOSTIC_LIMIT: u32 = 20_000_000;
 const QUALIFICATION_MAX_UNITS: u64 = 1_190_000;
 const ACCOUNT_MANIFEST_SHA256: &str =
     "d23776b358184c77fba32df600bf565a56b6935d129aec6b9567ad3c1c999504";
@@ -140,13 +144,14 @@ async fn execute(
     resource: Pubkey,
     controller: Pubkey,
     request: &resource_sbf::Request,
+    compute_limit: u32,
 ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
     let blockhash = client.get_latest_blockhash().await?;
     let tx = Transaction::new(
         &[payer],
         Message::new_with_blockhash(
             &[
-                ComputeBudgetInstruction::set_compute_unit_limit(NORMAL_LIMIT),
+                ComputeBudgetInstruction::set_compute_unit_limit(compute_limit),
                 instruction(resource, controller, request),
             ],
             Some(&payer.pubkey()),
@@ -166,12 +171,13 @@ fn program_test(
     mirror: &[u8],
     controller: &[u8],
     bad: &[u8],
+    compute_max_units: u32,
 ) -> ProgramTest {
     env::set_var("BPF_OUT_DIR", image.parent().unwrap());
     env::set_var("SBF_OUT_DIR", image.parent().unwrap());
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
-    bank.set_compute_max_units(NORMAL_LIMIT as u64);
+    bank.set_compute_max_units(compute_max_units as u64);
     bank.add_program("doom_sbf", PROGRAM, None);
     bank.add_account(CONTEXT, account(vec![0; resource_sbf::CONTEXT_BYTES]));
     bank.add_account(RESOURCE, account(resource.to_vec()));
@@ -236,13 +242,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         PathBuf::from(args.next().ok_or("missing resource image")?).canonicalize()?;
     let native = PathBuf::from(args.next().ok_or("missing native RI1 receipt")?).canonicalize()?;
     let controller_path = PathBuf::from(args.next().ok_or("missing controller")?).canonicalize()?;
-    if args.next().is_some() {
-        return Err("too many arguments".into());
-    }
+    let diagnostic = match args.next() {
+        None => false,
+        Some(flag) if flag == "--diagnostic" => true,
+        Some(_) => return Err("optional final argument must be --diagnostic".into()),
+    };
     if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
         return Err(format!("refusing non-empty receipt {}", receipt.display()).into());
     }
     fs::create_dir_all(&receipt)?;
+    fs::write(
+        receipt.join("run-mode.json"),
+        format!(
+            "{{\n  \"schema\": \"doom-e2r-run-mode/1\",\n  \"diagnostic_only\": {},\n  \"positive_compute_limit\": {},\n  \"qualification_compute_limit\": {}\n}}\n",
+            diagnostic,
+            if diagnostic { DIAGNOSTIC_LIMIT } else { NORMAL_LIMIT },
+            NORMAL_LIMIT
+        ),
+    )?;
     if !image.is_file() || image.file_name().and_then(|x| x.to_str()) != Some("doom_sbf.so") {
         return Err("expected stripped deploy/doom_sbf.so".into());
     }
@@ -346,9 +363,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mirror,
         &controller,
         &bad,
+        if diagnostic { DIAGNOSTIC_LIMIT } else { NORMAL_LIMIT },
     );
     let (mut client, payer, _) = bank.start().await;
-    let control = execute(&mut client, &payer, RESOURCE, BAD_CONTROLLER, &request).await?;
+    let control = execute(
+        &mut client,
+        &payer,
+        RESOURCE,
+        BAD_CONTROLLER,
+        &request,
+        NORMAL_LIMIT,
+    )
+    .await?;
     let control_text = format!("{control:?}");
     if !control_text.contains("InvalidAccountData") {
         write_report(
@@ -378,8 +404,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if &before[..state.len()] != state || before_mirror != mirror {
         return Err("malformed controller mutated state or mirror".into());
     }
-    let malformed_resource =
-        execute(&mut client, &payer, BAD_RESOURCE, CONTROLLER, &request).await?;
+    let malformed_resource = execute(
+        &mut client,
+        &payer,
+        BAD_RESOURCE,
+        CONTROLLER,
+        &request,
+        NORMAL_LIMIT,
+    )
+    .await?;
     let malformed_resource_text = format!("{malformed_resource:?}");
     if !malformed_resource_text.contains("Custom(235)") {
         write_report(
@@ -412,7 +445,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if &after_resource_state[..state.len()] != state || after_resource_mirror != mirror {
         return Err("malformed resource mutated state or mirror".into());
     }
-    let normal = execute(&mut client, &payer, RESOURCE, CONTROLLER, &request).await?;
+    let normal = execute(
+        &mut client,
+        &payer,
+        RESOURCE,
+        CONTROLLER,
+        &request,
+        if diagnostic { DIAGNOSTIC_LIMIT } else { NORMAL_LIMIT },
+    )
+    .await?;
     let units = normal.metadata.as_ref().map(|m| m.compute_units_consumed);
     if normal.result.is_err() {
         let e = format!("{normal:?}");

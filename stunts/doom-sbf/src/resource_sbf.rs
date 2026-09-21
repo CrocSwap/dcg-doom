@@ -8,7 +8,7 @@
 
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, msg, program_error::ProgramError,
-    program_memory::sol_memcpy, pubkey::Pubkey,
+    program_memory::{sol_memcmp, sol_memcpy, sol_memset}, pubkey::Pubkey,
 };
 
 pub const MAGIC: &[u8; 8] = b"DOOM-E2R";
@@ -26,6 +26,7 @@ pub const RESOURCE_IMAGE_BYTES: usize = RESOURCE_ACCOUNT_BYTES;
 pub const WAD_ACCOUNT_COUNT: usize = 5;
 pub const WAD_ACCOUNT_BYTES: usize = 1_048_576;
 pub const WAD_HEADER_BYTES: usize = 32;
+const WAD_MAX_TAIL_BYTES: usize = WAD_ACCOUNT_BYTES - WAD_HEADER_BYTES;
 pub const WAD_IMAGE_BYTES: usize = 4_196_020;
 pub const BOOTSTRAP_BYTES: usize = 2 * 1024 * 1024;
 pub const ALLOC_ALIGNMENT: usize = 16;
@@ -46,6 +47,44 @@ pub const BOOTSTRAP_OFFSET: usize = align16_const(WAD_IMAGE_OFFSET + WAD_IMAGE_B
 pub const CONTEXT_BYTES: usize = BOOTSTRAP_OFFSET + BOOTSTRAP_BYTES;
 
 const CONTROLLER_HEADER_BYTES: usize = 28;
+
+// DOOM-E2R diagnostic-only phase IDs. These are disjoint from the retained
+// E2S IDs; marker calls are compiled out of normal images.
+pub const PHASE_E2R_RUST_VALIDATION_START: u64 = 201;
+pub const PHASE_E2R_RUST_ACCOUNT_SHAPE_DONE: u64 = 202;
+pub const PHASE_E2R_RUST_STATE_MIRROR_DONE: u64 = 203;
+pub const PHASE_E2R_RUST_CONTROLLER_DONE: u64 = 204;
+pub const PHASE_E2R_RUST_RESOURCE_HEADER_DONE: u64 = 205;
+pub const PHASE_E2R_RUST_WAD_ACCOUNT_0_DONE: u64 = 210;
+pub const PHASE_E2R_RUST_WAD_ACCOUNT_1_DONE: u64 = 211;
+pub const PHASE_E2R_RUST_WAD_ACCOUNT_2_DONE: u64 = 212;
+pub const PHASE_E2R_RUST_WAD_ACCOUNT_3_DONE: u64 = 213;
+pub const PHASE_E2R_RUST_WAD_ACCOUNT_4_DONE: u64 = 214;
+pub const PHASE_E2R_RUST_WAD_VALIDATION_DONE: u64 = 215;
+pub const PHASE_E2R_RUST_WAD_COPY_START: u64 = 220;
+pub const PHASE_E2R_RUST_WAD_COPY_ACCOUNT_0_DONE: u64 = 221;
+pub const PHASE_E2R_RUST_WAD_COPY_ACCOUNT_1_DONE: u64 = 222;
+pub const PHASE_E2R_RUST_WAD_COPY_ACCOUNT_2_DONE: u64 = 223;
+pub const PHASE_E2R_RUST_WAD_COPY_ACCOUNT_3_DONE: u64 = 224;
+pub const PHASE_E2R_RUST_WAD_COPY_ACCOUNT_4_DONE: u64 = 225;
+pub const PHASE_E2R_RUST_WAD_COPY_DONE: u64 = 226;
+pub const PHASE_E2R_C_ENTRY: u64 = 230;
+
+const E2R_WAD_ACCOUNT_DONE: [u64; WAD_ACCOUNT_COUNT] = [
+    PHASE_E2R_RUST_WAD_ACCOUNT_0_DONE,
+    PHASE_E2R_RUST_WAD_ACCOUNT_1_DONE,
+    PHASE_E2R_RUST_WAD_ACCOUNT_2_DONE,
+    PHASE_E2R_RUST_WAD_ACCOUNT_3_DONE,
+    PHASE_E2R_RUST_WAD_ACCOUNT_4_DONE,
+];
+
+const E2R_WAD_COPY_DONE: [u64; WAD_ACCOUNT_COUNT] = [
+    PHASE_E2R_RUST_WAD_COPY_ACCOUNT_0_DONE,
+    PHASE_E2R_RUST_WAD_COPY_ACCOUNT_1_DONE,
+    PHASE_E2R_RUST_WAD_COPY_ACCOUNT_2_DONE,
+    PHASE_E2R_RUST_WAD_COPY_ACCOUNT_3_DONE,
+    PHASE_E2R_RUST_WAD_COPY_ACCOUNT_4_DONE,
+];
 
 const fn align16_const(value: usize) -> usize {
     (value + (ALLOC_ALIGNMENT - 1)) & !(ALLOC_ALIGNMENT - 1)
@@ -115,15 +154,17 @@ fn expected_bytes(index: usize) -> usize {
     }
 }
 
-fn has_nonzero_byte(bytes: &[u8]) -> bool {
-    let mut chunks = bytes.chunks_exact(8);
-    if chunks
-        .by_ref()
-        .any(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) != 0)
-    {
-        return true;
+fn has_nonzero_byte(bytes: &[u8], zeroes: &[u8]) -> bool {
+    debug_assert!(!zeroes.is_empty());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let chunk_bytes = (bytes.len() - offset).min(zeroes.len());
+        if sol_memcmp(&bytes[offset..], zeroes, chunk_bytes) != 0 {
+            return true;
+        }
+        offset += chunk_bytes;
     }
-    chunks.remainder().iter().any(|&byte| byte != 0)
+    false
 }
 
 #[inline(always)]
@@ -132,7 +173,11 @@ fn copy_nonoverlapping(dst: &mut [u8], src: &[u8]) {
     sol_memcpy(dst, src, dst.len());
 }
 
-fn validate_wad_account(account: &AccountInfo, ordinal: usize) -> ProgramResult {
+fn validate_wad_account(
+    account: &AccountInfo,
+    ordinal: usize,
+    zeroes: &[u8],
+) -> ProgramResult {
     let data = account.try_borrow_data()?;
     if &data[..8] != b"DOOM-WC1"
         || u32_at(&data, 8) != 1
@@ -144,7 +189,7 @@ fn validate_wad_account(account: &AccountInfo, ordinal: usize) -> ProgramResult 
     }
     let payload_bytes = u32_at(&data, 24) as usize;
     if payload_bytes > WAD_ACCOUNT_BYTES - WAD_HEADER_BYTES
-        || has_nonzero_byte(&data[WAD_HEADER_BYTES + payload_bytes..])
+        || has_nonzero_byte(&data[WAD_HEADER_BYTES + payload_bytes..], zeroes)
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -212,11 +257,7 @@ fn validate_controller(account: &AccountInfo, expected_tic: u32) -> ProgramResul
     Ok(())
 }
 
-fn validate_accounts(
-    program: &Pubkey,
-    accounts: &[AccountInfo],
-    request: Request,
-) -> ProgramResult {
+fn validate_account_shape(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if accounts.len() != ACCOUNT_COUNT {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -235,18 +276,32 @@ fn validate_accounts(
             return Err(ProgramError::InvalidAccountData);
         }
     }
+    super::diagnostic_phase(PHASE_E2R_RUST_ACCOUNT_SHAPE_DONE);
+    Ok(())
+}
+
+fn validate_account_contents(
+    accounts: &[AccountInfo],
+    request: Request,
+    zeroes: &[u8],
+) -> ProgramResult {
     validate_state(&accounts[STATE_ACCOUNT], request.state_len)?;
     validate_mirror(&accounts[MIRROR_ACCOUNT])?;
+    super::diagnostic_phase(PHASE_E2R_RUST_STATE_MIRROR_DONE);
     let state = accounts[STATE_ACCOUNT].try_borrow_data()?;
     let gametic = u32_at(&state, 20);
     drop(state);
     // This is intentionally before the RI1 and five-WAD scans.  It preserves
     // the bounded malformed-CI2 refusal under the normal qualification limit.
     validate_controller(&accounts[CONTROLLER_ACCOUNT], gametic)?;
+    super::diagnostic_phase(PHASE_E2R_RUST_CONTROLLER_DONE);
     validate_resource_header(&accounts[RESOURCE_ACCOUNT], request.resource_bytes)?;
+    super::diagnostic_phase(PHASE_E2R_RUST_RESOURCE_HEADER_DONE);
     for ordinal in 0..WAD_ACCOUNT_COUNT {
-        validate_wad_account(&accounts[WAD_FIRST_ACCOUNT + ordinal], ordinal)?;
+        validate_wad_account(&accounts[WAD_FIRST_ACCOUNT + ordinal], ordinal, zeroes)?;
+        super::diagnostic_phase(E2R_WAD_ACCOUNT_DONE[ordinal]);
     }
+    super::diagnostic_phase(PHASE_E2R_RUST_WAD_VALIDATION_DONE);
     Ok(())
 }
 
@@ -283,9 +338,29 @@ pub fn process(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let request = Request::decode(instruction_data)?;
-    validate_accounts(program, accounts, request)?;
+    super::diagnostic_phase(PHASE_E2R_C_ENTRY);
+    super::diagnostic_phase(PHASE_E2R_RUST_VALIDATION_START);
+    validate_account_shape(program, accounts)?;
 
     let mut context = accounts[CONTEXT_ACCOUNT].try_borrow_mut_data()?;
+    let zeroes_end = WAD_IMAGE_OFFSET + WAD_MAX_TAIL_BYTES;
+    if zeroes_end > context.len() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // The comparator is drawn from the staging region that the subsequent
+    // WAD copy overwrites completely. This keeps the exact reserved-tail
+    // predicate while replacing the per-word Rust scan with one bounded
+    // memory syscall; no account bytes are trusted or skipped.
+    sol_memset(
+        &mut context[WAD_IMAGE_OFFSET..zeroes_end],
+        0,
+        WAD_MAX_TAIL_BYTES,
+    );
+    validate_account_contents(
+        accounts,
+        request,
+        &context[WAD_IMAGE_OFFSET..zeroes_end],
+    )?;
     let wad_start = WAD_IMAGE_OFFSET;
     let wad_end = wad_start + request.wad_bytes;
     let bootstrap_start = BOOTSTRAP_OFFSET;
@@ -298,6 +373,7 @@ pub fn process(
         return Err(ProgramError::InvalidAccountData);
     }
     let mut cursor = wad_start;
+    super::diagnostic_phase(PHASE_E2R_RUST_WAD_COPY_START);
     for ordinal in 0..WAD_ACCOUNT_COUNT {
         let source = accounts[WAD_FIRST_ACCOUNT + ordinal].try_borrow_data()?;
         let payload_len = u32_at(&source, 24) as usize;
@@ -306,10 +382,12 @@ pub fn process(
             &source[WAD_HEADER_BYTES..WAD_HEADER_BYTES + payload_len],
         );
         cursor += payload_len;
+        super::diagnostic_phase(E2R_WAD_COPY_DONE[ordinal]);
     }
     if cursor != wad_end {
         return Err(ProgramError::InvalidAccountData);
     }
+    super::diagnostic_phase(PHASE_E2R_RUST_WAD_COPY_DONE);
     let (_, context_tail) = context.split_at_mut(wad_start);
     let (wad_image, after_wad) = context_tail.split_at_mut(request.wad_bytes);
     let (_gap, bootstrap_tail) = after_wad.split_at_mut(bootstrap_start - wad_end);
