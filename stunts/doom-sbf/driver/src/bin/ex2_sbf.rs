@@ -41,8 +41,8 @@ const WAD_ACCOUNT_SHA256: [&str; ex2_sbf::WAD_ACCOUNT_COUNT] = [
     "ef64b046aaf61eeab85b3d9f10edc564f9b4b640c341d10afc6a9dd67dddd6ca",
 ];
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-const INPUT_EX2_SHA256: &str = "c6f6eb99cb1e3c38ef9cb72afe9432b98068a7fbd28b20bd9b45828ec5e7b58a";
-const OUTPUT_EX2_SHA256: &str = "bf9309475127f45c6595c5d977b8446afdeaa14c6e172950ddaac20e73ca811b";
+const INPUT_EX2_SHA256: &str = "5a6c7e38f39b866e01beca48e29a5b616a3f7375747c72ae717b46b0ee5f56a2";
+const OUTPUT_EX2_SHA256: &str = "0080ed8ae8ead6eedb21240f9f158b6355f25c824868c010446a71c25e4427c4";
 // This oracle was produced from the same source tree as the SBF image.
 const NATIVE_CAPTURE_IMAGE_ID: &str =
     "627cdd1012ca9accd84ca7423f35c27a4432f6011c71c59ff09f335c32adf265";

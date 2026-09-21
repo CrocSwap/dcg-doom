@@ -37,22 +37,6 @@ static void sbf_p16(uint8_t *p, uint16_t x)
     p[1] = (uint8_t)(x >> 8);
 }
 
-static int sbf_slot_of(mobj_t **m, unsigned n, mobj_t *object, uint32_t *out)
-{
-    unsigned i;
-    if (!object) {
-        *out = 0;
-        return 0;
-    }
-    for (i = 0; i < n; i++) {
-        if (m[i] == object) {
-            *out = i + 1;
-            return 0;
-        }
-    }
-    return -1;
-}
-
 static int sbf_state_of(state_t *state, int32_t *out)
 {
     uintptr_t current;
@@ -107,6 +91,11 @@ int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32])
     sbf_p32(pool + 32, count < DOOM_SBF_POOL_SLOTS ? count : 0xffffffffU);
     memcpy(pool + 36, wad_hash, 32);
     for (i = 0; i < count; i++) {
+        sbf_p32(pool + DOOM_SBF_POOL_HEADER_BYTES + i * DOOM_SBF_POOL_SLOT_BYTES + 68,
+            (uint32_t)objects[i]->validcount_m);
+        objects[i]->validcount_m = (int32_t)(i + 1);
+    }
+    for (i = 0; i < count; i++) {
         mobj_t *object = objects[i];
         int32_t state_id;
         int32_t player_id;
@@ -116,8 +105,12 @@ int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32])
         if (object->type < 0 || object->type >= NUMMOBJTYPES
             || sbf_state_of(object->state, &state_id)
             || sbf_player_of(object->player, &player_id)
-            || sbf_slot_of(objects, count, object->target, &target)
-            || sbf_slot_of(objects, count, object->tracer, &tracer)) return -1;
+            || (object->target && ((target = (uint32_t)object->target->validcount_m) == 0 ||
+                target > count || objects[target - 1] != object->target))
+            || (object->tracer && ((tracer = (uint32_t)object->tracer->validcount_m) == 0 ||
+                tracer > count || objects[tracer - 1] != object->tracer))) goto fail;
+        if (!object->target) target = 0;
+        if (!object->tracer) tracer = 0;
         slot = pool + DOOM_SBF_POOL_HEADER_BYTES + i * DOOM_SBF_POOL_SLOT_BYTES;
         sbf_p32(slot + 0, i + 1);
         sbf_p32(slot + 4, 1);
@@ -136,7 +129,6 @@ int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32])
         sbf_p32(slot + 56, (uint32_t)object->momx);
         sbf_p32(slot + 60, (uint32_t)object->momy);
         sbf_p32(slot + 64, (uint32_t)object->momz);
-        sbf_p32(slot + 68, (uint32_t)object->validcount_m);
         sbf_p32(slot + 72, (uint32_t)object->type);
         sbf_p32(slot + 76, (uint32_t)state_id);
         sbf_p32(slot + 80, (uint32_t)object->tics);
@@ -154,5 +146,19 @@ int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32])
         sbf_p16(slot + 122, (uint16_t)object->spawnpoint.type);
         sbf_p16(slot + 124, (uint16_t)object->spawnpoint.options);
     }
+    for (i = 0; i < count; i++) {
+        const uint8_t *saved = pool + DOOM_SBF_POOL_HEADER_BYTES + i * DOOM_SBF_POOL_SLOT_BYTES + 68;
+        objects[i]->validcount_m = (int32_t)((uint32_t)saved[0] |
+            ((uint32_t)saved[1] << 8) | ((uint32_t)saved[2] << 16) |
+            ((uint32_t)saved[3] << 24));
+    }
     return 0;
+fail:
+    for (i = 0; i < count; i++) {
+        const uint8_t *saved = pool + DOOM_SBF_POOL_HEADER_BYTES + i * DOOM_SBF_POOL_SLOT_BYTES + 68;
+        objects[i]->validcount_m = (int32_t)((uint32_t)saved[0] |
+            ((uint32_t)saved[1] << 8) | ((uint32_t)saved[2] << 16) |
+            ((uint32_t)saved[3] << 24));
+    }
+    return -1;
 }

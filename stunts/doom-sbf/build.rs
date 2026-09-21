@@ -660,7 +660,7 @@ fn compile_ctx_engine(target: &str) {
             );
         }
         source = format!(
-            "static void doom_sbf_init_copy(void *dst, const void *src, unsigned long n) {{ unsigned long i; unsigned char *d = (unsigned char *)dst; const unsigned char *s = (const unsigned char *)src; for (i = 0; i < n; i++) d[i] = s[i]; }}\n{source}"
+            "static void doom_sbf_init_copy(void *dst, const void *src, unsigned long n) {{ unsigned char *d = (unsigned char *)dst; const unsigned char *s = (const unsigned char *)src; while (n >= 8u) {{ d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3]; d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7]; d += 8; s += 8; n -= 8; }} while (n--) *d++ = *s++; }}\n{source}"
         );
         for (needle, phase) in [
             ("memcpy(DOOM_CTX->angleturn, doom_ctx_init_angleturn, sizeof(DOOM_CTX->angleturn));", 0x64u64),
@@ -733,6 +733,66 @@ fn compile_ctx_engine(target: &str) {
         let state_grow_replacement = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=malloc(cap); if(q && b->p && b->used) memcpy(q,b->p,b->used); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
         assert_eq!(state_source.matches(state_grow_needle).count(), 1, "SBF state grow rewrite must match once");
         state_source = state_source.replacen(state_grow_needle, state_grow_replacement, 1);
+        // The SBF entry has a fixed ST1 output ceiling.  Reserve that exact
+        // bounded space once, then use checked fixed-width readers/writers.
+        // The wire bytes and refusal behavior stay the same, but the old
+        // byte-at-a-time helpers made every 16/32-bit field pay nested bounds
+        // checks.  This is intentionally SBF-only; the host codec remains the
+        // source oracle and keeps its original allocator behavior.
+        let state_need_fast = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=malloc(cap); if(q && b->p && b->used) memcpy(q,b->p,b->used); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
+        assert_eq!(state_source.matches(state_need_fast).count(), 1, "SBF state allocator rewrite must match once");
+        state_source = state_source.replacen(
+            state_need_fast,
+            "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; if (b->bad) return; if (n <= b->cap-b->used) return; if (b->p || n > 126976u) { b->bad=1; return; } q=malloc(126976u); if(!q){b->bad=1;return;} b->p=q; b->cap=126976u; }",
+            1,
+        );
+        let state_writer_needle = "static void ds_u8(ds_buf_t *b, uint8_t x) { ds_need(b,1);if(!b->bad)b->p[b->used++]=x; }\nstatic void ds_u16(ds_buf_t *b, uint16_t x) { ds_u8(b,(uint8_t)x);ds_u8(b,(uint8_t)(x>>8)); }\nstatic void ds_u32(ds_buf_t *b, uint32_t x) { ds_u16(b,(uint16_t)x);ds_u16(b,(uint16_t)(x>>16)); }";
+        assert_eq!(state_source.matches(state_writer_needle).count(), 1, "SBF state writer rewrite must match once");
+        state_source = state_source.replacen(
+            state_writer_needle,
+            "static void ds_u8(ds_buf_t *b, uint8_t x) { if (b->bad || b->used >= b->cap) { b->bad=1; return; } b->p[b->used++]=x; } static void ds_u16(ds_buf_t *b, uint16_t x) { if (b->bad || b->cap-b->used < 2u) { b->bad=1; return; } b->p[b->used++]=(uint8_t)x; b->p[b->used++]=(uint8_t)(x>>8); } static void ds_u32(ds_buf_t *b, uint32_t x) { if (b->bad || b->cap-b->used < 4u) { b->bad=1; return; } b->p[b->used++]=(uint8_t)x; b->p[b->used++]=(uint8_t)(x>>8); b->p[b->used++]=(uint8_t)(x>>16); b->p[b->used++]=(uint8_t)(x>>24); }",
+            1,
+        );
+        let state_reader_needle = "static uint8_t ds_r8(ds_read_t *r) { if(r->bad||r->used==r->cap){r->bad=1;return 0;}return r->p[r->used++]; }\nstatic uint16_t ds_r16(ds_read_t *r) { uint16_t a=ds_r8(r),b=ds_r8(r);return (uint16_t)(a|(b<<8)); }\nstatic uint32_t ds_r32(ds_read_t *r) { uint32_t a=ds_r16(r),b=ds_r16(r);return a|(b<<16); }\nstatic int32_t ds_ri32(ds_read_t *r) { return (int32_t)ds_r32(r); }";
+        assert_eq!(state_source.matches(state_reader_needle).count(), 1, "SBF state reader rewrite must match once");
+        state_source = state_source.replacen(
+            state_reader_needle,
+            "static uint8_t ds_r8(ds_read_t *r) { if(r->bad||r->used>=r->cap){r->bad=1;return 0;}return r->p[r->used++]; } static uint16_t ds_r16(ds_read_t *r) { uint16_t a,b; if(r->bad||r->cap-r->used<2u){r->bad=1;return 0;} a=r->p[r->used++]; b=r->p[r->used++]; return (uint16_t)(a|(b<<8)); } static uint32_t ds_r32(ds_read_t *r) { uint32_t a,b,c,d; if(r->bad||r->cap-r->used<4u){r->bad=1;return 0;} a=r->p[r->used++]; b=r->p[r->used++]; c=r->p[r->used++]; d=r->p[r->used++]; return a|(b<<8)|(c<<16)|(d<<24); } static int32_t ds_ri32(ds_read_t *r) { return (int32_t)ds_r32(r); }",
+            1,
+        );
+        // The retained encoder assigns stable IDs by scanning all mobjs for
+        // each link.  In the SBF copy only, temporarily index the same mobj
+        // order in the existing validcount field and restore it before return.
+        // ST1 emits that field as the canonical zero, so the wire bytes do not
+        // change and the context is not left with the temporary index.
+        let state_mobj_id_needle = "static uint32_t ds_mobj_id(mobj_t **m, unsigned n, mobj_t *x) { unsigned i; if(!x)return 0;for(i=0;i<n;i++)if(m[i]==x)return i+1;return 0; }";
+        assert_eq!(state_source.matches(state_mobj_id_needle).count(), 1, "SBF mobj index rewrite must match once");
+        state_source = state_source.replacen(
+            state_mobj_id_needle,
+            "static uint32_t ds_mobj_id(mobj_t **m, unsigned n, mobj_t *x) { unsigned value; (void)m; if(!x)return 0; value=(unsigned)x->validcount_m; return value && value<=n ? value : 0; } static void ds_mobj_index(mobj_t **m, unsigned n, int32_t *saved) { unsigned i; for(i=0;i<n;i++){saved[i]=m[i]->validcount_m;m[i]->validcount_m=(int32_t)(i+1);} } static void ds_mobj_restore(mobj_t **m, unsigned n, const int32_t *saved) { unsigned i; for(i=0;i<n;i++)m[i]->validcount_m=saved[i]; }",
+            1,
+        );
+        let state_encode_decl = "ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, nceil=0, nplat=0, i; int k; memset(&b,0,sizeof(b));";
+        assert_eq!(state_source.matches(state_encode_decl).count(), 1, "SBF encoder declaration rewrite must match once");
+        state_source = state_source.replacen(
+            state_encode_decl,
+            "ds_buf_t b; thinker_t *t; mobj_t **m; int32_t *mobj_validcount=0; unsigned nm=0, ns=0, nr=0, nceil=0, nplat=0, i; int k; memset(&b,0,sizeof(b));",
+            1,
+        );
+        let state_encode_mobj = "m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;";
+        assert_eq!(state_source.matches(state_encode_mobj).count(), 1, "SBF encoder mobj setup rewrite must match once");
+        state_source = state_source.replacen(
+            state_encode_mobj,
+            "m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}mobj_validcount=nm?malloc(nm*sizeof(*mobj_validcount)):0;if(nm&&!mobj_validcount){free(m);free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;if(nm)ds_mobj_index(m,nm,mobj_validcount);",
+            1,
+        );
+        let state_encode_cleanup = "free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}";
+        assert_eq!(state_source.matches(state_encode_cleanup).count(), 1, "SBF encoder cleanup rewrite must match once");
+        state_source = state_source.replacen(
+            state_encode_cleanup,
+            "if(nm)ds_mobj_restore(m,nm,mobj_validcount);free(mobj_validcount);free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}",
+            1,
+        );
         if diagnostic_profile {
             let marker = "extern void doom_sbf_phase_marker(unsigned long);\n";
             state_source = format!("{marker}{state_source}");
