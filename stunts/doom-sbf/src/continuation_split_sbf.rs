@@ -1213,7 +1213,7 @@ mod tests {
         let request = Request {
             operation: STEP,
             state_len: 64,
-            cursor: 7,
+            cursor: 8,
             fault: 0,
         };
         assert_eq!(
