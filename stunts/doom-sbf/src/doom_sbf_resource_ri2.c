@@ -105,8 +105,8 @@ static int ri2_controller_shape(const uint8_t *controller, size_t bytes,
         ri2_u32(controller + 20) == expected_tic && ri2_zero(controller + 28, 36u);
 }
 
-int doom_engine_ex2_resource_sbf_ri2_tic_entry(
-    uint8_t *context, const uint8_t *resource, unsigned long resource_bytes,
+static int doom_engine_ex2_resource_sbf_ri2_run(
+    int run_tic, uint8_t *context, const uint8_t *resource, unsigned long resource_bytes,
     const uint8_t *wad_image, unsigned long wad_bytes,
     uint8_t *bootstrap, unsigned long bootstrap_bytes,
     const uint8_t *state, unsigned long state_len,
@@ -223,12 +223,18 @@ int doom_engine_ex2_resource_sbf_ri2_tic_entry(
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
     setsizeneeded = false;
-    G_Ticker();
-    RI2_PHASE(580);
-    clipangle = xtoviewangle[0]; fixedcolormap = 0;
-    R_RenderPlayerView(&players[displayplayer]);
-    RI2_PHASE(590);
-    gametic++;
+    if (run_tic) {
+        G_Ticker();
+        RI2_PHASE(580);
+        clipangle = xtoviewangle[0]; fixedcolormap = 0;
+        R_RenderPlayerView(&players[displayplayer]);
+        RI2_PHASE(590);
+        gametic++;
+    } else {
+        /* E2R/3 uses the real engine's pointer reconstruction and
+         * state codec, but deliberately stops before the tic/render edge. */
+        RI2_PHASE(585);
+    }
     if (doom_sbf_arena_exhausted()) { free(frame); return RI2_REFUSE_ARENA; }
     derived = (uint8_t *)malloc(RI2_MIRROR_BYTES);
     if (!derived || doom_sbf_fill_pool(derived, ri2_wad_hash) ||
@@ -247,4 +253,44 @@ int doom_engine_ex2_resource_sbf_ri2_tic_entry(
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     DoomStateFree(encoded); free(derived); free(frame);
     return 0;
+}
+
+int doom_engine_ex2_resource_sbf_ri2_tic_entry(
+    uint8_t *context, const uint8_t *resource, unsigned long resource_bytes,
+    const uint8_t *wad_image, unsigned long wad_bytes,
+    uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    const uint8_t *state, unsigned long state_len,
+    const uint8_t *mirror, unsigned long mirror_len,
+    const uint8_t *controller, unsigned long controller_len,
+    uint8_t *frame_out, unsigned long frame_cap,
+    uint8_t *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    uint8_t *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
+    unsigned long *frame_out_len, unsigned long *arena_high_water_out)
+{
+    return doom_engine_ex2_resource_sbf_ri2_run(
+        1, context, resource, resource_bytes, wad_image, wad_bytes,
+        bootstrap, bootstrap_bytes, state, state_len, mirror, mirror_len,
+        controller, controller_len, frame_out, frame_cap, state_out,
+        state_cap, state_out_len, mirror_out, mirror_cap, mirror_out_len,
+        frame_out_len, arena_high_water_out);
+}
+
+int doom_engine_ex2_resource_sbf_ri2_reconstruct(
+    uint8_t *context, const uint8_t *resource, unsigned long resource_bytes,
+    const uint8_t *wad_image, unsigned long wad_bytes,
+    uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    const uint8_t *state, unsigned long state_len,
+    const uint8_t *mirror, unsigned long mirror_len,
+    const uint8_t *controller, unsigned long controller_len,
+    uint8_t *frame_out, unsigned long frame_cap,
+    uint8_t *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    uint8_t *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
+    unsigned long *frame_out_len, unsigned long *arena_high_water_out)
+{
+    return doom_engine_ex2_resource_sbf_ri2_run(
+        0, context, resource, resource_bytes, wad_image, wad_bytes,
+        bootstrap, bootstrap_bytes, state, state_len, mirror, mirror_len,
+        controller, controller_len, frame_out, frame_cap, state_out,
+        state_cap, state_out_len, mirror_out, mirror_cap, mirror_out_len,
+        frame_out_len, arena_high_water_out);
 }

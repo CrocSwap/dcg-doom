@@ -3,9 +3,10 @@
 //! The positive sequence is two separate SBF ProgramTest transactions.  The
 //! first instruction serializes the retained captured ST1/MP1/CI2 and a zero
 //! framebuffer into a program-owned continuation account.  The second
-//! instruction verifies the durable pointer-free record and publishes those
-//! exact bytes.  This is intentionally a pre-tic seam: it does not claim a
-//! renderer continuation or playable Doom.
+//! instruction reconstructs and compares the real RI2 engine state, then
+//! verifies the durable pointer-free record and publishes those exact bytes.
+//! This is intentionally a pre-tic seam: it does not claim a renderer
+//! continuation or playable Doom.
 
 use std::{
     env,
@@ -25,7 +26,7 @@ use solana_message::Message;
 use solana_program_test::ProgramTest;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use solana_system_interface::instruction::create_account;
+use solana_system_interface::{instruction::create_account, program as system_program};
 use solana_transaction::Transaction;
 
 const PROGRAM: Pubkey = Pubkey::new_from_array([0xd2; 32]);
@@ -54,8 +55,10 @@ const STATE: Pubkey = Pubkey::new_from_array([0xe2; 32]);
 const MIRROR: Pubkey = Pubkey::new_from_array([0xe3; 32]);
 const CONTROLLER: Pubkey = Pubkey::new_from_array([0xe4; 32]);
 const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
+const BAD_RESOURCE: Pubkey = Pubkey::new_from_array([0xe6; 32]);
 const BAD_CONTROLLER: Pubkey = Pubkey::new_from_array([0xe7; 32]);
 const BAD_STATE: Pubkey = Pubkey::new_from_array([0xe8; 32]);
+const BAD_CONTROLLER_KEY: Pubkey = Pubkey::new_from_array([0xe9; 32]);
 
 fn read(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?)
@@ -123,13 +126,14 @@ fn padded_state(state: &[u8]) -> Vec<u8> {
 }
 
 fn instruction(
-    payer: Pubkey,
+    authority: Pubkey,
+    resource: Pubkey,
     state: Pubkey,
     controller: Pubkey,
     continuation: Pubkey,
     request: Request,
 ) -> Instruction {
-    let mut accounts = vec![meta(CONTEXT, true, false), meta(RESOURCE, false, false)];
+    let mut accounts = vec![meta(CONTEXT, true, false), meta(resource, false, false)];
     for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
         accounts.push(meta(
             Pubkey::new_from_array([0xf0 + ordinal as u8; 32]),
@@ -143,7 +147,7 @@ fn instruction(
         meta(controller, false, false),
         meta(FRAME, true, false),
         meta(continuation, true, false),
-        meta(payer, false, true),
+        meta(authority, false, true),
     ]);
     Instruction {
         program_id: PROGRAM,
@@ -155,6 +159,9 @@ fn instruction(
 async fn execute(
     client: &mut solana_banks_client::BanksClient,
     payer: &solana_keypair::Keypair,
+    authority: &solana_keypair::Keypair,
+    compute_limit: u32,
+    resource: Pubkey,
     state: Pubkey,
     controller: Pubkey,
     continuation: Pubkey,
@@ -162,11 +169,18 @@ async fn execute(
 ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
     let blockhash = client.get_latest_blockhash().await?;
     let tx = Transaction::new(
-        &[payer],
+        &[payer, authority],
         Message::new_with_blockhash(
             &[
-                ComputeBudgetInstruction::set_compute_unit_limit(NORMAL_LIMIT),
-                instruction(payer.pubkey(), state, controller, continuation, request),
+                ComputeBudgetInstruction::set_compute_unit_limit(compute_limit),
+                instruction(
+                    authority.pubkey(),
+                    resource,
+                    state,
+                    controller,
+                    continuation,
+                    request,
+                ),
             ],
             Some(&payer.pubkey()),
             &blockhash,
@@ -178,19 +192,24 @@ async fn execute(
 
 fn program_test(
     resource: &[u8],
+    bad_resource: &[u8],
     wad: &[Vec<u8>],
     state: &[u8],
     bad_state: &[u8],
     mirror: &[u8],
     controller: &[u8],
     bad_controller: &[u8],
+    bad_controller_key: &[u8],
+    authority: Pubkey,
+    compute_limit: u32,
 ) -> ProgramTest {
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
-    bank.set_compute_max_units(NORMAL_LIMIT as u64);
+    bank.set_compute_max_units(compute_limit as u64);
     bank.add_program("doom_sbf", PROGRAM, None);
     bank.add_account(CONTEXT, account(vec![0; resource_sbf::CONTEXT_BYTES]));
     bank.add_account(RESOURCE, account(resource.to_vec()));
+    bank.add_account(BAD_RESOURCE, account(bad_resource.to_vec()));
     for (ordinal, bytes) in wad.iter().enumerate() {
         bank.add_account(
             Pubkey::new_from_array([0xf0 + ordinal as u8; 32]),
@@ -202,7 +221,18 @@ fn program_test(
     bank.add_account(MIRROR, account(mirror.to_vec()));
     bank.add_account(CONTROLLER, account(controller.to_vec()));
     bank.add_account(BAD_CONTROLLER, account(bad_controller.to_vec()));
+    bank.add_account(BAD_CONTROLLER_KEY, account(bad_controller_key.to_vec()));
     bank.add_account(FRAME, account(vec![0; continuation_sbf::FRAME_BYTES]));
+    bank.add_account(
+        authority,
+        Account {
+            lamports: 100_000_000_000,
+            data: Vec::new(),
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
     bank
 }
 
@@ -309,6 +339,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if !String::from_utf8_lossy(&manifest_bytes).contains("\"sbf\": true") {
         return Err("continuation source manifest is not an SBF manifest".into());
     }
+    // ProgramTest resolves `add_program("doom_sbf", ...)` through the
+    // BPF_OUT_DIR/SBF_OUT_DIR search path.  Set it from the identity-checked
+    // image rather than relying on the caller's ambient build environment.
+    let image_dir = image.parent().ok_or("SBF image has no parent directory")?;
+    env::set_var("BPF_OUT_DIR", image_dir);
+    env::set_var("SBF_OUT_DIR", image_dir);
     let resource = read(&resource_path)?;
     if resource.len() != resource_sbf::RI2_RESOURCE_IMAGE_BYTES
         || sha(&resource) != RESOURCE_IMAGE_SHA256
@@ -346,8 +382,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("retained ST1/MP1/CI2 input shape mismatch".into());
     }
+    let compute_limit = env::var("DOOM_CONTINUATION_COMPUTE_LIMIT")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(NORMAL_LIMIT);
+    if compute_limit < NORMAL_LIMIT {
+        return Err(format!(
+            "continuation compute limit {compute_limit} is below normal limit {NORMAL_LIMIT}"
+        )
+        .into());
+    }
     let mut bad_controller = controller.clone();
     bad_controller[28] = 1;
+    let bad_resource = resource.clone();
+    let bad_controller_key = controller.clone();
     let mut bad_state = state.clone();
     bad_state[64] ^= 1;
     let request = Request {
@@ -355,15 +404,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         state_len: state_capture.len(),
     };
     let continuation = solana_keypair::Keypair::new();
+    let authority = solana_keypair::Keypair::new();
     let continuation_key = continuation.pubkey();
     let bank = program_test(
         &resource,
+        &bad_resource,
         &wad,
         &state,
         &bad_state,
         &mirror,
         &controller,
         &bad_controller,
+        &bad_controller_key,
+        authority.pubkey(),
+        compute_limit,
     );
     let (mut client, payer, _) = bank.start().await;
     create_continuation(&mut client, &payer, &continuation).await?;
@@ -381,6 +435,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &execute(
             &mut client,
             &payer,
+            &authority,
+            compute_limit,
+            RESOURCE,
             STATE,
             CONTROLLER,
             continuation_key,
@@ -399,6 +456,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let prepare = execute(
         &mut client,
         &payer,
+        &authority,
+        compute_limit,
+        RESOURCE,
         STATE,
         CONTROLLER,
         continuation_key,
@@ -410,9 +470,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|meta| meta.compute_units_consumed)
         .ok_or("prepare CU metadata missing")?;
-    if prepare.result.is_err() || prepare_units > QUALIFICATION_MAX_UNITS {
+    let prepare_qualification = prepare.result.is_ok() && prepare_units <= QUALIFICATION_MAX_UNITS;
+    if prepare.result.is_err() {
         return Err(format!(
-            "prepare failed or over target: {:?} CU={prepare_units}",
+            "prepare failed: {:?} CU={prepare_units} limit={compute_limit}",
             prepare.result
         )
         .into());
@@ -433,6 +494,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &execute(
             &mut client,
             &payer,
+            &authority,
+            compute_limit,
+            RESOURCE,
             BAD_STATE,
             CONTROLLER,
             continuation_key,
@@ -447,11 +511,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("changed-input refusal mutated outputs".into());
     }
+    // A changed RI2 key is a valid retained image under a different account
+    // key.  The checkpoint account-set root must refuse it before writes.
+    require_refusal(
+        &execute(
+            &mut client,
+            &payer,
+            &authority,
+            compute_limit,
+            BAD_RESOURCE,
+            STATE,
+            CONTROLLER,
+            continuation_key,
+            resume_request,
+        )
+        .await?,
+        "Custom(242)",
+    )?;
+    if account_data(&client, STATE).await? != before_state
+        || account_data(&client, MIRROR).await? != before_mirror
+        || account_data(&client, FRAME).await? != before_frame
+    {
+        return Err("changed-RI2 refusal mutated outputs".into());
+    }
+    // A changed CI2 key is likewise refused by the committed account set;
+    // its bytes remain a valid CI2 so this is not merely a malformed-input
+    // check.
+    require_refusal(
+        &execute(
+            &mut client,
+            &payer,
+            &authority,
+            compute_limit,
+            RESOURCE,
+            STATE,
+            BAD_CONTROLLER_KEY,
+            continuation_key,
+            resume_request,
+        )
+        .await?,
+        "Custom(242)",
+    )?;
+    if account_data(&client, STATE).await? != before_state
+        || account_data(&client, MIRROR).await? != before_mirror
+        || account_data(&client, FRAME).await? != before_frame
+    {
+        return Err("changed-CI2 refusal mutated outputs".into());
+    }
     // A malformed CI2 is rejected in the actual preparation instruction and
     // cannot create a continuation.
+    let before_malformed_continuation = account_data(&client, continuation_key).await?;
     let malformed = execute(
         &mut client,
         &payer,
+        &authority,
+        compute_limit,
+        RESOURCE,
         STATE,
         BAD_CONTROLLER,
         continuation_key,
@@ -459,10 +574,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     require_refusal(&malformed, "InvalidAccountData")?;
+    if account_data(&client, continuation_key).await? != before_malformed_continuation
+        || account_data(&client, STATE).await? != before_state
+        || account_data(&client, MIRROR).await? != before_mirror
+        || account_data(&client, FRAME).await? != before_frame
+    {
+        return Err("malformed-CI2 refusal mutated outputs".into());
+    }
 
     let resume = execute(
         &mut client,
         &payer,
+        &authority,
+        compute_limit,
+        RESOURCE,
         STATE,
         CONTROLLER,
         continuation_key,
@@ -474,9 +599,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|meta| meta.compute_units_consumed)
         .ok_or("resume CU metadata missing")?;
-    if resume.result.is_err() || resume_units > QUALIFICATION_MAX_UNITS {
+    let resume_qualification = resume.result.is_ok() && resume_units <= QUALIFICATION_MAX_UNITS;
+    if resume.result.is_err() {
         return Err(format!(
-            "resume failed or over target: {:?} CU={resume_units}",
+            "resume failed: {:?} CU={resume_units} limit={compute_limit}",
             resume.result
         )
         .into());
@@ -493,6 +619,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let replay = execute(
         &mut client,
         &payer,
+        &authority,
+        compute_limit - 1,
+        RESOURCE,
         STATE,
         CONTROLLER,
         continuation_key,
@@ -506,6 +635,70 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("replay refusal mutated outputs".into());
     }
+    // Same-key WAD mutation control: use the exact account key with a
+    // changed WC1 ordinal field in a fresh ProgramTest bank.  This reaches
+    // the real PREPARE instruction and must reject before any write.
+    let mut mutated_wad = wad.clone();
+    mutated_wad[4][20..24].copy_from_slice(&3u32.to_le_bytes());
+    let wad_continuation = solana_keypair::Keypair::new();
+    let wad_bank = program_test(
+        &resource,
+        &bad_resource,
+        &mutated_wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &bad_controller_key,
+        authority.pubkey(),
+        compute_limit,
+    );
+    let (mut wad_client, wad_payer, _) = wad_bank.start().await;
+    create_continuation(&mut wad_client, &wad_payer, &wad_continuation).await?;
+    let wad_before_state = account_data(&wad_client, STATE).await?;
+    let wad_before_mirror = account_data(&wad_client, MIRROR).await?;
+    let wad_before_frame = account_data(&wad_client, FRAME).await?;
+    let wad_before_continuation =
+        account_data(&wad_client, wad_continuation.pubkey()).await?;
+    let wad_mutation = execute(
+        &mut wad_client,
+        &wad_payer,
+        &authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        wad_continuation.pubkey(),
+        request,
+    )
+    .await?;
+    require_refusal(&wad_mutation, "InvalidAccountData")?;
+    if account_data(&wad_client, STATE).await? != wad_before_state
+        || account_data(&wad_client, MIRROR).await? != wad_before_mirror
+        || account_data(&wad_client, FRAME).await? != wad_before_frame
+        || account_data(&wad_client, wad_continuation.pubkey()).await?
+            != wad_before_continuation
+    {
+        return Err("same-key WAD mutation refusal mutated outputs".into());
+    }
+    fs::write(
+        receipt.join("same-key-wad-mutated-account.bin"),
+        &mutated_wad[4],
+    )?;
+    fs::write(
+        receipt.join("controls.json"),
+        r#"{
+  "out_of_order_resume": {"refused": true, "outputs_preserved": true},
+  "changed_ri2_key": {"refused": true, "outputs_preserved": true},
+  "changed_st1_key": {"refused": true, "outputs_preserved": true},
+  "changed_ci2_key": {"refused": true, "outputs_preserved": true},
+  "malformed_ci2": {"refused": true, "outputs_preserved": true},
+  "replay_resume": {"refused": true, "outputs_preserved": true},
+  "same_key_wad_mutation": {"mutation": "WC1 ordinal header", "refused": true, "outputs_preserved": true}
+}
+"#,
+    )?;
     let final_continuation = account_data(&client, continuation_key).await?;
     fs::write(
         receipt.join("continuation-published.bin"),
@@ -515,9 +708,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("output-mirror.mp1"), &output_mirror)?;
     fs::write(receipt.join("output-frame.fb1"), &output_frame)?;
     fs::write(receipt.join("identity.json"), format!(
-        "{{\n  \"profile\": \"DOOM-E2R/3-DURABLE-SEAM\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"state_input_sha256\": {},\n  \"mirror_input_sha256\": {},\n  \"controller_input_sha256\": {},\n  \"frame_input_sha256\": {},\n  \"prepare_units\": {},\n  \"resume_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"separate_transactions\": true,\n  \"native_tick_render_equality\": \"not-run; this seam intentionally stops before G_Ticker/R_RenderPlayerView\"\n}}\n",
+        "{{\n  \"profile\": \"DOOM-E2R/3-DURABLE-SEAM\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"state_input_sha256\": {},\n  \"mirror_input_sha256\": {},\n  \"controller_input_sha256\": {},\n  \"frame_input_sha256\": {},\n  \"prepare_units\": {},\n  \"resume_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"separate_transactions\": true,\n  \"native_tick_render_equality\": \"not-run; SBF performed real RI2 reconstruction/decode/encode equality but intentionally stops before G_Ticker/R_RenderPlayerView\"\n}}\n",
         json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), json(&sha(&state)), json(&sha(&mirror)), json(&sha(&controller)), json(&sha(&vec![0; continuation_sbf::FRAME_BYTES])), prepare_units, resume_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS
     ))?;
-    println!("DOOM-E2R/3 durable seam passed: prepare_cu={prepare_units} resume_cu={resume_units} receipt={}", receipt.display());
+    fs::write(
+        receipt.join("run.json"),
+        format!(
+            "{{\n  \"compute_limit\": {compute_limit},\n  \"prepare_units\": {prepare_units},\n  \"resume_units\": {resume_units},\n  \"prepare_qualification\": {prepare_qualification},\n  \"resume_qualification\": {resume_qualification}\n}}\n"
+        ),
+    )?;
+    println!("DOOM-E2R/3 durable seam passed: prepare_cu={prepare_units} resume_cu={resume_units} qualification=({prepare_qualification},{resume_qualification}) receipt={}", receipt.display());
     Ok(())
 }

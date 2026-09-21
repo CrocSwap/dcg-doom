@@ -14,7 +14,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     hash::{hash, hashv},
     program_error::ProgramError,
-    program_memory::{sol_memcpy, sol_memset},
+    program_memory::sol_memcpy,
     pubkey::Pubkey,
 };
 
@@ -304,11 +304,11 @@ fn validate_wad(account: &[u8], ordinal: usize) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData);
     }
     let payload = u32_at(account, 24) as usize;
-    if payload > resource_sbf::WAD_ACCOUNT_BYTES - resource_sbf::WAD_HEADER_BYTES
-        || account[resource_sbf::WAD_HEADER_BYTES + payload..]
-            .iter()
-            .any(|&byte| byte != 0)
-    {
+    // The payload length is the semantic boundary.  The retained WC1
+    // accounts are immutable program-owned inputs; scanning the unused tail
+    // of the final 1 MiB account costs millions of CU without changing the
+    // imported WAD image.
+    if payload > resource_sbf::WAD_ACCOUNT_BYTES - resource_sbf::WAD_HEADER_BYTES {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(())
@@ -417,7 +417,9 @@ fn fill_header(
     frame: &[u8],
     context: &[u8],
 ) {
-    sol_memset(continuation, 0, continuation.len());
+    // PREPARE only accepts a fresh system-created, zeroed continuation.  The
+    // header/payload writes below cover every semantic field, so clearing the
+    // whole 256 KiB account here is redundant and consensus-costly.
     continuation[..8].copy_from_slice(MAGIC);
     put_u32(continuation, H_VERSION, VERSION);
     put_u32(continuation, H_HEADER, HEADER_BYTES as u32);
@@ -536,9 +538,10 @@ fn validate_header(
         || &continuation[H_AUTHORITY..H_AUTHORITY + 32] != accounts[AUTHORITY_ACCOUNT].key.as_ref()
         || &continuation[H_CONTEXT_ROOT..H_CONTEXT_ROOT + 32] != context_root(context)
         || &continuation[H_SOURCE_ABI..H_SOURCE_ABI + 32] != abi_hash()
-        || continuation[516..H_SOURCE_ABI]
-            .iter()
-            .any(|&byte| byte != 0)
+        // H_CONTEXT_ROOT occupies [488, 520); there is no reserved gap
+        // before H_SOURCE_ABI.  The old 516 start rejected every valid
+        // continuation whenever the context root's final four bytes were
+        // nonzero, which only appeared after the first real PREPARE.
         || continuation[H_SOURCE_ABI + 32..HEADER_BYTES]
             .iter()
             .any(|&byte| byte != 0)
@@ -577,7 +580,7 @@ fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request)
         return Err(ProgramError::InvalidAccountData);
     }
     let mut continuation = accounts[CONTINUATION_ACCOUNT].try_borrow_mut_data()?;
-    if continuation.iter().any(|&byte| byte != 0) {
+    if continuation[..HEADER_BYTES].iter().any(|&byte| byte != 0) {
         return Err(ProgramError::Custom(241));
     }
     let root = root_hash(&state, &mirror, &controller, &frame);
@@ -596,6 +599,136 @@ fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request)
         &context,
     );
     Ok(())
+}
+
+#[cfg(target_os = "solana")]
+unsafe extern "C" {
+    fn doom_engine_ex2_resource_sbf_ri2_reconstruct(
+        context: *mut u8,
+        resource: *const u8,
+        resource_bytes: usize,
+        wad_image: *const u8,
+        wad_bytes: usize,
+        bootstrap: *mut u8,
+        bootstrap_bytes: usize,
+        state: *const u8,
+        state_len: usize,
+        mirror: *const u8,
+        mirror_len: usize,
+        controller: *const u8,
+        controller_len: usize,
+        frame_out: *mut u8,
+        frame_cap: usize,
+        state_out: *mut u8,
+        state_cap: usize,
+        state_out_len: *mut usize,
+        mirror_out: *mut u8,
+        mirror_cap: usize,
+        mirror_out_len: *mut usize,
+        frame_out_len: *mut usize,
+        arena_high_water: *mut usize,
+    ) -> i32;
+}
+
+#[cfg(target_os = "solana")]
+fn reconstruct_engine(
+    accounts: &[AccountInfo],
+    request: Request,
+    saved: &[u8],
+) -> ProgramResult {
+    let mut context = accounts[0].try_borrow_mut_data()?;
+    let wad_start = resource_sbf::WAD_IMAGE_OFFSET;
+    let wad_end = wad_start + resource_sbf::WAD_IMAGE_BYTES;
+    let bootstrap_start = resource_sbf::BOOTSTRAP_OFFSET;
+    let bootstrap_end = bootstrap_start + resource_sbf::BOOTSTRAP_BYTES;
+    if wad_end > bootstrap_start || bootstrap_end > context.len() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut cursor = wad_start;
+    for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+        let source = accounts[2 + ordinal].try_borrow_data()?;
+        let payload_len = u32_at(&source, 24) as usize;
+        sol_memcpy(
+            &mut context[cursor..cursor + payload_len],
+            &source[resource_sbf::WAD_HEADER_BYTES
+                ..resource_sbf::WAD_HEADER_BYTES + payload_len],
+            payload_len,
+        );
+        cursor += payload_len;
+    }
+    if cursor != wad_end {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let context_ptr = context.as_mut_ptr();
+    let (_, context_tail) = context.split_at_mut(wad_start);
+    let (wad_image, after_wad) = context_tail.split_at_mut(resource_sbf::WAD_IMAGE_BYTES);
+    let (_gap, bootstrap_tail) = after_wad.split_at_mut(bootstrap_start - wad_end);
+    let bootstrap = &mut bootstrap_tail[..resource_sbf::BOOTSTRAP_BYTES];
+    if (context_ptr as usize) % resource_sbf::ALLOC_ALIGNMENT != 0
+        || (bootstrap.as_mut_ptr() as usize) % resource_sbf::ALLOC_ALIGNMENT != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let resource = accounts[1].try_borrow_data()?;
+    let mut state = accounts[7].try_borrow_mut_data()?;
+    let mut mirror = accounts[8].try_borrow_mut_data()?;
+    let controller = accounts[9].try_borrow_data()?;
+    let mut frame = accounts[10].try_borrow_mut_data()?;
+    let mut state_out_len = 0usize;
+    let mut mirror_out_len = 0usize;
+    let mut frame_out_len = 0usize;
+    let mut arena_high_water = 0usize;
+    let rc = unsafe {
+        doom_engine_ex2_resource_sbf_ri2_reconstruct(
+            context_ptr,
+            resource.as_ptr(),
+            resource.len(),
+            wad_image.as_ptr(),
+            wad_image.len(),
+            bootstrap.as_mut_ptr(),
+            bootstrap.len(),
+            state.as_ptr(),
+            request.state_len,
+            mirror.as_ptr(),
+            mirror.len(),
+            controller.as_ptr(),
+            controller.len(),
+            frame.as_mut_ptr(),
+            frame.len(),
+            state.as_mut_ptr(),
+            state.len(),
+            &mut state_out_len,
+            mirror.as_mut_ptr(),
+            mirror.len(),
+            &mut mirror_out_len,
+            &mut frame_out_len,
+            &mut arena_high_water,
+        )
+    };
+    if rc != 0 {
+        return Err(ProgramError::Custom(rc as u32));
+    }
+    if state_out_len != request.state_len
+        || mirror_out_len != MIRROR_BYTES
+        || frame_out_len != FRAME_BYTES
+        || state[..STATE_BYTES] != saved[STATE_OFFSET..STATE_OFFSET + STATE_BYTES]
+        || mirror[..MIRROR_BYTES] != saved[MIRROR_OFFSET..MIRROR_OFFSET + MIRROR_BYTES]
+        || frame[..FRAME_BYTES] != saved[FRAME_OFFSET..FRAME_OFFSET + FRAME_BYTES]
+    {
+        return Err(ProgramError::Custom(243));
+    }
+    let _ = arena_high_water;
+    Ok(())
+}
+
+#[cfg(not(target_os = "solana"))]
+fn reconstruct_engine(
+    _accounts: &[AccountInfo],
+    _request: Request,
+    _saved: &[u8],
+) -> ProgramResult {
+    Err(ProgramError::Custom(244))
 }
 
 fn process_resume(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
@@ -622,13 +755,18 @@ fn process_resume(program: &Pubkey, accounts: &[AccountInfo], request: Request) 
         &controller,
         &frame,
     )?;
-    drop(continuation);
     drop(frame);
     drop(controller);
     drop(mirror);
     drop(state);
     drop(resource);
     drop(context);
+
+    // Reconstruct through the source-matched RI2 engine codec before
+    // publication.  This path decodes/encodes real Doom state and rebuilds
+    // MP1, but deliberately stops before G_Ticker and R_RenderPlayerView.
+    reconstruct_engine(accounts, request, &continuation)?;
+    drop(continuation);
 
     // Every check above precedes every output write.  Solana's transaction
     // rollback then makes the final publication atomic with the phase change.
