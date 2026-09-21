@@ -749,7 +749,8 @@ fn compile_ctx_engine(target: &str) {
             .flag("doom_ctx.h")
             .file(tree.join("headless/doom_state.c"))
             .file(tree.join("headless/doom_controller.c"))
-            .file(manifest.join("src/doom_sbf_ex2.c"));
+            .file(manifest.join("src/doom_sbf_ex2.c"))
+            .file(manifest.join("src/doom_resource.c"));
         native.compile("doom_engine_ex2_native");
     }
 }

@@ -12,6 +12,8 @@ use solana_program::{
 pub mod bring_up;
 pub mod ex2;
 #[cfg(feature = "ctx-engine")]
+pub mod resource;
+#[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
 
 pub const FRAME_BYTES: usize = 320 * 200;

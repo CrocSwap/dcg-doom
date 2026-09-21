@@ -160,6 +160,18 @@ static int ex2_wad(
     return 0;
 }
 
+#ifndef DOOM_SBF_BUILD
+/* Export only the validated retained-WAD constructor to the experimental
+ * DOOM-RI1 host bridge.  The SBF image does not link this helper. */
+int doom_engine_ex2_make_wad(
+    const unsigned char *const accounts[EX2_WAD_COUNT],
+    const unsigned long lens[EX2_WAD_COUNT],
+    uint8_t **out, size_t *out_bytes, uint8_t hash[32])
+{
+    return ex2_wad(accounts, lens, out, out_bytes, hash);
+}
+#endif
+
 static int ex2_pool_shape(const uint8_t *pool, size_t bytes, const uint8_t wad_hash[32])
 {
     if (!pool || bytes != EX2_POOL_BYTES || memcmp(pool, "DOOM-MP1", 8)

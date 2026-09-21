@@ -39,6 +39,10 @@ name = "ex2_sbf"
 required-features = ["ex2-sbf"]
 
 [[bin]]
+name = "resource_native"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "headless"
 
 [dependencies]
