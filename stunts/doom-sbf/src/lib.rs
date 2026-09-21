@@ -21,6 +21,8 @@ pub mod resource;
 pub mod ex2_sbf;
 #[cfg(feature = "ctx-engine")]
 pub mod resource_sbf;
+#[cfg(feature = "ctx-engine")]
+pub mod simulation;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
@@ -165,6 +167,13 @@ pub fn process_instruction(
     #[cfg(feature = "ctx-engine")]
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.len() >= 12
+        && instruction_data.starts_with(simulation::MAGIC)
+        && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap()) == simulation::VERSION
+    {
+        return simulation::process(_program_id, accounts, instruction_data);
     }
     #[cfg(feature = "ctx-engine")]
     if instruction_data.len() >= 12

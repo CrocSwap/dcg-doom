@@ -195,6 +195,23 @@ u64_t doom_sbf_arena_high_water(void)
     return DOOM_CTX->arena_high_water;
 }
 
+/* The persistent SIM1 seam may need short-lived encoder/output buffers after
+ * the authoritative ticker.  Keep the engine's monotonic allocations intact
+ * while allowing that bounded serialization workspace to be reused per tic. */
+u64_t doom_sbf_arena_mark(void)
+{
+    return DOOM_CTX->arena_used;
+}
+
+int doom_sbf_arena_rewind(u64_t mark)
+{
+    if (mark > DOOM_CTX->arena_used)
+	return 0;
+    DOOM_CTX->arena_used = mark;
+    DOOM_CTX->arena_exhausted = 0;
+    return 1;
+}
+
 int doom_sbf_arena_exhausted(void)
 {
     return DOOM_CTX->arena_exhausted;

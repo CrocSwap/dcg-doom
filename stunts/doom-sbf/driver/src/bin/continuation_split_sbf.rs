@@ -13,6 +13,7 @@ use std::{
 
 use doom_sbf::continuation_split_sbf::{self, Request};
 use doom_sbf::resource_sbf;
+use doom_sbf::simulation;
 use sha2::{Digest, Sha256};
 use solana_account::{Account, AccountSharedData};
 use solana_banks_interface::BanksTransactionResultWithMetadata;
@@ -25,9 +26,9 @@ use solana_signer::Signer;
 use solana_system_interface::{instruction::create_account, program as system_program};
 use solana_transaction::Transaction;
 
-const PROGRAM: Pubkey = Pubkey::new_from_array([0xd2; 32]);
-const NORMAL_LIMIT: u32 = 1_400_000;
-const QUALIFICATION_MAX_UNITS: u64 = 1_190_000;
+pub const PROGRAM: Pubkey = Pubkey::new_from_array([0xd2; 32]);
+pub const NORMAL_LIMIT: u32 = 1_400_000;
+pub const QUALIFICATION_MAX_UNITS: u64 = 1_190_000;
 const ACCOUNT_MANIFEST_SHA256: &str =
     "d23776b358184c77fba32df600bf565a56b6935d129aec6b9567ad3c1c999504";
 const WAD_ACCOUNT_SHA256: [&str; 5] = [
@@ -37,42 +38,54 @@ const WAD_ACCOUNT_SHA256: [&str; 5] = [
     "20cc95f699d9a640c0edb4100184aeff2863aa7152492072f99db3fc131ad4a7",
     "ef64b046aaf61eeab85b3d9f10edc564f9b4b640c341d10afc6a9dd67dddd6ca",
 ];
-const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-const RESOURCE_IMAGE_SHA256: &str =
+pub const WAD_CONCAT_SHA256: &str =
+    "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
+pub const RESOURCE_IMAGE_SHA256: &str =
     "c3531934d3a2b271330653074457d8570e379a22ed32eb9225df6826a090ac50";
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/continuation_split_sbf.rs"
 ));
 
-const CONTEXT: Pubkey = Pubkey::new_from_array([0xe0; 32]);
-const RESOURCE: Pubkey = Pubkey::new_from_array([0xe1; 32]);
-const STATE: Pubkey = Pubkey::new_from_array([0xe2; 32]);
-const MIRROR: Pubkey = Pubkey::new_from_array([0xe3; 32]);
-const CONTROLLER: Pubkey = Pubkey::new_from_array([0xe4; 32]);
-const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
+pub const CONTEXT: Pubkey = Pubkey::new_from_array([0xe0; 32]);
+pub const RESOURCE: Pubkey = Pubkey::new_from_array([0xe1; 32]);
+pub const STATE: Pubkey = Pubkey::new_from_array([0xe2; 32]);
+pub const MIRROR: Pubkey = Pubkey::new_from_array([0xe3; 32]);
+pub const CONTROLLER: Pubkey = Pubkey::new_from_array([0xe4; 32]);
+pub const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
 const PREFIX: Pubkey = Pubkey::new_from_array([0xea; 32]);
 const BAD_RESOURCE: Pubkey = Pubkey::new_from_array([0xe6; 32]);
 const BAD_CONTROLLER: Pubkey = Pubkey::new_from_array([0xe7; 32]);
 const BAD_STATE: Pubkey = Pubkey::new_from_array([0xe8; 32]);
 const BAD_CONTROLLER_KEY: Pubkey = Pubkey::new_from_array([0xe9; 32]);
+const SIM_INPUT: Pubkey = Pubkey::new_from_array([0xeb; 32]);
+const SIM_META: Pubkey = Pubkey::new_from_array([0xec; 32]);
+const SIM_BAD_AUTHORITY: Pubkey = Pubkey::new_from_array([0xed; 32]);
+const SIM_STATE_STRIDE: usize = simulation::MAX_TICS * resource_sbf::STATE_MAX_BYTES;
+const SIM_MIRROR_STRIDE: usize = simulation::MAX_TICS * resource_sbf::MIRROR_BYTES;
+const SIM_INPUT_HEADER_BYTES: usize = simulation::INPUT_HEADER_BYTES;
+const SIM_INPUT_MAX_BYTES: usize = simulation::INPUT_MAX_BYTES;
+const SIM_DOMAIN_INPUT: &[u8] = b"DOOM-SIM/1-INPUT\0";
+const SIM_DOMAIN_STATE: &[u8] = b"DOOM-SIM/1-STATE\0";
+const SIM_DOMAIN_ACCOUNTS: &[u8] = b"DOOM-SIM/1-ACCOUNTS\0";
+const SIM_DOMAIN_CONTEXT: &[u8] = b"DOOM-SIM/1-CONTEXT\0";
 
-fn read(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn read(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
 }
-fn sha(bytes: &[u8]) -> String {
+pub fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
 }
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+pub fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 fn json(value: &str) -> String {
     serde_json::to_string(value).unwrap()
 }
-fn account(data: Vec<u8>) -> Account {
+pub fn account(data: Vec<u8>) -> Account {
     Account {
         lamports: 100_000_000_000,
         data,
@@ -81,7 +94,7 @@ fn account(data: Vec<u8>) -> Account {
         rent_epoch: 0,
     }
 }
-fn meta(key: Pubkey, writable: bool, signer: bool) -> AccountMeta {
+pub fn meta(key: Pubkey, writable: bool, signer: bool) -> AccountMeta {
     AccountMeta {
         pubkey: key,
         is_signer: signer,
@@ -89,7 +102,7 @@ fn meta(key: Pubkey, writable: bool, signer: bool) -> AccountMeta {
     }
 }
 
-fn wad_account(bytes: &[u8], ordinal: usize) -> Result<(), Box<dyn Error>> {
+pub fn wad_account(bytes: &[u8], ordinal: usize) -> Result<(), Box<dyn Error>> {
     if bytes.len() != resource_sbf::WAD_ACCOUNT_BYTES
         || sha(bytes) != WAD_ACCOUNT_SHA256[ordinal]
         || &bytes[..8] != b"DOOM-WC1"
@@ -111,7 +124,7 @@ fn wad_account(bytes: &[u8], ordinal: usize) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn padded_state(state: &[u8]) -> Vec<u8> {
+pub fn padded_state(state: &[u8]) -> Vec<u8> {
     let mut out = vec![0; resource_sbf::STATE_MAX_BYTES];
     out[..state.len()].copy_from_slice(state);
     out
@@ -160,7 +173,7 @@ fn moved_context_instruction() -> Instruction {
     }
 }
 
-async fn execute(
+pub async fn execute(
     client: &mut solana_banks_client::BanksClient,
     payer: &solana_keypair::Keypair,
     authority: &solana_keypair::Keypair,
@@ -194,7 +207,7 @@ async fn execute(
     Ok(client.process_transaction_with_metadata(tx).await?)
 }
 
-fn program_test(
+pub fn program_test(
     resource: &[u8],
     bad_resource: &[u8],
     wad: &[Vec<u8>],
@@ -293,7 +306,7 @@ async fn start_prepared(
     Ok((context, continuation))
 }
 
-async fn account_data(
+pub async fn account_data(
     client: &solana_banks_client::BanksClient,
     key: Pubkey,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -304,7 +317,7 @@ async fn account_data(
         .data)
 }
 
-async fn create_continuation(
+pub async fn create_continuation(
     client: &mut solana_banks_client::BanksClient,
     payer: &solana_keypair::Keypair,
     continuation: &solana_keypair::Keypair,
@@ -628,7 +641,9 @@ async fn continuation_header_mutation_control(
         || account_data(&context.banks_client, MIRROR).await? != before_mirror
         || account_data(&context.banks_client, FRAME).await? != before_frame
     {
-        return Err("continuation component mutation refusal did not preserve durable state".into());
+        return Err(
+            "continuation component mutation refusal did not preserve durable state".into(),
+        );
     }
     Ok(())
 }
@@ -636,7 +651,7 @@ async fn continuation_header_mutation_control(
 fn failure_text(result: &BanksTransactionResultWithMetadata) -> String {
     format!("{:?}", result.result)
 }
-fn require_refusal(
+pub fn require_refusal(
     result: &BanksTransactionResultWithMetadata,
     needle: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -646,7 +661,7 @@ fn require_refusal(
     }
     Ok(())
 }
-fn units(result: &BanksTransactionResultWithMetadata) -> Result<u64, Box<dyn Error>> {
+pub fn units(result: &BanksTransactionResultWithMetadata) -> Result<u64, Box<dyn Error>> {
     Ok(result
         .metadata
         .as_ref()
@@ -852,7 +867,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     for (label, mutate) in [
-        ("frame_first_nonzero", (|bytes: &mut Vec<u8>| bytes[0] = 1) as fn(&mut Vec<u8>)),
+        (
+            "frame_first_nonzero",
+            (|bytes: &mut Vec<u8>| bytes[0] = 1) as fn(&mut Vec<u8>),
+        ),
         (
             "frame_middle_nonzero",
             (|bytes: &mut Vec<u8>| bytes[continuation_split_sbf::FRAME_BYTES / 2] = 1)
@@ -1270,7 +1288,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 "#,
     )?;
-fs::write(receipt.join("identity.json"), format!("{{\n  \"profile\": \"DOOM-E2R/4-BOUNDED-SPLIT\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"checkpoint_magic\": {},\n  \"checkpoint_version\": {},\n  \"zero_proof\": \"first-byte-zero-plus-overlapping-shift-sol_memcmp\",\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"prepare_units\": {},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"oracle_equal\": true,\n  \"oracle_scope\": \"source-matched native pre-tic reconstruction; tic/render open\",\n  \"wad_payload_content_bound\": false,\n  \"tic_render\": \"not-run; split stops after pre-tic decode/encode\"\n}}\n", json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json("DOOM-CT5"), continuation_split_sbf::CHECKPOINT_VERSION, json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), prepare_units, phase_units, phase_high_water, injected_finalize_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS))?;
+    fs::write(receipt.join("identity.json"), format!("{{\n  \"profile\": \"DOOM-E2R/4-BOUNDED-SPLIT\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"checkpoint_magic\": {},\n  \"checkpoint_version\": {},\n  \"zero_proof\": \"first-byte-zero-plus-overlapping-shift-sol_memcmp\",\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"prepare_units\": {},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"oracle_equal\": true,\n  \"oracle_scope\": \"source-matched native pre-tic reconstruction; tic/render open\",\n  \"wad_payload_content_bound\": false,\n  \"tic_render\": \"not-run; split stops after pre-tic decode/encode\"\n}}\n", json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json("DOOM-CT5"), continuation_split_sbf::CHECKPOINT_VERSION, json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), prepare_units, phase_units, phase_high_water, injected_finalize_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS))?;
     fs::write(receipt.join("run.json"), format!("{{\n  \"compute_limit\": {compute_limit},\n  \"prepare_units\": {prepare_units},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {injected_finalize_units},\n  \"qualification\": {qualification},\n  \"separate_transactions\": true\n}}\n", phase_units, phase_high_water))?;
     println!("DOOM-E2R/4 bounded split passed: prepare_cu={prepare_units} phase_cu={phase_units:?} qualification={qualification} receipt={}", receipt.display());
     Ok(())

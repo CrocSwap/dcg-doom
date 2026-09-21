@@ -38,6 +38,12 @@ pub struct InitializedTic {
     pub graph_anchor: usize,
 }
 
+#[derive(Debug)]
+pub struct InitializedNoRenderSequence {
+    pub states: Vec<Vec<u8>>,
+    pub mirrors: Vec<Vec<u8>>,
+}
+
 unsafe extern "C" {
     fn doom_resource_encode(
         wad_accounts: *const *const u8,
@@ -123,6 +129,22 @@ unsafe extern "C" {
         frame_out: *mut u8,
         frame_cap: usize,
         frame_out_len: *mut usize,
+        graph_anchor: *mut usize,
+    ) -> i32;
+    fn doom_resource_import_initialized_no_render_sequence(
+        wad_accounts: *const *const u8,
+        wad_lens: *const usize,
+        image: *const u8,
+        image_len: usize,
+        state: *const u8,
+        state_len: usize,
+        commands: *const u8,
+        command_count: usize,
+        states_out: *mut u8,
+        state_stride: usize,
+        state_lens_out: *mut usize,
+        mirrors_out: *mut u8,
+        mirror_stride: usize,
         graph_anchor: *mut usize,
     ) -> i32;
     fn doom_resource_test_reset_setup_counter();
@@ -301,6 +323,71 @@ pub fn import_initialized_no_tic(
     controller: &[u8],
 ) -> Result<InitializedTic, i32> {
     import_initialized_mode(wad_accounts, image, state, mirror, controller, false)
+}
+
+/// Run a real captured command sequence through one initialized native Doom
+/// context.  This is the no-render oracle for DOOM-SIM/1: setup and state
+/// reconstruction happen once, while each command performs exactly one
+/// `G_Ticker` and emits ST1/MP1.
+pub fn import_initialized_no_render_sequence(
+    wad_accounts: [&[u8]; 5],
+    image: &[u8],
+    state: &[u8],
+    commands: &[u8],
+) -> Result<InitializedNoRenderSequence, i32> {
+    if image.is_empty()
+        || image.len() > IMAGE_MAX_BYTES
+        || state.len() < 64
+        || state.len() > STATE_MAX_BYTES
+        || commands.is_empty()
+        || commands.len() % 4 != 0
+    {
+        return Err(240);
+    }
+    let (pointers, lengths) = wad_ffi(wad_accounts);
+    let count = commands.len() / 4;
+    let mut states = vec![0u8; count * STATE_MAX_BYTES];
+    let mut state_lens = vec![0usize; count];
+    let mut mirrors = vec![0u8; count * MIRROR_BYTES];
+    let mut graph_anchor = 0usize;
+    let rc = unsafe {
+        doom_resource_import_initialized_no_render_sequence(
+            pointers.as_ptr(),
+            lengths.as_ptr(),
+            image.as_ptr(),
+            image.len(),
+            state.as_ptr(),
+            state.len(),
+            commands.as_ptr(),
+            count,
+            states.as_mut_ptr(),
+            STATE_MAX_BYTES,
+            state_lens.as_mut_ptr(),
+            mirrors.as_mut_ptr(),
+            MIRROR_BYTES,
+            &mut graph_anchor,
+        )
+    };
+    if rc != 0 {
+        return Err(rc);
+    }
+    let mut state_vecs = Vec::with_capacity(count);
+    let mut mirror_vecs = Vec::with_capacity(count);
+    for index in 0..count {
+        let len = state_lens[index];
+        if !(64..=STATE_MAX_BYTES).contains(&len) {
+            return Err(238);
+        }
+        state_vecs.push(states[index * STATE_MAX_BYTES..index * STATE_MAX_BYTES + len].to_vec());
+        mirror_vecs.push(
+            mirrors[index * MIRROR_BYTES..(index + 1) * MIRROR_BYTES].to_vec(),
+        );
+    }
+    let _ = graph_anchor;
+    Ok(InitializedNoRenderSequence {
+        states: state_vecs,
+        mirrors: mirror_vecs,
+    })
 }
 
 fn import_initialized_mode(

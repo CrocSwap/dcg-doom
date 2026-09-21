@@ -1357,3 +1357,74 @@ int doom_resource_import_initialized_no_tic(
         controller, controller_len, state_out, state_cap, state_out_len, mirror_out,
         mirror_cap, mirror_out_len, frame_out, frame_cap, frame_out_len, graph_anchor, 0);
 }
+
+/* Native no-render oracle for DOOM-SIM/1.  The RI2 graph, WAD, zone, tables,
+ * state graph, and DEMO1 bounds are installed once.  Every output slot then
+ * comes from one real G_Ticker followed by the same ST1/MP1 encoders used by
+ * the SBF seam.  No renderer is linked into this boundary. */
+int doom_resource_import_initialized_no_render_sequence(
+    const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
+    const unsigned char *image, unsigned long image_len,
+    const unsigned char *state, unsigned long state_len,
+    const unsigned char *commands, unsigned long command_count,
+    unsigned char *states_out, unsigned long state_stride, unsigned long *state_lens_out,
+    unsigned char *mirrors_out, unsigned long mirror_stride, unsigned long *graph_anchor)
+{
+    r2_section_t s[5]; r2_v2_plan_t plan; uint8_t *wad = 0, *carrier = 0;
+    uint8_t *frame = 0, *encoded = 0, *derived = 0, *demo; uint8_t hash[32];
+    size_t wad_bytes = 0, encoded_bytes = 0; uintptr_t anchor = 0;
+    unsigned long i; int lump, demo_len, rc;
+    if (!image || image_len > RI2_MAX_BYTES || image_len < 12u ||
+        !state || state_len < 64u || state_len > RI2_STATE_MAX ||
+        !commands || !command_count || command_count > 128u ||
+        !states_out || !state_lens_out || !mirrors_out ||
+        state_stride < RI2_STATE_MAX || mirror_stride < RI2_MIRROR_BYTES)
+        return 232;
+    if (r2_u32(image + 8) != RI2_VERSION || r2_v2_preflight(image, image_len, s, &plan))
+        return 240;
+    if (doom_engine_ex2_make_wad(wad_accounts, wad_lens, &wad, &wad_bytes, hash) ||
+        memcmp(hash, r2_wad_hash, 32)) { free(wad); return 234; }
+    carrier = (uint8_t *)calloc(1, 4u * 1024u * 1024u); if (!carrier) { free(wad); return 238; }
+    memset(DOOM_CTX, 0, sizeof(doom_ctx_t)); doom_ctx_init();
+    if (!doom_sbf_bind_arena(carrier, 4u * 1024u * 1024u, DOOM_ZONE_BYTES)) { free(carrier); free(wad); return 234; }
+    gamemode = shareware; gamemission = doom; language = english;
+    DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0; displayplayer = 0; myargc = 0; myargv = 0;
+    Z_Init(); P_InitThinkers(); W_InitAccountImage(wad, (int)wad_bytes);
+    if (doom_resource_ri1_import_graph(image + s[R2_GRAPH].offset, s[R2_GRAPH].bytes, &anchor)) { free(carrier); free(wad); return 242; }
+    lastanim = anims + plan.scalar[R2_SC_ANIMCOUNT]; numlinespecials = 0;
+    for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
+        if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
+    rc = r2_walk((const uint8_t *)(image + s[R2_SCALARS].offset), s[R2_SCALARS].bytes, s[R2_SCALARS].count, 1, r2_apply_scalar, 0);
+    if (rc || r2_v2_alloc_resources(&plan) ||
+        r2_walk(image + s[R2_TABLES].offset, s[R2_TABLES].bytes, s[R2_TABLES].count, 0, r2_v2_apply_table, 0) ||
+        r2_v2_apply_lights(&plan) || r2_apply_functions(image, s)) { free(carrier); free(wad); return 242; }
+    frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES); if (!frame) { free(carrier); free(wad); return 238; }
+    screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES; screens[2] = frame + 2u * RI2_FRAME_BYTES; screens[3] = frame + 3u * RI2_FRAME_BYTES; screens[4] = 0;
+    viewimage = screens[0]; for (rc = 0; rc < viewheight; rc++) ylookup[rc] = screens[0] + (size_t)rc * 320u;
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 : (SCREENHEIGHT - R2_SBARHEIGHT - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH; pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
+    lump = W_GetNumForName("DEMO1"); demo_len = W_LumpLength(lump); if (demo_len < 17) { free(frame); free(carrier); free(wad); return 234; }
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC); defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo; demoend = demo + demo_len;
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len); DoomStateSetAllocationFailure(-1);
+    if (DoomStateDecode(state, state_len) || DoomControllerValidateCapturedDemoCursor(demo_p)) { free(frame); free(carrier); free(wad); return 232; }
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 : (SCREENHEIGHT - R2_SBARHEIGHT - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH; pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
+    for (i = 0; i < command_count; i++) {
+        if (DoomControllerArmV2(commands + i * 4u) || DoomControllerValidateCapturedDemoCursor(demo_p)) { free(frame); free(carrier); free(wad); return 237; }
+        G_Ticker(); gametic++;
+        derived = (uint8_t *)malloc(RI2_MIRROR_BYTES);
+        if (!derived || doom_engine_ex2_fill_mirror(derived, wad, wad_bytes, hash) ||
+            DoomStateEncode(&encoded, &encoded_bytes) || encoded_bytes > state_stride || encoded_bytes < 64u) {
+            free(derived); free(encoded); free(frame); free(carrier); free(wad); return 238;
+        }
+        memcpy(states_out + i * state_stride, encoded, encoded_bytes);
+        memcpy(mirrors_out + i * mirror_stride, derived, RI2_MIRROR_BYTES);
+        state_lens_out[i] = encoded_bytes; DoomStateFree(encoded); encoded = 0; free(derived); derived = 0;
+    }
+    if (graph_anchor) *graph_anchor = (unsigned long)anchor;
+    free(frame); free(carrier); free(wad); return 0;
+}

@@ -30,6 +30,8 @@ extern int doom_ctx_guard(const void *data);
 extern void doom_ctx_init(void);
 extern int doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
 extern int doom_sbf_rebind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
+extern unsigned long doom_sbf_arena_mark(void);
+extern int doom_sbf_arena_rewind(unsigned long mark);
 extern int doom_sbf_arena_exhausted(void);
 extern unsigned long doom_sbf_arena_high_water(void);
 extern int doom_sbf_resource_import_graph(const uint8_t *image, unsigned long image_bytes);
@@ -617,5 +619,58 @@ int doom_engine_ex2_resource_sbf_ri2_split_finalize(
     RI2_PHASE(610);
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     DoomStateFree(encoded); free(derived);
+    return 0;
+}
+
+/* DOOM-SIM/1: one persistent, no-render transition after E2R/4 has published
+ * the initialized context.  The caller keeps DOOM_CTX and the arena mapped
+ * across instructions; this function only applies one captured tic command,
+ * runs the authoritative game ticker, and re-encodes ST1/MP1.  In particular,
+ * it does not call any RI2 setup, WAD import, state reconstruction, or render
+ * routine. */
+int doom_sbf_sim_tick(
+    uint8_t *context, const uint8_t *command, unsigned long command_len,
+    uint8_t *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    uint8_t *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len)
+{
+    uint8_t *derived = 0, *encoded = 0;
+    size_t encoded_bytes = 0;
+    unsigned long transient_mark, previous_state_bytes;
+    if (doom_ctx_guard(context)) return 199;
+    if (!command || command_len != 4u || !state_out || !state_out_len ||
+        !mirror_out || !mirror_out_len || state_cap < RI2_STATE_MAX ||
+        mirror_cap < RI2_MIRROR_BYTES) return 232;
+    if (DoomControllerArmV2(command) ||
+        DoomControllerValidateCapturedDemoCursor(demo_p)) return 237;
+    G_Ticker();
+    gametic++;
+    if (doom_sbf_arena_exhausted()) return 239;
+    transient_mark = doom_sbf_arena_mark();
+    derived = (uint8_t *)malloc(RI2_MIRROR_BYTES);
+    if (!derived) return 238;
+    if (doom_sbf_fill_pool(derived, ri2_wad_hash)) {
+        free(derived); return 233;
+    }
+    if (DoomStateEncode(&encoded, &encoded_bytes)) {
+        free(derived); free(encoded); return 236;
+    }
+    if (encoded_bytes > state_cap || encoded_bytes < 64u) {
+        free(derived); free(encoded); return 238;
+    }
+    previous_state_bytes = ri2_u32(state_out + 16);
+    if (previous_state_bytes < 64u || previous_state_bytes > state_cap) {
+        free(derived); free(encoded); return 238;
+    }
+    memcpy(state_out, encoded, encoded_bytes);
+    {
+        unsigned long i;
+        for (i = (unsigned long)encoded_bytes; i < previous_state_bytes; i++)
+            state_out[i] = 0;
+    }
+    memcpy(mirror_out, derived, RI2_MIRROR_BYTES);
+    *state_out_len = encoded_bytes;
+    *mirror_out_len = RI2_MIRROR_BYTES;
+    DoomStateFree(encoded); free(derived);
+    if (!doom_sbf_arena_rewind(transient_mark)) return 239;
     return 0;
 }
