@@ -49,8 +49,8 @@ extern void R_ExecuteSetViewSize(void);
 #define RI_NULL 0xffffffffu
 #define RI_STATE_MAX 126976u
 #define RI_MIRROR_BYTES 65536u
-#define RI_POOL_HEADER_BYTES 36u
-#define RI_POOL_SLOT_BYTES 128u
+#define RI_POOL_HEADER_BYTES 4096u
+#define RI_POOL_SLOT_BYTES 160u
 #define RI_POOL_SLOTS 384u
 #define RI_WAD_BYTES 4196020u
 #define RI_WAD_HASH_OFFSET 116u
@@ -313,18 +313,63 @@ int doom_engine_ex2_resource_sbf_tic_entry(
     DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len);
     if(e2r_import_graph(resource,sections)) return E2R_REFUSE_IMAGE;
     E2R_PHASE(340); /* RI1 scalar graph imported and pointers rebound */
-    if(DoomStateDecode(state,(size_t)state_len)) return E2R_REFUSE_STATE;
+    /* The source codec's failure-injection control is static on the host.
+     * Its SBF rewrite stores that control in an existing context cell, whose
+     * zeroed value must be restored to the source default (-1) before the
+     * first decoder allocation.  Without this explicit reset the consumer
+     * rejects every state before reading its ST1 header. */
+    DoomStateSetAllocationFailure(-1);
+    E2R_PHASE(349); /* source-matched ST1 decoder entered */
+    if(DoomStateDecode(state,(size_t)state_len)) {
+#ifdef DOOM_SBF_PHASE_PROFILE
+        if(arena_high_water_out) *arena_high_water_out=doom_sbf_arena_high_water();
+#endif
+        E2R_PHASE(358); return E2R_REFUSE_STATE;
+    }
     E2R_PHASE(350); /* ST1 decoded */
     if(DoomControllerArmV2(controller+24)) return E2R_REFUSE_CONTROLLER;
     E2R_PHASE(360); /* CI2 command armed */
-    derived=(uint8_t *)malloc(RI_MIRROR_BYTES); if(!derived || doom_sbf_fill_pool(derived,wad_hash) || memcmp(derived,mirror,RI_MIRROR_BYTES)) return E2R_REFUSE_POOL;
+    derived=(uint8_t *)malloc(RI_MIRROR_BYTES);
+    if(!derived) {
+#ifdef DOOM_SBF_PHASE_PROFILE
+        if(arena_high_water_out) *arena_high_water_out=doom_sbf_arena_high_water();
+        E2R_PHASE(373);
+#endif
+        return E2R_REFUSE_POOL;
+    }
+    if(doom_sbf_fill_pool(derived,wad_hash)) {
+#ifdef DOOM_SBF_PHASE_PROFILE
+        if(arena_high_water_out) *arena_high_water_out=doom_sbf_arena_high_water();
+        E2R_PHASE(374);
+#endif
+        return E2R_REFUSE_POOL;
+    }
+    if(memcmp(derived,mirror,RI_MIRROR_BYTES)) {
+#ifdef DOOM_SBF_PHASE_PROFILE
+        {
+            unsigned long mismatch=0;
+            while(mismatch<RI_MIRROR_BYTES && derived[mismatch]==mirror[mismatch]) mismatch++;
+            E2R_PHASE(0x100000u + mismatch);
+        }
+        if(arena_high_water_out) *arena_high_water_out=doom_sbf_arena_high_water();
+        E2R_PHASE(375);
+#endif
+        return E2R_REFUSE_POOL;
+    }
     E2R_PHASE(370); /* pre-tic MP1 derived and checked */
     if(DoomControllerValidateCapturedDemoCursor(demo_p)) return E2R_REFUSE_CONTROLLER;
     E2R_PHASE(380); /* captured DEMO1 cursor checked */
-    G_Ticker(); gametic++;
+    G_Ticker();
+    E2R_PHASE(385); /* native oracle renders after the tick */
+    R_RenderPlayerView(&players[displayplayer]);
+    gametic++;
     E2R_PHASE(390); /* real one-tic engine continuation complete */
+    E2R_PHASE(391);
     if(doom_sbf_arena_exhausted()) return E2R_REFUSE_ARENA;
+    E2R_PHASE(392);
+    E2R_PHASE(395);
     if(DoomStateEncode(&encoded,&encoded_bytes)||encoded_bytes>RI_STATE_MAX||encoded_bytes>state_cap||encoded_bytes<64) return E2R_REFUSE_OUTPUT;
+    E2R_PHASE(396);
     E2R_PHASE(400); /* next ST1 encoded */
     if(doom_sbf_fill_pool(derived,wad_hash)) return E2R_REFUSE_POOL;
     E2R_PHASE(410); /* next MP1 derived */

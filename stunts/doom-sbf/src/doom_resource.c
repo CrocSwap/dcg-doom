@@ -387,7 +387,7 @@ int doom_resource_import_tic(
     if(ri_copy_graph(image,sections,&anchor)){free(carrier);free(wad);return 234;}
     if(mutation_count)*mutation_count=1;
     if(ri_encode_graph(&canonical,&canonical_bytes,&anchor)||canonical_bytes!=image_len||memcmp(canonical,image,image_len)){free(canonical);free(carrier);free(wad);return 241;}
-    lump=W_GetNumForName("DEMO1");demo_len=W_LumpLength(lump);if(demo_len<17){free(canonical);free(carrier);free(wad);return 234;}demo=(uint8_t*)W_CacheLumpNum(lump,PU_STATIC);DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len);tic=ri_u32(state+20);if(DoomStateDecode(state,state_len)||DoomControllerArmV2(controller+24)||DoomControllerValidateCapturedDemoCursor(demo_p)){free(canonical);free(carrier);free(wad);return 232;}
+    lump=W_GetNumForName("DEMO1");demo_len=W_LumpLength(lump);if(demo_len<17){free(canonical);free(carrier);free(wad);return 234;}demo=(uint8_t*)W_CacheLumpNum(lump,PU_STATIC);DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len);tic=ri_u32(state+20);DoomStateSetAllocationFailure(-1);if(DoomStateDecode(state,state_len)||DoomControllerArmV2(controller+24)||DoomControllerValidateCapturedDemoCursor(demo_p)){free(canonical);free(carrier);free(wad);return 232;}
     G_Ticker();R_RenderPlayerView(&players[displayplayer]);gametic++;
     derived=(uint8_t *)malloc(RI_MIRROR_BYTES);
     if(!derived || doom_engine_ex2_fill_mirror(derived,wad,wad_bytes,hash)){free(derived);free(encoded);free(canonical);free(carrier);free(wad);return 233;}

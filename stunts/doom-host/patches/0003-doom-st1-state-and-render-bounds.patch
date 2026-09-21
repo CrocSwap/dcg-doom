@@ -362,4 +362,3 @@ index 00000000..d8bff85f
 +void DoomStateFree(uint8_t *image);
 +
 +#endif
-

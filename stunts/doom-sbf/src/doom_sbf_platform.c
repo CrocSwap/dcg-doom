@@ -187,6 +187,23 @@ void *memcpy(void *dst, const void *src, size_t n)
 	    d[i] = s[i];
 	return dst;
     }
+#ifdef DOOM_SBF_PHASE_PROFILE
+    /* The diagnostic image deliberately turns the runtime's overlap refusal
+     * into an observable phase and continues with memmove.  This must never
+     * be enabled for a qualifying image: it localizes a source-level memcpy
+     * contract violation without hiding it from the production syscall. */
+    {
+	uintptr_t d = (uintptr_t)dst;
+	uintptr_t s = (uintptr_t)src;
+	if ((d < s && s - d < (uintptr_t)n) ||
+	    (s < d && d - s < (uintptr_t)n)) {
+	    extern void doom_sbf_phase_marker(unsigned long phase);
+	    doom_sbf_phase_marker(0x200000ul + ((unsigned long)n & 0xffffful));
+	    sol_memmove_(dst, src, (uint64_t)n);
+	    return dst;
+	}
+    }
+#endif
     sol_memcpy_(dst, src, (uint64_t)n);
     return dst;
 }

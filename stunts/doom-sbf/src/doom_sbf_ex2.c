@@ -279,6 +279,7 @@ int doom_engine_ex2_entry(
     demo_p = demo;
     G_DoPlayDemo();
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    DoomStateSetAllocationFailure(-1);
     if (DoomStateDecode(state, (size_t)state_len)) {
         free(low_arena); free(wad); return EX2_REFUSE_STATE;
     }
@@ -479,6 +480,7 @@ int doom_engine_ex2_sbf_tic_entry(
     G_DoPlayDemo();
     DOOM_PHASE(70);
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    DoomStateSetAllocationFailure(-1);
     if (DoomStateDecode(state, (size_t)state_len)) return EX2_REFUSE_STATE;
     DOOM_PHASE(80);
     if (DoomControllerArmV2(controller + 24)) return EX2_REFUSE_CONTROLLER;

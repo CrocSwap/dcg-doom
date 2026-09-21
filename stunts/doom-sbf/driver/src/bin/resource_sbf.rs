@@ -30,7 +30,7 @@ const NORMAL_LIMIT: u32 = 1_400_000;
 /// Diagnostic-only ceiling; never used by the qualification path. It is
 /// deliberately high enough to expose the post-initialization boundaries;
 /// `run-mode.json` still labels the run ineligible for qualification.
-const DIAGNOSTIC_LIMIT: u32 = 20_000_000;
+const DIAGNOSTIC_LIMIT: u32 = 30_000_000;
 const QUALIFICATION_MAX_UNITS: u64 = 1_190_000;
 const ACCOUNT_MANIFEST_SHA256: &str =
     "d23776b358184c77fba32df600bf565a56b6935d129aec6b9567ad3c1c999504";
@@ -454,6 +454,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if diagnostic { DIAGNOSTIC_LIMIT } else { NORMAL_LIMIT },
     )
     .await?;
+    if diagnostic {
+        let logs = normal
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.log_messages.join("\n"))
+            .unwrap_or_default();
+        fs::write(receipt.join("normal-logs.txt"), logs)?;
+    }
     let units = normal.metadata.as_ref().map(|m| m.compute_units_consumed);
     if normal.result.is_err() {
         let e = format!("{normal:?}");
@@ -484,6 +492,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state_equal = &output_state[..expected_state.len()] == expected_state;
     let mirror_equal = output_mirror == expected_mirror;
     if !state_equal || !mirror_equal {
+        fs::write(
+            receipt.join("output-state.st1"),
+            &output_state[..expected_state.len()],
+        )?;
+        fs::write(receipt.join("output-mirror.mp1"), &output_mirror)?;
         write_report(
             &receipt,
             "failed-output-mismatch",

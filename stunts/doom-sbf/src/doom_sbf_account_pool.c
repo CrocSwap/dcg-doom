@@ -19,8 +19,8 @@
 #include "info.h"
 
 #define DOOM_SBF_POOL_BYTES 65536u
-#define DOOM_SBF_POOL_HEADER_BYTES 36u
-#define DOOM_SBF_POOL_SLOT_BYTES 128u
+#define DOOM_SBF_POOL_HEADER_BYTES 4096u
+#define DOOM_SBF_POOL_SLOT_BYTES 160u
 #define DOOM_SBF_POOL_SLOTS 384u
 
 static void sbf_p32(uint8_t *p, uint32_t x)

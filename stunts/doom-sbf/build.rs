@@ -571,6 +571,9 @@ fn compile_ctx_engine(target: &str) {
                 .flag("-fno-unwind-tables");
         }
     }
+    if diagnostic_profile {
+        platform.define("DOOM_SBF_PHASE_PROFILE", None);
+    }
     for tu in ENGINE_TUS {
         engine.file(tree.join(format!("{tu}.c")));
     }
@@ -652,6 +655,43 @@ fn compile_ctx_engine(target: &str) {
         // the existing decoder body; host ST1 behavior remains unchanged.
         let mut state_source =
             fs::read_to_string(&state).expect("read generated SBF state source");
+        // libc realloc cannot express the old allocation length, and the
+        // monotonic SBF arena places the larger replacement immediately after
+        // the old block.  The source codec only needs its live prefix, so the
+        // SBF copy uses malloc plus an exact-length memcpy.  Host/native
+        // builds retain the source's libc realloc path and byte behavior.
+        let state_grow_needle = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=realloc(b->p,cap); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
+        let state_grow_replacement = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=malloc(cap); if(q && b->p && b->used) memcpy(q,b->p,b->used); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
+        assert_eq!(state_source.matches(state_grow_needle).count(), 1, "SBF state grow rewrite must match once");
+        state_source = state_source.replacen(state_grow_needle, state_grow_replacement, 1);
+        if diagnostic_profile {
+            let marker = "extern void doom_sbf_phase_marker(unsigned long);\n";
+            state_source = format!("{marker}{state_source}");
+            // Split the source-matched header gate into observable checks so
+            // a refusal identifies the ABI/global mismatch rather than only
+            // reporting the decoder's aggregate -1.
+            let preflight_probe =
+                "    memset(p, 0, sizeof(*p));\n    if (!image || image_bytes < DS_HEADER_BYTES";
+            assert_eq!(
+                state_source.matches(preflight_probe).count(),
+                1,
+                "diagnostic decoder header probe must match once"
+            );
+            let preflight_checks = "    memset(p, 0, sizeof(*p));
+    if (!image || image_bytes < DS_HEADER_BYTES) { doom_sbf_phase_marker(361); return -1; }
+    if (image_bytes > DS_MAX_IMAGE_BYTES || image_bytes > 0xffffffffU) { doom_sbf_phase_marker(362); return -1; }
+    if (memcmp(image, \"DOOM-ST1\", 8)) { doom_sbf_phase_marker(363); return -1; }
+    if (ds_at32(image + 8) != profile || ds_at32(image + 12) != DS_HEADER_BYTES || ds_at32(image + 16) != (uint32_t)image_bytes) { doom_sbf_phase_marker(364); return -1; }
+    if (ds_at32(image + 36) != (uint32_t)numsectors) { doom_sbf_phase_marker(365); return -1; }
+    if (ds_at32(image + 40) != (uint32_t)(DOOM_CTX->numlines)) { doom_sbf_phase_marker(366); return -1; }
+    if (ds_at32(image + 44) != (uint32_t)numsides) { doom_sbf_phase_marker(367); return -1; }
+    if (ds_at32(image + 48) != (uint32_t)numflats) { doom_sbf_phase_marker(368); return -1; }
+    if (ds_at32(image + 52) != (uint32_t)numtextures) { doom_sbf_phase_marker(369); return -1; }
+    if (image[60] || image[61] || image[62] || image[63]) { doom_sbf_phase_marker(370); return -1; }
+    if (!image || image_bytes < DS_HEADER_BYTES
+";
+            state_source = state_source.replacen(preflight_probe, preflight_checks, 1);
+        }
         let profile_start = state_source
             .find("static int ds_decode_profile")
             .expect("find generated SBF decoder");
@@ -684,6 +724,69 @@ fn compile_ctx_engine(target: &str) {
             !profile.contains("ds_plan_t p;"),
             "SBF decoder plan rewrite left a stack plan reference"
         );
+        if diagnostic_profile {
+            let plan_alloc_probe = "if (!p) return -1; memset(p,0,sizeof(*p));";
+            assert_eq!(
+                profile.matches(plan_alloc_probe).count(),
+                1,
+                "diagnostic decoder plan-allocation probe must match once"
+            );
+            profile = profile.replacen(
+                plan_alloc_probe,
+                "if (!p) { doom_sbf_phase_marker(371); return -1; } memset(p,0,sizeof(*p));",
+                1,
+            );
+            // Keep the decoder refusal localized without changing the normal
+            // image. These markers distinguish preflight, plan allocation,
+            // full parse, and commit failures in the source-matched SBF copy.
+            let preflight =
+                "if (ds_preflight(image,image_bytes,p,profile) || ds_plan_prepare(p)) return -1;";
+            assert_eq!(
+                profile.matches(preflight).count(),
+                1,
+                "diagnostic decoder preflight rewrite must match once"
+            );
+            profile = profile.replacen(
+                preflight,
+                "if (ds_preflight(image,image_bytes,p,profile)) { doom_sbf_phase_marker(351); return -1; } doom_sbf_phase_marker(352); if (ds_plan_prepare(p)) { doom_sbf_phase_marker(353); return -1; } doom_sbf_phase_marker(354);",
+                1,
+            );
+            let parse_fail =
+                "if (r.bad || r.used != r.cap || mi != p->nmo || si != p->nsp)";
+            assert_eq!(
+                profile.matches(parse_fail).count(),
+                1,
+                "diagnostic decoder parse rewrite must match once"
+            );
+            profile = profile.replacen(
+                parse_fail,
+                "doom_sbf_phase_marker(355);\n    if (r.bad || r.used != r.cap || mi != p->nmo || si != p->nsp)",
+                1,
+            );
+            let parse_fail_tail =
+                "ds_plan_release(p, 1); free(p); return -1;\n    }\n    ds_commit_plan(p, ds_at32(image + 24));";
+            assert_eq!(
+                profile.matches(parse_fail_tail).count(),
+                1,
+                "diagnostic decoder parse-failure tail must match once"
+            );
+            profile = profile.replacen(
+                parse_fail_tail,
+                "ds_plan_release(p, 1); free(p); return -1;\n    }\n    doom_sbf_phase_marker(356);\n    ds_commit_plan(p, ds_at32(image + 24));",
+                1,
+            );
+            let commit_tail = "ds_plan_release(p, 0); free(p);\n    return 0;";
+            assert_eq!(
+                profile.matches(commit_tail).count(),
+                1,
+                "diagnostic decoder commit tail must match once"
+            );
+            profile = profile.replacen(
+                commit_tail,
+                "ds_plan_release(p, 0); free(p);\n    doom_sbf_phase_marker(357);\n    return 0;",
+                1,
+            );
+        }
         state_source.replace_range(profile_start..profile_end, &profile);
         fs::write(&state, state_source).expect("write SBF state source");
         let controller = write_sbf_codec_source(
