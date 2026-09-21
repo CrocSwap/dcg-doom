@@ -52,6 +52,21 @@ extern int doom_engine_ex2_fill_mirror(
 #define RI_MIRROR_BYTES 65536u
 #define RI_FRAME_BYTES (320u * 200u)
 
+/* Native RI2 gate instrumentation.  The consumer checks this linked counter
+ * after import; a report flag alone is not evidence that full setup was not
+ * called. */
+static unsigned long doom_ri1_setup_calls;
+
+void doom_resource_test_reset_setup_counter(void)
+{
+    doom_ri1_setup_calls = 0;
+}
+
+unsigned long doom_resource_test_setup_counter(void)
+{
+    return doom_ri1_setup_calls;
+}
+
 enum {
     RI_VERTEXES = 0,
     RI_SECTORS = 1,
@@ -401,6 +416,7 @@ int doom_resource_import_tic(
  * its section records. */
 int doom_resource_ri1_setup(const uint8_t *wad, size_t wad_bytes, uint8_t **carrier)
 {
+    doom_ri1_setup_calls++;
     return ri_setup_engine(wad, wad_bytes, carrier);
 }
 
@@ -415,4 +431,10 @@ int doom_resource_ri1_import_graph(const uint8_t *image, size_t image_bytes,
     ri_section_t sections[RI_MAX_SECTIONS];
     if (ri_validate(image, image_bytes, sections)) return -1;
     return ri_copy_graph(image, sections, anchor);
+}
+
+int doom_resource_ri1_validate_graph(const uint8_t *image, size_t image_bytes)
+{
+    ri_section_t sections[RI_MAX_SECTIONS];
+    return ri_validate(image, image_bytes, sections);
 }

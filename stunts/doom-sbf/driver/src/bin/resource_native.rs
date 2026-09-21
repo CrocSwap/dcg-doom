@@ -1,4 +1,5 @@
-//! Bounded native DOOM-RI1/RI2 gate.
+//! Bounded native DOOM-RI1/RI2 gate; `run-initialized` exercises RI2/2's
+//! fresh-process consumer without the full setup path.
 //!
 //! `run` deliberately forks the encoder, importer, and malformed-input check
 //! into separate processes.  The image is produced from the retained E1M5 WAD
@@ -217,14 +218,16 @@ fn malformed_child(
 fn encode_initialized_child(capture: &Path, receipt: &Path) -> Result<(), Box<dyn Error>> {
     let (accounts, _, _, _) = capture_inputs(capture, &receipt.join("controller.bin"))?;
     let refs = std::array::from_fn(|index| accounts[index].as_slice());
+    resource::reset_full_setup_counter();
     let encoded = resource::encode_initialized(refs)
         .map_err(|rc| format!("RI2 producer refused with {rc}"))?;
     write(&receipt.join("resource-image.ri2"), &encoded.bytes)?;
     write(
         &receipt.join("encode-initialized.json"),
         format!(
-            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"image_bytes\": {},\n  \"image_sha256\": \"{}\"\n}}\n",
-            std::process::id(), encoded.graph_anchor, encoded.bytes.len(), sha256(&encoded.bytes)
+            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"image_bytes\": {},\n  \"image_sha256\": \"{}\",\n  \"full_setup_calls\": {}\n}}\n",
+            std::process::id(), encoded.graph_anchor, encoded.bytes.len(), sha256(&encoded.bytes),
+            resource::full_setup_counter()
         )
         .as_bytes(),
     )?;
@@ -240,6 +243,7 @@ fn import_initialized_child(
         capture_inputs(capture, &receipt.join("controller.bin"))?;
     let image = read(image_path)?;
     let refs = std::array::from_fn(|index| accounts[index].as_slice());
+    resource::reset_full_setup_counter();
     let imported = resource::import_initialized_tic(refs, &image, &state, &mirror, &controller)
         .map_err(|rc| format!("RI2 consumer refused with {rc}"))?;
     write(&receipt.join("imported-state.st1"), &imported.state)?;
@@ -248,9 +252,10 @@ fn import_initialized_child(
     write(
         &receipt.join("import-initialized.json"),
         format!(
-            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"state_bytes\": {},\n  \"state_sha256\": \"{}\",\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\"\n}}\n",
+            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"state_bytes\": {},\n  \"state_sha256\": \"{}\",\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\",\n  \"full_setup_calls\": {}\n}}\n",
             std::process::id(), imported.graph_anchor, imported.state.len(),
-            sha256(&imported.state), sha256(&imported.mirror), sha256(&imported.frame)
+            sha256(&imported.state), sha256(&imported.mirror), sha256(&imported.frame),
+            resource::full_setup_counter()
         )
         .as_bytes(),
     )?;
@@ -270,6 +275,7 @@ fn malformed_initialized_child(
     }
     image[256..260].copy_from_slice(&u32::MAX.to_le_bytes());
     let refs = std::array::from_fn(|index| accounts[index].as_slice());
+    resource::reset_full_setup_counter();
     let result = resource::import_initialized_tic(refs, &image, &state, &mirror, &controller);
     if !matches!(result, Err(240)) {
         return Err(format!("malformed RI2 did not refuse with 240: {result:?}").into());
@@ -277,8 +283,8 @@ fn malformed_initialized_child(
     write(
         &receipt.join("malformed-initialized.json"),
         format!(
-            "{{\n  \"pid\": {},\n  \"return_code\": 240,\n  \"output_buffers_unchanged\": true\n}}\n",
-            std::process::id()
+            "{{\n  \"pid\": {},\n  \"return_code\": 240,\n  \"output_buffers_unchanged\": true,\n  \"full_setup_calls\": {}\n}}\n",
+            std::process::id(), resource::full_setup_counter()
         )
         .as_bytes(),
     )?;
@@ -415,18 +421,26 @@ fn run_initialized_gate(
     let image_path = receipt.join("resource-image.ri2");
     let encode_pid = parse_meta(&receipt.join("encode-initialized.json"), "pid")?;
     let encode_anchor = parse_meta(&receipt.join("encode-initialized.json"), "graph_anchor")?;
+    let encode_setup_calls = parse_meta(&receipt.join("encode-initialized.json"), "full_setup_calls")?;
     run_child(
         &exe,
         &child_args("malformed-initialized", &capture, receipt, &[&image_path]),
     )?;
+    if parse_meta(&receipt.join("malformed-initialized.json"), "full_setup_calls")? != 0 {
+        return Err("malformed RI2 path called full setup".into());
+    }
     run_child(
         &exe,
         &child_args("import-initialized", &capture, receipt, &[&image_path]),
     )?;
     let import_pid = parse_meta(&receipt.join("import-initialized.json"), "pid")?;
     let import_anchor = parse_meta(&receipt.join("import-initialized.json"), "graph_anchor")?;
+    let import_setup_calls = parse_meta(&receipt.join("import-initialized.json"), "full_setup_calls")?;
     if encode_pid == import_pid || encode_anchor == import_anchor {
         return Err("RI2 consumer did not run with a distinct process/address".into());
+    }
+    if encode_setup_calls == 0 || import_setup_calls != 0 {
+        return Err(format!("RI2 setup counter violation: producer={} consumer={}", encode_setup_calls, import_setup_calls).into());
     }
     let expected_state = read(&oracle_state)?;
     let expected_mirror = read(&oracle_mirror)?;
@@ -449,10 +463,10 @@ fn run_initialized_gate(
     write(
         &receipt.join("report.json"),
         format!(
-            "{{\n  \"status\": \"measured\",\n  \"profile\": \"DOOM-RI2-INITIALIZED-NATIVE\",\n  \"format\": \"DOOM-RI2/1\",\n  \"fresh_process\": true,\n  \"fresh_graph_address\": true,\n  \"image_bytes\": {},\n  \"image_sha256\": \"{}\",\n  \"state_sha256\": \"{}\",\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\",\n  \"initialized_capture\": true,\n  \"source_matched_native_tic\": true,\n  \"malformed_offset_refused_before_setup\": true,\n  \"consumer_runs_full_setup_before_import\": true,\n  \"encode_pid\": {},\n  \"import_pid\": {},\n  \"encode_graph_anchor\": {},\n  \"import_graph_anchor\": {},\n  \"native_note\": \"host-only actual C Doom engine; SBF consumer and CU gate remain open\"\n}}\n",
+            "{{\n  \"status\": \"measured\",\n  \"profile\": \"DOOM-RI2-INITIALIZED-NATIVE\",\n  \"format\": \"DOOM-RI2/2\",\n  \"fresh_process\": true,\n  \"fresh_graph_address\": true,\n  \"image_bytes\": {},\n  \"image_sha256\": \"{}\",\n  \"state_sha256\": \"{}\",\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\",\n  \"initialized_capture\": true,\n  \"source_matched_native_tic\": true,\n  \"malformed_offset_refused_before_setup\": true,\n  \"consumer_runs_full_setup_before_import\": false,\n  \"producer_full_setup_calls\": {},\n  \"consumer_full_setup_calls\": {},\n  \"instrumented_link_gate\": true,\n  \"encode_pid\": {},\n  \"import_pid\": {},\n  \"encode_graph_anchor\": {},\n  \"import_graph_anchor\": {},\n  \"native_note\": \"host-only actual C Doom engine; SBF consumer and CU gate remain open\"\n}}\n",
             read(&image_path)?.len(), sha256(&read(&image_path)?), sha256(&actual_state),
-            sha256(&actual_mirror), sha256(&actual_frame), encode_pid, import_pid,
-            encode_anchor, import_anchor
+            sha256(&actual_mirror), sha256(&actual_frame), encode_setup_calls,
+            import_setup_calls, encode_pid, import_pid, encode_anchor, import_anchor
         ).as_bytes(),
     )?;
     println!(
@@ -467,7 +481,7 @@ fn main() -> ExitCode {
     let mode = args.next().and_then(|value| value.into_string().ok());
     let result = (|| -> Result<(), Box<dyn Error>> {
         let mode = mode.as_deref().ok_or(
-            "usage: resource_native run CAPTURE CONTROLLER ORACLE_STATE ORACLE_OUTPUT RECEIPT_DIR | run-initialized CAPTURE CONTROLLER ORACLE_STATE ORACLE_MIRROR ORACLE_OUTPUT RECEIPT_DIR",
+            "usage: resource_native run CAPTURE CONTROLLER ORACLE_STATE ORACLE_OUTPUT RECEIPT_DIR | run-initialized CAPTURE CONTROLLER ORACLE_STATE ORACLE_MIRROR ORACLE_OUTPUT RECEIPT_DIR (RI2/2 no-setup native gate)",
         )?;
         match mode {
             "run" => {

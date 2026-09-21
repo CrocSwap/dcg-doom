@@ -103,6 +103,8 @@ unsafe extern "C" {
         frame_out_len: *mut usize,
         graph_anchor: *mut usize,
     ) -> i32;
+    fn doom_resource_test_reset_setup_counter();
+    fn doom_resource_test_setup_counter() -> usize;
 }
 
 fn wad_ffi(wad_accounts: [&[u8]; 5]) -> ([*const u8; 5], [usize; 5]) {
@@ -247,6 +249,14 @@ pub fn encode_initialized(wad_accounts: [&[u8]; 5]) -> Result<InitializedImage, 
         bytes,
         graph_anchor,
     })
+}
+
+pub fn reset_full_setup_counter() {
+    unsafe { doom_resource_test_reset_setup_counter() }
+}
+
+pub fn full_setup_counter() -> usize {
+    unsafe { doom_resource_test_setup_counter() }
 }
 
 pub fn import_initialized_tic(

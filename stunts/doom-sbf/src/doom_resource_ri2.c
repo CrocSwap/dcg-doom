@@ -1,5 +1,5 @@
 /*
- * DOOM-RI2/1 initialized-resource capture and native consumer.
+ * DOOM-RI2/2 initialized-resource capture and native consumer.
  *
  * RI1/E2R1 is frozen in doom_resource.c.  RI2 adds an explicit, additive
  * capture of the source-matched Z/W/V/R/view/P/demo initialization boundary.
@@ -32,13 +32,16 @@ extern int doom_engine_ex2_make_wad(
     uint8_t **out, size_t *out_bytes, uint8_t hash[32]);
 extern int doom_engine_ex2_fill_mirror(
     uint8_t *out, const uint8_t *wad, size_t wad_bytes, const uint8_t hash[32]);
+extern int doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
 extern int doom_resource_ri1_setup(const uint8_t *wad, size_t wad_bytes, uint8_t **carrier);
 extern int doom_resource_ri1_encode_graph(uint8_t **out, size_t *out_bytes, uintptr_t *anchor);
 extern int doom_resource_ri1_import_graph(const uint8_t *image, size_t image_bytes,
                                           uintptr_t *anchor);
+extern int doom_resource_ri1_validate_graph(const uint8_t *image, size_t image_bytes);
 
 #define RI2_MAGIC "DOOM-RI2"
-#define RI2_VERSION 1u
+#define RI2_VERSION_V1 1u
+#define RI2_VERSION 2u
 #define RI2_HEADER_BYTES 256u
 #define RI2_SCHEMA 2u
 #define RI2_SECTION_COUNT 5u
@@ -50,6 +53,8 @@ extern int doom_resource_ri1_import_graph(const uint8_t *image, size_t image_byt
 #define RI2_ENGINE_ID_BYTES 32u
 #define RI2_ZONE_BYTES 3145728u
 #define RI2_NULL 0xffffffffu
+#define R2_DISTMAP 2
+#define R2_SBARHEIGHT 32
 
 /* RI1 graph section IDs.  The graph payload is validated by the frozen RI1
  * codec; RI2 does not duplicate its record definitions. */
@@ -73,7 +78,7 @@ enum {
     R2_SC_NUMFLATS, R2_SC_NUMSPRITELUMPS, R2_SC_NUMSPRITES,
     R2_SC_NUMSWITCHES, R2_SC_FIRSTFLAT, R2_SC_LASTFLAT,
     R2_SC_FIRSTSPRITELUMP, R2_SC_LASTSPRITELUMP,
-    R2_SC_PRECACHE, R2_SC_DEMOPLAYBACK
+    R2_SC_PRECACHE, R2_SC_DEMOPLAYBACK, R2_SC_ANIMCOUNT
 };
 
 enum {
@@ -83,7 +88,12 @@ enum {
     R2_T_TEXTUREWIDTHMASK, R2_T_TEXTUREHEIGHT, R2_T_TEXTURECOMPOSITESIZE,
     R2_T_TEXTURETRANSLATION, R2_T_FLATTRANSLATION,
     R2_T_SPRITEWIDTH, R2_T_SPRITEOFFSET, R2_T_SPRITETOPOFFSET,
-    R2_T_SPRTEMP
+    R2_T_SPRTEMP,
+    /* v2 records are canonical payloads.  They contain no host pointers. */
+    R2_T_TEXTUREDEFS, R2_T_TEXTURECOLUMNLUMP, R2_T_TEXTURECOLUMNOFS,
+    R2_T_TEXTURECOMPOSITEBYTES, R2_T_SPRITEDEFS, R2_T_COLORMAPS,
+    R2_T_TRANSLATIONTABLEBYTES, R2_T_SCALIGHTOFFSETS,
+    R2_T_SCALIGHTFIXEDOFFSETS, R2_T_ZLIGHTOFFSETS, R2_T_LIGHTSELECTORS
 };
 
 enum {
@@ -177,11 +187,12 @@ static void r2_write_section(uint8_t *image, unsigned id, const r2_section_t *s)
     r2_put32(p + 8, s->count); r2_put32(p + 12, s->record_bytes);
 }
 
-static int r2_sections(const uint8_t *image, size_t bytes, r2_section_t out[5])
+static int r2_sections_version(const uint8_t *image, size_t bytes,
+                               r2_section_t out[5], uint32_t version)
 {
     uint32_t previous, directory_end, end; unsigned i;
     if (!image || bytes < RI2_HEADER_BYTES + RI2_SECTION_COUNT * 16u ||
-        memcmp(image, RI2_MAGIC, 8) || r2_u32(image + 8) != RI2_VERSION ||
+        memcmp(image, RI2_MAGIC, 8) || r2_u32(image + 8) != version ||
         r2_u32(image + 12) != RI2_HEADER_BYTES || r2_u32(image + 16) != bytes ||
         r2_u32(image + 20) != RI2_SCHEMA || r2_u32(image + 24) != 1 ||
         r2_u32(image + 28) != 5 || r2_u32(image + 32) != RI2_SECTION_COUNT ||
@@ -203,6 +214,16 @@ static int r2_sections(const uint8_t *image, size_t bytes, r2_section_t out[5])
         out[R2_RELOCS].bytes != out[R2_RELOCS].count * 24u ||
         out[R2_FUNCTIONS].bytes != out[R2_FUNCTIONS].count * 16u) return -1;
     return 0;
+}
+
+static int r2_sections(const uint8_t *image, size_t bytes, r2_section_t out[5])
+{
+    return r2_sections_version(image, bytes, out, RI2_VERSION);
+}
+
+static int r2_sections_v1(const uint8_t *image, size_t bytes, r2_section_t out[5])
+{
+    return r2_sections_version(image, bytes, out, RI2_VERSION_V1);
 }
 
 static int r2_walk(const uint8_t *bytes, size_t length, uint32_t expected,
@@ -266,7 +287,7 @@ static int r2_capture_scalars(r2_builder_t *scalars)
     R2_SCALAR(numswitches, R2_SC_NUMSWITCHES); R2_SCALAR(firstflat, R2_SC_FIRSTFLAT);
     R2_SCALAR(lastflat, R2_SC_LASTFLAT); R2_SCALAR(firstspritelump, R2_SC_FIRSTSPRITELUMP);
     R2_SCALAR(lastspritelump, R2_SC_LASTSPRITELUMP); R2_SCALAR(precache, R2_SC_PRECACHE);
-    R2_SCALAR(demoplayback, R2_SC_DEMOPLAYBACK);
+    R2_SCALAR(demoplayback, R2_SC_DEMOPLAYBACK); R2_SCALAR(lastanim - anims, R2_SC_ANIMCOUNT);
     return 0;
 }
 #undef R2_SCALAR
@@ -296,6 +317,184 @@ static int r2_capture_tables(r2_builder_t *tables)
         r2_table(tables, R2_T_SPRITEOFFSET, spriteoffset, (uint32_t)numspritelumps * 4u) ||
         r2_table(tables, R2_T_SPRITETOPOFFSET, spritetopoffset, (uint32_t)numspritelumps * 4u)) return -1;
     return 0;
+}
+
+/* v2 canonical payload helpers.  These deliberately describe object fields
+ * instead of copying the engine's pointer-bearing structs. */
+static int r2_blob_u32(uint8_t *blob, size_t cap, size_t *at, uint32_t value)
+{
+    if (!blob || !at || *at > cap - 4u) return -1;
+    r2_put32(blob + *at, value); *at += 4u; return 0;
+}
+
+static int r2_blob_bytes(uint8_t *blob, size_t cap, size_t *at,
+                         const void *data, size_t bytes)
+{
+    if (!blob || !at || (!data && bytes) || bytes > cap - *at) return -1;
+    if (bytes) memcpy(blob + *at, data, bytes); *at += bytes; return 0;
+}
+
+static int r2_capture_texture_defs(r2_builder_t *tables)
+{
+    size_t cap = 2u * 1024u * 1024u, at = 0, i, j; uint8_t *blob;
+    if (numtextures < 0 || numtextures > 4096) return -1;
+    blob = (uint8_t *)malloc(cap); if (!blob) return -1;
+    if (r2_blob_u32(blob, cap, &at, (uint32_t)numtextures)) goto fail;
+    for (i = 0; i < (size_t)numtextures; i++) {
+        texture_t *texture = textures ? textures[i] : 0;
+        if (!texture || texture->width <= 0 || texture->width > 4096 ||
+            texture->height <= 0 || texture->height > 4096 ||
+            texture->patchcount < 0 || texture->patchcount > 4096) goto fail;
+        if (r2_blob_bytes(blob, cap, &at, texture->name, 8) ||
+            r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)texture->width) ||
+            r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)texture->height) ||
+            r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)texture->patchcount)) goto fail;
+        for (j = 0; j < (size_t)texture->patchcount; j++) {
+            if (r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)texture->patches[j].originx) ||
+                r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)texture->patches[j].originy) ||
+                r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)texture->patches[j].patch)) goto fail;
+        }
+    }
+    if (r2_table(tables, R2_T_TEXTUREDEFS, blob, (uint32_t)at)) goto fail;
+    free(blob); return 0;
+fail:
+    free(blob); return -1;
+}
+
+static int r2_capture_texture_columns(r2_builder_t *tables, uint32_t id, int offsets)
+{
+    size_t cap = 2u * 1024u * 1024u, at = 0, i; uint8_t *blob;
+    if (numtextures < 0 || numtextures > 4096 || !textures) return -1;
+    blob = (uint8_t *)malloc(cap); if (!blob) return -1;
+    if (r2_blob_u32(blob, cap, &at, (uint32_t)numtextures)) goto fail;
+    for (i = 0; i < (size_t)numtextures; i++) {
+        size_t width, bytes;
+        const void *data = offsets ? (const void *)texturecolumnofs[i] : (const void *)texturecolumnlump[i];
+        if (!textures[i]) goto fail;
+        width = (size_t)textures[i]->width; bytes = width * sizeof(short);
+        if (width == 0 || width > 4096 || !data || bytes > 65536u ||
+            r2_blob_u32(blob, cap, &at, (uint32_t)width) ||
+            r2_blob_u32(blob, cap, &at, (uint32_t)bytes) ||
+            r2_blob_bytes(blob, cap, &at, data, bytes)) goto fail;
+    }
+    if (r2_table(tables, id, blob, (uint32_t)at)) goto fail;
+    free(blob); return 0;
+fail:
+    free(blob); return -1;
+}
+
+static int r2_capture_composites(r2_builder_t *tables)
+{
+    size_t cap = 4u * 1024u * 1024u, at = 0, i; uint8_t *blob;
+    if (numtextures < 0 || numtextures > 4096 || !texturecompositesize) return -1;
+    blob = (uint8_t *)malloc(cap); if (!blob) return -1;
+    if (r2_blob_u32(blob, cap, &at, (uint32_t)numtextures)) goto fail;
+    for (i = 0; i < (size_t)numtextures; i++) {
+        uint32_t bytes = (texturecomposite[i] && texturecompositesize[i] > 0) ? (uint32_t)texturecompositesize[i] : 0u;
+        if (bytes > 4u * 1024u * 1024u ||
+            r2_blob_u32(blob, cap, &at, bytes) ||
+            r2_blob_bytes(blob, cap, &at, texturecomposite[i], bytes)) goto fail;
+    }
+    if (r2_table(tables, R2_T_TEXTURECOMPOSITEBYTES, blob, (uint32_t)at)) goto fail;
+    free(blob); return 0;
+fail:
+    free(blob); return -1;
+}
+
+static int r2_capture_sprite_defs(r2_builder_t *tables)
+{
+    size_t cap = 2u * 1024u * 1024u, at = 0, i, j, k; uint8_t *blob;
+    if (numsprites < 0 || numsprites > 4096) return -1;
+    blob = (uint8_t *)malloc(cap); if (!blob) return -1;
+    if (r2_blob_u32(blob, cap, &at, (uint32_t)numsprites)) goto fail;
+    for (i = 0; i < (size_t)numsprites; i++) {
+        spritedef_t *sprite = sprites ? &sprites[i] : 0;
+        if (!sprite || sprite->numframes < 0 || sprite->numframes > 64 ||
+            (sprite->numframes && !sprite->spriteframes) ||
+            r2_blob_u32(blob, cap, &at, (uint32_t)sprite->numframes)) goto fail;
+        for (j = 0; j < (size_t)sprite->numframes; j++) {
+            spriteframe_t *frame = &sprite->spriteframes[j];
+            if (r2_blob_u32(blob, cap, &at, (uint32_t)frame->rotate)) goto fail;
+            for (k = 0; k < 8; k++)
+                if (r2_blob_u32(blob, cap, &at, (uint32_t)(int32_t)frame->lump[k])) goto fail;
+            for (k = 0; k < 8; k++)
+                if (r2_blob_u32(blob, cap, &at, (uint32_t)frame->flip[k])) goto fail;
+        }
+    }
+    if (r2_table(tables, R2_T_SPRITEDEFS, blob, (uint32_t)at)) goto fail;
+    free(blob); return 0;
+fail:
+    free(blob); return -1;
+}
+
+static int r2_capture_light_offsets(r2_builder_t *tables, uint32_t id,
+                                    lighttable_t *const *values, size_t count)
+{
+    size_t i; uint8_t *blob = (uint8_t *)malloc(count * 4u);
+    uintptr_t base = (uintptr_t)colormaps, end = base + (uintptr_t)W_LumpLength(W_GetNumForName("COLORMAP"));
+    if (!blob || !colormaps) { free(blob); return -1; }
+    for (i = 0; i < count; i++) {
+        uintptr_t p = (uintptr_t)values[i];
+        if (!values[i]) { r2_put32(blob + i * 4u, RI2_NULL); continue; }
+        if (end - base < 256u || p < base || p > end - 256u) { free(blob); return -1; }
+        r2_put32(blob + i * 4u, (uint32_t)(p - base));
+    }
+    if (r2_table(tables, id, blob, (uint32_t)(count * 4u))) { free(blob); return -1; }
+    free(blob); return 0;
+}
+
+static int r2_capture_zlight_offsets(r2_builder_t *tables)
+{
+    size_t i, j; uint8_t *blob = (uint8_t *)malloc(LIGHTLEVELS * MAXLIGHTZ * 4u);
+    if (!blob || !colormaps) { free(blob); return -1; }
+    /* R_InitLightTables is a pure compile-constant schedule over the WAD
+     * colormap bytes.  Re-emit its integer schedule; never serialize the
+     * source pointer array (which is absent on a portable consumer). */
+    for (i = 0; i < LIGHTLEVELS; i++) for (j = 0; j < MAXLIGHTZ; j++) {
+        int scale = FixedDiv((SCREENWIDTH / 2 * FRACUNIT), ((int)j + 1) << LIGHTZSHIFT);
+        int level = ((LIGHTLEVELS - 1 - (int)i) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
+        scale >>= LIGHTSCALESHIFT; level -= scale / R2_DISTMAP;
+        if (level < 0) level = 0;
+        if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS - 1;
+        r2_put32(blob + (i * MAXLIGHTZ + j) * 4u, (uint32_t)level * 256u);
+    }
+    if (r2_table(tables, R2_T_ZLIGHTOFFSETS, blob, LIGHTLEVELS * MAXLIGHTZ * 4u)) { free(blob); return -1; }
+    free(blob); return 0;
+}
+
+static uint32_t r2_light_selector(lighttable_t **value)
+{
+    int i;
+    if (!value) return RI2_NULL;
+    if (value == scalelightfixed) return 0x40000000u;
+    for (i = 0; i < LIGHTLEVELS; i++) if (value == scalelight[i]) return (uint32_t)i;
+    for (i = 0; i < LIGHTLEVELS; i++) if (value == zlight[i]) return 0x80000000u | (uint32_t)i;
+    return RI2_NULL - 1u;
+}
+
+static int r2_capture_v2_tables(r2_builder_t *tables)
+{
+    uint8_t selectors[12]; uint32_t values[3]; size_t i;
+    if (r2_capture_texture_defs(tables)) return -101;
+    if (r2_capture_texture_columns(tables, R2_T_TEXTURECOLUMNLUMP, 0)) return -102;
+    if (r2_capture_texture_columns(tables, R2_T_TEXTURECOLUMNOFS, 1)) return -103;
+    if (r2_capture_composites(tables)) return -104;
+    if (r2_capture_sprite_defs(tables)) return -105;
+    if (!colormaps || !translationtables ||
+        r2_table(tables, R2_T_COLORMAPS, colormaps, (uint32_t)W_LumpLength(W_GetNumForName("COLORMAP"))) ||
+        r2_table(tables, R2_T_TRANSLATIONTABLEBYTES, translationtables, 256u * 3u) ||
+        r2_capture_light_offsets(tables, R2_T_SCALIGHTOFFSETS,
+                                 (lighttable_t *const *)scalelight,
+                                 LIGHTLEVELS * MAXLIGHTSCALE) ||
+        r2_capture_light_offsets(tables, R2_T_SCALIGHTFIXEDOFFSETS,
+                                 (lighttable_t *const *)scalelightfixed, MAXLIGHTSCALE) ||
+        r2_capture_zlight_offsets(tables)) return -106;
+    values[0] = r2_light_selector(spritelights);
+    values[1] = r2_light_selector(walllights);
+    values[2] = r2_light_selector(planezlight);
+    for (i = 0; i < 3; i++) if (values[i] == RI2_NULL - 1u) return -1;
+    for (i = 0; i < 3; i++) r2_put32(selectors + i * 4u, values[i]);
+    return r2_table(tables, R2_T_LIGHTSELECTORS, selectors, sizeof(selectors));
 }
 
 static int r2_zone_offset(const void *pointer, uint32_t bytes, uint32_t *offset)
@@ -447,6 +646,8 @@ int doom_resource_encode_initialized(
     if (rc) { free(graph); free(carrier); free(wad); return 242; }
     if (r2_capture_scalars(&scalars)) { free(graph); free(carrier); free(wad); return 243; }
     if (r2_capture_tables(&tables)) { free(graph); free(carrier); free(wad); return 244; }
+    rc = r2_capture_v2_tables(&tables);
+    if (rc) { free(graph); free(carrier); free(wad); return (unsigned long)(-rc); }
     rc = r2_capture_relocs(&relocs, (uint32_t)demo_len);
     if (rc) { free(graph); free(carrier); free(wad); return (unsigned long)(-rc); }
     if (r2_capture_functions(&functions)) { free(graph); free(carrier); free(wad); return 246; }
@@ -483,6 +684,7 @@ static int r2_apply_scalar(uint32_t id, uint32_t bytes, const uint8_t *p, void *
     R2_APPLY(lastflat, R2_SC_LASTFLAT); R2_APPLY(firstspritelump, R2_SC_FIRSTSPRITELUMP);
     R2_APPLY(lastspritelump, R2_SC_LASTSPRITELUMP); R2_APPLY(precache, R2_SC_PRECACHE);
     R2_APPLY(demoplayback, R2_SC_DEMOPLAYBACK);
+    case R2_SC_ANIMCOUNT: if (r2_u32(p) > MAXANIMS) return -1; lastanim = anims + r2_u32(p); break;
     default: return -(1000 + (int)id);
     }
 #undef R2_APPLY
@@ -602,7 +804,7 @@ static int r2_validate_record_shape(const uint8_t *bytes, size_t length,
     return count == expected ? 0 : -1;
 }
 
-int doom_resource_import_initialized_tic(
+static int doom_resource_import_initialized_tic_v1(
     const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
     const unsigned char *image, unsigned long image_len,
     const unsigned char *state, unsigned long state_len,
@@ -616,7 +818,7 @@ int doom_resource_import_initialized_tic(
     r2_section_t s[5]; uint8_t *wad = 0, *carrier = 0, *graph = 0, *encoded = 0, *derived = 0;
     uint8_t hash[32], *demo; size_t wad_bytes = 0, graph_bytes, encoded_bytes = 0; uintptr_t anchor = 0;
     int lump, demo_len, rc;
-    if (!image || image_len > RI2_MAX_BYTES || r2_sections(image, image_len, s) ||
+    if (!image || image_len > RI2_MAX_BYTES || r2_sections_v1(image, image_len, s) ||
         r2_validate_record_shape(image + s[R2_SCALARS].offset, s[R2_SCALARS].bytes, s[R2_SCALARS].count, 1) ||
         r2_validate_record_shape(image + s[R2_TABLES].offset, s[R2_TABLES].bytes, s[R2_TABLES].count, 0)) return 240;
     if (!state || state_len < 64 || state_len > RI2_STATE_MAX || !mirror || mirror_len != RI2_MIRROR_BYTES ||
@@ -656,4 +858,468 @@ int doom_resource_import_initialized_tic(
     *mirror_out_len = RI2_MIRROR_BYTES; *frame_out_len = RI2_FRAME_BYTES;
     if (graph_anchor) *graph_anchor = (unsigned long)anchor;
     DoomStateFree(encoded); free(derived); free(graph); free(carrier); free(wad); return 0;
+}
+
+typedef struct {
+    uint32_t scalar[64];
+    const uint8_t *table[64];
+    uint32_t table_bytes[64];
+} r2_v2_plan_t;
+
+static int r2_v2_scalar_plan(const r2_section_t *s, const uint8_t *image,
+                             r2_v2_plan_t *plan)
+{
+    uint8_t seen[64] = {0}; size_t at = 0; uint32_t id, n; unsigned i;
+    const uint8_t *p = image + s[R2_SCALARS].offset;
+    while (at < s[R2_SCALARS].bytes) {
+        if (s[R2_SCALARS].bytes - at < 12u) return -1;
+        id = r2_u32(p + at); n = r2_u32(p + at + 4); at += 8u;
+        if (id == 0 || id >= 64 || seen[id] || n != 4 ||
+            n > s[R2_SCALARS].bytes - at) return -1;
+        seen[id] = 1; plan->scalar[id] = r2_u32(p + at); at += n;
+    }
+    if (at != s[R2_SCALARS].bytes || s[R2_SCALARS].count != 38u) return -1;
+    for (i = R2_SC_SETBLOCKS; i <= R2_SC_ANIMCOUNT; i++) if (!seen[i]) return -1;
+    if (plan->scalar[R2_SC_NUMTEXTURES] > 4096u || plan->scalar[R2_SC_NUMFLATS] > 4096u ||
+        plan->scalar[R2_SC_NUMSPRITELUMPS] > 4096u || plan->scalar[R2_SC_NUMSPRITES] > 4096u ||
+        plan->scalar[R2_SC_ANIMCOUNT] > MAXANIMS ||
+        plan->scalar[R2_SC_VIEWHEIGHT] > 200u || plan->scalar[R2_SC_VIEWWIDTH] > 320u ||
+        plan->scalar[R2_SC_SCALEDVIEWWIDTH] > 320u) return -1;
+    return 0;
+}
+
+static int r2_v2_table_expected(uint32_t id, const r2_v2_plan_t *plan, uint32_t *bytes)
+{
+    switch (id) {
+    case R2_T_VIEWANGLETOX: *bytes = sizeof(viewangletox); return 0;
+    case R2_T_XTOVIEWANGLE: *bytes = sizeof(xtoviewangle); return 0;
+    case R2_T_YSLOPE: *bytes = sizeof(yslope); return 0;
+    case R2_T_DISTSCALE: *bytes = sizeof(distscale); return 0;
+    case R2_T_SCREENHEIGHTARRAY: *bytes = sizeof(screenheightarray); return 0;
+    case R2_T_COLUMNOFS: *bytes = sizeof(columnofs); return 0;
+    case R2_T_SWITCHLIST: *bytes = sizeof(switchlist); return 0;
+    case R2_T_ANIMS: *bytes = sizeof(anims); return 0;
+    case R2_T_TRANSLATIONS: *bytes = sizeof(translations); return 0;
+    case R2_T_SPRTEMP: *bytes = sizeof(sprtemp); return 0;
+    case R2_T_TEXTUREWIDTHMASK: *bytes = plan->scalar[R2_SC_NUMTEXTURES] * 4u; return 0;
+    case R2_T_TEXTUREHEIGHT: *bytes = plan->scalar[R2_SC_NUMTEXTURES] * 4u; return 0;
+    case R2_T_TEXTURECOMPOSITESIZE: *bytes = plan->scalar[R2_SC_NUMTEXTURES] * 4u; return 0;
+    case R2_T_TEXTURETRANSLATION: *bytes = (plan->scalar[R2_SC_NUMTEXTURES] + 1u) * 4u; return 0;
+    case R2_T_FLATTRANSLATION: *bytes = (plan->scalar[R2_SC_NUMFLATS] + 1u) * 4u; return 0;
+    case R2_T_SPRITEWIDTH: *bytes = plan->scalar[R2_SC_NUMSPRITELUMPS] * 4u; return 0;
+    case R2_T_SPRITEOFFSET: *bytes = plan->scalar[R2_SC_NUMSPRITELUMPS] * 4u; return 0;
+    case R2_T_SPRITETOPOFFSET: *bytes = plan->scalar[R2_SC_NUMSPRITELUMPS] * 4u; return 0;
+    case R2_T_TEXTUREDEFS: case R2_T_TEXTURECOLUMNLUMP: case R2_T_TEXTURECOLUMNOFS:
+    case R2_T_TEXTURECOMPOSITEBYTES: case R2_T_SPRITEDEFS: case R2_T_COLORMAPS:
+    case R2_T_TRANSLATIONTABLEBYTES: case R2_T_SCALIGHTOFFSETS:
+    case R2_T_SCALIGHTFIXEDOFFSETS: case R2_T_ZLIGHTOFFSETS: case R2_T_LIGHTSELECTORS:
+        *bytes = 0xffffffffu; return 0;
+    default: return -1;
+    }
+}
+
+static int r2_v2_parse_count(const uint8_t *p, size_t n, uint32_t expected,
+                             size_t *at)
+{
+    uint32_t count;
+    if (!p || !at || n < 4u) return -1;
+    count = r2_u32(p); if (count != expected) return -1; *at = 4u; return 0;
+}
+
+static int r2_v2_validate_variable_tables(const r2_v2_plan_t *plan)
+{
+    const uint8_t *p; size_t n, at, i, j, k; uint32_t width, bytes, frames;
+    p = plan->table[R2_T_TEXTUREDEFS]; n = plan->table_bytes[R2_T_TEXTUREDEFS];
+    if (r2_v2_parse_count(p, n, plan->scalar[R2_SC_NUMTEXTURES], &at)) return -1;
+    for (i = 0; i < plan->scalar[R2_SC_NUMTEXTURES]; i++) {
+        int32_t w, h, patches;
+        if (n - at < 20u) return -1; at += 8u;
+        w = (int32_t)r2_u32(p + at); h = (int32_t)r2_u32(p + at + 4); patches = (int32_t)r2_u32(p + at + 8); at += 12u;
+        if (w <= 0 || w > 4096 || h <= 0 || h > 4096 || patches < 0 || patches > 4096 ||
+            (uint64_t)patches * 12u > n - at) return -1;
+        at += (size_t)patches * 12u;
+    }
+    if (at != n) return -1;
+    for (k = 0; k < 2; k++) {
+        uint32_t id = k ? R2_T_TEXTURECOLUMNOFS : R2_T_TEXTURECOLUMNLUMP;
+        p = plan->table[id]; n = plan->table_bytes[id];
+        if (r2_v2_parse_count(p, n, plan->scalar[R2_SC_NUMTEXTURES], &at)) return -1;
+        for (i = 0; i < plan->scalar[R2_SC_NUMTEXTURES]; i++) {
+            if (n - at < 8u) return -1; width = r2_u32(p + at); bytes = r2_u32(p + at + 4); at += 8u;
+            if (width == 0 || width > 4096 || bytes != width * sizeof(short) || bytes > n - at) return -1;
+            at += bytes;
+        }
+        if (at != n) return -1;
+    }
+    p = plan->table[R2_T_TEXTURECOMPOSITEBYTES]; n = plan->table_bytes[R2_T_TEXTURECOMPOSITEBYTES];
+    if (r2_v2_parse_count(p, n, plan->scalar[R2_SC_NUMTEXTURES], &at)) return -1;
+    for (i = 0; i < plan->scalar[R2_SC_NUMTEXTURES]; i++) {
+        if (n - at < 4u) return -1; bytes = r2_u32(p + at); at += 4u;
+        if (bytes > 4u * 1024u * 1024u || bytes > n - at) return -1; at += bytes;
+    }
+    if (at != n) return -1;
+    p = plan->table[R2_T_SPRITEDEFS]; n = plan->table_bytes[R2_T_SPRITEDEFS];
+    if (r2_v2_parse_count(p, n, plan->scalar[R2_SC_NUMSPRITES], &at)) return -1;
+    for (i = 0; i < plan->scalar[R2_SC_NUMSPRITES]; i++) {
+        if (n - at < 4u) return -1; frames = r2_u32(p + at); at += 4u;
+        if (frames > 64u || (uint64_t)frames * 68u > n - at) return -1;
+        for (j = 0; j < frames; j++) { for (k = 0; k < 17; k++) if (n - at < 4u) return -1; else at += 4u; }
+    }
+    if (at != n || plan->table_bytes[R2_T_COLORMAPS] < NUMCOLORMAPS * 256u ||
+        plan->table_bytes[R2_T_COLORMAPS] % 256u != 0 ||
+        plan->table_bytes[R2_T_TRANSLATIONTABLEBYTES] != 256u * 3u ||
+        plan->table_bytes[R2_T_SCALIGHTOFFSETS] != LIGHTLEVELS * MAXLIGHTSCALE * 4u ||
+        plan->table_bytes[R2_T_SCALIGHTFIXEDOFFSETS] != MAXLIGHTSCALE * 4u ||
+        plan->table_bytes[R2_T_ZLIGHTOFFSETS] != LIGHTLEVELS * MAXLIGHTZ * 4u ||
+        plan->table_bytes[R2_T_LIGHTSELECTORS] != 12u) return -1;
+    return 0;
+}
+
+static int r2_v2_table_plan(const r2_section_t *s, const uint8_t *image,
+                            r2_v2_plan_t *plan)
+{
+    uint8_t seen[64] = {0}; size_t at = 0; uint32_t id, n, expected; unsigned i;
+    const uint8_t *p = image + s[R2_TABLES].offset;
+    while (at < s[R2_TABLES].bytes) {
+        if (s[R2_TABLES].bytes - at < 8u) return -1;
+        id = r2_u32(p + at); n = r2_u32(p + at + 4); at += 8u;
+        if (id == 0 || id >= 64 || seen[id] || n > s[R2_TABLES].bytes - at ||
+            r2_v2_table_expected(id, plan, &expected)) return -1;
+        if (expected != 0xffffffffu && n != expected) return -1;
+        seen[id] = 1; plan->table[id] = p + at; plan->table_bytes[id] = n; at += n;
+    }
+    if (at != s[R2_TABLES].bytes || s[R2_TABLES].count != 29u) return -1;
+    for (i = R2_T_VIEWANGLETOX; i <= R2_T_LIGHTSELECTORS; i++) if (!seen[i]) return -1;
+    return r2_v2_validate_variable_tables(plan);
+}
+
+static int r2_v2_reloc_plan(const r2_section_t *s, const uint8_t *image,
+                            const r2_v2_plan_t *plan)
+{
+    uint8_t seen[64][256] = {{0}}, zone_seen[64] = {0};
+    uint32_t zone_offset[64] = {0}, zone_bytes[64] = {0};
+    const uint8_t *p = image + s[R2_RELOCS].offset;
+    const uint8_t *graph = image + s[R2_GRAPH].offset;
+    size_t at; uint32_t field, index, region, offset, bytes, expected;
+    uint32_t nv, ns, nsi, nl, ng, nss, nn, bmapw, bmaph;
+    uint32_t demo_offset = 0, demo_bytes = 0, demo_p_offset = 0, demo_p_bytes = 0;
+    unsigned i, j;
+    if (s[R2_GRAPH].bytes < 172u) return -1;
+    nv = r2_u32(graph + 32); ns = r2_u32(graph + 36); nsi = r2_u32(graph + 40);
+    nl = r2_u32(graph + 44); ng = r2_u32(graph + 48); nss = r2_u32(graph + 52);
+    nn = r2_u32(graph + 56); bmapw = r2_u32(graph + 156); bmaph = r2_u32(graph + 160);
+    if ((uint64_t)nv * 8u > 0xffffffffu || (uint64_t)ns * 64u > 0xffffffffu ||
+        (uint64_t)nsi * 20u > 0xffffffffu || (uint64_t)nl * 64u > 0xffffffffu ||
+        (uint64_t)ng * 48u > 0xffffffffu || (uint64_t)nss * 16u > 0xffffffffu ||
+        (uint64_t)nn * 64u > 0xffffffffu || (uint64_t)bmapw * bmaph * sizeof(mobj_t *) > 0xffffffffu) return -1;
+    for (at = 0; at < s[R2_RELOCS].bytes; at += 24u) {
+        field = r2_u32(p + at); index = r2_u32(p + at + 4); region = r2_u32(p + at + 8);
+        offset = r2_u32(p + at + 12); bytes = r2_u32(p + at + 16);
+        if (field == 0 || field >= 64 || index >= 256 || seen[field][index] ||
+            r2_u32(p + at + 20) || region < R2_REGION_GRAPH || region > R2_REGION_RUNTIME) return -1;
+        seen[field][index] = 1;
+        if (region == R2_REGION_ZONE && ((uint64_t)offset + bytes > RI2_ZONE_BYTES)) return -1;
+        if (field >= R2_PTR_VERTEXES && field <= R2_PTR_REJECT) {
+            if (index || region != R2_REGION_GRAPH) return -1;
+            switch (field) {
+            case R2_PTR_VERTEXES: expected = nv * 8u; break;
+            case R2_PTR_SECTORS: expected = ns * 64u; break;
+            case R2_PTR_SIDES: expected = nsi * 20u; break;
+            case R2_PTR_LINES: expected = nl * 64u; break;
+            case R2_PTR_SEGS: expected = ng * 48u; break;
+            case R2_PTR_SUBSECTORS: expected = nss * 16u; break;
+            case R2_PTR_NODES: expected = nn * 64u; break;
+            case R2_PTR_BLOCKMAPLUMP: case R2_PTR_REJECT: expected = 0; break;
+            default: return -1;
+            }
+            if ((field == R2_PTR_BLOCKMAPLUMP && offset != R2_GRAPH_BLOCKMAP) ||
+                (field == R2_PTR_REJECT && offset != R2_GRAPH_REJECT) ||
+                (field != R2_PTR_BLOCKMAPLUMP && field != R2_PTR_REJECT &&
+                 offset != field - R2_PTR_VERTEXES) || bytes != expected) return -1;
+        } else if (field == R2_PTR_SCREENS) {
+            if (index >= 4 || region != R2_REGION_FRAME || bytes != RI2_FRAME_BYTES || offset != index * RI2_FRAME_BYTES) return -1;
+        } else if (field == R2_PTR_YLOOKUP) {
+            if (index >= plan->scalar[R2_SC_VIEWHEIGHT] || region != R2_REGION_FRAME || bytes != RI2_FRAME_BYTES || offset != index * 320u) return -1;
+        } else if (region == R2_REGION_GRAPH) {
+            return -1;
+        } else if (region == R2_REGION_ZONE) {
+            if (index || field > R2_PTR_DEMOEND ||
+                field == R2_PTR_BLOCKMAP || field == R2_PTR_DEMOEND ||
+                (field >= R2_PTR_SCALIGHT && field <= R2_PTR_PLANEZLIGHT)) return -1;
+            switch (field) {
+            case R2_PTR_BLOCKLINKS: expected = bmapw * bmaph * (uint32_t)sizeof(mobj_t *); break;
+            case R2_PTR_TEXTURES: expected = plan->scalar[R2_SC_NUMTEXTURES] * (uint32_t)sizeof(texture_t *); break;
+            case R2_PTR_TEXTURECOLUMNLUMP: expected = plan->scalar[R2_SC_NUMTEXTURES] * (uint32_t)sizeof(short *); break;
+            case R2_PTR_TEXTURECOLUMNOFS: expected = plan->scalar[R2_SC_NUMTEXTURES] * (uint32_t)sizeof(unsigned short *); break;
+            case R2_PTR_TEXTURECOMPOSITE: expected = plan->scalar[R2_SC_NUMTEXTURES] * (uint32_t)sizeof(byte *); break;
+            case R2_PTR_TEXTURECOMPOSITESIZE: expected = plan->scalar[R2_SC_NUMTEXTURES] * 4u; break;
+            case R2_PTR_TEXTUREHEIGHT: expected = plan->scalar[R2_SC_NUMTEXTURES] * 4u; break;
+            case R2_PTR_TEXTURETRANSLATION: expected = (plan->scalar[R2_SC_NUMTEXTURES] + 1u) * 4u; break;
+            case R2_PTR_TEXTUREWIDTHMASK: expected = plan->scalar[R2_SC_NUMTEXTURES] * 4u; break;
+            case R2_PTR_FLATTRANSLATION: expected = (plan->scalar[R2_SC_NUMFLATS] + 1u) * 4u; break;
+            case R2_PTR_SPRITEWIDTH: case R2_PTR_SPRITEOFFSET: case R2_PTR_SPRITETOPOFFSET:
+                expected = plan->scalar[R2_SC_NUMSPRITELUMPS] * 4u; break;
+            case R2_PTR_SPRITES: expected = plan->scalar[R2_SC_NUMSPRITES] * (uint32_t)sizeof(spritedef_t *); break;
+            case R2_PTR_COLORMAPS: case R2_PTR_TRANSLATIONTABLES: expected = 1u; break;
+            case R2_PTR_DEMOBUFFER: case R2_PTR_DEMOP: expected = 0u; break;
+            default: return -1;
+            }
+            if (field != R2_PTR_DEMOBUFFER && field != R2_PTR_DEMOP && bytes != expected) return -1;
+            if (field == R2_PTR_DEMOBUFFER) { if (!bytes) return -1; demo_offset = offset; demo_bytes = bytes; }
+            if (field == R2_PTR_DEMOP) { if (!bytes) return -1; demo_p_offset = offset; demo_p_bytes = bytes; }
+            if (field != R2_PTR_DEMOBUFFER && field != R2_PTR_DEMOP) {
+                zone_seen[field] = 1; zone_offset[field] = offset; zone_bytes[field] = bytes;
+            }
+        } else return -1;
+    }
+    if (!demo_bytes || !demo_p_bytes || demo_p_offset < demo_offset ||
+        demo_p_offset - demo_offset != 13u || demo_p_bytes + 13u != demo_bytes) return -1;
+    for (i = R2_PTR_VERTEXES; i <= R2_PTR_DEMOEND; i++) for (j = i + 1; j <= R2_PTR_DEMOEND; j++) {
+        uint64_t a0, a1, b0, b1;
+        if (!zone_seen[i] || !zone_seen[j]) continue;
+        a0 = zone_offset[i]; a1 = a0 + zone_bytes[i]; b0 = zone_offset[j]; b1 = b0 + zone_bytes[j];
+        if (a0 < b1 && b0 < a1) return -1;
+    }
+    /* Every pointer-bearing field in the v1 directory must be present once;
+     * screens and ylookup are the only indexed families. */
+    for (field = R2_PTR_VERTEXES; field <= R2_PTR_DEMOEND; field++) {
+        if (field == R2_PTR_SCREENS || field == R2_PTR_YLOOKUP || field == R2_PTR_BLOCKMAP || field == R2_PTR_DEMOEND ||
+            (field >= R2_PTR_SCALIGHT && field <= R2_PTR_PLANEZLIGHT)) continue;
+        if (!seen[field][0]) return -1;
+    }
+    for (i = 0; i < 4; i++) if (!seen[R2_PTR_SCREENS][i]) return -1;
+    for (i = 0; i < plan->scalar[R2_SC_VIEWHEIGHT]; i++) if (!seen[R2_PTR_YLOOKUP][i]) return -1;
+    if (!seen[R2_PTR_DEMOBUFFER][0] || !seen[R2_PTR_DEMOP][0] ||
+        s[R2_RELOCS].count != 9u + 4u + plan->scalar[R2_SC_VIEWHEIGHT] + 18u) return -1;
+    return 0;
+}
+
+static int r2_v2_function_plan(const r2_section_t *s, const uint8_t *image)
+{
+    uint8_t seen[8] = {0}; const uint8_t *p = image + s[R2_FUNCTIONS].offset;
+    size_t at; uint32_t field, id;
+    if (s[R2_FUNCTIONS].count != 5u) return -1;
+    for (at = 0; at < s[R2_FUNCTIONS].bytes; at += 16u) {
+        field = r2_u32(p + at); id = r2_u32(p + at + 8);
+        if (field == 0 || field > 5 || seen[field] || r2_u32(p + at + 4) ||
+            r2_u32(p + at + 12) || !r2_function_value(id)) return -1;
+        seen[field] = 1;
+    }
+    return seen[1] && seen[2] && seen[3] && seen[4] && seen[5] ? 0 : -1;
+}
+
+static int r2_v2_preflight(const uint8_t *image, size_t bytes,
+                           r2_section_t s[5], r2_v2_plan_t *plan)
+{
+    memset(plan, 0, sizeof(*plan));
+    if (r2_sections(image, bytes, s) || r2_v2_scalar_plan(s, image, plan) ||
+        r2_v2_table_plan(s, image, plan) || r2_v2_reloc_plan(s, image, plan) ||
+        r2_v2_function_plan(s, image) ||
+        doom_resource_ri1_validate_graph(image + s[R2_GRAPH].offset, s[R2_GRAPH].bytes)) return -1;
+    return 0;
+}
+
+static void *r2_v2_zalloc(size_t bytes)
+{
+    if (!bytes || bytes > 0x7fffffffu) return 0;
+    return Z_Malloc((int)bytes, PU_STATIC, 0);
+}
+
+static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
+{
+    size_t i, j, count = plan->scalar[R2_SC_NUMTEXTURES], flats = plan->scalar[R2_SC_NUMFLATS];
+    size_t lumps = plan->scalar[R2_SC_NUMSPRITELUMPS], sprites_count = plan->scalar[R2_SC_NUMSPRITES];
+    const uint8_t *p; size_t n, at; uint32_t width, bytes, frames;
+    void *raw;
+    textures = (texture_t **)r2_v2_zalloc(count * sizeof(*textures));
+    texturecolumnlump = (short **)r2_v2_zalloc(count * sizeof(*texturecolumnlump));
+    texturecolumnofs = (unsigned short **)r2_v2_zalloc(count * sizeof(*texturecolumnofs));
+    texturecomposite = (byte **)r2_v2_zalloc(count * sizeof(*texturecomposite));
+    texturecompositesize = (int *)r2_v2_zalloc(count * sizeof(*texturecompositesize));
+    textureheight = (fixed_t *)r2_v2_zalloc(count * sizeof(*textureheight));
+    texturetranslation = (int *)r2_v2_zalloc((count + 1u) * sizeof(*texturetranslation));
+    texturewidthmask = (int *)r2_v2_zalloc(count * sizeof(*texturewidthmask));
+    flattranslation = (int *)r2_v2_zalloc((flats + 1u) * sizeof(*flattranslation));
+    spritewidth = (fixed_t *)r2_v2_zalloc(lumps * sizeof(*spritewidth));
+    spriteoffset = (fixed_t *)r2_v2_zalloc(lumps * sizeof(*spriteoffset));
+    spritetopoffset = (fixed_t *)r2_v2_zalloc(lumps * sizeof(*spritetopoffset));
+    sprites = (spritedef_t *)r2_v2_zalloc(sprites_count * sizeof(*sprites));
+    blocklinks = (mobj_t **)r2_v2_zalloc((size_t)bmapwidth * (size_t)bmapheight * sizeof(*blocklinks));
+    if ((count && (!textures || !texturecolumnlump || !texturecolumnofs || !texturecomposite ||
+                   !texturecompositesize || !textureheight || !texturetranslation || !texturewidthmask)) ||
+        !flattranslation || (lumps && (!spritewidth || !spriteoffset || !spritetopoffset)) ||
+        (sprites_count && !sprites) || !blocklinks) return -1;
+
+    raw = r2_v2_zalloc((size_t)plan->table_bytes[R2_T_COLORMAPS] + 255u);
+    if (!raw) return -1;
+    colormaps = (lighttable_t *)(((uintptr_t)raw + 255u) & ~(uintptr_t)255u);
+    raw = r2_v2_zalloc(256u * 3u + 255u);
+    if (!raw) return -1;
+    translationtables = (byte *)(((uintptr_t)raw + 255u) & ~(uintptr_t)255u);
+
+    p = plan->table[R2_T_TEXTUREDEFS]; n = plan->table_bytes[R2_T_TEXTUREDEFS];
+    if (r2_v2_parse_count(p, n, (uint32_t)count, &at)) return -1;
+    for (i = 0; i < count; i++) {
+        int32_t w, h, patchcount; texture_t *texture;
+        if (n - at < 20u) return -1;
+        texture = (texture_t *)r2_v2_zalloc(sizeof(*texture) +
+            (r2_u32(p + at + 16u) ? (size_t)(r2_u32(p + at + 16u) - 1u) * sizeof(texpatch_t) : 0u));
+        if (!texture) return -1;
+        memcpy(texture->name, p + at, 8u); w = (int32_t)r2_u32(p + at + 8u);
+        h = (int32_t)r2_u32(p + at + 12u); patchcount = (int32_t)r2_u32(p + at + 16u);
+        texture->width = (short)w; texture->height = (short)h; texture->patchcount = (short)patchcount;
+        at += 20u; textures[i] = texture;
+        for (j = 0; j < (size_t)patchcount; j++) {
+            texture->patches[j].originx = (int32_t)r2_u32(p + at);
+            texture->patches[j].originy = (int32_t)r2_u32(p + at + 4u);
+            texture->patches[j].patch = (int32_t)r2_u32(p + at + 8u); at += 12u;
+        }
+    }
+    if (at != n) return -1;
+    for (j = 0; j < 2; j++) {
+        uint32_t id = j ? R2_T_TEXTURECOLUMNOFS : R2_T_TEXTURECOLUMNLUMP;
+        p = plan->table[id]; n = plan->table_bytes[id];
+        if (r2_v2_parse_count(p, n, (uint32_t)count, &at)) return -1;
+        for (i = 0; i < count; i++) {
+            if (n - at < 8u) return -1; width = r2_u32(p + at); bytes = r2_u32(p + at + 4u); at += 8u;
+            if (j) texturecolumnofs[i] = (unsigned short *)r2_v2_zalloc(bytes);
+            else texturecolumnlump[i] = (short *)r2_v2_zalloc(bytes);
+            if (bytes && ((!j && !texturecolumnlump[i]) || (j && !texturecolumnofs[i]))) return -1;
+            memcpy(j ? (void *)texturecolumnofs[i] : (void *)texturecolumnlump[i], p + at, bytes); at += bytes;
+            (void)width;
+        }
+        if (at != n) return -1;
+    }
+    p = plan->table[R2_T_TEXTURECOMPOSITEBYTES]; n = plan->table_bytes[R2_T_TEXTURECOMPOSITEBYTES];
+    if (r2_v2_parse_count(p, n, (uint32_t)count, &at)) return -1;
+    for (i = 0; i < count; i++) { bytes = r2_u32(p + at); at += 4u; if (bytes) {
+        texturecomposite[i] = (byte *)r2_v2_zalloc(bytes); if (!texturecomposite[i]) return -1;
+        memcpy(texturecomposite[i], p + at, bytes);
+    } at += bytes; }
+    if (at != n) return -1;
+    p = plan->table[R2_T_SPRITEDEFS]; n = plan->table_bytes[R2_T_SPRITEDEFS];
+    if (r2_v2_parse_count(p, n, (uint32_t)sprites_count, &at)) return -1;
+    for (i = 0; i < sprites_count; i++) {
+        frames = r2_u32(p + at); at += 4u; sprites[i].numframes = (int)frames;
+        if (frames) { sprites[i].spriteframes = (spriteframe_t *)r2_v2_zalloc(frames * sizeof(spriteframe_t)); if (!sprites[i].spriteframes) return -1; }
+        for (j = 0; j < frames; j++) {
+            size_t k; sprites[i].spriteframes[j].rotate = (boolean)r2_u32(p + at); at += 4u;
+            for (k = 0; k < 8; k++) { sprites[i].spriteframes[j].lump[k] = (short)(int32_t)r2_u32(p + at); at += 4u; }
+            for (k = 0; k < 8; k++) { sprites[i].spriteframes[j].flip[k] = (byte)r2_u32(p + at); at += 4u; }
+        }
+    }
+    if (at != n) return -1;
+    memcpy(colormaps, plan->table[R2_T_COLORMAPS], plan->table_bytes[R2_T_COLORMAPS]);
+    memcpy(translationtables, plan->table[R2_T_TRANSLATIONTABLEBYTES], 256u * 3u);
+    return 0;
+}
+
+static int r2_v2_apply_lights(const r2_v2_plan_t *plan)
+{
+    size_t i; uint32_t off, selector; const uint8_t *p;
+    p = plan->table[R2_T_SCALIGHTOFFSETS]; for (i = 0; i < LIGHTLEVELS * MAXLIGHTSCALE; i++) {
+        off = r2_u32(p + i * 4u); if (off == RI2_NULL || off > plan->table_bytes[R2_T_COLORMAPS] - 256u) return -1; ((lighttable_t **)scalelight)[i] = colormaps + off;
+    }
+    p = plan->table[R2_T_SCALIGHTFIXEDOFFSETS]; for (i = 0; i < MAXLIGHTSCALE; i++) {
+        off = r2_u32(p + i * 4u); if (off == RI2_NULL) scalelightfixed[i] = 0; else { if (off > plan->table_bytes[R2_T_COLORMAPS] - 256u) return -1; scalelightfixed[i] = colormaps + off; }
+    }
+    p = plan->table[R2_T_ZLIGHTOFFSETS]; for (i = 0; i < LIGHTLEVELS * MAXLIGHTZ; i++) {
+        off = r2_u32(p + i * 4u); if (off > plan->table_bytes[R2_T_COLORMAPS] - 256u) return -1; ((lighttable_t **)zlight)[i] = colormaps + off;
+    }
+    p = plan->table[R2_T_LIGHTSELECTORS]; selector = r2_u32(p); if (selector == RI2_NULL) spritelights = 0;
+    else if (selector & 0x80000000u) { if ((selector & 0x7fffffffu) >= LIGHTLEVELS) return -1; spritelights = zlight[selector & 0x7fffffffu]; }
+    else if (selector & 0x40000000u) spritelights = scalelightfixed;
+    else { if (selector >= LIGHTLEVELS) return -1; spritelights = scalelight[selector]; }
+    selector = r2_u32(p + 4u); if (selector == RI2_NULL) walllights = 0;
+    else if (selector & 0x80000000u) { if ((selector & 0x7fffffffu) >= LIGHTLEVELS) return -1; walllights = zlight[selector & 0x7fffffffu]; }
+    else if (selector & 0x40000000u) walllights = scalelightfixed;
+    else { if (selector >= LIGHTLEVELS) return -1; walllights = scalelight[selector]; }
+    selector = r2_u32(p + 8u); if (selector == RI2_NULL) planezlight = 0;
+    else if (selector & 0x80000000u) { if ((selector & 0x7fffffffu) >= LIGHTLEVELS) return -1; planezlight = zlight[selector & 0x7fffffffu]; }
+    else if (selector & 0x40000000u) planezlight = scalelightfixed;
+    else { if (selector >= LIGHTLEVELS) return -1; planezlight = scalelight[selector]; }
+    return 0;
+}
+
+static int r2_v2_apply_table(uint32_t id, uint32_t n, const uint8_t *p, void *opaque)
+{
+    if (id >= R2_T_TEXTUREDEFS) return 0;
+    return r2_apply_table(id, n, p, opaque);
+}
+
+static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
+                        const uint8_t *image, const uint8_t *wad, size_t wad_bytes,
+                        const uint8_t hash[32],
+                        const uint8_t *state, size_t state_len, const uint8_t *controller,
+                        uint8_t **state_out, size_t *state_out_len, uint8_t *mirror_out,
+                        uint8_t *frame_out, uintptr_t *anchor)
+{
+    uint8_t *carrier = 0, *frame = 0, *encoded = 0, *derived = 0, *demo; size_t encoded_bytes = 0;
+    int lump, demo_len, rc;
+    (void)image; (void)s;
+    carrier = (uint8_t *)calloc(1, 4u * 1024u * 1024u); if (!carrier) return 238;
+    memset(DOOM_CTX, 0, sizeof(doom_ctx_t)); doom_ctx_init();
+    if (!doom_sbf_bind_arena(carrier, 4u * 1024u * 1024u, DOOM_ZONE_BYTES)) { free(carrier); return 234; }
+    gamemode = shareware; gamemission = doom; language = english;
+    DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0; displayplayer = 0; myargc = 0; myargv = 0;
+    Z_Init(); P_InitThinkers(); W_InitAccountImage(wad, (int)wad_bytes);
+    if (doom_resource_ri1_import_graph(image + s[R2_GRAPH].offset, s[R2_GRAPH].bytes, anchor)) { free(carrier); return 242; }
+    lastanim = anims + plan->scalar[R2_SC_ANIMCOUNT];
+    numlinespecials = 0;
+    for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
+        if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
+    {
+        int apply_rc = r2_walk((const uint8_t *)(image + s[R2_SCALARS].offset), s[R2_SCALARS].bytes, s[R2_SCALARS].count, 1, r2_apply_scalar, 0);
+        if (apply_rc || r2_v2_alloc_resources(plan) ||
+            r2_walk(image + s[R2_TABLES].offset, s[R2_TABLES].bytes, s[R2_TABLES].count, 0, r2_v2_apply_table, 0) ||
+            r2_v2_apply_lights(plan) || r2_apply_functions(image, s)) { free(carrier); return 242; }
+    }
+    frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES); if (!frame) { free(carrier); return 238; }
+    screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES; screens[2] = frame + 2u * RI2_FRAME_BYTES; screens[3] = frame + 3u * RI2_FRAME_BYTES; screens[4] = 0;
+    viewimage = screens[0]; for (rc = 0; rc < viewheight; rc++) ylookup[rc] = screens[0] + (size_t)rc * 320u;
+    /* These are derived view scalars, not setup calls.  They are reconstructed
+     * from the captured view dimensions and lookup table before any render. */
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 : (SCREENHEIGHT - R2_SBARHEIGHT - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
+    pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
+    lump = W_GetNumForName("DEMO1"); demo_len = W_LumpLength(lump); if (demo_len < 17) { free(frame); free(carrier); return 234; }
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC); defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo; demoend = demo + demo_len;
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len); DoomStateSetAllocationFailure(-1);
+    if (DoomStateDecode(state, state_len) || DoomControllerArmV2(controller + 24) || DoomControllerValidateCapturedDemoCursor(demo_p)) { free(frame); free(carrier); return 232; }
+    /* State decoding restores gameplay fields only; reassert the derived
+     * renderer fields immediately before the real tic/render boundary. */
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 : (SCREENHEIGHT - R2_SBARHEIGHT - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
+    pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
+    G_Ticker(); clipangle = xtoviewangle[0]; fixedcolormap = 0; R_RenderPlayerView(&players[displayplayer]); gametic++;
+    derived = (uint8_t *)malloc(RI2_MIRROR_BYTES); if (!derived || doom_engine_ex2_fill_mirror(derived, wad, wad_bytes, hash) || DoomStateEncode(&encoded, &encoded_bytes) || encoded_bytes > RI2_STATE_MAX) { free(derived); free(encoded); free(frame); free(carrier); return 238; }
+    memcpy(*state_out, encoded, encoded_bytes); *state_out_len = encoded_bytes; memcpy(mirror_out, derived, RI2_MIRROR_BYTES); memcpy(frame_out, screens[0], RI2_FRAME_BYTES);
+    DoomStateFree(encoded); free(derived); free(frame); free(carrier); return 0;
+}
+
+int doom_resource_import_initialized_tic(
+    const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
+    const unsigned char *image, unsigned long image_len, const unsigned char *state, unsigned long state_len,
+    const unsigned char *mirror, unsigned long mirror_len, const unsigned char *controller, unsigned long controller_len,
+    unsigned char *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    unsigned char *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
+    unsigned char *frame_out, unsigned long frame_cap, unsigned long *frame_out_len, unsigned long *graph_anchor)
+{
+    r2_section_t s[5]; r2_v2_plan_t plan; uint8_t *wad = 0, hash[32]; size_t wad_bytes = 0, out_len = 0; uintptr_t anchor = 0; int rc;
+    if (!image || image_len > RI2_MAX_BYTES || image_len < 12u ||
+        !state || state_len < 64u || state_len > RI2_STATE_MAX || !mirror || mirror_len != RI2_MIRROR_BYTES ||
+        !controller || controller_len != 64u || !state_out || !mirror_out || !frame_out || !state_out_len || !mirror_out_len || !frame_out_len ||
+        state_cap < RI2_STATE_MAX || mirror_cap < RI2_MIRROR_BYTES || frame_cap < RI2_FRAME_BYTES) return 232;
+    if (r2_u32(image + 8) == RI2_VERSION_V1)
+        return doom_resource_import_initialized_tic_v1(wad_accounts, wad_lens, image, image_len, state, state_len, mirror, mirror_len, controller, controller_len, state_out, state_cap, state_out_len, mirror_out, mirror_cap, mirror_out_len, frame_out, frame_cap, frame_out_len, graph_anchor);
+    if (r2_u32(image + 8) != RI2_VERSION || r2_v2_preflight(image, image_len, s, &plan)) return 240;
+    if (doom_engine_ex2_make_wad(wad_accounts, wad_lens, &wad, &wad_bytes, hash) || memcmp(hash, r2_wad_hash, 32)) { free(wad); return 234; }
+    rc = r2_v2_commit(&plan, &s, image, wad, wad_bytes, hash, state, state_len, controller, &state_out, &out_len, mirror_out, frame_out, &anchor);
+    if (rc) { free(wad); return rc; }
+    *state_out_len = out_len; *mirror_out_len = RI2_MIRROR_BYTES; *frame_out_len = RI2_FRAME_BYTES; if (graph_anchor) *graph_anchor = (unsigned long)anchor;
+    free(wad); return 0;
 }
