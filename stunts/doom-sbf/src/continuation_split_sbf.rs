@@ -11,7 +11,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     hash::{hash, hashv},
     program_error::ProgramError,
-    program_memory::sol_memcpy,
+    program_memory::{sol_memcmp, sol_memcpy},
     pubkey::Pubkey,
 };
 
@@ -55,6 +55,7 @@ const PHASE_DECODED: u32 = 7;
 const PHASE_PUBLISHED: u32 = 8;
 const DOMAIN_ROOT: &[u8] = b"DOOM-E2R/4-ROOT\0";
 const DOMAIN_ACCOUNTS: &[u8] = b"DOOM-E2R/4-ACCOUNTS\0";
+const DOMAIN_COMPONENTS: &[u8] = b"DOOM-E2R/4-COMPONENTS\0";
 const DOMAIN_PROTOCOL: &[u8] = b"DOOM-E2R/4-PROTOCOL\0";
 const DOMAIN_PROGRAM: &[u8] = b"DOOM-E2R/4-PROGRAM\0";
 const WAD_HASH: [u8; 32] = [
@@ -159,6 +160,11 @@ fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     hash(bytes).to_bytes()
 }
 
+#[inline(always)]
+fn same_bytes(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len() && sol_memcmp(left, right, left.len()) == 0
+}
+
 fn account_set_hash(program: &Pubkey, accounts: &[AccountInfo]) -> [u8; 32] {
     let keys: Vec<&[u8]> = accounts
         .iter()
@@ -190,6 +196,44 @@ fn abi_hash() -> [u8; 32] {
 
 fn root_hash(state: &[u8], mirror: &[u8], controller: &[u8], frame: &[u8]) -> [u8; 32] {
     hashv(&[DOMAIN_ROOT, state, mirror, controller, frame]).to_bytes()
+}
+
+fn component_commitment(
+    resource_hash: &[u8; 32],
+    state_hash: &[u8; 32],
+    mirror_hash: &[u8; 32],
+    controller_hash: &[u8; 32],
+    frame_hash: &[u8; 32],
+) -> [u8; 32] {
+    hashv(&[
+        DOMAIN_COMPONENTS,
+        resource_hash,
+        state_hash,
+        mirror_hash,
+        controller_hash,
+        frame_hash,
+    ])
+    .to_bytes()
+}
+
+fn header_component_commitment(continuation: &[u8]) -> [u8; 32] {
+    component_commitment(
+        continuation[H_RESOURCE_HASH..H_RESOURCE_HASH + 32]
+            .try_into()
+            .unwrap(),
+        continuation[H_STATE_HASH..H_STATE_HASH + 32]
+            .try_into()
+            .unwrap(),
+        continuation[H_MIRROR_HASH..H_MIRROR_HASH + 32]
+            .try_into()
+            .unwrap(),
+        continuation[H_CONTROLLER_HASH..H_CONTROLLER_HASH + 32]
+            .try_into()
+            .unwrap(),
+        continuation[H_FRAME_HASH..H_FRAME_HASH + 32]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 fn context_root(context: &[u8]) -> [u8; 32] {
@@ -377,6 +421,7 @@ fn fill_checkpoint(
     cursor: u32,
     state_root: &[u8; 32],
     accounts_root: &[u8; 32],
+    components_commitment: &[u8; 32],
     arena_high_water: usize,
 ) {
     let checkpoint = &mut context
@@ -391,6 +436,7 @@ fn fill_checkpoint(
     put_u32(checkpoint, 84, 0);
     put_u32(checkpoint, 88, CONTEXT_CHECKPOINT_OFFSET as u32);
     put_u32(checkpoint, 92, arena_high_water as u32);
+    set_hash(checkpoint, 96, components_commitment);
 }
 
 fn check_checkpoint(
@@ -399,6 +445,7 @@ fn check_checkpoint(
     cursor: u32,
     state_root: &[u8; 32],
     accounts_root: &[u8; 32],
+    components_commitment: &[u8; 32],
 ) -> ProgramResult {
     let checkpoint =
         &context[CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES];
@@ -411,6 +458,7 @@ fn check_checkpoint(
         || u32_at(checkpoint, 92) as usize > ACTIVE_ARENA_BYTES
         || &checkpoint[20..52] != state_root
         || &checkpoint[52..84] != accounts_root
+        || &checkpoint[96..128] != components_commitment
     {
         return Err(ProgramError::Custom(241));
     }
@@ -443,6 +491,11 @@ fn fill_header(
     controller: &[u8],
     frame: &[u8],
     context: &[u8],
+    resource_hash: &[u8; 32],
+    state_hash: &[u8; 32],
+    mirror_hash: &[u8; 32],
+    controller_hash: &[u8; 32],
+    frame_hash: &[u8; 32],
 ) {
     continuation[..8].copy_from_slice(MAGIC);
     put_u32(continuation, H_VERSION, VERSION);
@@ -475,13 +528,13 @@ fn fill_header(
     set_hash(
         continuation,
         H_RESOURCE_HASH,
-        &hash_bytes(&accounts[1].try_borrow_data().unwrap()),
+        resource_hash,
     );
     set_hash(continuation, H_WAD_HASH, &WAD_HASH);
-    set_hash(continuation, H_STATE_HASH, &hash_bytes(state));
-    set_hash(continuation, H_MIRROR_HASH, &hash_bytes(mirror));
-    set_hash(continuation, H_CONTROLLER_HASH, &hash_bytes(controller));
-    set_hash(continuation, H_FRAME_HASH, &hash_bytes(frame));
+    set_hash(continuation, H_STATE_HASH, state_hash);
+    set_hash(continuation, H_MIRROR_HASH, mirror_hash);
+    set_hash(continuation, H_CONTROLLER_HASH, controller_hash);
+    set_hash(continuation, H_FRAME_HASH, frame_hash);
     let root = root_hash(state, mirror, controller, frame);
     set_hash(continuation, H_PREVIOUS_ROOT, &root);
     set_hash(continuation, H_OUTPUT_ROOT, &root);
@@ -527,11 +580,14 @@ fn validate_header(
     request: Request,
     phase: u32,
     context: &[u8],
-    resource: &[u8],
     state: &[u8],
     mirror: &[u8],
     controller: &[u8],
     frame: &[u8],
+    resource_hash: &[u8; 32],
+    components_commitment: &[u8; 32],
+    expected_root: &[u8; 32],
+    accounts_root: &[u8; 32],
 ) -> ProgramResult {
     if &continuation[..8] != MAGIC
         || u32_at(continuation, H_VERSION) != VERSION
@@ -558,27 +614,34 @@ fn validate_header(
         || &continuation[H_PROTOCOL..H_PROTOCOL + 32] != protocol_hash()
         || &continuation[H_PROGRAM..H_PROGRAM + 32] != program_hash(program)
         || &continuation[H_SOURCE..H_SOURCE + 32] != source_hash()
-        || &continuation[H_RESOURCE_HASH..H_RESOURCE_HASH + 32] != hash_bytes(resource)
+        || &continuation[H_RESOURCE_HASH..H_RESOURCE_HASH + 32] != resource_hash
         || &continuation[H_WAD_HASH..H_WAD_HASH + 32] != WAD_HASH
-        || &continuation[H_STATE_HASH..H_STATE_HASH + 32] != hash_bytes(state)
-        || &continuation[H_MIRROR_HASH..H_MIRROR_HASH + 32] != hash_bytes(mirror)
-        || &continuation[H_CONTROLLER_HASH..H_CONTROLLER_HASH + 32] != hash_bytes(controller)
-        || &continuation[H_FRAME_HASH..H_FRAME_HASH + 32] != hash_bytes(frame)
-        || &continuation[H_PREVIOUS_ROOT..H_PREVIOUS_ROOT + 32]
-            != root_hash(state, mirror, controller, frame)
-        || &continuation[H_OUTPUT_ROOT..H_OUTPUT_ROOT + 32]
-            != root_hash(state, mirror, controller, frame)
-        || &continuation[H_ACCOUNT_SET..H_ACCOUNT_SET + 32] != account_set_hash(program, accounts)
+        || &header_component_commitment(continuation) != components_commitment
+        || &continuation[H_PREVIOUS_ROOT..H_PREVIOUS_ROOT + 32] != expected_root
+        || &continuation[H_OUTPUT_ROOT..H_OUTPUT_ROOT + 32] != expected_root
+        || &continuation[H_ACCOUNT_SET..H_ACCOUNT_SET + 32] != accounts_root
         || &continuation[H_AUTHORITY..H_AUTHORITY + 32] != accounts[AUTHORITY_ACCOUNT].key.as_ref()
         || &continuation[H_CONTEXT_ROOT..H_CONTEXT_ROOT + 32] != context_root(context)
         || &continuation[H_SOURCE_ABI..H_SOURCE_ABI + 32] != abi_hash()
         || continuation[H_SOURCE_ABI + 32..HEADER_BYTES]
             .iter()
             .any(|&byte| byte != 0)
-        || continuation[STATE_OFFSET..STATE_OFFSET + STATE_BYTES] != *state
-        || continuation[MIRROR_OFFSET..MIRROR_OFFSET + MIRROR_BYTES] != *mirror
-        || continuation[CONTROLLER_OFFSET..CONTROLLER_OFFSET + CONTROLLER_BYTES] != *controller
-        || continuation[FRAME_OFFSET..FRAME_OFFSET + FRAME_BYTES] != *frame
+        || !same_bytes(
+            &continuation[STATE_OFFSET..STATE_OFFSET + STATE_BYTES],
+            state,
+        )
+        || !same_bytes(
+            &continuation[MIRROR_OFFSET..MIRROR_OFFSET + MIRROR_BYTES],
+            mirror,
+        )
+        || !same_bytes(
+            &continuation[CONTROLLER_OFFSET..CONTROLLER_OFFSET + CONTROLLER_BYTES],
+            controller,
+        )
+        || !same_bytes(
+            &continuation[FRAME_OFFSET..FRAME_OFFSET + FRAME_BYTES],
+            frame,
+        )
     {
         return Err(ProgramError::Custom(242));
     }
@@ -586,6 +649,7 @@ fn validate_header(
 }
 
 fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
+    crate::diagnostic_phase(700);
     let mut context = accounts[0].try_borrow_mut_data()?;
     let resource = accounts[1].try_borrow_data()?;
     validate_resource(&resource)?;
@@ -610,14 +674,35 @@ fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request)
     if frame.iter().any(|&byte| byte != 0) {
         return Err(ProgramError::InvalidAccountData);
     }
+    let root = root_hash(&state, &mirror, &controller, &frame);
+    let accounts_root = account_set_hash(program, accounts);
+    let resource_hash = hash_bytes(&resource);
+    let state_hash = hash_bytes(&state);
+    let mirror_hash = hash_bytes(&mirror);
+    let controller_hash = hash_bytes(&controller);
+    let frame_hash = hash_bytes(&frame);
+    let components_commitment = component_commitment(
+        &resource_hash,
+        &state_hash,
+        &mirror_hash,
+        &controller_hash,
+        &frame_hash,
+    );
     drop(resource);
     let mut continuation = accounts[CONTINUATION_ACCOUNT].try_borrow_mut_data()?;
     if continuation[..HEADER_BYTES].iter().any(|&byte| byte != 0) {
         return Err(ProgramError::Custom(241));
     }
-    let root = root_hash(&state, &mirror, &controller, &frame);
-    let accounts_root = account_set_hash(program, accounts);
-    fill_checkpoint(&mut context, PHASE_PREPARED, 1, &root, &accounts_root, 0);
+    crate::diagnostic_phase(701);
+    fill_checkpoint(
+        &mut context,
+        PHASE_PREPARED,
+        1,
+        &root,
+        &accounts_root,
+        &components_commitment,
+        0,
+    );
     fill_header(
         &mut continuation,
         program,
@@ -628,6 +713,11 @@ fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request)
         &controller,
         &frame,
         &context,
+        &resource_hash,
+        &state_hash,
+        &mirror_hash,
+        &controller_hash,
+        &frame_hash,
     );
     Ok(())
 }
@@ -756,6 +846,7 @@ fn run_phase(
     let mirror = accounts[8].try_borrow_data()?;
     let controller = accounts[9].try_borrow_data()?;
     let mut arena_high_water = 0usize;
+    crate::diagnostic_phase(708);
     let rc = if cursor == 1 {
         let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
@@ -786,6 +877,7 @@ fn run_phase(
         if at != wad_end {
             return Err(ProgramError::InvalidAccountData);
         }
+        crate::diagnostic_phase(709);
         let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
             doom_engine_ex2_resource_sbf_ri2_split_setup(
@@ -898,14 +990,24 @@ fn run_phase(
                 || state_out_len != u32_at(saved, H_STATE_LEN) as usize
                 || mirror_out_len != MIRROR_BYTES
                 || frame_out_len != FRAME_BYTES
-                || state_out[..STATE_BYTES] != saved[STATE_OFFSET..STATE_OFFSET + STATE_BYTES]
-                || mirror_out[..MIRROR_BYTES] != saved[MIRROR_OFFSET..MIRROR_OFFSET + MIRROR_BYTES]
-                || frame_out[..FRAME_BYTES] != saved[FRAME_OFFSET..FRAME_OFFSET + FRAME_BYTES])
+                || !same_bytes(
+                    &state_out[..STATE_BYTES],
+                    &saved[STATE_OFFSET..STATE_OFFSET + STATE_BYTES],
+                )
+                || !same_bytes(
+                    &mirror_out[..MIRROR_BYTES],
+                    &saved[MIRROR_OFFSET..MIRROR_OFFSET + MIRROR_BYTES],
+                )
+                || !same_bytes(
+                    &frame_out[..FRAME_BYTES],
+                    &saved[FRAME_OFFSET..FRAME_OFFSET + FRAME_BYTES],
+                ))
         {
             return Err(ProgramError::Custom(243));
         }
         rc
     };
+    crate::diagnostic_phase(720 + cursor as u64);
     if rc != 0 {
         return Err(ProgramError::Custom(rc as u32));
     }
@@ -929,6 +1031,7 @@ fn run_phase(
 }
 
 fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
+    crate::diagnostic_phase(702);
     let context = accounts[0].try_borrow_data()?;
     let resource = accounts[1].try_borrow_data()?;
     validate_resource(&resource)?;
@@ -943,6 +1046,7 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
     if wad_bytes != resource_sbf::WAD_IMAGE_BYTES {
         return Err(ProgramError::InvalidAccountData);
     }
+    crate::diagnostic_phase(703);
     let state = accounts[7].try_borrow_data()?;
     let mirror = accounts[8].try_borrow_data()?;
     let controller = accounts[9].try_borrow_data()?;
@@ -953,8 +1057,15 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
     if frame.iter().any(|&byte| byte != 0) {
         return Err(ProgramError::InvalidAccountData);
     }
+    crate::diagnostic_phase(704);
+    let resource_hash = hash_bytes(&resource);
     let expected_root = root_hash(&state, &mirror, &controller, &frame);
     let accounts_root = account_set_hash(program, accounts);
+    let components_commitment: [u8; 32] = context
+        [CONTEXT_CHECKPOINT_OFFSET + 96..CONTEXT_CHECKPOINT_OFFSET + 128]
+        .try_into()
+        .unwrap();
+    crate::diagnostic_phase(705);
     let expected_phase = request.cursor;
     let phase = match expected_phase {
         1 => PHASE_PREPARED,
@@ -975,12 +1086,16 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         request,
         phase,
         &context,
-        &resource,
         &state,
         &mirror,
         &controller,
         &frame,
+        &resource_hash,
+        &components_commitment,
+        &expected_root,
+        &accounts_root,
     )?;
+    crate::diagnostic_phase(706);
     // Validate the live account bytes and key set before comparing the
     // checkpoint's root.  A same-key mutation must reach validate_header and
     // refuse as the authenticated-input control (242), rather than being
@@ -991,7 +1106,9 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         expected_phase,
         &expected_root,
         &accounts_root,
+        &components_commitment,
     )?;
+    crate::diagnostic_phase(707);
     drop(frame);
     drop(controller);
     drop(mirror);
@@ -1007,6 +1124,7 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         request.fault,
         &mut arena_high_water,
     )?;
+    crate::diagnostic_phase(730 + request.cursor as u64);
     drop(continuation);
 
     let next_phase = match request.cursor {
@@ -1027,6 +1145,7 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         next_cursor,
         &expected_root,
         &accounts_root,
+        &components_commitment,
         arena_high_water,
     );
     let mut continuation = accounts[CONTINUATION_ACCOUNT].try_borrow_mut_data()?;
@@ -1034,6 +1153,7 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
     put_u32(&mut continuation, H_PHASE, next_phase);
     put_u32(&mut continuation, H_CURSOR, next_cursor);
     set_hash(&mut continuation, H_CONTEXT_ROOT, &context_root(&context));
+    crate::diagnostic_phase(740 + request.cursor as u64);
     Ok(())
 }
 
@@ -1044,6 +1164,7 @@ pub fn process(
 ) -> ProgramResult {
     let request = Request::decode(instruction_data)?;
     validate_accounts(program, accounts)?;
+    crate::diagnostic_phase(701);
     match request.operation {
         PREPARE => process_prepare(program, accounts, request),
         STEP => process_step(program, accounts, request),
