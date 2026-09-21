@@ -15,6 +15,8 @@ pub mod ex2;
 pub mod resource;
 #[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
+#[cfg(feature = "ctx-engine")]
+pub mod resource_sbf;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
@@ -159,6 +161,10 @@ pub fn process_instruction(
     #[cfg(feature = "ctx-engine")]
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.starts_with(resource_sbf::MAGIC) {
+        return resource_sbf::process(_program_id, accounts, instruction_data);
     }
     #[cfg(feature = "ctx-engine")]
     if instruction_data.starts_with(ex2_sbf::MAGIC) {

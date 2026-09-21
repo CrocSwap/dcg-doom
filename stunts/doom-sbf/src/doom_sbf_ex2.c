@@ -170,6 +170,21 @@ int doom_engine_ex2_make_wad(
 {
     return ex2_wad(accounts, lens, out, out_bytes, hash);
 }
+
+/* The RI1 host importer uses the retained MP1 codec through this narrow
+ * adapter; no native account object crosses the resource-image boundary. */
+int doom_engine_ex2_fill_mirror(
+    uint8_t *out, const uint8_t *wad, size_t wad_bytes,
+    const uint8_t wad_hash[32])
+{
+    doom_account_t account;
+    if (!out || !wad || !wad_bytes || !wad_hash) return -1;
+    memset(&account, 0, sizeof(account));
+    account.wad = wad;
+    account.wad_bytes = wad_bytes;
+    memcpy(account.wad_hash, wad_hash, sizeof(account.wad_hash));
+    return fill_pool(out, &account);
+}
 #endif
 
 static int ex2_pool_shape(const uint8_t *pool, size_t bytes, const uint8_t wad_hash[32])

@@ -6,6 +6,7 @@
 
 pub const IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const STATE_MAX_BYTES: usize = 126_976;
+pub const MIRROR_BYTES: usize = 65_536;
 pub const FRAME_BYTES: usize = 320 * 200;
 
 #[derive(Debug)]
@@ -17,6 +18,7 @@ pub struct EncodedImage {
 #[derive(Debug)]
 pub struct ImportedTic {
     pub state: Vec<u8>,
+    pub mirror: Vec<u8>,
     pub frame: Vec<u8>,
     pub canonical_image: Vec<u8>,
     pub graph_anchor: usize,
@@ -45,6 +47,9 @@ unsafe extern "C" {
         state_out: *mut u8,
         state_cap: usize,
         state_out_len: *mut usize,
+        mirror_out: *mut u8,
+        mirror_cap: usize,
+        mirror_out_len: *mut usize,
         frame_out: *mut u8,
         frame_cap: usize,
         frame_out_len: *mut usize,
@@ -103,9 +108,11 @@ pub fn import_tic(
     }
     let (pointers, lengths) = wad_ffi(wad_accounts);
     let mut state_out = vec![0xa5; STATE_MAX_BYTES];
+    let mut mirror_out = vec![0xa5; MIRROR_BYTES];
     let mut frame_out = vec![0xa5; FRAME_BYTES];
     let mut image_out = vec![0xa5; image.len()];
     let mut state_len = 0usize;
+    let mut mirror_len = 0usize;
     let mut frame_len = 0usize;
     let mut image_len = 0usize;
     let mut graph_anchor = 0usize;
@@ -125,6 +132,9 @@ pub fn import_tic(
             state_out.as_mut_ptr(),
             state_out.len(),
             &mut state_len,
+            mirror_out.as_mut_ptr(),
+            mirror_out.len(),
+            &mut mirror_len,
             frame_out.as_mut_ptr(),
             frame_out.len(),
             &mut frame_len,
@@ -138,6 +148,7 @@ pub fn import_tic(
     if rc != 0 {
         if mutation_count != 0
             || state_out.iter().any(|&b| b != 0xa5)
+            || mirror_out.iter().any(|&b| b != 0xa5)
             || frame_out.iter().any(|&b| b != 0xa5)
             || image_out.iter().any(|&b| b != 0xa5)
         {
@@ -147,16 +158,19 @@ pub fn import_tic(
     }
     if state_len == 0
         || state_len > state_out.len()
+        || mirror_len != MIRROR_BYTES
         || frame_len != FRAME_BYTES
         || image_len != image.len()
     {
         return Err(238);
     }
     state_out.truncate(state_len);
+    mirror_out.truncate(mirror_len);
     frame_out.truncate(frame_len);
     image_out.truncate(image_len);
     Ok(ImportedTic {
         state: state_out,
+        mirror: mirror_out,
         frame: frame_out,
         canonical_image: image_out,
         graph_anchor,

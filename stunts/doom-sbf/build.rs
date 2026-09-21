@@ -18,6 +18,7 @@ const ENGINE_TUS: &[&str] = &[
 
 const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC/2|schema=2|roles=12|state=ST1/v0|mirror=MP1/v1|controller=CI2/v1|frame=FB1/64000|role-map=00..0b";
 const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
+const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -279,6 +280,11 @@ fn source_manifest(
         "  \"sbf_abi_descriptor\": \"{SBF_ABI_DESCRIPTOR}\","
     )
     .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"resource_sbf_abi_descriptor\": \"{RESOURCE_SBF_ABI_DESCRIPTOR}\","
+    )
+    .unwrap();
     writeln!(&mut manifest, "  \"build_metadata\": {metadata},").unwrap();
     writeln!(&mut manifest, "  \"compiler_flags\": [").unwrap();
     for (index, flag) in common_flags.iter().enumerate() {
@@ -326,6 +332,9 @@ fn write_identity(
     let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags, &metadata);
     let abi_id = digest(format!("DOOM-EX2-ABI-ID\0{ABI_DESCRIPTOR}").as_bytes());
     let sbf_abi_id = digest(format!("DOOM-E2S-ABI-ID\0{SBF_ABI_DESCRIPTOR}").as_bytes());
+    let resource_sbf_abi_id = digest(
+        format!("DOOM-E2R-ABI-ID\0{RESOURCE_SBF_ABI_DESCRIPTOR}").as_bytes(),
+    );
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
     let image_id = digest(&image_input);
@@ -336,11 +345,16 @@ fn write_identity(
         "pub const IMAGE_ID: [u8; 32] = [{}];\n\
          pub const ABI_ID: [u8; 32] = [{}];\n\
          pub const SBF_ABI_ID: [u8; 32] = [{}];\n\
+         pub const RESOURCE_SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const SOURCE_MANIFEST_SHA256: &str = \"{manifest_id}\";\n\
          pub const ABI_DESCRIPTOR: &str = {ABI_DESCRIPTOR:?};\n\
          pub const SBF_ABI_DESCRIPTOR: &str = {SBF_ABI_DESCRIPTOR:?};\n\
+         pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_SBF_ABI_DESCRIPTOR:?};\n\
          pub const BUILD_SOURCE_MANIFEST: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/doom_ex2_source_manifest.json\"));\n",
-        rust_array(&image_id), rust_array(&abi_id), rust_array(&sbf_abi_id),
+        rust_array(&image_id),
+        rust_array(&abi_id),
+        rust_array(&sbf_abi_id),
+        rust_array(&resource_sbf_abi_id),
     );
     fs::write(out_dir.join("doom_ex2_build_identity.rs"), generated)
         .expect("write Doom EX2 build identity");
@@ -384,6 +398,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_sbf_ctx.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_engine.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_ex2.c");
+    println!("cargo:rerun-if-changed=src/doom_sbf_resource.c");
+    println!("cargo:rerun-if-changed=src/doom_resource.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
     let out_dir =
@@ -724,7 +740,8 @@ fn compile_ctx_engine(target: &str) {
             .file(state)
             .file(controller)
             .file(manifest.join("src/doom_sbf_account_pool.c"))
-            .file(manifest.join("src/doom_sbf_ex2.c"));
+            .file(manifest.join("src/doom_sbf_ex2.c"))
+            .file(manifest.join("src/doom_sbf_resource.c"));
         if diagnostic_profile {
             codec.define("DOOM_SBF_PHASE_PROFILE", None);
         }
@@ -750,6 +767,7 @@ fn compile_ctx_engine(target: &str) {
             .file(tree.join("headless/doom_state.c"))
             .file(tree.join("headless/doom_controller.c"))
             .file(manifest.join("src/doom_sbf_ex2.c"))
+            .file(manifest.join("src/doom_sbf_resource.c"))
             .file(manifest.join("src/doom_resource.c"));
         native.compile("doom_engine_ex2_native");
     }

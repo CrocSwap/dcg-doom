@@ -33,6 +33,9 @@ extern void R_ExecuteSetViewSize(void);
 extern int doom_engine_ex2_make_wad(
     const unsigned char *const accounts[5], const unsigned long lens[5],
     uint8_t **out, size_t *out_bytes, uint8_t hash[32]);
+extern int doom_engine_ex2_fill_mirror(
+    uint8_t *out, const uint8_t *wad, size_t wad_bytes,
+    const uint8_t wad_hash[32]);
 
 #define RI_MAGIC "DOOM-RI1"
 #define RI_VERSION 1u
@@ -367,17 +370,18 @@ int doom_resource_import_tic(
     const unsigned char *mirror, unsigned long mirror_len,
     const unsigned char *controller, unsigned long controller_len,
     unsigned char *state_out, unsigned long state_cap, unsigned long *state_out_len,
+    unsigned char *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
     unsigned char *frame_out, unsigned long frame_cap, unsigned long *frame_out_len,
     unsigned char *image_out, unsigned long image_cap, unsigned long *image_out_len,
     unsigned long *graph_anchor, unsigned long *mutation_count)
 {
-    ri_section_t sections[RI_MAX_SECTIONS];uint8_t *wad=0,*carrier=0,*canonical=0,*encoded=0;size_t wad_bytes=0,canonical_bytes=0,encoded_bytes=0;uint8_t hash[32];uintptr_t anchor=0;uint32_t tic;int rc,lump,demo_len;uint8_t *demo;
+    ri_section_t sections[RI_MAX_SECTIONS];uint8_t *wad=0,*carrier=0,*canonical=0,*encoded=0,*derived=0;size_t wad_bytes=0,canonical_bytes=0,encoded_bytes=0;uint8_t hash[32];uintptr_t anchor=0;uint32_t tic;int rc,lump,demo_len;uint8_t *demo;
     if(mutation_count)*mutation_count=0;
     /* This is intentionally first: an invalid section offset cannot reset
      * context state, allocate an engine graph, or write an output buffer. */
     if(ri_validate(image,image_len,sections))return 240;
     if(!state||state_len<64||state_len>RI_STATE_MAX||memcmp(state,"DOOM-ST1",8)||ri_u32(state+16)!=state_len||!ri_mirror_ok(mirror,mirror_len)||!controller||controller_len!=64||memcmp(controller,"DOOM-CI2",8)||ri_u32(controller+20)!=ri_u32(state+20))return 232;
-    if(!state_out||!frame_out||!image_out||!state_out_len||!frame_out_len||state_cap<RI_STATE_MAX||frame_cap<RI_FRAME_BYTES||image_cap<image_len)return 238;
+    if(!state_out||!mirror_out||!frame_out||!image_out||!state_out_len||!mirror_out_len||!frame_out_len||state_cap<RI_STATE_MAX||mirror_cap<RI_MIRROR_BYTES||frame_cap<RI_FRAME_BYTES||image_cap<image_len)return 238;
     if(doom_engine_ex2_make_wad(wad_accounts,wad_lens,&wad,&wad_bytes,hash)||memcmp(hash,image+116,32)){free(wad);return 234;}
     if(ri_setup_engine(wad,wad_bytes,&carrier)){free(carrier);free(wad);return 234;}
     if(ri_copy_graph(image,sections,&anchor)){free(carrier);free(wad);return 234;}
@@ -385,6 +389,8 @@ int doom_resource_import_tic(
     if(ri_encode_graph(&canonical,&canonical_bytes,&anchor)||canonical_bytes!=image_len||memcmp(canonical,image,image_len)){free(canonical);free(carrier);free(wad);return 241;}
     lump=W_GetNumForName("DEMO1");demo_len=W_LumpLength(lump);if(demo_len<17){free(canonical);free(carrier);free(wad);return 234;}demo=(uint8_t*)W_CacheLumpNum(lump,PU_STATIC);DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len);tic=ri_u32(state+20);if(DoomStateDecode(state,state_len)||DoomControllerArmV2(controller+24)||DoomControllerValidateCapturedDemoCursor(demo_p)){free(canonical);free(carrier);free(wad);return 232;}
     G_Ticker();R_RenderPlayerView(&players[displayplayer]);gametic++;
-    if(DoomStateEncode(&encoded,&encoded_bytes)||encoded_bytes>state_cap||encoded_bytes<64||!screens[0]){free(encoded);free(canonical);free(carrier);free(wad);return 238;}
-    memcpy(state_out,encoded,encoded_bytes);memcpy(frame_out,screens[0],RI_FRAME_BYTES);memcpy(image_out,canonical,canonical_bytes);*state_out_len=(unsigned long)encoded_bytes;*frame_out_len=RI_FRAME_BYTES;*image_out_len=(unsigned long)canonical_bytes;if(graph_anchor)*graph_anchor=(unsigned long)anchor;DoomStateFree(encoded);free(canonical);free(carrier);free(wad);(void)tic;return 0;
+    derived=(uint8_t *)malloc(RI_MIRROR_BYTES);
+    if(!derived || doom_engine_ex2_fill_mirror(derived,wad,wad_bytes,hash)){free(derived);free(encoded);free(canonical);free(carrier);free(wad);return 233;}
+    if(DoomStateEncode(&encoded,&encoded_bytes)||encoded_bytes>state_cap||encoded_bytes<64||!screens[0]){free(derived);free(encoded);free(canonical);free(carrier);free(wad);return 238;}
+    memcpy(state_out,encoded,encoded_bytes);memcpy(mirror_out,derived,RI_MIRROR_BYTES);memcpy(frame_out,screens[0],RI_FRAME_BYTES);memcpy(image_out,canonical,canonical_bytes);*state_out_len=(unsigned long)encoded_bytes;*mirror_out_len=RI_MIRROR_BYTES;*frame_out_len=RI_FRAME_BYTES;*image_out_len=(unsigned long)canonical_bytes;if(graph_anchor)*graph_anchor=(unsigned long)anchor;DoomStateFree(encoded);free(derived);free(canonical);free(carrier);free(wad);(void)tic;return 0;
 }

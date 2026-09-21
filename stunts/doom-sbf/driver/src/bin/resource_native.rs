@@ -62,7 +62,9 @@ fn wad_accounts(capture: &Path) -> Result<[Vec<u8>; 5], Box<dyn Error>> {
         }
         let length = u32_at(&account, 24) as usize;
         if length > WAD_PAYLOAD_BYTES
-            || account[WAD_HEADER_BYTES + length..].iter().any(|&byte| byte != 0)
+            || account[WAD_HEADER_BYTES + length..]
+                .iter()
+                .any(|&byte| byte != 0)
         {
             return Err(format!("WAD account {} has invalid padding", path.display()).into());
         }
@@ -78,7 +80,11 @@ fn capture_inputs(
     controller_path: &Path,
 ) -> Result<([Vec<u8>; 5], Vec<u8>, Vec<u8>, Vec<u8>), Box<dyn Error>> {
     if !capture.join("account/manifest.json").is_file() {
-        return Err(format!("missing retained account manifest under {}", capture.display()).into());
+        return Err(format!(
+            "missing retained account manifest under {}",
+            capture.display()
+        )
+        .into());
     }
     let accounts = wad_accounts(capture)?;
     let state = read(&capture.join("dumped-doom-st1.bin"))?;
@@ -113,7 +119,11 @@ fn capture_inputs(
 }
 
 fn child_args(mode: &str, capture: &Path, receipt: &Path, rest: &[&Path]) -> Vec<String> {
-    let mut args = vec![mode.to_owned(), capture.display().to_string(), receipt.display().to_string()];
+    let mut args = vec![
+        mode.to_owned(),
+        capture.display().to_string(),
+        receipt.display().to_string(),
+    ];
     args.extend(rest.iter().map(|path| path.display().to_string()));
     args
 }
@@ -153,16 +163,22 @@ fn import_child(capture: &Path, receipt: &Path, image_path: &Path) -> Result<(),
     let imported = resource::import_tic(refs, &image, &state, &mirror, &controller)
         .map_err(|rc| format!("RI1 importer refused with {rc}"))?;
     write(&receipt.join("import-state.st1"), &imported.state)?;
+    write(&receipt.join("import-mirror.mp1"), &imported.mirror)?;
     write(&receipt.join("import-frame.fb1"), &imported.frame)?;
-    write(&receipt.join("resource-image-reencoded.ri1"), &imported.canonical_image)?;
+    write(
+        &receipt.join("resource-image-reencoded.ri1"),
+        &imported.canonical_image,
+    )?;
     write(
         &receipt.join("import.json"),
         format!(
-            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"state_bytes\": {},\n  \"state_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\",\n  \"canonical_image_sha256\": \"{}\"\n}}\n",
+            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"state_bytes\": {},\n  \"state_sha256\": \"{}\",\n  \"mirror_bytes\": {},\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\",\n  \"canonical_image_sha256\": \"{}\"\n}}\n",
             std::process::id(),
             imported.graph_anchor,
             imported.state.len(),
             sha256(&imported.state),
+            imported.mirror.len(),
+            sha256(&imported.mirror),
             sha256(&imported.frame),
             sha256(&imported.canonical_image),
         )
@@ -171,14 +187,20 @@ fn import_child(capture: &Path, receipt: &Path, image_path: &Path) -> Result<(),
     Ok(())
 }
 
-fn malformed_child(capture: &Path, receipt: &Path, image_path: &Path) -> Result<(), Box<dyn Error>> {
+fn malformed_child(
+    capture: &Path,
+    receipt: &Path,
+    image_path: &Path,
+) -> Result<(), Box<dyn Error>> {
     let controller_path = receipt.join("controller.bin");
     let (accounts, state, mirror, controller) = capture_inputs(capture, &controller_path)?;
     let image = read(image_path)?;
     let refs = std::array::from_fn(|index| accounts[index].as_slice());
     let result = resource::import_tic(refs, &image, &state, &mirror, &controller);
     if !matches!(result, Err(240)) {
-        return Err(format!("malformed offset did not refuse with RI1 code 240: {result:?}").into());
+        return Err(
+            format!("malformed offset did not refuse with RI1 code 240: {result:?}").into(),
+        );
     }
     write(
         &receipt.join("malformed.json"),
@@ -197,7 +219,9 @@ fn ex2_frame(bytes: &[u8]) -> Result<&[u8], Box<dyn Error>> {
     }
     let offset = u32_at(bytes, 120) as usize;
     let length = u32_at(bytes, 124) as usize;
-    let end = offset.checked_add(length).ok_or("oracle frame range overflow")?;
+    let end = offset
+        .checked_add(length)
+        .ok_or("oracle frame range overflow")?;
     if length != resource::FRAME_BYTES || end > bytes.len() {
         return Err("retained native oracle has no full framebuffer".into());
     }
@@ -245,7 +269,10 @@ fn run_gate(
         &child_args("malformed", &capture, receipt, &[&malformed]),
     )?;
 
-    run_child(&exe, &child_args("import", &capture, receipt, &[&image_path]))?;
+    run_child(
+        &exe,
+        &child_args("import", &capture, receipt, &[&image_path]),
+    )?;
     let import_pid = parse_meta(&receipt.join("import.json"), "pid")?;
     let import_anchor = parse_meta(&receipt.join("import.json"), "graph_anchor")?;
     if encode_pid == import_pid {
@@ -310,7 +337,13 @@ fn main() -> ExitCode {
                 if args.next().is_some() {
                     return Err("too many arguments".into());
                 }
-                run_gate(&capture, &controller, &oracle_state, &oracle_output, &receipt)
+                run_gate(
+                    &capture,
+                    &controller,
+                    &oracle_state,
+                    &oracle_output,
+                    &receipt,
+                )
             }
             "encode" | "import" | "malformed" => {
                 let capture = PathBuf::from(args.next().ok_or("missing capture")?);
