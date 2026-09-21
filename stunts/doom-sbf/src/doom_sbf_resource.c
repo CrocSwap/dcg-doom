@@ -245,14 +245,14 @@ static int e2r_mirror_shape(const uint8_t *mirror, size_t bytes, const uint8_t w
     return mirror && bytes==RI_MIRROR_BYTES && !memcmp(mirror,"DOOM-MP1",8) &&
         e2r_u32(mirror+8)==1 && e2r_u32(mirror+12)==4096 && e2r_u32(mirror+16)==RI_MIRROR_BYTES &&
         e2r_u32(mirror+20)==160 && e2r_u32(mirror+24)==384 && e2r_u32(mirror+28)<=384 &&
-        !e2r_zero(mirror+68,4096-68) && !memcmp(mirror+36,wad_hash,32);
+        e2r_zero(mirror+68,4096-68) && !memcmp(mirror+36,wad_hash,32);
 }
 
 static int e2r_controller_shape(const uint8_t *controller, size_t bytes, uint32_t expected_tic)
 {
     return controller && bytes==64 && !memcmp(controller,"DOOM-CI2",8) && e2r_u32(controller+8)==1 &&
         e2r_u32(controller+12)==28 && e2r_u32(controller+16)==64 && e2r_u32(controller+20)==expected_tic &&
-        !e2r_zero(controller+28,36);
+        e2r_zero(controller+28,36);
 }
 
 int doom_engine_ex2_resource_sbf_tic_entry(
