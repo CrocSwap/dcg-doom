@@ -476,6 +476,163 @@ async fn same_key_wad_payload_control(
     Ok(())
 }
 
+/// Mutate one captured input in a fresh bank, then exercise the real SBF
+/// validation path. The mutation is installed before the transaction, so a
+/// successful control proves both the expected refusal and that the failed
+/// transaction did not rewrite any durable account.
+async fn mutated_input_refusal_control(
+    label: &str,
+    target: Pubkey,
+    mutate: fn(&mut Vec<u8>),
+    expected: &str,
+    resource: &[u8],
+    bad_resource: &[u8],
+    wad: &[Vec<u8>],
+    state: &[u8],
+    bad_state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    bad_controller: &[u8],
+    bad_controller_key: &[u8],
+    authority: &solana_keypair::Keypair,
+    compute_limit: u32,
+) -> Result<(), Box<dyn Error>> {
+    let (mut context, continuation) = start_prepared(
+        resource,
+        bad_resource,
+        wad,
+        state,
+        bad_state,
+        mirror,
+        controller,
+        bad_controller,
+        bad_controller_key,
+        authority,
+        compute_limit,
+    )
+    .await?;
+    let before_cont = account_data(&context.banks_client, continuation.pubkey()).await?;
+    let before_state = account_data(&context.banks_client, STATE).await?;
+    let before_mirror = account_data(&context.banks_client, MIRROR).await?;
+    let before_frame = account_data(&context.banks_client, FRAME).await?;
+    let mut changed = account_data(&context.banks_client, target).await?;
+    mutate(&mut changed);
+    context.set_account(&target, &AccountSharedData::from(account(changed.clone())));
+    let refusal = execute(
+        &mut context.banks_client,
+        &context.payer,
+        authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation.pubkey(),
+        Request {
+            operation: continuation_split_sbf::STEP,
+            state_len: u32_at(state, 16) as usize,
+            cursor: 1,
+            fault: 0,
+        },
+    )
+    .await?;
+    require_refusal(&refusal, expected)?;
+    let expected_cont = if target == continuation.pubkey() {
+        changed.clone()
+    } else {
+        before_cont.clone()
+    };
+    let expected_state = if target == STATE {
+        changed.clone()
+    } else {
+        before_state.clone()
+    };
+    let expected_mirror = if target == MIRROR {
+        changed.clone()
+    } else {
+        before_mirror.clone()
+    };
+    let expected_frame = if target == FRAME {
+        changed.clone()
+    } else {
+        before_frame.clone()
+    };
+    if account_data(&context.banks_client, continuation.pubkey()).await? != expected_cont
+        || account_data(&context.banks_client, STATE).await? != expected_state
+        || account_data(&context.banks_client, MIRROR).await? != expected_mirror
+        || account_data(&context.banks_client, FRAME).await? != expected_frame
+    {
+        return Err(format!("{label} refusal did not preserve durable state").into());
+    }
+    Ok(())
+}
+
+/// Flip a committed continuation header byte in a fresh, captured-input bank.
+/// The component commitment check must refuse with the header-authentication
+/// error before any engine phase runs.
+async fn continuation_header_mutation_control(
+    resource: &[u8],
+    bad_resource: &[u8],
+    wad: &[Vec<u8>],
+    state: &[u8],
+    bad_state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    bad_controller: &[u8],
+    bad_controller_key: &[u8],
+    authority: &solana_keypair::Keypair,
+    compute_limit: u32,
+) -> Result<(), Box<dyn Error>> {
+    let (mut context, continuation) = start_prepared(
+        resource,
+        bad_resource,
+        wad,
+        state,
+        bad_state,
+        mirror,
+        controller,
+        bad_controller,
+        bad_controller_key,
+        authority,
+        compute_limit,
+    )
+    .await?;
+    let before_state = account_data(&context.banks_client, STATE).await?;
+    let before_mirror = account_data(&context.banks_client, MIRROR).await?;
+    let before_frame = account_data(&context.banks_client, FRAME).await?;
+    let mut changed = account_data(&context.banks_client, continuation.pubkey()).await?;
+    changed[continuation_split_sbf::HEADER_STATE_HASH_OFFSET] ^= 1;
+    context.set_account(
+        &continuation.pubkey(),
+        &AccountSharedData::from(account(changed.clone())),
+    );
+    let refusal = execute(
+        &mut context.banks_client,
+        &context.payer,
+        authority,
+        compute_limit,
+        RESOURCE,
+        STATE,
+        CONTROLLER,
+        continuation.pubkey(),
+        Request {
+            operation: continuation_split_sbf::STEP,
+            state_len: u32_at(state, 16) as usize,
+            cursor: 1,
+            fault: 0,
+        },
+    )
+    .await?;
+    require_refusal(&refusal, "Custom(242)")?;
+    if account_data(&context.banks_client, continuation.pubkey()).await? != changed
+        || account_data(&context.banks_client, STATE).await? != before_state
+        || account_data(&context.banks_client, MIRROR).await? != before_mirror
+        || account_data(&context.banks_client, FRAME).await? != before_frame
+    {
+        return Err("continuation component mutation refusal did not preserve durable state".into());
+    }
+    Ok(())
+}
+
 fn failure_text(result: &BanksTransactionResultWithMetadata) -> String {
     format!("{:?}", result.result)
 }
@@ -681,6 +838,88 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     same_key_wad_payload_control(
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
+    for (label, mutate) in [
+        ("frame_first_nonzero", (|bytes: &mut Vec<u8>| bytes[0] = 1) as fn(&mut Vec<u8>)),
+        (
+            "frame_middle_nonzero",
+            (|bytes: &mut Vec<u8>| bytes[continuation_split_sbf::FRAME_BYTES / 2] = 1)
+                as fn(&mut Vec<u8>),
+        ),
+        (
+            "frame_last_nonzero",
+            (|bytes: &mut Vec<u8>| bytes[continuation_split_sbf::FRAME_BYTES - 1] = 1)
+                as fn(&mut Vec<u8>),
+        ),
+    ] {
+        mutated_input_refusal_control(
+            label,
+            FRAME,
+            mutate,
+            "InvalidAccountData",
+            &resource,
+            &resource,
+            &wad,
+            &state,
+            &bad_state,
+            &mirror,
+            &controller,
+            &bad_controller,
+            &controller,
+            &authority,
+            compute_limit,
+        )
+        .await?;
+    }
+    mutated_input_refusal_control(
+        "mirror_tail_nonzero",
+        MIRROR,
+        |bytes| bytes[continuation_split_sbf::MIRROR_BYTES - 1] = 1,
+        "InvalidAccountData",
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
+    mutated_input_refusal_control(
+        "checkpoint_component_mutation",
+        CONTEXT,
+        |bytes| bytes[continuation_split_sbf::CONTEXT_CHECKPOINT_OFFSET + 96] ^= 1,
+        "Custom(242)",
+        &resource,
+        &resource,
+        &wad,
+        &state,
+        &bad_state,
+        &mirror,
+        &controller,
+        &bad_controller,
+        &controller,
+        &authority,
+        compute_limit,
+    )
+    .await?;
+    continuation_header_mutation_control(
         &resource,
         &resource,
         &wad,
@@ -1015,6 +1254,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
   "same_key_ri2": {"refused": true, "code": "Custom(242)", "outputs_preserved": true},
   "same_key_ci2": {"refused": true, "code": "Custom(242)", "outputs_preserved": true},
   "malformed_ci2": {"refused": true, "code": "InvalidAccountData", "outputs_preserved": true},
+  "frame_first_nonzero": {"refused": true, "code": "InvalidAccountData", "input_preserved": true},
+  "frame_middle_nonzero": {"refused": true, "code": "InvalidAccountData", "input_preserved": true},
+  "frame_last_nonzero": {"refused": true, "code": "InvalidAccountData", "input_preserved": true},
+  "mirror_tail_nonzero": {"refused": true, "code": "InvalidAccountData", "input_preserved": true},
+  "checkpoint_component_mutation": {"refused": true, "code": "Custom(242)", "continuation_preserved": true},
+  "continuation_state_hash_mutation": {"refused": true, "code": "Custom(242)", "continuation_preserved": true},
   "moved_context": {"refused": true, "code": "Custom(199)"},
   "same_key_wad_payload": {"accepted": true, "content_bound": false},
   "same_key_wad_header": {"refused": true, "code": "InvalidAccountData", "continuation_preserved": true},
@@ -1022,7 +1267,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 "#,
     )?;
-    fs::write(receipt.join("identity.json"), format!("{{\n  \"profile\": \"DOOM-E2R/4-BOUNDED-SPLIT\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"prepare_units\": {},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"oracle_equal\": true,\n  \"oracle_scope\": \"source-matched native pre-tic reconstruction; tic/render open\",\n  \"wad_payload_content_bound\": false,\n  \"tic_render\": \"not-run; split stops after pre-tic decode/encode\"\n}}\n", json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), prepare_units, phase_units, phase_high_water, injected_finalize_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS))?;
+fs::write(receipt.join("identity.json"), format!("{{\n  \"profile\": \"DOOM-E2R/4-BOUNDED-SPLIT\",\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"driver_sha256\": {},\n  \"continuation_abi_id\": {},\n  \"checkpoint_magic\": {},\n  \"checkpoint_version\": {},\n  \"zero_proof\": \"first-byte-zero-plus-overlapping-shift-sol_memcmp\",\n  \"ri2_source_abi_id\": {},\n  \"resource_sha256\": {},\n  \"wad_sha256\": {},\n  \"prepare_units\": {},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"oracle_equal\": true,\n  \"oracle_scope\": \"source-matched native pre-tic reconstruction; tic/render open\",\n  \"wad_payload_content_bound\": false,\n  \"tic_render\": \"not-run; split stops after pre-tic decode/encode\"\n}}\n", json(&expected_image), json(&expected_manifest), json(&expected_driver), json(&abi), json("DOOM-CT5"), continuation_split_sbf::CHECKPOINT_VERSION, json(&sha(&resource_sbf::RI2_ABI_ID)), json(&sha(&resource)), json(WAD_CONCAT_SHA256), prepare_units, phase_units, phase_high_water, injected_finalize_units, NORMAL_LIMIT, QUALIFICATION_MAX_UNITS))?;
     fs::write(receipt.join("run.json"), format!("{{\n  \"compute_limit\": {compute_limit},\n  \"prepare_units\": {prepare_units},\n  \"phase_units\": {:?},\n  \"phase_high_water\": {:?},\n  \"injected_finalizer_units\": {injected_finalize_units},\n  \"qualification\": {qualification},\n  \"separate_transactions\": true\n}}\n", phase_units, phase_high_water))?;
     println!("DOOM-E2R/4 bounded split passed: prepare_cu={prepare_units} phase_cu={phase_units:?} qualification={qualification} receipt={}", receipt.display());
     Ok(())

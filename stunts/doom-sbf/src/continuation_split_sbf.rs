@@ -22,7 +22,7 @@ pub const VERSION: u32 = 4;
 pub const PREPARE: u8 = 5;
 pub const STEP: u8 = 6;
 pub const INSTRUCTION_BYTES: usize = 32;
-pub const ABI_DESCRIPTOR: &str = "DOOM-E2R/4|instruction=32|operations=PREPARE/5+STEP/6|accounts=13|continuation=262144|payload=ST1+MP1+CI2+FB1|relocations=typed-offsets|context=DOOM-CT4-pinned-live-engine|phases=setup-part1+setup-part2+decode+finalize|fault=byte24-cursor7-only";
+pub const ABI_DESCRIPTOR: &str = "DOOM-E2R/4|instruction=32|operations=PREPARE/5+STEP/6|accounts=13|continuation=262144|payload=ST1+MP1+CI2+FB1|relocations=typed-offsets|context=DOOM-CT4-pinned-live-engine|checkpoint=DOOM-CT5/v5|component-commitment=checkpoint-tail-96..128|phases=setup-part1+setup-part2+decode+finalize|fault=byte24-cursor7-only";
 
 pub const CONTINUATION_ACCOUNT: usize = 11;
 pub const AUTHORITY_ACCOUNT: usize = 12;
@@ -44,6 +44,13 @@ pub const CONTEXT_CHECKPOINT_OFFSET: usize = resource_sbf::CONTEXT_BYTES - 128;
 pub const CONTEXT_CHECKPOINT_BYTES: usize = 128;
 const SPLIT_PLAN_RESERVE: usize = 256 * 1024;
 const ACTIVE_ARENA_BYTES: usize = resource_sbf::BOOTSTRAP_BYTES - SPLIT_PLAN_RESERVE;
+// CT5 occupies the existing checkpoint tail. The RI2 plan still exactly
+// fills its 256 KiB reserve; its current table ids stop before the
+// checkpoint-overlaid table_bytes[32..64]. Future plan/table growth must
+// reject any id or allocation that reaches this tail rather than silently
+// aliasing durable checkpoint bytes.
+pub const CHECKPOINT_MAGIC: &[u8; 8] = b"DOOM-CT5";
+pub const CHECKPOINT_VERSION: u32 = 5;
 
 const PHASE_PREPARED: u32 = 1;
 const PHASE_PREFLIGHT: u32 = 2;
@@ -94,6 +101,8 @@ const H_ACCOUNT_SET: usize = 424;
 const H_AUTHORITY: usize = 456;
 const H_CONTEXT_ROOT: usize = 488;
 const H_SOURCE_ABI: usize = 520;
+pub const HEADER_STATE_HASH_OFFSET: usize = H_STATE_HASH;
+pub const HEADER_FRAME_HASH_OFFSET: usize = H_FRAME_HASH;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Request {
@@ -163,6 +172,17 @@ fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
 #[inline(always)]
 fn same_bytes(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len() && sol_memcmp(left, right, left.len()) == 0
+}
+
+/// Prove that a non-empty byte slice is all zero without charging a bytewise
+/// iterator scan. Every byte equals its predecessor, and the first byte is
+/// explicitly zero. The two shift operands intentionally overlap; this is a
+/// read-only comparison and is the loader's exact `sol_memcmp` contract.
+#[inline(always)]
+fn exact_zero(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes[0] == 0
+        && sol_memcmp(&bytes[1..], &bytes[..bytes.len() - 1], bytes.len() - 1) == 0
 }
 
 fn account_set_hash(program: &Pubkey, accounts: &[AccountInfo]) -> [u8; 32] {
@@ -311,7 +331,7 @@ fn validate_mirror(mirror: &[u8]) -> ProgramResult {
         || u32_at(mirror, 20) != 160
         || u32_at(mirror, 24) != 384
         || u32_at(mirror, 28) > 384
-        || mirror[68..4096].iter().any(|&byte| byte != 0)
+        || !exact_zero(&mirror[68..4096])
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -427,8 +447,8 @@ fn fill_checkpoint(
     let checkpoint = &mut context
         [CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES];
     checkpoint.fill(0);
-    checkpoint[..8].copy_from_slice(b"DOOM-CT4");
-    put_u32(checkpoint, 8, VERSION);
+    checkpoint[..8].copy_from_slice(CHECKPOINT_MAGIC);
+    put_u32(checkpoint, 8, CHECKPOINT_VERSION);
     put_u32(checkpoint, 12, phase);
     put_u32(checkpoint, 16, cursor);
     set_hash(checkpoint, 20, state_root);
@@ -445,12 +465,14 @@ fn check_checkpoint(
     cursor: u32,
     state_root: &[u8; 32],
     accounts_root: &[u8; 32],
-    components_commitment: &[u8; 32],
 ) -> ProgramResult {
     let checkpoint =
         &context[CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES];
-    if &checkpoint[..8] != b"DOOM-CT4"
-        || u32_at(checkpoint, 8) != VERSION
+    // The component commitment is authenticated by validate_header before
+    // this structural checkpoint check; comparing it to the same checkpoint
+    // bytes here would be tautological.
+    if &checkpoint[..8] != CHECKPOINT_MAGIC
+        || u32_at(checkpoint, 8) != CHECKPOINT_VERSION
         || u32_at(checkpoint, 12) != phase
         || u32_at(checkpoint, 16) != cursor
         || u32_at(checkpoint, 84) != 0
@@ -458,7 +480,6 @@ fn check_checkpoint(
         || u32_at(checkpoint, 92) as usize > ACTIVE_ARENA_BYTES
         || &checkpoint[20..52] != state_root
         || &checkpoint[52..84] != accounts_root
-        || &checkpoint[96..128] != components_commitment
     {
         return Err(ProgramError::Custom(241));
     }
@@ -468,8 +489,8 @@ fn check_checkpoint(
 fn check_checkpoint_order(context: &[u8], phase: u32, cursor: u32) -> ProgramResult {
     let checkpoint =
         &context[CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES];
-    if &checkpoint[..8] != b"DOOM-CT4"
-        || u32_at(checkpoint, 8) != VERSION
+    if &checkpoint[..8] != CHECKPOINT_MAGIC
+        || u32_at(checkpoint, 8) != CHECKPOINT_VERSION
         || u32_at(checkpoint, 12) != phase
         || u32_at(checkpoint, 16) != cursor
         || u32_at(checkpoint, 84) != 0
@@ -671,7 +692,7 @@ fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request)
     validate_state(&state, request.state_len)?;
     validate_mirror(&mirror)?;
     validate_controller(&controller, u32_at(&state, 20))?;
-    if frame.iter().any(|&byte| byte != 0) {
+    if !exact_zero(&frame) {
         return Err(ProgramError::InvalidAccountData);
     }
     let root = root_hash(&state, &mirror, &controller, &frame);
@@ -1054,7 +1075,8 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
     validate_state(&state, request.state_len)?;
     validate_mirror(&mirror)?;
     validate_controller(&controller, u32_at(&state, 20))?;
-    if frame.iter().any(|&byte| byte != 0) {
+    crate::diagnostic_phase(7031); // framecheck: committed-source zero-proof boundary
+    if !exact_zero(&frame) {
         return Err(ProgramError::InvalidAccountData);
     }
     crate::diagnostic_phase(704);
@@ -1106,7 +1128,6 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
         expected_phase,
         &expected_root,
         &accounts_root,
-        &components_commitment,
     )?;
     crate::diagnostic_phase(707);
     drop(frame);
