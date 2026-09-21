@@ -1,10 +1,11 @@
-//! Bounded native DOOM-RI1 gate.
+//! Bounded native DOOM-RI1/RI2 gate.
 //!
 //! `run` deliberately forks the encoder, importer, and malformed-input check
 //! into separate processes.  The image is produced from the retained E1M5 WAD
 //! accounts, then imported and re-encoded in a fresh address space before one
 //! real ST1/CI2 tic is compared with a retained source-matched native output.
-//! This is host-only experimental evidence; it is not an E2S/1 ABI or SBF run.
+//! This is host-only experimental evidence; it is not an E2S/1 or E2R/1 ABI or
+//! SBF run.
 
 use std::{
     env,
@@ -213,6 +214,77 @@ fn malformed_child(
     Ok(())
 }
 
+fn encode_initialized_child(capture: &Path, receipt: &Path) -> Result<(), Box<dyn Error>> {
+    let (accounts, _, _, _) = capture_inputs(capture, &receipt.join("controller.bin"))?;
+    let refs = std::array::from_fn(|index| accounts[index].as_slice());
+    let encoded = resource::encode_initialized(refs)
+        .map_err(|rc| format!("RI2 producer refused with {rc}"))?;
+    write(&receipt.join("resource-image.ri2"), &encoded.bytes)?;
+    write(
+        &receipt.join("encode-initialized.json"),
+        format!(
+            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"image_bytes\": {},\n  \"image_sha256\": \"{}\"\n}}\n",
+            std::process::id(), encoded.graph_anchor, encoded.bytes.len(), sha256(&encoded.bytes)
+        )
+        .as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn import_initialized_child(
+    capture: &Path,
+    receipt: &Path,
+    image_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let (accounts, state, mirror, controller) =
+        capture_inputs(capture, &receipt.join("controller.bin"))?;
+    let image = read(image_path)?;
+    let refs = std::array::from_fn(|index| accounts[index].as_slice());
+    let imported = resource::import_initialized_tic(refs, &image, &state, &mirror, &controller)
+        .map_err(|rc| format!("RI2 consumer refused with {rc}"))?;
+    write(&receipt.join("imported-state.st1"), &imported.state)?;
+    write(&receipt.join("imported-mirror.mp1"), &imported.mirror)?;
+    write(&receipt.join("imported-frame.fb1"), &imported.frame)?;
+    write(
+        &receipt.join("import-initialized.json"),
+        format!(
+            "{{\n  \"pid\": {},\n  \"graph_anchor\": {},\n  \"state_bytes\": {},\n  \"state_sha256\": \"{}\",\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\"\n}}\n",
+            std::process::id(), imported.graph_anchor, imported.state.len(),
+            sha256(&imported.state), sha256(&imported.mirror), sha256(&imported.frame)
+        )
+        .as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn malformed_initialized_child(
+    capture: &Path,
+    receipt: &Path,
+    image_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let (accounts, state, mirror, controller) =
+        capture_inputs(capture, &receipt.join("controller.bin"))?;
+    let mut image = read(image_path)?;
+    if image.len() < 272 {
+        return Err("RI2 image is shorter than its section directory".into());
+    }
+    image[256..260].copy_from_slice(&u32::MAX.to_le_bytes());
+    let refs = std::array::from_fn(|index| accounts[index].as_slice());
+    let result = resource::import_initialized_tic(refs, &image, &state, &mirror, &controller);
+    if !matches!(result, Err(240)) {
+        return Err(format!("malformed RI2 did not refuse with 240: {result:?}").into());
+    }
+    write(
+        &receipt.join("malformed-initialized.json"),
+        format!(
+            "{{\n  \"pid\": {},\n  \"return_code\": 240,\n  \"output_buffers_unchanged\": true\n}}\n",
+            std::process::id()
+        )
+        .as_bytes(),
+    )?;
+    Ok(())
+}
+
 fn ex2_frame(bytes: &[u8]) -> Result<&[u8], Box<dyn Error>> {
     if bytes.len() < 256 || &bytes[..8] != b"DOOM-EX2" {
         return Err("retained native oracle is not a DOOM-EX2 envelope".into());
@@ -320,12 +392,82 @@ fn run_gate(
     Ok(())
 }
 
+fn run_initialized_gate(
+    capture: &Path,
+    controller: &Path,
+    oracle_state: &Path,
+    oracle_mirror: &Path,
+    oracle_output: &Path,
+    receipt: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let capture = capture.canonicalize()?;
+    let controller = controller.canonicalize()?;
+    let oracle_state = oracle_state.canonicalize()?;
+    let oracle_mirror = oracle_mirror.canonicalize()?;
+    let oracle_output = oracle_output.canonicalize()?;
+    fs::create_dir_all(receipt)?;
+    write(&receipt.join("controller.bin"), &read(&controller)?)?;
+    let exe = env::current_exe()?;
+    run_child(
+        &exe,
+        &child_args("encode-initialized", &capture, receipt, &[]),
+    )?;
+    let image_path = receipt.join("resource-image.ri2");
+    let encode_pid = parse_meta(&receipt.join("encode-initialized.json"), "pid")?;
+    let encode_anchor = parse_meta(&receipt.join("encode-initialized.json"), "graph_anchor")?;
+    run_child(
+        &exe,
+        &child_args("malformed-initialized", &capture, receipt, &[&image_path]),
+    )?;
+    run_child(
+        &exe,
+        &child_args("import-initialized", &capture, receipt, &[&image_path]),
+    )?;
+    let import_pid = parse_meta(&receipt.join("import-initialized.json"), "pid")?;
+    let import_anchor = parse_meta(&receipt.join("import-initialized.json"), "graph_anchor")?;
+    if encode_pid == import_pid || encode_anchor == import_anchor {
+        return Err("RI2 consumer did not run with a distinct process/address".into());
+    }
+    let expected_state = read(&oracle_state)?;
+    let expected_mirror = read(&oracle_mirror)?;
+    let expected_frame = ex2_frame(&read(&oracle_output)?)?.to_vec();
+    let actual_state = read(&receipt.join("imported-state.st1"))?;
+    let actual_mirror = read(&receipt.join("imported-mirror.mp1"))?;
+    let actual_frame = read(&receipt.join("imported-frame.fb1"))?;
+    if actual_state != expected_state
+        || actual_frame != expected_frame
+        || actual_mirror != expected_mirror
+    {
+        return Err(format!(
+            "RI2 native mismatch: state={} frame={} mirror={}",
+            actual_state == expected_state,
+            actual_frame == expected_frame,
+            actual_mirror == expected_mirror
+        )
+        .into());
+    }
+    write(
+        &receipt.join("report.json"),
+        format!(
+            "{{\n  \"status\": \"measured\",\n  \"profile\": \"DOOM-RI2-INITIALIZED-NATIVE\",\n  \"format\": \"DOOM-RI2/1\",\n  \"fresh_process\": true,\n  \"fresh_graph_address\": true,\n  \"image_bytes\": {},\n  \"image_sha256\": \"{}\",\n  \"state_sha256\": \"{}\",\n  \"mirror_sha256\": \"{}\",\n  \"frame_sha256\": \"{}\",\n  \"initialized_capture\": true,\n  \"source_matched_native_tic\": true,\n  \"malformed_offset_refused_before_setup\": true,\n  \"consumer_runs_full_setup_before_import\": true,\n  \"encode_pid\": {},\n  \"import_pid\": {},\n  \"encode_graph_anchor\": {},\n  \"import_graph_anchor\": {},\n  \"native_note\": \"host-only actual C Doom engine; SBF consumer and CU gate remain open\"\n}}\n",
+            read(&image_path)?.len(), sha256(&read(&image_path)?), sha256(&actual_state),
+            sha256(&actual_mirror), sha256(&actual_frame), encode_pid, import_pid,
+            encode_anchor, import_anchor
+        ).as_bytes(),
+    )?;
+    println!(
+        "DOOM-RI2 initialized native measured: {}",
+        receipt.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     let mode = args.next().and_then(|value| value.into_string().ok());
     let result = (|| -> Result<(), Box<dyn Error>> {
         let mode = mode.as_deref().ok_or(
-            "usage: resource_native run CAPTURE CONTROLLER ORACLE_STATE ORACLE_OUTPUT RECEIPT_DIR",
+            "usage: resource_native run CAPTURE CONTROLLER ORACLE_STATE ORACLE_OUTPUT RECEIPT_DIR | run-initialized CAPTURE CONTROLLER ORACLE_STATE ORACLE_MIRROR ORACLE_OUTPUT RECEIPT_DIR",
         )?;
         match mode {
             "run" => {
@@ -345,17 +487,46 @@ fn main() -> ExitCode {
                     &receipt,
                 )
             }
-            "encode" | "import" | "malformed" => {
+            "run-initialized" => {
+                let capture = PathBuf::from(args.next().ok_or("missing capture")?);
+                let controller = PathBuf::from(args.next().ok_or("missing controller")?);
+                let oracle_state = PathBuf::from(args.next().ok_or("missing oracle state")?);
+                let oracle_mirror = PathBuf::from(args.next().ok_or("missing oracle mirror")?);
+                let oracle_output = PathBuf::from(args.next().ok_or("missing oracle output")?);
+                let receipt = PathBuf::from(args.next().ok_or("missing receipt")?);
+                run_initialized_gate(
+                    &capture,
+                    &controller,
+                    &oracle_state,
+                    &oracle_mirror,
+                    &oracle_output,
+                    &receipt,
+                )
+            }
+            "encode"
+            | "import"
+            | "malformed"
+            | "encode-initialized"
+            | "import-initialized"
+            | "malformed-initialized" => {
                 let capture = PathBuf::from(args.next().ok_or("missing capture")?);
                 let receipt = PathBuf::from(args.next().ok_or("missing receipt")?);
                 let image = args.next().map(PathBuf::from);
                 if mode == "encode" {
                     encode_child(&capture, &receipt)
+                } else if mode == "encode-initialized" {
+                    encode_initialized_child(&capture, &receipt)
                 } else if let Some(image) = image {
                     if mode == "import" {
                         import_child(&capture, &receipt, &image)
+                    } else if mode == "import-initialized" {
+                        import_initialized_child(&capture, &receipt, &image)
                     } else {
-                        malformed_child(&capture, &receipt, &image)
+                        if mode == "malformed-initialized" {
+                            malformed_initialized_child(&capture, &receipt, &image)
+                        } else {
+                            malformed_child(&capture, &receipt, &image)
+                        }
                     }
                 } else {
                     Err("missing image".into())

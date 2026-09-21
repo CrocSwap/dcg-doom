@@ -27,6 +27,7 @@
 #include "doom_controller.h"
 
 extern int doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
+
 extern void R_ExecuteSetViewSize(void);
 
 /* The host EX2 bridge owns the retained account/WAD validator. */
@@ -393,4 +394,25 @@ int doom_resource_import_tic(
     if(!derived || doom_engine_ex2_fill_mirror(derived,wad,wad_bytes,hash)){free(derived);free(encoded);free(canonical);free(carrier);free(wad);return 233;}
     if(DoomStateEncode(&encoded,&encoded_bytes)||encoded_bytes>state_cap||encoded_bytes<64||!screens[0]){free(derived);free(encoded);free(canonical);free(carrier);free(wad);return 238;}
     memcpy(state_out,encoded,encoded_bytes);memcpy(mirror_out,derived,RI_MIRROR_BYTES);memcpy(frame_out,screens[0],RI_FRAME_BYTES);memcpy(image_out,canonical,canonical_bytes);*state_out_len=(unsigned long)encoded_bytes;*mirror_out_len=RI_MIRROR_BYTES;*frame_out_len=RI_FRAME_BYTES;*image_out_len=(unsigned long)canonical_bytes;if(graph_anchor)*graph_anchor=(unsigned long)anchor;DoomStateFree(encoded);free(derived);free(canonical);free(carrier);free(wad);(void)tic;return 0;
+}
+
+/* Narrow host-only adapters used by the additive RI2 capture module.  RI1
+ * remains the owner of the graph codec; RI2 never duplicates or reinterprets
+ * its section records. */
+int doom_resource_ri1_setup(const uint8_t *wad, size_t wad_bytes, uint8_t **carrier)
+{
+    return ri_setup_engine(wad, wad_bytes, carrier);
+}
+
+int doom_resource_ri1_encode_graph(uint8_t **out, size_t *out_bytes, uintptr_t *anchor)
+{
+    return ri_encode_graph(out, out_bytes, anchor);
+}
+
+int doom_resource_ri1_import_graph(const uint8_t *image, size_t image_bytes,
+                                   uintptr_t *anchor)
+{
+    ri_section_t sections[RI_MAX_SECTIONS];
+    if (ri_validate(image, image_bytes, sections)) return -1;
+    return ri_copy_graph(image, sections, anchor);
 }

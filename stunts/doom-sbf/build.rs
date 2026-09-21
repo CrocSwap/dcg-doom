@@ -400,6 +400,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_sbf_ex2.c");
     println!("cargo:rerun-if-changed=src/doom_sbf_resource.c");
     println!("cargo:rerun-if-changed=src/doom_resource.c");
+    println!("cargo:rerun-if-changed=src/doom_resource_ri2.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
     let out_dir =
@@ -871,7 +872,8 @@ fn compile_ctx_engine(target: &str) {
             .file(tree.join("headless/doom_controller.c"))
             .file(manifest.join("src/doom_sbf_ex2.c"))
             .file(manifest.join("src/doom_sbf_resource.c"))
-            .file(manifest.join("src/doom_resource.c"));
+            .file(manifest.join("src/doom_resource.c"))
+            .file(manifest.join("src/doom_resource_ri2.c"));
         native.compile("doom_engine_ex2_native");
     }
 }
