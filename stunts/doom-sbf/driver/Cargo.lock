@@ -1213,6 +1213,7 @@ dependencies = [
  "solana-program-test",
  "solana-pubkey",
  "solana-signer",
+ "solana-system-interface",
  "solana-transaction",
  "solana-transaction-error",
  "tokio",

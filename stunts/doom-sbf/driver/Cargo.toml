@@ -47,6 +47,10 @@ name = "resource_ri2_sbf"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "continuation_sbf"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "headless"
 
 [dependencies]
@@ -61,6 +65,7 @@ solana-keypair = "=2.2.3"
 solana-message = "=2.4.0"
 solana-pubkey = "=2.4.0"
 solana-signer = "=2.2.1"
+solana-system-interface = "=1.0.0"
 solana-transaction = "=2.2.3"
 solana-transaction-error = "=2.2.1"
 solana-banks-client = "=2.3.9"
