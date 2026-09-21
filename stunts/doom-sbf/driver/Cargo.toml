@@ -51,6 +51,10 @@ name = "continuation_sbf"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "continuation_split_sbf"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "headless"
 
 [dependencies]

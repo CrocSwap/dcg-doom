@@ -171,6 +171,25 @@ int doom_sbf_bind_arena(void *base, u64_t bytes, u64_t zone_bytes)
     return 1;
 }
 
+/* Re-enter a later authenticated continuation phase with the same carrier.
+ * Unlike bind_arena this deliberately preserves the monotonic allocator
+ * cursor and high-water mark.  The context guard is performed by each
+ * caller before this function, so a moved context cannot make its pointers
+ * look valid merely by rebinding an arbitrary carrier. */
+int doom_sbf_rebind_arena(void *base, u64_t bytes, u64_t zone_bytes)
+{
+    if (!base || ((uintptr_t)base & (DOOM_SBF_ALLOC_ALIGNMENT - 1u)) != 0 ||
+	DOOM_CTX->arena_used > bytes) {
+	DOOM_CTX->arena_exhausted = 1;
+	return 0;
+    }
+    DOOM_CTX->arena_base = (byte_t *)base;
+    DOOM_CTX->arena_bytes = bytes;
+    DOOM_CTX->arena_zone_bytes = zone_bytes;
+    DOOM_CTX->arena_exhausted = 0;
+    return 1;
+}
+
 u64_t doom_sbf_arena_high_water(void)
 {
     return DOOM_CTX->arena_high_water;

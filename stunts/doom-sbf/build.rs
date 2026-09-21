@@ -917,6 +917,20 @@ fn compile_ctx_engine(target: &str) {
             );
         }
         state_source.replace_range(profile_start..profile_end, &profile);
+        // E2R/4 reuses the exact source-matched decoder body, but keeps its
+        // validated plan in the caller-bound arena so the preflight,
+        // allocation, and parse/commit portions can be authenticated as
+        // separate transactions.  E2R/3 continues to call DoomStateDecode
+        // and therefore retains its prior behavior.
+        let split_body_start = profile
+            .find("\n    memset(&r,0,sizeof(r));")
+            .expect("find generated decoder parse body");
+        let split_body = &profile[split_body_start..];
+        let split_decoder = format!(
+            "static ds_plan_t *doom_state_split_plan(void) {{\n    if (!DOOM_CTX->arena_base || DOOM_CTX->arena_bytes <= sizeof(ds_plan_t) + 4096u) return 0;\n    return (ds_plan_t *)((uint8_t *)DOOM_CTX->arena_base + DOOM_CTX->arena_bytes - sizeof(ds_plan_t) - 4096u);\n}}\n\nint DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_bytes) {{\n    ds_plan_t *p = doom_state_split_plan();\n    if (!p) return -1;\n    memset(p, 0, sizeof(*p));\n    return ds_preflight(image, image_bytes, p, DS_IMPORT_PROFILE_V0);\n}}\n\nint DoomStateDecodeSplitPrepare(void) {{\n    ds_plan_t *p = doom_state_split_plan();\n    return p ? ds_plan_prepare(p) : -1;\n}}\n\nstatic int ds_decode_split_parse(const uint8_t *image, size_t image_bytes, unsigned profile) {{\n    ds_plan_t *p = doom_state_split_plan();\n    ds_read_t r; unsigned i, j, mi = 0, si = 0;\n    if (!p) return -1;{}\n\nint DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes) {{\n    return ds_decode_split_parse(image, image_bytes, DS_IMPORT_PROFILE_V0);\n}}\n",
+            split_body
+        );
+        state_source.push_str(&split_decoder);
         fs::write(&state, state_source).expect("write SBF state source");
         let controller = write_sbf_codec_source(
             &out_dir,

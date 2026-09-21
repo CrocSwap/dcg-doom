@@ -14,6 +14,8 @@ pub mod ex2;
 #[cfg(feature = "ctx-engine")]
 pub mod continuation_sbf;
 #[cfg(feature = "ctx-engine")]
+pub mod continuation_split_sbf;
+#[cfg(feature = "ctx-engine")]
 pub mod resource;
 #[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
@@ -163,6 +165,14 @@ pub fn process_instruction(
     #[cfg(feature = "ctx-engine")]
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.len() >= 12
+        && instruction_data.starts_with(continuation_split_sbf::MAGIC)
+        && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
+            == continuation_split_sbf::VERSION
+    {
+        return continuation_split_sbf::process(_program_id, accounts, instruction_data);
     }
     #[cfg(feature = "ctx-engine")]
     if instruction_data.len() >= 12
