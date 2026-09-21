@@ -886,7 +886,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     mutated_input_refusal_control(
         "mirror_tail_nonzero",
         MIRROR,
-        |bytes| bytes[continuation_split_sbf::MIRROR_BYTES - 1] = 1,
+        // validate_mirror's reserved-zero proof covers [68..4096); keep the
+        // control at the exact end of that committed scan, not at the end of
+        // the larger MP1 account.
+        |bytes| bytes[4095] = 1,
         "InvalidAccountData",
         &resource,
         &resource,
