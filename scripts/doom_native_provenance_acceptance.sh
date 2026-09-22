@@ -12,12 +12,17 @@ die() {
 
 : "${SOURCE_COMMIT:?set SOURCE_COMMIT to the reviewed code commit}"
 : "${SOURCE_TREE:?set SOURCE_TREE to SOURCE_COMMIT^{tree}}"
+: "${RECEIPTS:?set RECEIPTS to a new final-native receipt root}"
+: "${CAPTURE:?set CAPTURE to the retained Doom account-image capture}"
+: "${RESOURCE:?set RESOURCE to the retained RI2 resource image}"
+
+test -d "$CAPTURE" && test ! -L "$CAPTURE" || die "CAPTURE must be a real directory: $CAPTURE"
+test -f "$RESOURCE" && test ! -L "$RESOURCE" || die "RESOURCE must be a real file: $RESOURCE"
 
 ROOT=$(git rev-parse --show-toplevel)
-SOURCE=${SOURCE:-/private/tmp/basanos-doom-effective-profile-fixes-20260922-source}
-SCRATCH=${SCRATCH:-/private/tmp/basanos-doom-effective-profile-fixes-20260922-scratch}
-TARGET=${TARGET:-/private/tmp/basanos-doom-effective-profile-fixes-20260922-target}
-RECEIPTS=${RECEIPTS:-$ROOT/out/runs/doom-effective-profile-fixes-20260922}
+SOURCE=${SOURCE:-/private/tmp/basanos-doom-native-tool-preflight-repair-20260922-source}
+SCRATCH=${SCRATCH:-/private/tmp/basanos-doom-native-tool-preflight-repair-20260922-scratch}
+TARGET=${TARGET:-/private/tmp/basanos-doom-native-tool-preflight-repair-20260922-target}
 PYTHON_BIN=${PYTHON_BIN:-$ROOT/.venv/bin/python}
 test -x "$PYTHON_BIN" || die "PYTHON_BIN is not executable: $PYTHON_BIN"
 
@@ -54,9 +59,9 @@ print(digest.hexdigest())
 [[ ! -e "$RECEIPTS" ]] || die "receipt root is not unique: $RECEIPTS"
 [[ -z "${RUSTC_WRAPPER-}" && -z "${RUSTC_WORKSPACE_WRAPPER-}" ]] || die "Rust wrappers must be empty"
 
-case "$SOURCE" in /private/tmp/basanos-doom-effective-profile-fixes-20260922-*) ;; *) die "SOURCE is outside the fresh-root namespace" ;; esac
-case "$SCRATCH" in /private/tmp/basanos-doom-effective-profile-fixes-20260922-*) ;; *) die "SCRATCH is outside the fresh-root namespace" ;; esac
-case "$TARGET" in /private/tmp/basanos-doom-effective-profile-fixes-20260922-*) ;; *) die "TARGET is outside the fresh-root namespace" ;; esac
+case "$SOURCE" in /private/tmp/basanos-doom-native-tool-preflight-repair-20260922-*) ;; *) die "SOURCE is outside the fresh-root namespace" ;; esac
+case "$SCRATCH" in /private/tmp/basanos-doom-native-tool-preflight-repair-20260922-*) ;; *) die "SCRATCH is outside the fresh-root namespace" ;; esac
+case "$TARGET" in /private/tmp/basanos-doom-native-tool-preflight-repair-20260922-*) ;; *) die "TARGET is outside the fresh-root namespace" ;; esac
 
 mkdir -p "$RECEIPTS"
 mkdir "$TARGET" "$SCRATCH"
@@ -68,14 +73,34 @@ test -z "$(git -C "$SOURCE" status --porcelain --untracked-files=all)"
 export CARGO_TARGET_DIR="$TARGET"
 export DOOM_SCRATCH="$SCRATCH"
 export DOOM_SBF_SOURCE_TREE="$SOURCE_TREE"
-export RUSTC="${RUSTC:-$(command -v rustc)}"
-export CARGO="${CARGO:-$(command -v cargo)}"
-export CC="${CC:-cc}"
-export AR="${AR:-ar}"
+
+resolve_tool() {
+  local selected="$1"
+  local label="$2"
+  if [[ "$selected" != /* ]]; then
+    selected=$(command -v "$selected") || die "$label is not on PATH: $1"
+  fi
+  [[ "$selected" == /* ]] || die "$label did not resolve to an absolute executable: $selected"
+  test -x "$selected" || die "$label is not executable: $selected"
+  printf '%s\n' "$selected"
+}
+
+RUSTC=$(resolve_tool "${RUSTC:-rustc}" RUSTC)
+CARGO=$(resolve_tool "${CARGO:-cargo}" CARGO)
+CC=$(resolve_tool "${CC:-cc}" CC)
+AR=$(resolve_tool "${AR:-ar}" AR)
+export RUSTC CARGO CC AR
+
+# Use the same selected-tool implementation as the independent expected
+# profile before the host build or Cargo can consume significant resources.
+TOOL_PREFLIGHT="$RECEIPTS/tool-preflight.json"
+PYTHONPATH="$SOURCE:$SOURCE/src" "$PYTHON_BIN" \
+  "$SOURCE/scripts/doom_native_expected_profile.py" --preflight-tools --output "$TOOL_PREFLIGHT" \
+  >"$RECEIPTS/tool-preflight.log" 2>&1
 
 {
   for name in \
-    SOURCE_COMMIT SOURCE_TREE SOURCE SCRATCH TARGET RECEIPTS PYTHON_BIN CARGO_TARGET_DIR \
+    SOURCE_COMMIT SOURCE_TREE SOURCE SCRATCH TARGET RECEIPTS CAPTURE RESOURCE FINAL_DOCS_COMMIT FINAL_DOCS_TREE PYTHON_BIN CARGO_TARGET_DIR \
     DOOM_SCRATCH DOOM_SBF_SOURCE_TREE RUSTC CARGO CC AR PROFILE OPT_LEVEL DEBUG \
     DEBUG_ASSERTIONS CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS CARGO_PROFILE_RELEASE_LTO \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CFLAGS \
@@ -104,9 +129,9 @@ wc -c <"$EXPECTED" | tr -d ' ' >"$RECEIPTS/expected-build-configuration.bytes"
 EXPECTED_SHA256=$(<"$RECEIPTS/expected-build-configuration.sha256")
 EXPECTED_BYTES=$(<"$RECEIPTS/expected-build-configuration.bytes")
 
-printf '%q ' cargo build --locked --manifest-path "$SOURCE/stunts/doom-sbf/driver/Cargo.toml" \
+printf '%q ' "$CARGO" build --locked --manifest-path "$SOURCE/stunts/doom-sbf/driver/Cargo.toml" \
   --release --features ctx-engine --bin sweep_native --bin fresh_resume_probe >"$RECEIPTS/cargo-build.argv"
-cargo build --locked --manifest-path "$SOURCE/stunts/doom-sbf/driver/Cargo.toml" \
+"$CARGO" build --locked --manifest-path "$SOURCE/stunts/doom-sbf/driver/Cargo.toml" \
   --release --features ctx-engine --bin sweep_native --bin fresh_resume_probe \
   >"$RECEIPTS/cargo-build.log" 2>&1
 
@@ -134,8 +159,6 @@ BUILD_BYTES=$(wc -c <"$BUILD_DESCRIPTOR" | tr -d ' ')
 printf '%s\n' "$BUILD_SHA256" >"$RECEIPTS/source-build-descriptor.sha256"
 printf '%s\n' "$BUILD_BYTES" >"$RECEIPTS/source-build-descriptor.bytes"
 
-CAPTURE=${CAPTURE:?set CAPTURE to the retained Doom account-image capture}
-RESOURCE=${RESOURCE:?set RESOURCE to the retained RI2 resource image}
 ORACLE="$RECEIPTS/oracle"
 printf '%q ' "$SWEEP" "$CAPTURE" "$RESOURCE" "$ORACLE" --tics 1000 \
   --build-descriptor "$BUILD_DESCRIPTOR" --build-descriptor-sha256 "$BUILD_SHA256" \
@@ -187,11 +210,20 @@ test "$("$PYTHON_BIN" -c 'import sys,xml.etree.ElementTree as E; print(sum(int(x
 
 git -C "$SOURCE" rev-parse HEAD >"$RECEIPTS/code-commit.txt"
 git -C "$SOURCE" rev-parse HEAD^{tree} >"$RECEIPTS/code-tree.txt"
+cp "$RECEIPTS/code-commit.txt" "$RECEIPTS/tested-code-head.txt"
+cp "$RECEIPTS/code-tree.txt" "$RECEIPTS/tested-code-tree.txt"
+if [[ -n "${FINAL_DOCS_COMMIT-}" || -n "${FINAL_DOCS_TREE-}" ]]; then
+  [[ "${FINAL_DOCS_COMMIT-}" =~ ^[0-9a-f]{40}$ ]] || die "FINAL_DOCS_COMMIT must be a 40-byte hexadecimal commit"
+  [[ "${FINAL_DOCS_TREE-}" =~ ^[0-9a-f]{40}$ ]] || die "FINAL_DOCS_TREE must be a 40-byte hexadecimal tree"
+  printf '%s\n' "$FINAL_DOCS_COMMIT" >"$RECEIPTS/final-docs-head.txt"
+  printf '%s\n' "$FINAL_DOCS_TREE" >"$RECEIPTS/final-docs-tree.txt"
+fi
 git -C "$SOURCE" ls-files -s -- \
   stunts/doom-sbf/build.rs stunts/doom-sbf/driver/src/bin/fresh_resume_probe.rs \
   stunts/doom-sbf/driver/src/bin/sweep_native.rs scripts/doom_native_provenance_descriptor.py \
   scripts/doom_native_expected_profile.py scripts/doom_native_provenance_acceptance.sh \
-  stunts/doom-sbf/doom-native-host-profile-v2.json tests/test_doom_review_fixes.py \
+  stunts/doom-sbf/doom-native-host-profile-v2.json stunts/doom-sbf/src/native_archiver.rs \
+  tests/test_doom_review_fixes.py \
   | sha256_stdin >"$RECEIPTS/owned-files.sha256"
 date -u +%Y-%m-%dT%H:%M:%SZ >"$RECEIPTS/finished-at.txt"
 "$PYTHON_BIN" - "$RECEIPTS" >"$RECEIPTS/checksums.sha256" <<'PY'

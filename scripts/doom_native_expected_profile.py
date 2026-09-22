@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -24,6 +25,7 @@ TEMPLATE = ROOT / "stunts" / "doom-sbf" / "doom-native-host-profile-v2.json"
 UPSTREAM_COMMIT = "a77dfb96cb91780ca334d0d4cfd86957558007e0"
 SCHEMA = "DOOM-NATIVE-HOST-RELEASE-CONFIG/2"
 PORTABLE_ARCHIVER_PROBE = "DOOM-NATIVE-ARCHIVER-PROBE/1"
+TOOL_PREFLIGHT_SCHEMA = "DOOM-NATIVE-TOOL-PREFLIGHT/1"
 
 
 def fail(message: str) -> None:
@@ -41,10 +43,30 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def probe(name: str, default: str) -> dict[str, str]:
-    value = os.environ.get(name, default)
+def resolve_executable(value: str, label: str) -> str:
     if not value or any(char.isspace() for char in value):
-        fail(f"{name} must name one executable without arguments")
+        fail(f"{label} must name one executable without arguments")
+    selected = shutil.which(value) if not Path(value).is_absolute() else value
+    if not selected:
+        fail(f"{label} is not on PATH: {value}")
+    try:
+        # Keep the selected basename/symlink spelling (rustup dispatches based
+        # on argv[0]) while making the recorded path absolute.
+        path = Path(os.path.abspath(selected))
+    except OSError as error:
+        fail(f"{label} cannot be resolved: {error}")
+    if not path.is_file() or not os.access(path, os.X_OK):
+        fail(f"{label} is not an executable file: {path}")
+    return str(path)
+
+
+def executable_record(path: str) -> dict[str, object]:
+    data = Path(path).read_bytes()
+    return {"bytes": len(data), "sha256": sha256(data)}
+
+
+def probe(name: str, default: str) -> dict[str, object]:
+    value = resolve_executable(os.environ.get(name, default), name)
     if name == "AR":
         return probe_archiver(value)
     result = subprocess.run([value, "--version"], check=False, capture_output=True, text=True)
@@ -53,7 +75,7 @@ def probe(name: str, default: str) -> dict[str, str]:
     return {"path": value, "version": (result.stdout + result.stderr).strip()}
 
 
-def probe_archiver(value: str) -> dict[str, str]:
+def probe_archiver(value: str) -> dict[str, object]:
     """Use the same portable identity policy as the Rust build script.
 
     Apple's system ``ar`` has no successful ``--version`` option.  The
@@ -61,9 +83,15 @@ def probe_archiver(value: str) -> dict[str, str]:
     mocked version string or a help-text check.
     """
 
+    value = resolve_executable(value, "AR")
+    identity = executable_record(value)
     version = subprocess.run([value, "--version"], check=False, capture_output=True, text=True)
     if version.returncode == 0 and (version.stdout + version.stderr).strip():
-        return {"path": value, "version": (version.stdout + version.stderr).strip()}
+        return {
+            "path": value,
+            "version": (version.stdout + version.stderr).strip(),
+            **identity,
+        }
     try:
         with tempfile.TemporaryDirectory(prefix="basanos-doom-ar-probe-") as directory:
             root = Path(directory)
@@ -84,15 +112,14 @@ def probe_archiver(value: str) -> dict[str, str]:
             )
             listed_member = any(line.strip() == member.name for line in listing.stdout.splitlines())
             if create.returncode == 0 and listing.returncode == 0 and archive.is_file() and listed_member:
-                return {"path": value, "version": PORTABLE_ARCHIVER_PROBE}
+                return {"path": value, "version": PORTABLE_ARCHIVER_PROBE, **identity}
     except OSError as error:
         fail(f"AR portable archive probe could not execute: {error}")
     fail("AR --version and the portable archive create/list probe both failed")
 
 
 def probe_path(value: str, label: str) -> dict[str, str]:
-    if not value or any(char.isspace() for char in value):
-        fail(f"{label} must name one executable without arguments")
+    value = resolve_executable(value, label)
     result = subprocess.run([value, "--version"], check=False, capture_output=True, text=True)
     if result.returncode or not (result.stdout + result.stderr).strip():
         fail(f"{label} --version must succeed before the expected profile is generated")
@@ -275,14 +302,30 @@ def profile(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def tool_preflight(output: Path) -> int:
+    tools = {
+        name: probe(name, default)
+        for name, default in (("RUSTC", "rustc"), ("CARGO", "cargo"), ("CC", "cc"), ("AR", "ar"))
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({"schema": TOOL_PREFLIGHT_SCHEMA, "tools": tools}, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"schema": TOOL_PREFLIGHT_SCHEMA, "path": str(output.resolve()), "tools": tools}, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=ROOT)
-    parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--upstream-tree", type=Path, required=True)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--upstream-tree", type=Path)
     parser.add_argument("--target")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--preflight-tools", action="store_true")
     args = parser.parse_args()
+    if args.preflight_tools:
+        return tool_preflight(args.output)
+    if not args.source_commit or args.upstream_tree is None:
+        parser.error("--source-commit and --upstream-tree are required unless --preflight-tools is set")
     output = profile(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")

@@ -4,7 +4,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "src/native_archiver.rs"]
+mod native_archiver;
+use native_archiver::archiver_version;
 
 /// The 41 patch-0007 engine translation units (mkctx TUS): the whole engine
 /// cut that runs on the host goldens, compiled for SBF with the context
@@ -24,7 +27,6 @@ const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operati
 const NATIVE_PROVENANCE_PROFILE: &str =
     "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
-const PORTABLE_ARCHIVER_PROBE: &str = "DOOM-NATIVE-ARCHIVER-PROBE/1";
 
 const NATIVE_ALLOWED_CARGO_FEATURES: &[&str] = &["ctx-engine"];
 const NATIVE_RUST_MODULE_CLOSURE: &[(&str, &[&str])] = &[
@@ -158,63 +160,6 @@ fn command_version(path: &Path, required: bool) -> String {
     }
 }
 
-/// Apple's system `ar` has no successful `--version` option. Keep the
-/// fallback policy identical to doom_native_expected_profile.py: exercise the
-/// selected archiver by creating and listing a real archive, then record a
-/// stable probe identity rather than pretending that usage text is a version.
-fn archiver_version(path: &Path, required: bool) -> String {
-    if let Ok(output) = Command::new(path).arg("--version").output() {
-        if output.status.success() {
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            if !output.stderr.is_empty() {
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-            }
-            let text = text.trim().to_owned();
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_nanos();
-    let probe_dir = env::temp_dir().join(format!(
-        "basanos-doom-ar-probe-{}-{nonce}",
-        std::process::id()
-    ));
-    let member = probe_dir.join("member.o");
-    let archive = probe_dir.join("libprobe.a");
-    let result = (|| {
-        fs::create_dir(&probe_dir).ok()?;
-        fs::write(&member, b"basanos-doom-archiver-probe\n").ok()?;
-        let create = Command::new(path)
-            .arg("-rcS")
-            .arg(&archive)
-            .arg(&member)
-            .output()
-            .ok()?;
-        let listing = Command::new(path).arg("-t").arg(&archive).output().ok()?;
-        let listed_member = String::from_utf8_lossy(&listing.stdout)
-            .lines()
-            .any(|line| line.trim() == "member.o");
-        (create.status.success() && listing.status.success() && archive.is_file() && listed_member)
-            .then_some(PORTABLE_ARCHIVER_PROBE.to_owned())
-    })();
-    let _ = fs::remove_dir_all(&probe_dir);
-    if let Some(identity) = result {
-        return identity;
-    }
-    if required {
-        panic!(
-            "tool {} --version and the portable archive create/list probe both failed",
-            path.display()
-        );
-    }
-    format!("failed: portable archive probe for {}", path.display())
-}
-
 fn env_value(name: &str, fallback: &str) -> String {
     env::var(name).unwrap_or_else(|_| fallback.to_owned())
 }
@@ -293,6 +238,16 @@ fn json_tool(path: &Path, version: &str) -> String {
     )
 }
 
+fn json_archiver(path: &Path, capability: &str, bytes: u64, sha256: &str) -> String {
+    format!(
+        "{{\"path\": {}, \"version\": {}, \"bytes\": {}, \"sha256\": {}}}",
+        json_string(&path.to_string_lossy()),
+        json_string(capability),
+        bytes,
+        json_string(sha256),
+    )
+}
+
 fn canonical_path(path: &Path) -> String {
     path.canonicalize()
         .unwrap_or_else(|error| {
@@ -303,6 +258,27 @@ fn canonical_path(path: &Path) -> String {
         })
         .to_string_lossy()
         .into_owned()
+}
+
+fn resolve_executable(path: &Path) -> PathBuf {
+    let candidate = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join(path))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| path.to_owned())
+    };
+    if !candidate.is_file() {
+        panic!("cannot resolve selected executable {}", path.display());
+    }
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        env::current_dir()
+            .expect("current directory is available")
+            .join(candidate)
+    }
 }
 
 fn host_group_json(
@@ -318,6 +294,8 @@ fn host_group_json(
     compiler_version: &str,
     archiver: &str,
     archiver_version: &str,
+    archiver_bytes: u64,
+    archiver_sha256: &str,
 ) -> String {
     format!(
         "{{\"name\": {}, \"archive_output\": {}, \"files\": {}, \"flags\": {}, \"defines\": {}, \"forced_includes\": {}, \"include_root_keys\": {}, \"include_roots\": {}, \"compiler\": {}, \"archiver\": {}}}",
@@ -330,7 +308,7 @@ fn host_group_json(
         json_string_array(include_root_keys),
         json_string_array(include_roots),
         json_tool(Path::new(compiler), compiler_version),
-        json_tool(Path::new(archiver), archiver_version),
+        json_archiver(Path::new(archiver), archiver_version, archiver_bytes, archiver_sha256),
     )
 }
 
@@ -341,6 +319,8 @@ fn host_groups_metadata(
     compiler_version: &str,
     archiver: &Path,
     archiver_version: &str,
+    archiver_bytes: u64,
+    archiver_sha256: &str,
 ) -> (String, String, String) {
     let upstream = canonical_path(tree);
     let upstream_headless = canonical_path(&tree.join("headless"));
@@ -407,6 +387,8 @@ fn host_groups_metadata(
             compiler_version,
             &archiver,
             archiver_version,
+            archiver_bytes,
+            archiver_sha256,
         ),
         host_group_json(
             "engine",
@@ -425,6 +407,8 @@ fn host_groups_metadata(
             compiler_version,
             &archiver,
             archiver_version,
+            archiver_bytes,
+            archiver_sha256,
         ),
         host_group_json(
             "context",
@@ -447,6 +431,8 @@ fn host_groups_metadata(
             compiler_version,
             &archiver,
             archiver_version,
+            archiver_bytes,
+            archiver_sha256,
         ),
         host_group_json(
             "platform",
@@ -465,6 +451,8 @@ fn host_groups_metadata(
             compiler_version,
             &archiver,
             archiver_version,
+            archiver_bytes,
+            archiver_sha256,
         ),
         host_group_json(
             "nativecodec",
@@ -479,6 +467,8 @@ fn host_groups_metadata(
             compiler_version,
             &archiver,
             archiver_version,
+            archiver_bytes,
+            archiver_sha256,
         ),
     ]
     .join(", ");
@@ -505,20 +495,22 @@ fn host_groups_metadata(
 
 fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: bool) -> String {
     let mut compiler_probe = cc::Build::new();
-    if is_sbf {
-        let cc = env::var("CC").expect("ctx-engine SBF build needs CC from cargo-build-sbf");
-        let ar = env::var("AR").expect("ctx-engine SBF build needs AR from cargo-build-sbf");
-        compiler_probe.compiler(cc);
-        compiler_probe.archiver(ar);
-    }
+    let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let ar = env::var("AR").unwrap_or_else(|_| "ar".to_owned());
+    compiler_probe.compiler(cc).archiver(ar);
     let compiler = compiler_probe.get_compiler();
-    let cc_path = compiler.path().to_string_lossy().into_owned();
+    let compiler_path = resolve_executable(compiler.path());
+    let cc_path = compiler_path.to_string_lossy().into_owned();
     let strict = !is_sbf;
-    let cc_version = command_version(compiler.path(), strict);
+    let cc_version = command_version(&compiler_path, strict);
     let archiver_command = compiler_probe.get_archiver();
-    let ar_path = PathBuf::from(archiver_command.get_program());
-    let rustc_path = PathBuf::from(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
-    let cargo_path = PathBuf::from(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let ar_path = resolve_executable(Path::new(archiver_command.get_program()));
+    let rustc_path = resolve_executable(&PathBuf::from(
+        env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+    ));
+    let cargo_path = resolve_executable(&PathBuf::from(
+        env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+    ));
     let linker_path = env::var_os("RUSTC_LINKER")
         .or_else(|| {
             let key = format!(
@@ -528,7 +520,8 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
             env::var_os(key)
         })
         .map(PathBuf::from)
-        .unwrap_or_else(|| compiler.path().to_owned());
+        .unwrap_or_else(|| compiler_path.clone());
+    let linker_path = resolve_executable(&linker_path);
     let profile = env_value("PROFILE", "unknown");
     let opt_level = env_value("OPT_LEVEL", "unknown");
     let debug = env_value("DEBUG", "unknown");
@@ -600,6 +593,20 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
     let rustc_version = command_version(&rustc_path, strict);
     let cargo_version = command_version(&cargo_path, strict);
     let ar_version = archiver_version(&ar_path, strict);
+    let ar_bytes = fs::metadata(&ar_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "cannot stat selected archiver {}: {error}",
+                ar_path.display()
+            )
+        })
+        .len();
+    let ar_sha256 = hex(&digest(&fs::read(&ar_path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read selected archiver {}: {error}",
+            ar_path.display()
+        )
+    })));
     let hotloop_defines = if env::var_os("CARGO_FEATURE_STATIC_WRITE_PROBE").is_some() {
         vec!["DOOM_STATIC_WRITE_PROBE".to_owned()]
     } else if env::var_os("CARGO_FEATURE_ZERO_BSS_PROBE").is_some() {
@@ -622,15 +629,17 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
         Some(tree) if !is_sbf => host_groups_metadata(
             crate_root,
             tree,
-            compiler.path(),
+            &compiler_path,
             &cc_version,
             &ar_path,
             &ar_version,
+            ar_bytes,
+            &ar_sha256,
         ),
         _ => ("[]".to_owned(), "null".to_owned(), "[]".to_owned()),
     };
     format!(
-        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"groups\": {}, \"group_scope\": \"exact-host-cc-build-contract/1\", \"header_root\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"exact-host-build-inputs/1\"}},\n  \"rust_module_closure\": {},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
+        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"groups\": {}, \"group_scope\": \"exact-host-cc-build-contract/1\", \"header_root\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"exact-host-build-inputs/1\"}},\n  \"rust_module_closure\": {},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
         json_string(target),
         json_string(&rustc_path.to_string_lossy()),
         json_string(&rustc_version),
@@ -640,8 +649,7 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
         json_string(&cc_version),
         json_string(&linker_path.to_string_lossy()),
         json_string(&linker_version),
-        json_string(&ar_path.to_string_lossy()),
-        json_string(&ar_version),
+        json_archiver(&ar_path, &ar_version, ar_bytes, &ar_sha256),
         json_string(&profile),
         json_string(&opt_level),
         json_string(&debug),
@@ -1274,6 +1282,8 @@ fn main() {
 
     let mut build = cc::Build::new();
     build.file("src/doom_hotloops.c");
+    let host_cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let host_ar = env::var("AR").unwrap_or_else(|_| "ar".to_owned());
     if env::var("CARGO_FEATURE_STATIC_WRITE_PROBE").is_ok() {
         build.define("DOOM_STATIC_WRITE_PROBE", None);
     }
@@ -1295,6 +1305,8 @@ fn main() {
             .flag("-fno-builtin")
             .flag("-fno-asynchronous-unwind-tables")
             .flag("-fno-unwind-tables");
+    } else {
+        build.compiler(host_cc).archiver(host_ar);
     }
 
     build.compile("doom_hotloops");
@@ -1388,6 +1400,8 @@ fn compile_ctx_engine(target: &str) {
     let mut engine = cc::Build::new();
     let mut ctx = cc::Build::new();
     let mut platform = cc::Build::new();
+    let selected_cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let selected_ar = env::var("AR").unwrap_or_else(|_| "ar".to_owned());
     for b in [&mut engine, &mut ctx, &mut platform] {
         for f in common {
             b.flag(f);
@@ -1401,12 +1415,12 @@ fn compile_ctx_engine(target: &str) {
             // needed, and cc-rs 1.2.58 cannot parse the sbf triple anyway).
             // Reading them from the environment keeps this working across
             // installs instead of hardcoding one toolchain path.
-            let cc = env::var("CC").expect(
-                "ctx-engine SBF build needs CC from cargo-build-sbf \
-                 (build with cargo-build-sbf, not plain cargo build)",
-            );
-            let ar = env::var("AR").expect("ctx-engine SBF build needs AR from cargo-build-sbf");
-            b.compiler(cc).archiver(ar);
+            if env::var("CC").is_err() || env::var("AR").is_err() {
+                panic!(
+                    "ctx-engine SBF build needs CC and AR from cargo-build-sbf \
+                     (build with cargo-build-sbf, not plain cargo build)"
+                );
+            }
             b.flag("-DDOOM_SBF_BUILD")
                 .flag("-ffreestanding")
                 .flag("-fno-stack-protector")
@@ -1414,6 +1428,8 @@ fn compile_ctx_engine(target: &str) {
                 .flag("-fno-asynchronous-unwind-tables")
                 .flag("-fno-unwind-tables");
         }
+        b.compiler(selected_cc.clone())
+            .archiver(selected_ar.clone());
     }
     if diagnostic_profile {
         platform.define("DOOM_SBF_PHASE_PROFILE", None);
@@ -1825,8 +1841,8 @@ fn compile_ctx_engine(target: &str) {
             .flag("-fno-builtin")
             .flag("-fno-asynchronous-unwind-tables")
             .flag("-fno-unwind-tables")
-            .compiler(env::var("CC").expect("ctx-engine SBF build needs CC"))
-            .archiver(env::var("AR").expect("ctx-engine SBF build needs AR"))
+            .compiler(selected_cc.clone())
+            .archiver(selected_ar.clone())
             .file(state)
             .file(controller)
             .file(manifest.join("src/doom_sbf_account_pool.c"))
@@ -1855,7 +1871,9 @@ fn compile_ctx_engine(target: &str) {
             .include(&tree)
             .include(tree.join("headless"))
             .flag("-include")
-            .flag("doom_ctx.h");
+            .flag("doom_ctx.h")
+            .compiler(selected_cc)
+            .archiver(selected_ar);
         for relative in HOST_NATIVE_CODEC_UPSTREAM_FILES {
             native.file(tree.join(relative));
         }
