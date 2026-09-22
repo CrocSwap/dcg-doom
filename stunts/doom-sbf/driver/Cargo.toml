@@ -66,6 +66,10 @@ name = "sweep_native"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "fresh_resume_probe"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "sweep_gate"
 required-features = ["sim-transport"]
 
