@@ -22,7 +22,7 @@ use std::{cell::Cell, env, error::Error, fs, io::Write, path::PathBuf, rc::Rc};
 
 use common::{hex, Capture, CellBudget, NativeEngine, Rng};
 use doom_sbf::{ex2, resource, resource_sbf, sim2};
-use serde_json::Value;
+use serde_json::{json, Value};
 use solana_program::program_error::ProgramError;
 use solana_pubkey::Pubkey;
 
@@ -427,7 +427,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--checkpoint" => checkpoint_path = Some(PathBuf::from(value).canonicalize()?),
             "--sim1-receipt" => sim1_receipt = Some(PathBuf::from(value).canonicalize()?),
             "--build-descriptor" => build_descriptor = Some(PathBuf::from(value).canonicalize()?),
-            "--build-descriptor-sha256" => build_descriptor_sha256 = Some(value),
+            "--build-descriptor-sha256" => build_descriptor_sha256 = Some(value.clone()),
             "--build-descriptor-bytes" => build_descriptor_bytes = Some(value.parse()?),
             _ => return Err(format!("unknown flag {flag}").into()),
         }

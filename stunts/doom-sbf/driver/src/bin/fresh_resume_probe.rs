@@ -22,7 +22,7 @@ use std::{
 };
 
 use common::{hex, Capture};
-use doom_sbf::{resource, resource_sbf, sim2};
+use doom_sbf::{ex2, resource, resource_sbf, sim2};
 use serde_json::{json, Value};
 
 const CORRECTED_DECODER_COMMIT: &str = "53bd00225df56df8037fc95b884c542db633a09b";
