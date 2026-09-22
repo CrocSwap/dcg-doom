@@ -767,7 +767,12 @@ fn compile_ctx_engine(target: &str) {
         assert_eq!(state_source.matches(state_writer_needle).count(), 1, "SBF state writer rewrite must match once");
         state_source = state_source.replacen(
             state_writer_needle,
-            "static void ds_u8(ds_buf_t *b, uint8_t x) { if (b->bad || b->used >= b->cap) { b->bad=1; return; } b->p[b->used++]=x; } static void ds_u16(ds_buf_t *b, uint16_t x) { if (b->bad || b->cap-b->used < 2u) { b->bad=1; return; } b->p[b->used++]=(uint8_t)x; b->p[b->used++]=(uint8_t)(x>>8); } static void ds_u32(ds_buf_t *b, uint32_t x) { if (b->bad || b->cap-b->used < 4u) { b->bad=1; return; } b->p[b->used++]=(uint8_t)x; b->p[b->used++]=(uint8_t)(x>>8); b->p[b->used++]=(uint8_t)(x>>16); b->p[b->used++]=(uint8_t)(x>>24); }",
+            // Each writer loads the cursor and base once and stores the new
+            // cursor once.  `b->p[b->used++]` forced a reload of both after
+            // every byte store (a uint8_t store may alias the buffer
+            // header), which dominated the SBF encoder (measured, DOOM-SIM/2
+            // profile).  Same bytes, same order, same refusal (`bad`) rule.
+            "static void ds_u8(ds_buf_t *b, uint8_t x) { size_t u = b->used; if (b->bad || u >= b->cap) { b->bad=1; return; } b->p[u]=x; b->used=u+1u; } static void ds_u16(ds_buf_t *b, uint16_t x) { size_t u = b->used; uint8_t *q; if (b->bad || b->cap-u < 2u) { b->bad=1; return; } q=b->p+u; q[0]=(uint8_t)x; q[1]=(uint8_t)(x>>8); b->used=u+2u; } static void ds_u32(ds_buf_t *b, uint32_t x) { size_t u = b->used; uint8_t *q; if (b->bad || b->cap-u < 4u) { b->bad=1; return; } q=b->p+u; q[0]=(uint8_t)x; q[1]=(uint8_t)(x>>8); q[2]=(uint8_t)(x>>16); q[3]=(uint8_t)(x>>24); b->used=u+4u; }",
             1,
         );
         let state_reader_needle = "static uint8_t ds_r8(ds_read_t *r) { if(r->bad||r->used==r->cap){r->bad=1;return 0;}return r->p[r->used++]; }\nstatic uint16_t ds_r16(ds_read_t *r) { uint16_t a=ds_r8(r),b=ds_r8(r);return (uint16_t)(a|(b<<8)); }\nstatic uint32_t ds_r32(ds_read_t *r) { uint32_t a=ds_r16(r),b=ds_r16(r);return a|(b<<16); }\nstatic int32_t ds_ri32(ds_read_t *r) { return (int32_t)ds_r32(r); }";
