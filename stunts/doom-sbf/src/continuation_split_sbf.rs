@@ -18,11 +18,26 @@ use solana_program::{
 use crate::resource_sbf;
 
 pub const MAGIC: &[u8; 8] = b"DOOM-E2R";
+/// The transport profile hardens PREPARE (see `HARDENED`) and therefore
+/// speaks wire version 5; the legacy profile keeps E2R/4 unchanged.
+#[cfg(not(feature = "sim-transport"))]
 pub const VERSION: u32 = 4;
+#[cfg(feature = "sim-transport")]
+pub const VERSION: u32 = 5;
+/// E2R/5 = E2R/4 plus two PREPARE refusals: the context account must sign
+/// (only the holder of the key that created it can claim it), and its
+/// checkpoint must still be all zero (a prepared or published context can
+/// never be re-prepared).  There is deliberately no reset path.
+pub const HARDENED: bool = cfg!(feature = "sim-transport");
+pub const REFUSE_PREPARE_CONTEXT_SIGNER: u32 = 245;
+pub const REFUSE_PREPARE_CHECKPOINT_EXISTS: u32 = 246;
 pub const PREPARE: u8 = 5;
 pub const STEP: u8 = 6;
 pub const INSTRUCTION_BYTES: usize = 32;
+#[cfg(not(feature = "sim-transport"))]
 pub const ABI_DESCRIPTOR: &str = "DOOM-E2R/4|instruction=32|operations=PREPARE/5+STEP/6|accounts=13|continuation=262144|payload=ST1+MP1+CI2+FB1|relocations=typed-offsets|context=DOOM-CT4-pinned-live-engine|checkpoint=DOOM-CT5/v5|component-commitment=checkpoint-tail-96..128|phases=setup-part1+setup-part2+decode+finalize|fault=byte24-cursor7-only";
+#[cfg(feature = "sim-transport")]
+pub const ABI_DESCRIPTOR: &str = "DOOM-E2R/5|instruction=32|operations=PREPARE/5+STEP/6|accounts=13|continuation=262144|payload=ST1+MP1+CI2+FB1|relocations=typed-offsets|context=DOOM-CT4-pinned-live-engine|checkpoint=DOOM-CT5/v5|component-commitment=checkpoint-tail-96..128|phases=setup-part1+setup-part2+decode+finalize|fault=byte24-cursor7-only|prepare=context-signer+zero-checkpoint";
 
 pub const CONTINUATION_ACCOUNT: usize = 11;
 pub const AUTHORITY_ACCOUNT: usize = 12;
@@ -185,6 +200,28 @@ fn exact_zero(bytes: &[u8]) -> bool {
         && sol_memcmp(&bytes[1..], &bytes[..bytes.len() - 1], bytes.len() - 1) == 0
 }
 
+/// The E2R account-set commitment recorded in the checkpoint, computed from
+/// keys alone (same bytes as `account_set_hash`): SIM/2 INIT uses it to prove
+/// which STATE, MIRROR and authority a published context was built with.
+pub fn account_set_root(program: &Pubkey, keys: &[&Pubkey; ACCOUNT_COUNT]) -> [u8; 32] {
+    let mut concat = [0u8; ACCOUNT_COUNT * 32];
+    for (index, key) in keys.iter().enumerate() {
+        concat[index * 32..index * 32 + 32].copy_from_slice(key.as_ref());
+    }
+    hashv(&[DOMAIN_ACCOUNTS, program.as_ref(), &concat]).to_bytes()
+}
+
+/// The component commitment recorded in checkpoint bytes 96..128.
+pub fn published_components(
+    resource_hash: &[u8; 32],
+    state_hash: &[u8; 32],
+    mirror_hash: &[u8; 32],
+    controller_hash: &[u8; 32],
+    frame_hash: &[u8; 32],
+) -> [u8; 32] {
+    component_commitment(resource_hash, state_hash, mirror_hash, controller_hash, frame_hash)
+}
+
 fn account_set_hash(program: &Pubkey, accounts: &[AccountInfo]) -> [u8; 32] {
     let keys: Vec<&[u8]> = accounts
         .iter()
@@ -288,10 +325,12 @@ fn validate_accounts(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     for (index, account) in accounts.iter().enumerate().take(CONTINUATION_ACCOUNT + 1) {
+        // E2R/5 PREPARE requires the context (index 0) to sign; that check
+        // lives in process_prepare so it refuses with its own code.
         if account.owner != program
             || account.data_len() != expected_bytes(index)
             || account.is_writable != expected_writable(index)
-            || account.is_signer
+            || (account.is_signer && !(HARDENED && index == 0))
             || accounts[..index]
                 .iter()
                 .any(|previous| previous.key == account.key)
@@ -671,6 +710,17 @@ fn validate_header(
 
 fn process_prepare(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
     crate::diagnostic_phase(700);
+    if HARDENED {
+        if !accounts[0].is_signer {
+            return Err(ProgramError::Custom(REFUSE_PREPARE_CONTEXT_SIGNER));
+        }
+        let context = accounts[0].try_borrow_data()?;
+        if !exact_zero(
+            &context[CONTEXT_CHECKPOINT_OFFSET..CONTEXT_CHECKPOINT_OFFSET + CONTEXT_CHECKPOINT_BYTES],
+        ) {
+            return Err(ProgramError::Custom(REFUSE_PREPARE_CHECKPOINT_EXISTS));
+        }
+    }
     let mut context = accounts[0].try_borrow_mut_data()?;
     let resource = accounts[1].try_borrow_data()?;
     validate_resource(&resource)?;

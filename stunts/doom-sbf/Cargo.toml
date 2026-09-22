@@ -36,6 +36,9 @@ ctx-engine = []
 # instrumentation only: it changes the image identity and must never be used
 # for a positive qualification claim.
 diagnostic-profile = []
+# The deployable DOOM-SIM/2 transport profile: E2R/5 + DOOM-STG/1 + SIM/2
+# only (see transport_process_instruction).  Requires the engine.
+sim-transport = ["ctx-engine"]
 
 [dependencies]
 solana-program = "=2.3.0"

@@ -1428,3 +1428,126 @@ int doom_resource_import_initialized_no_render_sequence(
     if (graph_anchor) *graph_anchor = (unsigned long)anchor;
     free(frame); free(carrier); free(wad); return 0;
 }
+
+/*
+ * DOOM-SIM/2 host session oracle.
+ *
+ * The sequence oracle above runs a fixed command list (<= 128) and encodes
+ * after every tic.  SIM/2 needs a longer reference (the 1,000-tic transport
+ * gate) and a way to publish ST1/MP1 only at chosen cursors, so this keeps
+ * one host engine resident across calls.  Setup is the same no-setup RI2/2
+ * import as doom_resource_import_initialized_no_render_sequence, copied
+ * rather than refactored so the retained sequence oracle stays byte-for-byte
+ * unchanged.  The per-tic path is the SBF step verbatim: the shared pre-tic
+ * guard, DoomControllerArmV2, G_Ticker, gametic++.  Host-only; one session
+ * per process (the host engine lives in the global DOOM_CTX).
+ */
+#include "doom_sim2_guard.h"
+
+static uint8_t *sim2_native_wad, *sim2_native_carrier, *sim2_native_frame;
+static size_t sim2_native_wad_bytes;
+static uint8_t sim2_native_hash[32];
+static int sim2_native_open;
+
+void doom_resource_sim_session_close(void)
+{
+    free(sim2_native_frame); free(sim2_native_carrier); free(sim2_native_wad);
+    sim2_native_frame = 0; sim2_native_carrier = 0; sim2_native_wad = 0;
+    sim2_native_wad_bytes = 0; sim2_native_open = 0;
+}
+
+int doom_resource_sim_session_open(
+    const unsigned char *const wad_accounts[5], const unsigned long wad_lens[5],
+    const unsigned char *image, unsigned long image_len,
+    const unsigned char *state, unsigned long state_len)
+{
+    r2_section_t s[5]; r2_v2_plan_t plan; uint8_t *demo;
+    uintptr_t anchor = 0; int lump, demo_len, rc;
+    doom_resource_sim_session_close();
+    if (!image || image_len > RI2_MAX_BYTES || image_len < 12u ||
+        !state || state_len < 64u || state_len > RI2_STATE_MAX)
+        return 232;
+    if (r2_u32(image + 8) != RI2_VERSION || r2_v2_preflight(image, image_len, s, &plan))
+        return 240;
+    if (doom_engine_ex2_make_wad(wad_accounts, wad_lens, &sim2_native_wad,
+                                 &sim2_native_wad_bytes, sim2_native_hash) ||
+        memcmp(sim2_native_hash, r2_wad_hash, 32)) { doom_resource_sim_session_close(); return 234; }
+    sim2_native_carrier = (uint8_t *)calloc(1, 4u * 1024u * 1024u);
+    if (!sim2_native_carrier) { doom_resource_sim_session_close(); return 238; }
+    memset(DOOM_CTX, 0, sizeof(doom_ctx_t)); doom_ctx_init();
+    if (!doom_sbf_bind_arena(sim2_native_carrier, 4u * 1024u * 1024u, DOOM_ZONE_BYTES)) { doom_resource_sim_session_close(); return 234; }
+    gamemode = shareware; gamemission = doom; language = english;
+    DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0; displayplayer = 0; myargc = 0; myargv = 0;
+    Z_Init(); P_InitThinkers(); W_InitAccountImage(sim2_native_wad, (int)sim2_native_wad_bytes);
+    if (doom_resource_ri1_import_graph(image + s[R2_GRAPH].offset, s[R2_GRAPH].bytes, &anchor)) { doom_resource_sim_session_close(); return 242; }
+    lastanim = anims + plan.scalar[R2_SC_ANIMCOUNT]; numlinespecials = 0;
+    for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
+        if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
+    rc = r2_walk((const uint8_t *)(image + s[R2_SCALARS].offset), s[R2_SCALARS].bytes, s[R2_SCALARS].count, 1, r2_apply_scalar, 0);
+    if (rc || r2_v2_alloc_resources(&plan) ||
+        r2_walk(image + s[R2_TABLES].offset, s[R2_TABLES].bytes, s[R2_TABLES].count, 0, r2_v2_apply_table, 0) ||
+        r2_v2_apply_lights(&plan) || r2_apply_functions(image, s)) { doom_resource_sim_session_close(); return 242; }
+    sim2_native_frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
+    if (!sim2_native_frame) { doom_resource_sim_session_close(); return 238; }
+    screens[0] = sim2_native_frame; screens[1] = sim2_native_frame + RI2_FRAME_BYTES;
+    screens[2] = sim2_native_frame + 2u * RI2_FRAME_BYTES; screens[3] = sim2_native_frame + 3u * RI2_FRAME_BYTES; screens[4] = 0;
+    viewimage = screens[0]; for (rc = 0; rc < viewheight; rc++) ylookup[rc] = screens[0] + (size_t)rc * 320u;
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 : (SCREENHEIGHT - R2_SBARHEIGHT - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH; pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
+    lump = W_GetNumForName("DEMO1"); demo_len = W_LumpLength(lump); if (demo_len < 17) { doom_resource_sim_session_close(); return 234; }
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC); defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo; demoend = demo + demo_len;
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len); DoomStateSetAllocationFailure(-1);
+    if (DoomStateDecode(state, state_len) || DoomControllerValidateCapturedDemoCursor(demo_p)) { doom_resource_sim_session_close(); return 232; }
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 : (SCREENHEIGHT - R2_SBARHEIGHT - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH; pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
+    sim2_native_open = 1;
+    return 0;
+}
+
+/* Same contract as doom_sbf_sim2_step: 0 ran, 1..5 halted before G_Ticker,
+ * 232 refused command, 237 arm failure. */
+int doom_resource_sim_session_step(const unsigned char *command)
+{
+    int halt;
+    if (!sim2_native_open) return 232;
+    halt = doom_sim2_pretic_guard(command);
+    if (halt) return halt;
+    if (DoomControllerArmV2(command)) return 237;
+    G_Ticker(); gametic++;
+    return 0;
+}
+
+/* Same outputs as doom_sbf_sim2_publish: MP1 derived from the live thinker
+ * graph, ST1 encoded, the ST1 tail up to state_cap zeroed. */
+int doom_resource_sim_session_publish(
+    unsigned char *state_out, unsigned long state_cap, unsigned long *state_len_out,
+    unsigned char *mirror_out, unsigned long mirror_cap)
+{
+    uint8_t *encoded = 0; size_t encoded_bytes = 0;
+    if (!sim2_native_open || !state_out || !state_len_out || !mirror_out ||
+        state_cap < RI2_STATE_MAX || mirror_cap < RI2_MIRROR_BYTES) return 232;
+    if (doom_engine_ex2_fill_mirror(mirror_out, sim2_native_wad, sim2_native_wad_bytes, sim2_native_hash))
+        return 233;
+    if (DoomStateEncode(&encoded, &encoded_bytes) || encoded_bytes > state_cap || encoded_bytes < 64u) {
+        DoomStateFree(encoded); return 238;
+    }
+    memcpy(state_out, encoded, encoded_bytes);
+    memset(state_out + encoded_bytes, 0, state_cap - encoded_bytes);
+    *state_len_out = encoded_bytes;
+    DoomStateFree(encoded);
+    return 0;
+}
+
+/* Engine-level probe fields the host gate records per tic (not committed). */
+int doom_resource_sim_session_probe(long out[6])
+{
+    if (!sim2_native_open || !out) return 232;
+    out[0] = gametic; out[1] = gamestate; out[2] = gameaction;
+    out[3] = players[0].playerstate; out[4] = players[0].health;
+    out[5] = (long)(demo_p - demobuffer);
+    return 0;
+}

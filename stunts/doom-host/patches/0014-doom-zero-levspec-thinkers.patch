@@ -1,0 +1,39 @@
+From: basanos doom staged-sweep worker
+Subject: [PATCH 0014] zero PU_LEVSPEC zone blocks so ST1 commits no stale bytes
+
+EV_DoPlat leaves plat_t.count unset until the lift reaches a stop and
+EV_DoDoor/EV_VerticalDoor leave vldoor_t.topcountdown unset until the door
+reaches the top.  The recycled zone block keeps stale bytes (measured:
+pointer bits that differ between host processes) and ST1 v0 encodes every
+field, so the committed state carried non-semantic garbage for the life of
+such a thinker (measured: 160 tics of DEMO1 from tic 597).  Every such field
+is written before it is read, so zeroing PU_LEVSPEC blocks changes no play.
+
+--- a/linuxdoom-1.10/z_zone.c
++++ b/linuxdoom-1.10/z_zone.c
+@@ -25,6 +25,7 @@
+ rcsid[] = "$Id: z_zone.c,v 1.4 1997/02/03 16:47:58 b1 Exp $";
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include "z_zone.h"
+ #include "i_system.h"
+@@ -300,6 +301,17 @@
+     mainzone->rover = base->next;	
+ 	
+     base->id = ZONEID;
++
++    /* Special thinkers (doors, plats, floors, ceilings, lights) are
++       allocated PU_LEVSPEC and vanilla leaves some fields unset until
++       first use (plat_t.count until the lift reaches a stop, vldoor_t
++       .topcountdown until the door reaches the top).  The recycled zone
++       block then holds stale bytes, often pointer bits, which the ST1
++       codec commits.  Zero them: every such field is written before it is
++       read, so play is unchanged and ST1 becomes a function of game state
++       on every build. */
++    if (tag == PU_LEVSPEC)
++	memset ((byte *)base + sizeof(memblock_t), 0, base->size - sizeof(memblock_t));
+     
+     return (void *) ((byte *)base + sizeof(memblock_t));
+ }

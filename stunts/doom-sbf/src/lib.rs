@@ -23,6 +23,10 @@ pub mod ex2_sbf;
 pub mod resource_sbf;
 #[cfg(feature = "ctx-engine")]
 pub mod simulation;
+#[cfg(feature = "ctx-engine")]
+pub mod sim2;
+#[cfg(feature = "ctx-engine")]
+pub mod stage;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
@@ -125,7 +129,42 @@ pub unsafe extern "C" fn doom_sbf_panic() -> ! {
     panic!("doom_sbf_panic");
 }
 
+#[cfg(not(feature = "sim-transport"))]
 entrypoint!(process_instruction);
+#[cfg(feature = "sim-transport")]
+entrypoint!(transport_process_instruction);
+
+/// The deployable DOOM-SIM/2 transport profile.  Only three instruction
+/// families are reachable: E2R/5 reconstruction (PREPARE requires the context
+/// signer and a zero checkpoint), DOOM-STG/1 seal-once staging, and SIM/2.
+/// SIM/1 (permissionless INIT, test-only ROLLBACK), the earlier E2R/E2S
+/// continuations, bring-up, CX1 and the hot-loop probes are not dispatched,
+/// so no other instruction in this image can write a context, ST1, MP1, meta
+/// or input-buffer account.
+#[cfg(feature = "sim-transport")]
+pub fn transport_process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let version = if instruction_data.len() >= 12 {
+        u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
+    } else {
+        0
+    };
+    if instruction_data.starts_with(sim2::MAGIC) && version == sim2::VERSION {
+        return sim2::process(program_id, accounts, instruction_data);
+    }
+    if instruction_data.starts_with(continuation_split_sbf::MAGIC)
+        && version == continuation_split_sbf::VERSION
+    {
+        return continuation_split_sbf::process(program_id, accounts, instruction_data);
+    }
+    if instruction_data.starts_with(stage::MAGIC) && version == stage::VERSION {
+        return stage::process(program_id, accounts, instruction_data);
+    }
+    Err(ProgramError::InvalidInstructionData)
+}
 
 fn write_result(data: &mut [u8], result: u64) -> ProgramResult {
     if data.len() < 8 {

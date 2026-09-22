@@ -636,24 +636,30 @@ int doom_sbf_sim_tick(
     uint8_t *derived = 0, *encoded = 0;
     size_t encoded_bytes = 0;
     unsigned long transient_mark, previous_state_bytes;
+    RI2_PHASE(810);
     if (doom_ctx_guard(context)) return 199;
     if (!command || command_len != 4u || !state_out || !state_out_len ||
         !mirror_out || !mirror_out_len || state_cap < RI2_STATE_MAX ||
         mirror_cap < RI2_MIRROR_BYTES) return 232;
     if (DoomControllerArmV2(command) ||
         DoomControllerValidateCapturedDemoCursor(demo_p)) return 237;
+    RI2_PHASE(811);
     G_Ticker();
     gametic++;
+    RI2_PHASE(812);
     if (doom_sbf_arena_exhausted()) return 239;
     transient_mark = doom_sbf_arena_mark();
     derived = (uint8_t *)malloc(RI2_MIRROR_BYTES);
     if (!derived) return 238;
+    RI2_PHASE(813);
     if (doom_sbf_fill_pool(derived, ri2_wad_hash)) {
         free(derived); return 233;
     }
+    RI2_PHASE(814);
     if (DoomStateEncode(&encoded, &encoded_bytes)) {
         free(derived); free(encoded); return 236;
     }
+    RI2_PHASE(815);
     if (encoded_bytes > state_cap || encoded_bytes < 64u) {
         free(derived); free(encoded); return 238;
     }
@@ -662,15 +668,78 @@ int doom_sbf_sim_tick(
         free(derived); free(encoded); return 238;
     }
     memcpy(state_out, encoded, encoded_bytes);
+    RI2_PHASE(816);
     {
         unsigned long i;
         for (i = (unsigned long)encoded_bytes; i < previous_state_bytes; i++)
             state_out[i] = 0;
     }
+    RI2_PHASE(817);
     memcpy(mirror_out, derived, RI2_MIRROR_BYTES);
+    RI2_PHASE(818);
     *state_out_len = encoded_bytes;
     *mirror_out_len = RI2_MIRROR_BYTES;
     DoomStateFree(encoded); free(derived);
     if (!doom_sbf_arena_rewind(transient_mark)) return 239;
+    RI2_PHASE(819);
+    return 0;
+}
+
+/* DOOM-SIM/2: the same persistent no-render transition as SIM/1, split so
+ * that one ADVANCE instruction can execute several consecutive staged tics
+ * against the resident engine and derive ST1/MP1 exactly once, at the
+ * committed cursor.  doom_sbf_sim2_step never allocates, encodes, or renders;
+ * doom_sbf_sim2_publish is the only ST1/MP1 writer.  The pre-tic guard in
+ * doom_sim2_guard.h is shared verbatim with the host session oracle. */
+#include "doom_sim2_guard.h"
+
+int doom_sbf_sim2_step(uint8_t *context, const uint8_t *command,
+                       unsigned long command_len)
+{
+    int halt;
+    RI2_PHASE(900);
+    if (doom_ctx_guard(context)) return 199;
+    if (!command || command_len != 4u) return 232;
+    halt = doom_sim2_pretic_guard(command);
+    if (halt) return halt;
+    if (DoomControllerArmV2(command)) return 237;
+    RI2_PHASE(901);
+    G_Ticker();
+    gametic++;
+    RI2_PHASE(902);
+    if (doom_sbf_arena_exhausted()) return 239;
+    return 0;
+}
+
+int doom_sbf_sim2_publish(
+    uint8_t *context, uint8_t *state_out, unsigned long state_cap,
+    unsigned long *state_out_len, uint8_t *mirror_out, unsigned long mirror_cap)
+{
+    uint8_t *encoded = 0;
+    size_t encoded_bytes = 0;
+    unsigned long transient_mark;
+    RI2_PHASE(910);
+    if (doom_ctx_guard(context)) return 199;
+    if (!state_out || !state_out_len || !mirror_out ||
+        state_cap < RI2_STATE_MAX || mirror_cap < RI2_MIRROR_BYTES) return 232;
+    if (doom_sbf_arena_exhausted()) return 239;
+    transient_mark = doom_sbf_arena_mark();
+    /* fill_pool clears the whole 64 KiB pool before writing its header and
+     * slots, so the mirror account needs no staging buffer. */
+    if (doom_sbf_fill_pool(mirror_out, ri2_wad_hash)) return 233;
+    RI2_PHASE(911);
+    if (DoomStateEncode(&encoded, &encoded_bytes)) {
+        free(encoded); return 236;
+    }
+    RI2_PHASE(912);
+    if (encoded_bytes > state_cap || encoded_bytes < 64u) {
+        free(encoded); return 238;
+    }
+    memcpy(state_out, encoded, encoded_bytes);
+    memset(state_out + encoded_bytes, 0, state_cap - encoded_bytes);
+    *state_out_len = encoded_bytes;
+    DoomStateFree(encoded);
+    if (!doom_sbf_arena_rewind(transient_mark)) return 239;
+    RI2_PHASE(913);
     return 0;
 }

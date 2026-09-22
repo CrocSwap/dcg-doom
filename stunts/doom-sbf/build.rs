@@ -275,6 +275,16 @@ fn source_manifest(
         "  \"upstream_commit\": \"{upstream_commit}\","
     )
     .unwrap();
+    // The reproducible wrapper exports the git tree of `stunts/` at the
+    // built commit; any other build records that it was not recorded.
+    let source_tree = env::var("DOOM_SBF_SOURCE_TREE").unwrap_or_else(|_| "unrecorded".to_owned());
+    writeln!(&mut manifest, "  \"source_tree\": {},", json_string(&source_tree)).unwrap();
+    let profile = if env::var("CARGO_FEATURE_SIM_TRANSPORT").is_ok() {
+        "sim-transport"
+    } else {
+        "legacy"
+    };
+    writeln!(&mut manifest, "  \"profile\": \"{profile}\",").unwrap();
     writeln!(&mut manifest, "  \"abi_descriptor\": \"{ABI_DESCRIPTOR}\",").unwrap();
     writeln!(
         &mut manifest,
@@ -481,6 +491,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZERO_BSS_PROBE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DIAGNOSTIC_PROFILE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SIM_TRANSPORT");
+    println!("cargo:rerun-if-env-changed=DOOM_SBF_SOURCE_TREE");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=AR");
@@ -755,7 +767,12 @@ fn compile_ctx_engine(target: &str) {
         assert_eq!(state_source.matches(state_writer_needle).count(), 1, "SBF state writer rewrite must match once");
         state_source = state_source.replacen(
             state_writer_needle,
-            "static void ds_u8(ds_buf_t *b, uint8_t x) { if (b->bad || b->used >= b->cap) { b->bad=1; return; } b->p[b->used++]=x; } static void ds_u16(ds_buf_t *b, uint16_t x) { if (b->bad || b->cap-b->used < 2u) { b->bad=1; return; } b->p[b->used++]=(uint8_t)x; b->p[b->used++]=(uint8_t)(x>>8); } static void ds_u32(ds_buf_t *b, uint32_t x) { if (b->bad || b->cap-b->used < 4u) { b->bad=1; return; } b->p[b->used++]=(uint8_t)x; b->p[b->used++]=(uint8_t)(x>>8); b->p[b->used++]=(uint8_t)(x>>16); b->p[b->used++]=(uint8_t)(x>>24); }",
+            // Each writer loads the cursor and base once and stores the new
+            // cursor once.  `b->p[b->used++]` forced a reload of both after
+            // every byte store (a uint8_t store may alias the buffer
+            // header), which dominated the SBF encoder (measured, DOOM-SIM/2
+            // profile).  Same bytes, same order, same refusal (`bad`) rule.
+            "static void ds_u8(ds_buf_t *b, uint8_t x) { size_t u = b->used; if (b->bad || u >= b->cap) { b->bad=1; return; } b->p[u]=x; b->used=u+1u; } static void ds_u16(ds_buf_t *b, uint16_t x) { size_t u = b->used; uint8_t *q; if (b->bad || b->cap-u < 2u) { b->bad=1; return; } q=b->p+u; q[0]=(uint8_t)x; q[1]=(uint8_t)(x>>8); b->used=u+2u; } static void ds_u32(ds_buf_t *b, uint32_t x) { size_t u = b->used; uint8_t *q; if (b->bad || b->cap-u < 4u) { b->bad=1; return; } q=b->p+u; q[0]=(uint8_t)x; q[1]=(uint8_t)(x>>8); q[2]=(uint8_t)(x>>16); q[3]=(uint8_t)(x>>24); b->used=u+4u; }",
             1,
         );
         let state_reader_needle = "static uint8_t ds_r8(ds_read_t *r) { if(r->bad||r->used==r->cap){r->bad=1;return 0;}return r->p[r->used++]; }\nstatic uint16_t ds_r16(ds_read_t *r) { uint16_t a=ds_r8(r),b=ds_r8(r);return (uint16_t)(a|(b<<8)); }\nstatic uint32_t ds_r32(ds_read_t *r) { uint32_t a=ds_r16(r),b=ds_r16(r);return a|(b<<16); }\nstatic int32_t ds_ri32(ds_read_t *r) { return (int32_t)ds_r32(r); }";
@@ -801,6 +818,26 @@ fn compile_ctx_engine(target: &str) {
         if diagnostic_profile {
             let marker = "extern void doom_sbf_phase_marker(unsigned long);\n";
             state_source = format!("{marker}{state_source}");
+            // Encoder section markers (950-957) for the DOOM-SIM/2 compute
+            // profile: globals, booleans, players+bodyque, sectors, lines,
+            // translations+items+buttons, thinkers, header.
+            for (needle, phase) in [
+                ("    ds_i32(&b,gameskill);", 950u32),
+                ("    ds_u8(&b,(uint8_t)respawnmonsters);", 951),
+                ("    for(i=0;i<MAXPLAYERS;i++)ds_player(&b,&players[i],m,nm);", 952),
+                ("    for(i=0;i<(unsigned)numsectors;i++){sector_t*x=&sectors[i];", 953),
+                ("    for(i=0;i<(unsigned)(DOOM_CTX->numlines);i++){line_t*x=&lines[i];", 954),
+                ("    for(i=0;i<=(unsigned)numflats;i++)", 955),
+                ("    for(t=thinkercap.next;t!=&thinkercap;t=t->next){if(t->function.acv==(actionf_v)-1)continue;k=ds_kind(t);if(k==DS_MOBJ)", 956),
+                ("    memcpy(b.p,\"DOOM-ST1\",8);", 957),
+            ] {
+                assert_eq!(state_source.matches(needle).count(), 1, "encoder marker needle must match once");
+                state_source = state_source.replacen(
+                    needle,
+                    &format!("    doom_sbf_phase_marker({phase});{}", &needle[4..]),
+                    1,
+                );
+            }
             // Split the source-matched header gate into observable checks so
             // a refusal identifies the ABI/global mismatch rather than only
             // reporting the decoder's aggregate -1.

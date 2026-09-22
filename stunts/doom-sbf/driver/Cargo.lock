@@ -1198,6 +1198,7 @@ dependencies = [
 name = "doom-sbf-driver"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bincode",
  "doom-sbf",
  "serde_json",
@@ -1210,6 +1211,7 @@ dependencies = [
  "solana-instruction",
  "solana-keypair",
  "solana-message",
+ "solana-program",
  "solana-program-test",
  "solana-pubkey",
  "solana-signer",

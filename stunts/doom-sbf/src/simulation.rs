@@ -6,6 +6,11 @@
 //! `G_Ticker`, derives ST1/MP1, and advances a small authenticated cursor.
 //! There is deliberately no resource, WAD, framebuffer, or render account in
 //! this account set.
+//!
+//! LEGACY: superseded by DOOM-SIM/2 (`sim2.rs`).  SIM/1 INIT is permissionless
+//! (review F1) and ROLLBACK_TEST is a test-only opcode (F6), so SIM/1 is not
+//! dispatched by the deployable `sim-transport` profile; it stays in the
+//! legacy ctx-engine profile only to reproduce M1201.
 
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program_error::ProgramError,
@@ -465,18 +470,26 @@ fn process_tick(
     request: Request,
     rollback: bool,
 ) -> ProgramResult {
+    crate::diagnostic_phase(800);
     let context = accounts[CONTEXT_ACCOUNT].try_borrow_data()?;
     validate_context_ready(&context)?;
+    crate::diagnostic_phase(801);
     let input = accounts[INPUT_ACCOUNT].try_borrow_data()?;
     let input_info = validate_input(&input)?;
+    crate::diagnostic_phase(802);
     let state = accounts[STATE_ACCOUNT].try_borrow_data()?;
     let mirror = accounts[MIRROR_ACCOUNT].try_borrow_data()?;
     validate_mirror(&mirror)?;
+    crate::diagnostic_phase(803);
     let state_len = u32_at(&state, 16) as usize;
     validate_state(&state, state_len)?;
+    crate::diagnostic_phase(804);
     let actual_state_root = state_root(&state, state_len, &mirror);
+    crate::diagnostic_phase(805);
     let account_set = account_set_hash(program, accounts);
+    crate::diagnostic_phase(806);
     let context_commitment = context_root(&context);
+    crate::diagnostic_phase(807);
     let meta = accounts[META_ACCOUNT].try_borrow_data()?;
     validate_meta(
         &meta,
@@ -502,6 +515,7 @@ fn process_tick(
     {
         return Err(ProgramError::Custom(REFUSE_ROOT));
     }
+    crate::diagnostic_phase(808);
     let command_start = INPUT_HEADER_BYTES + request.input_index as usize * 4;
     let mut command = [0u8; 4];
     command.copy_from_slice(&input[command_start..command_start + 4]);
@@ -514,20 +528,26 @@ fn process_tick(
     let mut context = accounts[CONTEXT_ACCOUNT].try_borrow_mut_data()?;
     let mut state = accounts[STATE_ACCOUNT].try_borrow_mut_data()?;
     let mut mirror = accounts[MIRROR_ACCOUNT].try_borrow_mut_data()?;
+    crate::diagnostic_phase(809);
     let (new_state_len, new_mirror_len) =
         run_c_tick(&mut context, &command, &mut state, &mut mirror)?;
+    crate::diagnostic_phase(820);
     if rollback {
         return Err(ProgramError::Custom(REFUSE_ROLLBACK));
     }
     validate_state(&state, new_state_len)?;
+    crate::diagnostic_phase(821);
     validate_mirror(&mirror)?;
+    crate::diagnostic_phase(822);
     if new_mirror_len != resource_sbf::MIRROR_BYTES
         || u32_at(&state, 20) != request.expected_tic.wrapping_add(1)
     {
         return Err(ProgramError::Custom(REFUSE_ROOT));
     }
     let new_state_root = state_root(&state, new_state_len, &mirror);
+    crate::diagnostic_phase(824);
     let new_context_root = context_root(&context);
+    crate::diagnostic_phase(825);
     let next_tic = request
         .expected_tic
         .checked_add(1)
@@ -555,6 +575,7 @@ fn process_tick(
         &account_set,
         accounts[AUTHORITY_ACCOUNT].key,
     );
+    crate::diagnostic_phase(826);
     Ok(())
 }
 
