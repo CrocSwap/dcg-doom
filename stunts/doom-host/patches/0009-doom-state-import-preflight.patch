@@ -14,7 +14,7 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
   * explicit little-endian writer.  Pointer-bearing engine links are emitted as
   * zero/null, map-array indexes, player indexes, or 1-based thinker slots.
   */
-@@ -92,63 +92,871 @@
+@@ -92,63 +92,869 @@
  static void ds_mapthing(ds_buf_t *b,const mapthing_t *x){ds_u16(b,(uint16_t)x->x);ds_u16(b,(uint16_t)x->y);ds_u16(b,(uint16_t)x->angle);ds_u16(b,(uint16_t)x->type);ds_u16(b,(uint16_t)x->options);}
  static void ds_rmapthing(ds_read_t *r,mapthing_t *x){x->x=(short)ds_r16(r);x->y=(short)ds_r16(r);x->angle=(short)ds_r16(r);x->type=(short)ds_r16(r);x->options=(short)ds_r16(r);}
  
@@ -283,8 +283,6 @@ Subject: [PATCH] Harden Doom decoder transaction and native publication gate
 +        value = ds_scan_i32(r); if (value < up || value > in_stasis) return -1;
 +        ds_scan_bool(r);
 +        ds_scan_i32(r); ds_scan_i32(r);
-+        value = ds_scan_i32(r);
-+        if (value < perpetualRaise || value > blazeDWUS) return -1;
 +        break;
 +    case DS_FLASH:
 +        sector = ds_scan_i32(r);

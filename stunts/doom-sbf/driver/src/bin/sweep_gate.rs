@@ -224,6 +224,16 @@ impl Gate {
         meta_key: Pubkey,
         request: &sim2::InitRequest,
     ) -> Instruction {
+        self.init_ix_with_buffer(authority, meta_key, self.keys.buffer.pubkey(), request)
+    }
+
+    fn init_ix_with_buffer(
+        &self,
+        authority: Pubkey,
+        meta_key: Pubkey,
+        buffer_key: Pubkey,
+        request: &sim2::InitRequest,
+    ) -> Instruction {
         Instruction {
             program_id: base::PROGRAM,
             accounts: vec![
@@ -231,7 +241,7 @@ impl Gate {
                 meta(self.keys.state.pubkey(), false, false),
                 meta(self.keys.mirror.pubkey(), false, false),
                 meta(meta_key, true, false),
-                meta(self.keys.buffer.pubkey(), true, false),
+                meta(buffer_key, true, false),
                 meta(authority, true, true),
                 meta(system_program::id(), false, false),
             ],
@@ -792,6 +802,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mut gate,
         &mut controls,
         "init_non_pda_meta",
+        sim2::REFUSE_BINDING,
+        vec![ix],
+        &[&authority],
+    )
+    .await?;
+    let (noncanonical_meta, noncanonical_bump) = (0..gate.keys.bump)
+        .find_map(|candidate| {
+            Pubkey::create_program_address(
+                &[sim2::META_SEED, context_kp.pubkey().as_ref(), &[candidate]],
+                &base::PROGRAM,
+            )
+            .ok()
+            .map(|key| (key, candidate))
+        })
+        .ok_or("no valid non-canonical PDA bump")?;
+    let mut noncanonical = init.clone();
+    noncanonical.bump = noncanonical_bump;
+    let ix = gate.init_ix_with_buffer(
+        authority.pubkey(),
+        noncanonical_meta,
+        ZERO_BUFFER,
+        &noncanonical,
+    );
+    refused(
+        &mut gate,
+        &mut controls,
+        "init_noncanonical_bump",
         sim2::REFUSE_BINDING,
         vec![ix],
         &[&authority],

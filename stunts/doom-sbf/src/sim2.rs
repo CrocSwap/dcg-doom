@@ -76,8 +76,11 @@ pub const BT_SPECIAL: u8 = 0x80;
 /// testnet and mainnet, measured 2026-09-22), so a deployable sweep cannot
 /// read its own budget.  Measured on SBF over the 1,000 DEMO1 tics: the worst
 /// 8-tic window plus the worst pre-sweep, publication and post-publication
-/// costs is 1,137,509 CU, leaving 262,491 CU (more than the worst single tic,
-/// 223,333) under the 1,400,000 limit; the worst 11-tic window exceeds it.
+/// costs is 1,136,519 CU, leaving 263,481 CU under the 1,400,000 limit. The
+/// recomputed 11-tic window is 1,374,193 CU and fits; the worst 12-tic window
+/// exceeds the limit. Across the retained 5,026-tic DEMO1 lifetime, the
+/// measured maximum sweep was 1,177,656 CU, so the margin is input-dependent
+/// and smaller than the worst single-tic cost.
 /// A sweep that does exceed its budget fails atomically and changes nothing;
 /// the sender retries with a smaller explicit `max_tics`.
 pub const DEFAULT_SWEEP_TICS: u32 = 8;
@@ -919,10 +922,12 @@ fn check_meta_address(
     meta: &Pubkey,
     bump: u8,
 ) -> ProgramResult {
-    match Pubkey::create_program_address(&[META_SEED, context.as_ref(), &[bump]], program) {
-        Ok(expected) if expected == *meta => Ok(()),
-        _ => Err(refuse(REFUSE_BINDING)),
+    let (canonical, canonical_bump) =
+        Pubkey::find_program_address(&[META_SEED, context.as_ref()], program);
+    if bump != canonical_bump || *meta != canonical {
+        return Err(refuse(REFUSE_BINDING));
     }
+    Ok(())
 }
 
 fn read_checkpoint(context: &AccountInfo) -> Result<[u8; CHECKPOINT_BYTES], ProgramError> {
@@ -1240,6 +1245,32 @@ mod tests {
         assert_eq!(effective_max_tics(0), default);
         assert_eq!(effective_max_tics(3), 3);
         assert_eq!(effective_max_tics(u32::MAX), MAX_SWEEP_TICS);
+    }
+
+    #[test]
+    fn meta_address_requires_the_canonical_bump() {
+        let program = Pubkey::new_from_array([0x11; 32]);
+        let context = Pubkey::new_from_array([0x22; 32]);
+        let (canonical, bump) = meta_address(&program, &context);
+        assert_eq!(
+            check_meta_address(&program, &context, &canonical, bump),
+            Ok(())
+        );
+        let (alternate, alternate_bump) = (0..bump)
+            .find_map(|candidate| {
+                Pubkey::create_program_address(
+                    &[META_SEED, context.as_ref(), &[candidate]],
+                    &program,
+                )
+                .ok()
+                .map(|key| (key, candidate))
+            })
+            .expect("test PDA has an alternate valid bump");
+        assert_ne!(alternate, canonical);
+        assert_eq!(
+            check_meta_address(&program, &context, &alternate, alternate_bump),
+            Err(refuse(REFUSE_BINDING))
+        );
     }
 
     #[test]
