@@ -342,14 +342,12 @@ fn host_groups_metadata(
         .iter()
         .map(|tu| format!("external/{tu}.c"))
         .collect::<Vec<_>>();
-    let context_files = [
-        "external/headless/doom_ctx_init.c".to_owned(),
+    let mut context_files = vec!["external/headless/doom_ctx_init.c".to_owned()];
+    context_files.extend(
         HOST_CONTEXT_REPO_FILES
             .iter()
-            .map(|path| format!("repo/stunts/doom-sbf/{path}"))
-            .collect::<Vec<_>>(),
-    ]
-    .concat();
+            .map(|path| format!("repo/stunts/doom-sbf/{path}")),
+    );
     let platform_files = HOST_PLATFORM_REPO_FILES
         .iter()
         .map(|path| format!("repo/stunts/doom-sbf/{path}"))
