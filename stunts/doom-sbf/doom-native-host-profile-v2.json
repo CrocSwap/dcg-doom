@@ -1,0 +1,217 @@
+{
+  "schema": "DOOM-NATIVE-HOST-RELEASE-CONFIG/2",
+  "version": 2,
+  "target_source": "rustc-host-probe-or-explicit-target",
+  "allowed_cargo_features": ["ctx-engine"],
+  "enabled_cargo_features": ["ctx-engine"],
+  "input_scope": "conservative-source-envelope",
+  "rust_module_closure": {
+    "sweep_native": [
+      "driver/src/bin/sweep_native.rs",
+      "driver/src/bin/continuation_split_sbf.rs",
+      "driver/src/sweep_common.rs",
+      "src/lib.rs",
+      "src/ex2.rs",
+      "src/continuation_split_sbf.rs",
+      "src/resource.rs",
+      "src/resource_sbf.rs",
+      "src/simulation.rs",
+      "src/sim2.rs",
+      "src/stage.rs"
+    ],
+    "fresh_resume_probe": [
+      "driver/src/bin/fresh_resume_probe.rs",
+      "driver/src/bin/continuation_split_sbf.rs",
+      "driver/src/sweep_common.rs",
+      "src/lib.rs",
+      "src/ex2.rs",
+      "src/continuation_split_sbf.rs",
+      "src/resource.rs",
+      "src/resource_sbf.rs",
+      "src/simulation.rs",
+      "src/sim2.rs",
+      "src/stage.rs"
+    ]
+  },
+  "build_scripts_and_locks": [
+    "repo/stunts/doom-sbf/build.rs",
+    "repo/stunts/doom-sbf/Cargo.toml",
+    "repo/stunts/doom-sbf/Cargo.lock",
+    "repo/stunts/doom-sbf/driver/Cargo.toml",
+    "repo/stunts/doom-sbf/driver/Cargo.lock"
+  ],
+  "compiler_flags": [
+    "-O2",
+    "-std=gnu89",
+    "-DNORMALUNIX",
+    "-DHEADLESS_DOOM",
+    "-Wno-deprecated-non-prototype",
+    "-Wno-implicit-int",
+    "-Wno-int-conversion",
+    "-Wno-incompatible-pointer-types",
+    "-Wno-format-security"
+  ],
+  "header_root": "external/headless/doom_ctx.h",
+  "host_groups": [
+    {
+      "name": "hotloop",
+      "files": ["repo/stunts/doom-sbf/src/doom_hotloops.c"],
+      "flags": [],
+      "defines": [],
+      "forced_includes": [],
+      "include_root_keys": []
+    },
+    {
+      "name": "engine",
+      "files": [
+        "external/doomdef.c",
+        "external/doomstat.c",
+        "external/dstrings.c",
+        "external/d_items.c",
+        "external/g_game.c",
+        "external/m_argv.c",
+        "external/m_bbox.c",
+        "external/m_fixed.c",
+        "external/m_random.c",
+        "external/m_swap.c",
+        "external/tables.c",
+        "external/info.c",
+        "external/z_zone.c",
+        "external/w_wad.c",
+        "external/v_video.c",
+        "external/p_ceilng.c",
+        "external/p_doors.c",
+        "external/p_enemy.c",
+        "external/p_floor.c",
+        "external/p_inter.c",
+        "external/p_lights.c",
+        "external/p_map.c",
+        "external/p_maputl.c",
+        "external/p_mobj.c",
+        "external/p_plats.c",
+        "external/p_pspr.c",
+        "external/p_setup.c",
+        "external/p_sight.c",
+        "external/p_spec.c",
+        "external/p_switch.c",
+        "external/p_telept.c",
+        "external/p_tick.c",
+        "external/p_user.c",
+        "external/r_bsp.c",
+        "external/r_data.c",
+        "external/r_draw.c",
+        "external/r_main.c",
+        "external/r_plane.c",
+        "external/r_segs.c",
+        "external/r_sky.c",
+        "external/r_things.c"
+      ],
+      "flags": [
+        "-O2",
+        "-std=gnu89",
+        "-DNORMALUNIX",
+        "-DHEADLESS_DOOM",
+        "-Wno-deprecated-non-prototype",
+        "-Wno-implicit-int",
+        "-Wno-int-conversion",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-format-security",
+        "-include",
+        "doom_ctx.h"
+      ],
+      "defines": ["NORMALUNIX", "HEADLESS_DOOM"],
+      "forced_includes": ["doom_ctx.h"],
+      "include_root_keys": ["upstream", "upstream/headless", "repo/sbfinc"]
+    },
+    {
+      "name": "context",
+      "files": [
+        "external/headless/doom_ctx_init.c",
+        "repo/stunts/doom-sbf/src/doom_sbf_ctx.c",
+        "repo/stunts/doom-sbf/src/doom_sbf_engine.c"
+      ],
+      "flags": [
+        "-O2",
+        "-std=gnu89",
+        "-DNORMALUNIX",
+        "-DHEADLESS_DOOM",
+        "-Wno-deprecated-non-prototype",
+        "-Wno-implicit-int",
+        "-Wno-int-conversion",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-format-security",
+        "-include",
+        "doom_ctx.h",
+        "-DDOOM_CTX_NO_MACROS"
+      ],
+      "defines": ["NORMALUNIX", "HEADLESS_DOOM", "DOOM_CTX_NO_MACROS"],
+      "forced_includes": ["doom_ctx.h"],
+      "include_root_keys": ["upstream", "upstream/headless", "repo/sbfinc"]
+    },
+    {
+      "name": "platform",
+      "files": ["repo/stunts/doom-sbf/src/doom_sbf_platform.c"],
+      "flags": [
+        "-O2",
+        "-std=gnu89",
+        "-DNORMALUNIX",
+        "-DHEADLESS_DOOM",
+        "-Wno-deprecated-non-prototype",
+        "-Wno-implicit-int",
+        "-Wno-int-conversion",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-format-security"
+      ],
+      "defines": ["NORMALUNIX", "HEADLESS_DOOM"],
+      "forced_includes": [],
+      "include_root_keys": ["upstream", "upstream/headless", "repo/sbfinc"]
+    },
+    {
+      "name": "nativecodec",
+      "files": [
+        "external/headless/doom_state.c",
+        "external/headless/doom_controller.c",
+        "repo/stunts/doom-sbf/src/doom_sbf_ex2.c",
+        "repo/stunts/doom-sbf/src/doom_sbf_resource.c",
+        "repo/stunts/doom-sbf/src/doom_resource.c",
+        "repo/stunts/doom-sbf/src/doom_resource_ri2.c"
+      ],
+      "flags": [
+        "-O2",
+        "-std=gnu89",
+        "-DNORMALUNIX",
+        "-DHEADLESS_DOOM",
+        "-Wno-deprecated-non-prototype",
+        "-Wno-implicit-int",
+        "-Wno-int-conversion",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-format-security",
+        "-include",
+        "doom_ctx.h"
+      ],
+      "defines": ["NORMALUNIX", "HEADLESS_DOOM"],
+      "forced_includes": ["doom_ctx.h"],
+      "include_root_keys": ["upstream", "upstream/headless"]
+    }
+  ],
+  "profile": {
+    "name": "release",
+    "opt_level": "3",
+    "debug": "false",
+    "debug_assertions": "false",
+    "overflow_checks": "false",
+    "lto": "true",
+    "codegen_units": "1"
+  },
+  "rust": {
+    "rustflags": "",
+    "encoded_rustflags": [],
+    "rustc_wrapper": "",
+    "rustc_workspace_wrapper": ""
+  },
+  "c_environment": {
+    "cflags": "",
+    "cppflags": "",
+    "c_include_path": ""
+  }
+}

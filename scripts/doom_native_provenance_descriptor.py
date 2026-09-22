@@ -28,7 +28,7 @@ PROFILE = "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-hos
 SOURCE_MANIFEST_SCHEMA = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3"
 BUILD_DESCRIPTOR_SCHEMA = "DOOM-SIM/2-NATIVE-BUILD-DESCRIPTOR/2"
 FINAL_DESCRIPTOR_SCHEMA = "DOOM-SIM/2-NATIVE-ACCEPTANCE-DESCRIPTOR/2"
-EXPECTED_CONFIG_SCHEMA = "DOOM-NATIVE-HOST-RELEASE-CONFIG/1"
+EXPECTED_CONFIG_SCHEMA = "DOOM-NATIVE-HOST-RELEASE-CONFIG/2"
 ORACLE_FILE_TABLE_DOMAIN = b"DOOM-SIM/2-NATIVE-ORACLE-FILE-TABLE/1\0"
 INPUT_FILE_TABLE_DOMAIN = b"DOOM-SIM/2-NATIVE-INPUT-FILE-TABLE/1\0"
 COMMAND_DOMAIN = "DOOM-SIM/2-COMMANDS/1"
@@ -114,6 +114,10 @@ def repo_inputs(repo: Path, source_commit: str) -> dict[str, bytes]:
         "stunts/doom-host/build.sh",
         "stunts/doom-host/tools/doom_controller_producer.py",
         "stunts/doom-host/tools/doom_account_image.py",
+        "scripts/doom_native_provenance_descriptor.py",
+        "scripts/doom_native_expected_profile.py",
+        "scripts/doom_native_provenance_acceptance.sh",
+        "stunts/doom-sbf/doom-native-host-profile-v2.json",
     ]
     paths.extend(git_files(repo, source_commit, "stunts/doom-sbf/src", {".rs", ".c", ".h", ".inc"}))
     paths.extend(git_files(repo, source_commit, "stunts/doom-sbf/sbfinc", {".h"}))
@@ -209,6 +213,12 @@ def validate_expected_configuration(manifest: dict[str, object], expected: dict[
     ):
         if manifest.get(key) != expected.get(key):
             raise SystemExit(f"manifest {key} differs from the independently pinned host profile")
+    if manifest.get("compile_source_commit") != expected.get("compile_source_commit"):
+        raise SystemExit("manifest source commit differs from the independently pinned source commit")
+    if manifest.get("compile_source_tree") != expected.get("compile_source_tree"):
+        raise SystemExit("manifest source tree differs from the independently pinned source tree")
+    if manifest.get("upstream_commit") != expected.get("upstream_commit"):
+        raise SystemExit("manifest upstream commit differs from the literal pinned upstream commit")
     if manifest.get("allowed_cargo_features") != EXPECTED_CARGO_FEATURES:
         raise SystemExit("native host profile advertises an unexpected Cargo feature allowlist")
     if manifest.get("enabled_cargo_features") != EXPECTED_CARGO_FEATURES:
@@ -307,6 +317,23 @@ def generate_build_descriptor(args: argparse.Namespace) -> int:
         raise SystemExit("build descriptor requires a clean host, non-SBF build")
     if manifest.get("binary_targets") != EXPECTED_BINARY_TARGETS:
         raise SystemExit("build descriptor requires both native binary targets")
+    actual_source_commit = run(
+        ["git", "-C", str(repo), "rev-parse", f"{args.source_commit}^{{commit}}"]
+    ).decode().strip()
+    if actual_source_commit != args.source_commit:
+        raise SystemExit("named source commit does not resolve to itself")
+    actual_source_tree = run(
+        ["git", "-C", str(repo), "rev-parse", f"{args.source_commit}^{{tree}}"]
+    ).decode().strip()
+    if manifest.get("compile_source_tree") != actual_source_tree:
+        raise SystemExit("manifest compile_source_tree is not git rev-parse source_commit^{tree}")
+    actual_upstream_commit = run(
+        ["git", "-C", str(args.upstream_tree.resolve()), "rev-parse", "HEAD"]
+    ).decode().strip()
+    if actual_upstream_commit != UPSTREAM_COMMIT:
+        raise SystemExit("upstream checkout is not the literal pinned upstream commit")
+    if manifest.get("upstream_commit") != UPSTREAM_COMMIT:
+        raise SystemExit("manifest upstream commit is not the literal pinned upstream commit")
     expected = load_json(args.expected_build_configuration.resolve(), "expected build configuration")
     validate_expected_configuration(manifest, expected)
     records, root = build_records(repo, args.source_commit, args.upstream_tree, manifest)

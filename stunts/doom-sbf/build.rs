@@ -59,18 +59,26 @@ const NATIVE_RUST_MODULE_CLOSURE: &[(&str, &[&str])] = &[
         ],
     ),
 ];
-const NATIVE_C_TRANSLATION_UNITS: &[&str] = &[
-    "src/doom_hotloops.c",
-    "src/doom_sbf_platform.c",
-    "src/doom_sbf_ctx.c",
-    "src/doom_sbf_engine.c",
+const HOST_COMMON_FLAGS: &[&str] = &[
+    "-O2",
+    "-std=gnu89",
+    "-DNORMALUNIX",
+    "-DHEADLESS_DOOM",
+    "-Wno-deprecated-non-prototype",
+    "-Wno-implicit-int",
+    "-Wno-int-conversion",
+    "-Wno-incompatible-pointer-types",
+    "-Wno-format-security",
+];
+const HOST_CONTEXT_REPO_FILES: &[&str] = &["src/doom_sbf_ctx.c", "src/doom_sbf_engine.c"];
+const HOST_PLATFORM_REPO_FILES: &[&str] = &["src/doom_sbf_platform.c"];
+const HOST_NATIVE_CODEC_UPSTREAM_FILES: &[&str] =
+    &["headless/doom_state.c", "headless/doom_controller.c"];
+const HOST_NATIVE_CODEC_REPO_FILES: &[&str] = &[
     "src/doom_sbf_ex2.c",
     "src/doom_sbf_resource.c",
     "src/doom_resource.c",
     "src/doom_resource_ri2.c",
-    "external/headless/doom_state.c",
-    "external/headless/doom_controller.c",
-    "external/headless/doom_ctx_init.c",
 ];
 const NATIVE_BUILD_METADATA_FILES: &[&str] = &[
     "repo/stunts/doom-sbf/build.rs",
@@ -191,19 +199,260 @@ fn json_static_array(values: &[&str]) -> String {
     json_string_array(&owned)
 }
 
-fn build_metadata(target: &str, is_sbf: bool) -> String {
+fn host_translation_units() -> Vec<String> {
+    let mut files = vec!["repo/stunts/doom-sbf/src/doom_hotloops.c".to_owned()];
+    files.extend(ENGINE_TUS.iter().map(|tu| format!("external/{tu}.c")));
+    files.push("external/headless/doom_ctx_init.c".to_owned());
+    files.extend(
+        HOST_CONTEXT_REPO_FILES
+            .iter()
+            .map(|path| format!("repo/stunts/doom-sbf/{path}")),
+    );
+    files.extend(
+        HOST_PLATFORM_REPO_FILES
+            .iter()
+            .map(|path| format!("repo/stunts/doom-sbf/{path}")),
+    );
+    files.extend(
+        HOST_NATIVE_CODEC_UPSTREAM_FILES
+            .iter()
+            .map(|path| format!("external/{path}")),
+    );
+    files.extend(
+        HOST_NATIVE_CODEC_REPO_FILES
+            .iter()
+            .map(|path| format!("repo/stunts/doom-sbf/{path}")),
+    );
+    files
+}
+
+fn json_tool(path: &Path, version: &str) -> String {
+    format!(
+        "{{\"path\": {}, \"version\": {}}}",
+        json_string(&path.to_string_lossy()),
+        json_string(version)
+    )
+}
+
+fn canonical_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|error| {
+            panic!(
+                "cannot canonicalize provenance path {}: {error}",
+                path.display()
+            )
+        })
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn host_group_json(
+    name: &str,
+    files: &[String],
+    flags: &[String],
+    defines: &[String],
+    forced_includes: &[String],
+    include_root_keys: &[String],
+    include_roots: &[String],
+    compiler: &str,
+    compiler_version: &str,
+    archiver: &str,
+    archiver_version: &str,
+) -> String {
+    format!(
+        "{{\"name\": {}, \"files\": {}, \"flags\": {}, \"defines\": {}, \"forced_includes\": {}, \"include_root_keys\": {}, \"include_roots\": {}, \"compiler\": {}, \"archiver\": {}}}",
+        json_string(name),
+        json_string_array(files),
+        json_string_array(flags),
+        json_string_array(defines),
+        json_string_array(forced_includes),
+        json_string_array(include_root_keys),
+        json_string_array(include_roots),
+        json_tool(Path::new(compiler), compiler_version),
+        json_tool(Path::new(archiver), archiver_version),
+    )
+}
+
+fn host_groups_metadata(
+    crate_root: &Path,
+    tree: &Path,
+    compiler: &Path,
+    compiler_version: &str,
+    archiver: &Path,
+    archiver_version: &str,
+) -> (String, String, String) {
+    let upstream = canonical_path(tree);
+    let upstream_headless = canonical_path(&tree.join("headless"));
+    let repo_sbfinc = canonical_path(&crate_root.join("sbfinc"));
+    let compiler = compiler.to_string_lossy();
+    let archiver = archiver.to_string_lossy();
+    let common = HOST_COMMON_FLAGS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    let hotloop_defines = Vec::new();
+    let mut engine_flags = common.clone();
+    engine_flags.extend(["-include", "doom_ctx.h"].into_iter().map(str::to_owned));
+    let mut context_flags = engine_flags.clone();
+    context_flags.push("-DDOOM_CTX_NO_MACROS".to_owned());
+    let platform_flags = common.clone();
+    let native_codec_flags = engine_flags.clone();
+    let engine_files = ENGINE_TUS
+        .iter()
+        .map(|tu| format!("external/{tu}.c"))
+        .collect::<Vec<_>>();
+    let context_files = [
+        "external/headless/doom_ctx_init.c".to_owned(),
+        HOST_CONTEXT_REPO_FILES
+            .iter()
+            .map(|path| format!("repo/stunts/doom-sbf/{path}"))
+            .collect::<Vec<_>>(),
+    ]
+    .concat();
+    let platform_files = HOST_PLATFORM_REPO_FILES
+        .iter()
+        .map(|path| format!("repo/stunts/doom-sbf/{path}"))
+        .collect::<Vec<_>>();
+    let native_codec_files = HOST_NATIVE_CODEC_UPSTREAM_FILES
+        .iter()
+        .map(|path| format!("external/{path}"))
+        .chain(
+            HOST_NATIVE_CODEC_REPO_FILES
+                .iter()
+                .map(|path| format!("repo/stunts/doom-sbf/{path}")),
+        )
+        .collect::<Vec<_>>();
+    let roots_engine = [
+        upstream.clone(),
+        upstream_headless.clone(),
+        repo_sbfinc.clone(),
+    ]
+    .into_iter()
+    .collect::<Vec<_>>();
+    let roots_native = [upstream.clone(), upstream_headless.clone()]
+        .into_iter()
+        .collect::<Vec<_>>();
+    let groups = [
+        host_group_json(
+            "hotloop",
+            &["repo/stunts/doom-sbf/src/doom_hotloops.c".to_owned()],
+            &[],
+            &hotloop_defines,
+            &[],
+            &[],
+            &[],
+            &compiler,
+            compiler_version,
+            &archiver,
+            archiver_version,
+        ),
+        host_group_json(
+            "engine",
+            &engine_files,
+            &engine_flags,
+            &["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()],
+            &["doom_ctx.h".to_owned()],
+            &[
+                "upstream".to_owned(),
+                "upstream/headless".to_owned(),
+                "repo/sbfinc".to_owned(),
+            ],
+            &roots_engine,
+            &compiler,
+            compiler_version,
+            &archiver,
+            archiver_version,
+        ),
+        host_group_json(
+            "context",
+            &context_files,
+            &context_flags,
+            &[
+                "NORMALUNIX".to_owned(),
+                "HEADLESS_DOOM".to_owned(),
+                "DOOM_CTX_NO_MACROS".to_owned(),
+            ],
+            &["doom_ctx.h".to_owned()],
+            &[
+                "upstream".to_owned(),
+                "upstream/headless".to_owned(),
+                "repo/sbfinc".to_owned(),
+            ],
+            &roots_engine,
+            &compiler,
+            compiler_version,
+            &archiver,
+            archiver_version,
+        ),
+        host_group_json(
+            "platform",
+            &platform_files,
+            &platform_flags,
+            &["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()],
+            &[],
+            &[
+                "upstream".to_owned(),
+                "upstream/headless".to_owned(),
+                "repo/sbfinc".to_owned(),
+            ],
+            &roots_engine,
+            &compiler,
+            compiler_version,
+            &archiver,
+            archiver_version,
+        ),
+        host_group_json(
+            "nativecodec",
+            &native_codec_files,
+            &native_codec_flags,
+            &["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()],
+            &["doom_ctx.h".to_owned()],
+            &["upstream".to_owned(), "upstream/headless".to_owned()],
+            &roots_native,
+            &compiler,
+            compiler_version,
+            &archiver,
+            archiver_version,
+        ),
+    ]
+    .join(", ");
+    let header = tree.join("headless/doom_ctx.h");
+    let header_bytes = fs::read(&header).unwrap_or_else(|error| {
+        panic!(
+            "cannot read host provenance header {}: {error}",
+            header.display()
+        )
+    });
+    let header_root = format!(
+        "{{\"path\": \"external/headless/doom_ctx.h\", \"absolute_path\": {}, \"bytes\": {}, \"sha256\": {}}}",
+        json_string(&canonical_path(&header)),
+        header_bytes.len(),
+        json_string(&hex(&digest(&header_bytes)))
+    );
+    let translation_units = host_translation_units();
+    (
+        format!("[{}]", groups),
+        header_root,
+        json_string_array(&translation_units),
+    )
+}
+
+fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: bool) -> String {
     let mut compiler_probe = cc::Build::new();
     if is_sbf {
         let cc = env::var("CC").expect("ctx-engine SBF build needs CC from cargo-build-sbf");
+        let ar = env::var("AR").expect("ctx-engine SBF build needs AR from cargo-build-sbf");
         compiler_probe.compiler(cc);
+        compiler_probe.archiver(ar);
     }
     let compiler = compiler_probe.get_compiler();
     let cc_path = compiler.path().to_string_lossy().into_owned();
     let strict = !is_sbf;
     let cc_version = command_version(compiler.path(), strict);
+    let archiver_command = compiler_probe.get_archiver();
+    let ar_path = PathBuf::from(archiver_command.get_program());
     let rustc_path = PathBuf::from(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
     let cargo_path = PathBuf::from(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    let ar_path = PathBuf::from(env::var_os("AR").unwrap_or_else(|| "ar".into()));
     let linker_path = env::var_os("RUSTC_LINKER")
         .or_else(|| {
             let key = format!(
@@ -274,6 +523,9 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
     let rustc_workspace_wrapper = env::var_os("RUSTC_WORKSPACE_WRAPPER")
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if strict && (!rustc_wrapper.is_empty() || !rustc_workspace_wrapper.is_empty()) {
+        panic!("native host provenance requires empty RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER");
+    }
     let cflags = normalized_env("CFLAGS");
     let cppflags = normalized_env("CPPFLAGS");
     let c_include_path = normalized_env("C_INCLUDE_PATH");
@@ -289,33 +541,30 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
     } else {
         Vec::new()
     };
-    let common_flags = vec![
-        "-O2",
-        "-std=gnu89",
-        "-DNORMALUNIX",
-        "-DHEADLESS_DOOM",
-        "-Wno-deprecated-non-prototype",
-        "-Wno-implicit-int",
-        "-Wno-int-conversion",
-        "-Wno-incompatible-pointer-types",
-        "-Wno-format-security",
-    ];
+    let common_flags = HOST_COMMON_FLAGS.to_vec();
     let engine_flags = common_flags
         .iter()
         .map(|v| (*v).to_owned())
         .collect::<Vec<_>>();
     let hotloop_flags = Vec::<String>::new();
     let host_c_defines = vec!["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()];
-    let host_c_tus = NATIVE_C_TRANSLATION_UNITS
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect::<Vec<_>>();
     let module_closure = NATIVE_RUST_MODULE_CLOSURE
         .iter()
         .map(|(binary, paths)| format!("{}: {}", binary, paths.join(",")))
         .collect::<Vec<_>>();
+    let (host_groups, host_header_root, host_translation_units) = match tree {
+        Some(tree) if !is_sbf => host_groups_metadata(
+            crate_root,
+            tree,
+            compiler.path(),
+            &cc_version,
+            &ar_path,
+            &ar_version,
+        ),
+        _ => ("[]".to_owned(), "null".to_owned(), "[]".to_owned()),
+    };
     format!(
-        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"conservative-source-envelope\", \"header_scope\": \"conservative-source-envelope\"}},\n  \"rust_module_closure\": {},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
+        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"groups\": {}, \"group_scope\": \"exact-host-cc-build-contract/1\", \"header_root\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"exact-host-build-inputs/1\"}},\n  \"rust_module_closure\": {},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
         json_string(target),
         json_string(&rustc_path.to_string_lossy()),
         json_string(&rustc_version),
@@ -346,7 +595,9 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
         json_string_array(&hotloop_defines),
         json_string_array(&engine_flags),
         json_string_array(&host_c_defines),
-        json_string_array(&host_c_tus),
+        host_groups,
+        host_header_root,
+        host_translation_units,
         json_string_array(&module_closure),
     )
 }
@@ -523,10 +774,15 @@ fn source_manifest(
         "../doom-host/build.sh",
         "../doom-host/tools/doom_controller_producer.py",
         "../doom-host/tools/doom_account_image.py",
+        "../../scripts/doom_native_provenance_descriptor.py",
+        "../../scripts/doom_native_expected_profile.py",
+        "../../scripts/doom_native_provenance_acceptance.sh",
+        "doom-native-host-profile-v2.json",
     ] {
         let path = crate_root.join(name);
-        let display = name.strip_prefix("../").unwrap_or(name);
-        let manifest_name = if name.starts_with("../") {
+        let manifest_name = if let Some(display) = name.strip_prefix("../../") {
+            format!("repo/{display}")
+        } else if let Some(display) = name.strip_prefix("../") {
             format!("repo/stunts/{display}")
         } else {
             format!("repo/stunts/doom-sbf/{name}")
@@ -581,10 +837,7 @@ fn source_manifest(
         .filter(|(name, _)| name.ends_with(".h") || name.ends_with(".inc"))
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
-    let c_translation_units = NATIVE_C_TRANSLATION_UNITS
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect::<Vec<_>>();
+    let c_translation_units = tree.map(|_| host_translation_units()).unwrap_or_default();
     let source_profile = if tree.is_some() && !is_sbf {
         NATIVE_PROVENANCE_PROFILE
     } else if tree.is_some() {
@@ -658,8 +911,13 @@ fn source_manifest(
     .unwrap();
     writeln!(
         &mut manifest,
-        "  \"c_headers\": {{\"scope\": \"conservative-source-envelope\", \"paths\": {}}},",
-        json_string_array(&header_inputs)
+        "  \"c_headers\": {{\"scope\": \"conservative-source-envelope\", \"paths\": {}, \"header_root\": {}}},",
+        json_string_array(&header_inputs),
+        json_string(if tree.is_some() {
+            "external/headless/doom_ctx.h"
+        } else {
+            "none"
+        })
     )
     .unwrap();
     writeln!(
@@ -777,7 +1035,7 @@ fn write_identity(
     is_sbf: bool,
     common_flags: &[&str],
 ) {
-    let metadata = build_metadata(target, is_sbf);
+    let metadata = build_metadata(crate_root, tree, target, is_sbf);
     let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags, &metadata);
     let abi_id = digest(format!("DOOM-EX2-ABI-ID\0{ABI_DESCRIPTOR}").as_bytes());
     let sbf_abi_id = digest(format!("DOOM-E2S-ABI-ID\0{SBF_ABI_DESCRIPTOR}").as_bytes());
@@ -936,6 +1194,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=DEBUG_ASSERTIONS");
+    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=RUSTC_WRAPPER");
+    println!("cargo:rerun-if-env-changed=RUSTC_WORKSPACE_WRAPPER");
+    println!("cargo:rerun-if-env-changed=CFLAGS");
+    println!("cargo:rerun-if-env-changed=CPPFLAGS");
+    println!("cargo:rerun-if-env-changed=C_INCLUDE_PATH");
+    println!("cargo:rerun-if-env-changed=RUSTC_LINKER");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_RELEASE_LTO");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_RELEASE_CODEGEN_UNITS");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS");
 
     let mut build = cc::Build::new();
     build.file("src/doom_hotloops.c");
@@ -1022,17 +1291,7 @@ fn compile_ctx_engine(target: &str) {
     // then the freestanding SBF backend flags the hotloop build uses.
     // DOOM_SBF_BUILD is SBF-only: host feature builds (driver link, crate
     // tests) keep the real host backing so the objects stay honest.
-    let common: &[&str] = &[
-        "-O2",
-        "-std=gnu89",
-        "-DNORMALUNIX",
-        "-DHEADLESS_DOOM",
-        "-Wno-deprecated-non-prototype",
-        "-Wno-implicit-int",
-        "-Wno-int-conversion",
-        "-Wno-incompatible-pointer-types",
-        "-Wno-format-security",
-    ];
+    let common: &[&str] = HOST_COMMON_FLAGS;
     // NB: cargo-build-sbf v1.51 reports TARGET as `sbpf-solana-solana`; the
     // older `sbf-solana-solana` spelling is kept so the same build.rs works
     // under both.  (The pre-existing hotloop block above still checks only
@@ -1147,10 +1406,13 @@ fn compile_ctx_engine(target: &str) {
     } else {
         tree.join("headless/doom_ctx_init.c")
     };
-    ctx.file(ctx_init)
-        .file(manifest.join("src/doom_sbf_ctx.c"))
-        .file(manifest.join("src/doom_sbf_engine.c"));
-    platform.file(manifest.join("src/doom_sbf_platform.c"));
+    ctx.file(ctx_init);
+    for relative in HOST_CONTEXT_REPO_FILES {
+        ctx.file(manifest.join(relative));
+    }
+    for relative in HOST_PLATFORM_REPO_FILES {
+        platform.file(manifest.join(relative));
+    }
     engine.compile("doom_engine_ctx");
     platform.compile("doom_sbf_platform");
     ctx.compile("doom_engine_ctx_state");
@@ -1527,13 +1789,13 @@ fn compile_ctx_engine(target: &str) {
             .include(&tree)
             .include(tree.join("headless"))
             .flag("-include")
-            .flag("doom_ctx.h")
-            .file(tree.join("headless/doom_state.c"))
-            .file(tree.join("headless/doom_controller.c"))
-            .file(manifest.join("src/doom_sbf_ex2.c"))
-            .file(manifest.join("src/doom_sbf_resource.c"))
-            .file(manifest.join("src/doom_resource.c"))
-            .file(manifest.join("src/doom_resource_ri2.c"));
+            .flag("doom_ctx.h");
+        for relative in HOST_NATIVE_CODEC_UPSTREAM_FILES {
+            native.file(tree.join(relative));
+        }
+        for relative in HOST_NATIVE_CODEC_REPO_FILES {
+            native.file(manifest.join(relative));
+        }
         native.compile("doom_engine_ex2_native");
     }
 }
