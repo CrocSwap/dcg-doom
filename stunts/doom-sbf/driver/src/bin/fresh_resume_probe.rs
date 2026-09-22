@@ -29,11 +29,11 @@ const CORRECTED_DECODER_COMMIT: &str = "53bd00225df56df8037fc95b884c542db633a09b
 const PINNED_PATCH_0014_SHA256: &str =
     "788a1a3f830a42e4d82c704db80fda6a281ac6b09dec22fcabd8b727e7d1e08e";
 const PINNED_UPSTREAM_COMMIT: &str = "a77dfb96cb91780ca334d0d4cfd86957558007e0";
-const ORACLE_IDENTITY_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/3";
-const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/2";
-const ACCEPTANCE_DESCRIPTOR_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ACCEPTANCE-DESCRIPTOR/1";
+const ORACLE_IDENTITY_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/4";
+const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
+const FINAL_DESCRIPTOR_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ACCEPTANCE-DESCRIPTOR/2";
 const NATIVE_PROVENANCE_PROFILE: &str =
-    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/1";
+    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const PATCH_0014_PATH: &str = "repo/stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch";
 const Z_ZONE_PATH: &str = "external/z_zone.c";
 const FORWARD_TICS: usize = 1000;
@@ -46,6 +46,10 @@ const DIAGNOSTIC_STATE_ROW: usize = 597;
 const DIAGNOSTIC_PLAT_RECORD_OFFSET: usize = 59128;
 const DIAGNOSTIC_PLAT_COUNT_OFFSET: usize = 59149;
 const DS_PLAT: u8 = 5;
+const ORACLE_FILE_TABLE_DOMAIN: &[u8] = b"DOOM-SIM/2-NATIVE-ORACLE-FILE-TABLE/1\0";
+const INPUT_FILE_TABLE_DOMAIN: &[u8] = b"DOOM-SIM/2-NATIVE-INPUT-FILE-TABLE/1\0";
+const COMMAND_DOMAIN: &str = "DOOM-SIM/2-COMMANDS/1";
+const COMMAND_WIDTH: usize = 4;
 
 fn sha(bytes: &[u8]) -> String {
     base::sha(bytes)
@@ -76,7 +80,7 @@ fn nonempty_metadata(metadata: &Value) -> bool {
     if metadata.is_empty() {
         return false;
     }
-    for tool in ["rustc", "cargo", "c_compiler", "archiver"] {
+    for tool in ["rustc", "cargo", "c_compiler", "linker", "archiver"] {
         let Some(tool) = metadata.get(tool).and_then(Value::as_object) else {
             return false;
         };
@@ -112,19 +116,107 @@ fn nonempty_metadata(metadata: &Value) -> bool {
         })
 }
 
-fn descriptor_string(descriptor: &Value, path: &str) -> Result<String, Box<dyn Error>> {
-    descriptor[path]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("acceptance descriptor field {path} is missing").into())
-}
-
 fn manifest_input<'a>(manifest: &'a Value, path: &str) -> Option<&'a Value> {
     manifest["inputs"]
         .as_array()?
         .iter()
         .find(|input| input["path"].as_str() == Some(path))
+}
+
+fn file_record(path: &str, bytes: &[u8]) -> Value {
+    json!({"path": path, "bytes": bytes.len(), "sha256": sha(bytes)})
+}
+
+fn collect_files(root: &Path, base: &Path, out: &mut Vec<Value>) -> Result<(), Box<dyn Error>> {
+    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(base)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let kind = fs::symlink_metadata(&path)?.file_type();
+        if kind.is_symlink() {
+            return Err(format!("final descriptor {relative} is a symlink").into());
+        }
+        if kind.is_dir() {
+            collect_files(&path, base, out)?;
+        } else if kind.is_file() {
+            out.push(file_record(&relative, &fs::read(&path)?));
+        }
+    }
+    out.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    Ok(())
+}
+
+fn table_root(records: &[Value], domain: &[u8]) -> Result<String, Box<dyn Error>> {
+    let mut encoded = domain.to_vec();
+    for record in records {
+        let path = record["path"].as_str().ok_or("file table path")?;
+        let bytes = record["bytes"].as_u64().ok_or("file table byte length")?;
+        let digest = record["sha256"].as_str().ok_or("file table sha256")?;
+        encoded.extend_from_slice(path.as_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(bytes.to_string().as_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(digest.as_bytes());
+        encoded.push(b'\n');
+    }
+    Ok(sha(&encoded))
+}
+
+fn validate_file_table(
+    root: &Path,
+    expected: &Value,
+    expected_root: &Value,
+    label: &str,
+    exact: bool,
+    domain: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let expected_records = expected
+        .as_array()
+        .ok_or(format!("{label} file table is missing"))?;
+    let mut actual = Vec::new();
+    if exact {
+        collect_files(root, root, &mut actual)?;
+    } else {
+        for record in expected_records {
+            let relative = record["path"]
+                .as_str()
+                .ok_or(format!("{label} file path"))?;
+            let path = root.join(relative);
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                return Err(format!(
+                    "final descriptor {label} required file {relative} is a symlink"
+                )
+                .into());
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("{label} required file {relative}: {error}"))?;
+            actual.push(file_record(relative, &bytes));
+        }
+    }
+    if &actual != expected_records {
+        let mismatch = expected_records
+            .iter()
+            .map(|record| record["path"].as_str().unwrap_or("<invalid>"))
+            .find(|path| {
+                actual
+                    .iter()
+                    .find(|record| record["path"].as_str() == Some(*path))
+                    != expected_records
+                        .iter()
+                        .find(|record| record["path"].as_str() == Some(*path))
+            })
+            .unwrap_or("<directory-shape>");
+        return Err(format!("final descriptor {label} file pin mismatch: {mismatch}").into());
+    }
+    let root = table_root(&actual, domain)?;
+    if expected_root.as_str() != Some(root.as_str()) {
+        return Err(format!("final descriptor {label} file-table root mismatch").into());
+    }
+    Ok(())
 }
 
 fn required_sha(value: &Value, label: &str) -> Result<String, Box<dyn Error>> {
@@ -137,13 +229,15 @@ fn required_sha(value: &Value, label: &str) -> Result<String, Box<dyn Error>> {
     Ok(sha.to_owned())
 }
 
-fn validate_acceptance_descriptor(
+fn validate_final_descriptor(
     descriptor_path: &Path,
     descriptor_sha256: &str,
     descriptor_bytes: usize,
     role: &str,
     executable: &Path,
     oracle_path: &Path,
+    capture_path: &Path,
+    resource_path: &Path,
     manifest: &Value,
     manifest_bytes: &[u8],
 ) -> Result<Value, Box<dyn Error>> {
@@ -155,17 +249,51 @@ fn validate_acceptance_descriptor(
         || bytes.len() != descriptor_bytes
         || sha(&bytes) != descriptor_sha256
     {
-        return Err("acceptance descriptor bytes/hash do not match the external pin".into());
+        return Err("final descriptor bytes/hash do not match the external pin".into());
     }
     let descriptor: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("acceptance descriptor is not JSON: {error}"))?;
-    if descriptor["schema"] != ACCEPTANCE_DESCRIPTOR_SCHEMA
+        .map_err(|error| format!("final descriptor is not JSON: {error}"))?;
+    if descriptor["schema"] != FINAL_DESCRIPTOR_SCHEMA
+        || descriptor["version"] != 2
+        || descriptor["stage"] != "acceptance"
         || descriptor["profile"] != NATIVE_PROVENANCE_PROFILE
-        || descriptor_string(&descriptor, "oracle_directory")?
-            != oracle_path.canonicalize()?.display().to_string()
+        || descriptor["oracle"]["directory"] != oracle_path.canonicalize()?.display().to_string()
     {
-        return Err("acceptance descriptor schema/profile/oracle path mismatch".into());
+        return Err("final descriptor stage/version/profile/oracle path mismatch".into());
     }
+    validate_file_table(
+        oracle_path,
+        &descriptor["oracle"]["file_table"],
+        &descriptor["oracle"]["file_table_root"],
+        "oracle",
+        true,
+        ORACLE_FILE_TABLE_DOMAIN,
+    )?;
+    if descriptor["capture"]["directory"] != capture_path.canonicalize()?.display().to_string() {
+        return Err("final descriptor capture directory mismatch".into());
+    }
+    validate_file_table(
+        capture_path,
+        &descriptor["capture"]["file_table"],
+        &descriptor["capture"]["file_table_root"],
+        "capture",
+        false,
+        INPUT_FILE_TABLE_DOMAIN,
+    )?;
+    if descriptor["resource"]["path"] != resource_path.canonicalize()?.display().to_string() {
+        return Err("final descriptor resource path mismatch".into());
+    }
+    let resource_parent = resource_path
+        .parent()
+        .ok_or("resource path has no parent")?;
+    validate_file_table(
+        resource_parent,
+        &descriptor["resource"]["file_table"],
+        &descriptor["resource"]["file_table_root"],
+        "resource",
+        false,
+        INPUT_FILE_TABLE_DOMAIN,
+    )?;
     let binary = descriptor["binaries"][role]
         .as_object()
         .ok_or_else(|| format!("acceptance descriptor has no {role} binary"))?;
@@ -174,14 +302,13 @@ fn validate_acceptance_descriptor(
         || binary["bytes"].as_u64() != Some(actual_binary.len() as u64)
         || binary["sha256"].as_str() != Some(sha(&actual_binary).as_str())
     {
-        return Err(
-            format!("{role} binary does not match the external acceptance descriptor").into(),
-        );
+        return Err(format!("{role} binary does not match the final descriptor").into());
     }
     let compile = descriptor["compile"]
         .as_object()
         .ok_or("acceptance descriptor compile section is missing")?;
-    if compile["target"] != manifest["target"]
+    if compile["manifest_schema"] != manifest["schema"]
+        || compile["target"] != manifest["target"]
         || compile["sbf"] != manifest["sbf"]
         || compile["source_profile"] != manifest["source_profile"]
         || compile["source_commit"] != manifest["compile_source_commit"]
@@ -193,11 +320,18 @@ fn validate_acceptance_descriptor(
         || compile["inputs"] != manifest["inputs"]
         || compile["build_metadata"] != manifest["build_metadata"]
         || compile["compiler_flags"] != manifest["compiler_flags"]
-        || compile["source_manifest_sha256"] != sha(manifest_bytes)
+        || compile["source_manifest"]["bytes"] != manifest_bytes.len()
+        || compile["source_manifest"]["sha256"] != sha(manifest_bytes)
+        || compile["allowed_cargo_features"] != manifest["allowed_cargo_features"]
+        || compile["enabled_cargo_features"] != manifest["enabled_cargo_features"]
+        || compile["input_scope"] != manifest["input_scope"]
+        || compile["rust_module_closure"] != manifest["rust_module_closure"]
+        || compile["c_translation_units"] != manifest["c_translation_units"]
+        || compile["c_translation_units_scope"] != manifest["c_translation_units_scope"]
+        || compile["c_headers"] != manifest["c_headers"]
+        || compile["build_scripts_and_locks"] != manifest["build_scripts_and_locks"]
     {
-        return Err(
-            "embedded build manifest differs from the external acceptance descriptor".into(),
-        );
+        return Err("embedded build manifest differs from the final descriptor".into());
     }
     if manifest["schema"] != SOURCE_MANIFEST_SCHEMA
         || manifest["binary_targets"] != json!(["sweep_native", "fresh_resume_probe"])
@@ -209,9 +343,7 @@ fn validate_acceptance_descriptor(
             .as_array()
             .is_none_or(|flags| flags.is_empty())
     {
-        return Err(
-            "embedded source manifest is incomplete or has empty toolchain metadata".into(),
-        );
+        return Err("embedded source manifest is incomplete, debug, or feature-expanded".into());
     }
     let patch = manifest_input(manifest, PATCH_0014_PATH).ok_or("manifest omits patch 0014")?;
     let z_zone = manifest_input(manifest, Z_ZONE_PATH).ok_or("manifest omits patched z_zone.c")?;
@@ -278,9 +410,7 @@ fn validate_oracle_identity(
     oracle_path: &Path,
     identity: &Value,
     descriptor: &Value,
-    descriptor_path: &Path,
     descriptor_sha256: &str,
-    descriptor_bytes: usize,
 ) -> Result<Value, Box<dyn Error>> {
     if identity["schema"] != ORACLE_IDENTITY_SCHEMA {
         return Err("oracle identity schema is missing or unsupported".into());
@@ -290,7 +420,7 @@ fn validate_oracle_identity(
         .map_err(|error| format!("cannot read retained oracle source manifest: {error}"))?;
     let manifest_sha256 = sha(&manifest_bytes);
     if identity["source_manifest_sha256"].as_str() != Some(manifest_sha256.as_str())
-        || manifest_sha256 != descriptor["compile"]["source_manifest_sha256"]
+        || manifest_sha256 != descriptor["compile"]["source_manifest"]["sha256"]
     {
         return Err("oracle source manifest hash does not match its identity".into());
     }
@@ -308,6 +438,15 @@ fn validate_oracle_identity(
         || manifest["upstream_commit"] != descriptor["compile"]["upstream_commit"]
         || manifest["build_metadata"] != descriptor["compile"]["build_metadata"]
         || manifest["compiler_flags"] != descriptor["compile"]["compiler_flags"]
+        || manifest["allowed_cargo_features"] != descriptor["compile"]["allowed_cargo_features"]
+        || manifest["enabled_cargo_features"] != descriptor["compile"]["enabled_cargo_features"]
+        || manifest["input_scope"] != descriptor["compile"]["input_scope"]
+        || manifest["rust_module_closure"] != descriptor["compile"]["rust_module_closure"]
+        || manifest["c_translation_units"] != descriptor["compile"]["c_translation_units"]
+        || manifest["c_translation_units_scope"]
+            != descriptor["compile"]["c_translation_units_scope"]
+        || manifest["c_headers"] != descriptor["compile"]["c_headers"]
+        || manifest["build_scripts_and_locks"] != descriptor["compile"]["build_scripts_and_locks"]
         || !nonempty_metadata(&manifest["build_metadata"])
     {
         return Err(
@@ -330,13 +469,8 @@ fn validate_oracle_identity(
     {
         return Err("oracle z_zone.c manifest entry is empty".into());
     }
-    let expected_acceptance_descriptor = json!({
-        "path": descriptor_path.display().to_string(),
-        "sha256": descriptor_sha256,
-        "bytes": descriptor_bytes,
-    });
-    if identity["acceptance_descriptor"] != expected_acceptance_descriptor
-        || identity["provenance"]["acceptance_descriptor"] != expected_acceptance_descriptor
+    if identity["build_descriptor"] != descriptor["build_descriptor"]
+        || identity["provenance"]["build_descriptor"] != descriptor["build_descriptor"]
         || identity["provenance"]["corrected_decoder_commit"].as_str()
             != Some(CORRECTED_DECODER_COMMIT)
         || identity["provenance"]["patch_0014_sha256"].as_str() != Some(PINNED_PATCH_0014_SHA256)
@@ -393,7 +527,7 @@ fn validate_oracle_identity(
         "source_commit": descriptor["compile"]["source_commit"],
         "source_tree": descriptor["compile"]["source_tree"],
         "source_tree_clean": true,
-        "acceptance_descriptor_sha256": descriptor_sha256,
+        "final_descriptor_sha256": descriptor_sha256,
         "binary": {"path": binary_path, "sha256": binary_sha256},
     }))
 }
@@ -520,13 +654,13 @@ fn malformed_controls(
 fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = env::args().collect();
     let [_, capture, resource_path, oracle, receipt, rest @ ..] = &argv[..] else {
-        return Err("usage: fresh_resume_probe <capture> <resource> <oracle> <receipt> --acceptance-descriptor PATH --acceptance-descriptor-sha256 HEX --acceptance-descriptor-bytes N [--corrected-commit COMMIT] [--source-root ROOT]".into());
+        return Err("usage: fresh_resume_probe <capture> <resource> <oracle> <receipt> --final-descriptor PATH --final-descriptor-sha256 HEX --final-descriptor-bytes N [--corrected-commit COMMIT] [--source-root ROOT]".into());
     };
     let mut corrected_commit = CORRECTED_DECODER_COMMIT.to_owned();
     let mut source_root: Option<PathBuf> = None;
-    let mut acceptance_descriptor: Option<PathBuf> = None;
-    let mut acceptance_descriptor_sha256: Option<String> = None;
-    let mut acceptance_descriptor_bytes: Option<usize> = None;
+    let mut final_descriptor: Option<PathBuf> = None;
+    let mut final_descriptor_sha256: Option<String> = None;
+    let mut final_descriptor_bytes: Option<usize> = None;
     let mut args = rest.iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -541,22 +675,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                     args.next().ok_or("--source-root needs a value")?,
                 ));
             }
-            "--acceptance-descriptor" => {
-                acceptance_descriptor = Some(PathBuf::from(
-                    args.next().ok_or("--acceptance-descriptor needs a value")?,
+            "--final-descriptor" => {
+                final_descriptor = Some(PathBuf::from(
+                    args.next().ok_or("--final-descriptor needs a value")?,
                 ));
             }
-            "--acceptance-descriptor-sha256" => {
-                acceptance_descriptor_sha256 = Some(
+            "--final-descriptor-sha256" => {
+                final_descriptor_sha256 = Some(
                     args.next()
-                        .ok_or("--acceptance-descriptor-sha256 needs a value")?
+                        .ok_or("--final-descriptor-sha256 needs a value")?
                         .clone(),
                 );
             }
-            "--acceptance-descriptor-bytes" => {
-                acceptance_descriptor_bytes = Some(
+            "--final-descriptor-bytes" => {
+                final_descriptor_bytes = Some(
                     args.next()
-                        .ok_or("--acceptance-descriptor-bytes needs a value")?
+                        .ok_or("--final-descriptor-bytes needs a value")?
                         .parse()?,
                 );
             }
@@ -566,13 +700,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     if corrected_commit != CORRECTED_DECODER_COMMIT {
         return Err("probe only accepts the corrected 53bd0022 decoder identity".into());
     }
-    let acceptance_descriptor = acceptance_descriptor
-        .ok_or("--acceptance-descriptor is required")?
+    let final_descriptor = final_descriptor
+        .ok_or("--final-descriptor is required")?
         .canonicalize()?;
-    let acceptance_descriptor_sha256 =
-        acceptance_descriptor_sha256.ok_or("--acceptance-descriptor-sha256 is required")?;
-    let acceptance_descriptor_bytes =
-        acceptance_descriptor_bytes.ok_or("--acceptance-descriptor-bytes is required")?;
+    let final_descriptor_sha256 =
+        final_descriptor_sha256.ok_or("--final-descriptor-sha256 is required")?;
+    let final_descriptor_bytes =
+        final_descriptor_bytes.ok_or("--final-descriptor-bytes is required")?;
 
     let capture_path = PathBuf::from(capture).canonicalize()?;
     let resource_path = PathBuf::from(resource_path).canonicalize()?;
@@ -586,13 +720,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest_bytes = ex2::BUILD_SOURCE_MANIFEST.as_bytes();
     let build_manifest: Value = serde_json::from_str(ex2::BUILD_SOURCE_MANIFEST)
         .map_err(|error| format!("embedded Doom build manifest is not JSON: {error}"))?;
-    let acceptance = validate_acceptance_descriptor(
-        &acceptance_descriptor,
-        &acceptance_descriptor_sha256,
-        acceptance_descriptor_bytes,
+    let final_descriptor_value = validate_final_descriptor(
+        &final_descriptor,
+        &final_descriptor_sha256,
+        final_descriptor_bytes,
         "fresh_resume_probe",
         &executable,
         &oracle_path,
+        &capture_path,
+        &resource_path,
         &build_manifest,
         manifest_bytes,
     )?;
@@ -601,12 +737,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let states = gunzip(&oracle_path.join("oracle-st1.bin.gz"))?;
     let mirrors = gunzip(&oracle_path.join("oracle-mp1.bin.gz"))?;
     let commands = fs::read(oracle_path.join("commands.bin"))?;
+    let command_descriptor = &final_descriptor_value["commands"];
+    if command_descriptor["path"] != "commands.bin"
+        || command_descriptor["domain"] != COMMAND_DOMAIN
+        || command_descriptor["record_width"] != COMMAND_WIDTH
+        || command_descriptor["eof"] != "exact"
+        || command_descriptor["bytes"] != commands.len()
+        || command_descriptor["sha256"] != sha(&commands)
+        || command_descriptor["count"] != commands.len() / COMMAND_WIDTH
+        || commands.len() % COMMAND_WIDTH != 0
+    {
+        return Err("final descriptor command identity/width/domain/EOF mismatch".into());
+    }
     let rows: Vec<Value> = fs::read_to_string(oracle_path.join("oracle-per-tic.jsonl"))?
         .lines()
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
     if rows.len() != FORWARD_TICS
-        || commands.len() != FORWARD_TICS * 4
+        || commands.len() != FORWARD_TICS * COMMAND_WIDTH
         || states.len() != rows.len() * resource_sbf::STATE_MAX_BYTES
         || mirrors.len() != rows.len() * resource_sbf::MIRROR_BYTES
     {
@@ -618,10 +766,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let oracle_provenance = validate_oracle_identity(
         &oracle_path,
         &oracle_identity,
-        &acceptance,
-        &acceptance_descriptor,
-        &acceptance_descriptor_sha256,
-        acceptance_descriptor_bytes,
+        &final_descriptor_value,
+        &final_descriptor_sha256,
     )?;
 
     let repo = source_root

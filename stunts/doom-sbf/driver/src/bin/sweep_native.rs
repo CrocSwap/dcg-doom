@@ -46,10 +46,10 @@ const PINNED_PATCH_0014_SHA256: &str =
 const PINNED_UPSTREAM_COMMIT: &str = "a77dfb96cb91780ca334d0d4cfd86957558007e0";
 const PATCH_0014_PATH: &str = "repo/stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch";
 const Z_ZONE_PATH: &str = "external/z_zone.c";
-const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/2";
-const ACCEPTANCE_DESCRIPTOR_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ACCEPTANCE-DESCRIPTOR/1";
+const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
+const BUILD_DESCRIPTOR_SCHEMA: &str = "DOOM-SIM/2-NATIVE-BUILD-DESCRIPTOR/2";
 const NATIVE_PROVENANCE_PROFILE: &str =
-    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/1";
+    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 
 type Snapshot = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
@@ -221,7 +221,7 @@ fn nonempty_metadata(metadata: &Value) -> bool {
     if metadata.is_empty() {
         return false;
     }
-    for tool in ["rustc", "cargo", "c_compiler", "archiver"] {
+    for tool in ["rustc", "cargo", "c_compiler", "linker", "archiver"] {
         let Some(tool) = metadata.get(tool).and_then(Value::as_object) else {
             return false;
         };
@@ -257,21 +257,12 @@ fn nonempty_metadata(metadata: &Value) -> bool {
         })
 }
 
-fn descriptor_string(descriptor: &Value, path: &str) -> Result<String, Box<dyn Error>> {
-    descriptor[path]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("acceptance descriptor field {path} is missing").into())
-}
-
-fn validate_acceptance_descriptor(
+fn validate_build_descriptor(
     descriptor_path: &std::path::Path,
     descriptor_sha256: &str,
     descriptor_bytes: usize,
     role: &str,
     executable: &std::path::Path,
-    oracle_path: &std::path::Path,
     manifest: &Value,
     manifest_bytes: &[u8],
 ) -> Result<Value, Box<dyn Error>> {
@@ -280,20 +271,20 @@ fn validate_acceptance_descriptor(
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err("acceptance descriptor SHA-256 is not hexadecimal".into());
+        return Err("build descriptor SHA-256 is not hexadecimal".into());
     }
     let bytes = fs::read(descriptor_path)?;
     if bytes.len() != descriptor_bytes || base::sha(&bytes) != descriptor_sha256 {
-        return Err("acceptance descriptor bytes/hash do not match the external pin".into());
+        return Err("build descriptor bytes/hash do not match the external pin".into());
     }
     let descriptor: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("acceptance descriptor is not JSON: {error}"))?;
-    if descriptor["schema"] != ACCEPTANCE_DESCRIPTOR_SCHEMA
+        .map_err(|error| format!("build descriptor is not JSON: {error}"))?;
+    if descriptor["schema"] != BUILD_DESCRIPTOR_SCHEMA
+        || descriptor["version"] != 2
+        || descriptor["stage"] != "source-build"
         || descriptor["profile"] != NATIVE_PROVENANCE_PROFILE
-        || descriptor_string(&descriptor, "oracle_directory")?
-            != oracle_path.canonicalize()?.display().to_string()
     {
-        return Err("acceptance descriptor schema/profile/oracle path mismatch".into());
+        return Err("build descriptor stage/version/profile mismatch".into());
     }
     let binary = descriptor["binaries"][role]
         .as_object()
@@ -303,14 +294,13 @@ fn validate_acceptance_descriptor(
         || binary["bytes"].as_u64() != Some(actual_binary.len() as u64)
         || binary["sha256"].as_str() != Some(base::sha(&actual_binary).as_str())
     {
-        return Err(
-            format!("{role} binary does not match the external acceptance descriptor").into(),
-        );
+        return Err(format!("{role} binary does not match the external build descriptor").into());
     }
     let compile = descriptor["compile"]
         .as_object()
         .ok_or("acceptance descriptor compile section is missing")?;
-    if compile["target"] != manifest["target"]
+    if compile["manifest_schema"] != manifest["schema"]
+        || compile["target"] != manifest["target"]
         || compile["sbf"] != manifest["sbf"]
         || compile["source_profile"] != manifest["source_profile"]
         || compile["source_commit"] != manifest["compile_source_commit"]
@@ -322,10 +312,19 @@ fn validate_acceptance_descriptor(
         || compile["inputs"] != manifest["inputs"]
         || compile["build_metadata"] != manifest["build_metadata"]
         || compile["compiler_flags"] != manifest["compiler_flags"]
-        || compile["source_manifest_sha256"] != base::sha(manifest_bytes)
+        || compile["source_manifest"]["bytes"] != manifest_bytes.len()
+        || compile["source_manifest"]["sha256"] != base::sha(manifest_bytes)
+        || compile["allowed_cargo_features"] != manifest["allowed_cargo_features"]
+        || compile["enabled_cargo_features"] != manifest["enabled_cargo_features"]
+        || compile["input_scope"] != manifest["input_scope"]
+        || compile["rust_module_closure"] != manifest["rust_module_closure"]
+        || compile["c_translation_units"] != manifest["c_translation_units"]
+        || compile["c_translation_units_scope"] != manifest["c_translation_units_scope"]
+        || compile["c_headers"] != manifest["c_headers"]
+        || compile["build_scripts_and_locks"] != manifest["build_scripts_and_locks"]
     {
         return Err(
-            "embedded build manifest differs from the external acceptance descriptor".into(),
+            "embedded build manifest differs from the external source-build descriptor".into(),
         );
     }
     if manifest["schema"] != SOURCE_MANIFEST_SCHEMA
@@ -334,13 +333,13 @@ fn validate_acceptance_descriptor(
         || manifest["compile_source_dirty"] != false
         || manifest["input_count"].as_u64() != manifest["inputs"].as_array().map(|v| v.len() as u64)
         || !nonempty_metadata(&manifest["build_metadata"])
-        || manifest["compiler_flags"]
-            .as_array()
-            .is_none_or(|flags| flags.is_empty())
+        || manifest["compiler_flags"].as_array().is_none()
+        || manifest["allowed_cargo_features"] != json!(["ctx-engine"])
+        || manifest["enabled_cargo_features"] != json!(["ctx-engine"])
+        || manifest["input_scope"] != "conservative-source-envelope"
+        || manifest["c_translation_units_scope"] != "conservative-source-envelope"
     {
-        return Err(
-            "embedded source manifest is incomplete or has empty toolchain metadata".into(),
-        );
+        return Err("embedded source manifest is incomplete, debug, or feature-expanded".into());
     }
     let patch = manifest_input(manifest, PATCH_0014_PATH).ok_or("manifest omits patch 0014")?;
     let z_zone = manifest_input(manifest, Z_ZONE_PATH).ok_or("manifest omits patched z_zone.c")?;
@@ -360,18 +359,16 @@ fn build_provenance(
     descriptor_path: &std::path::Path,
     descriptor_sha256: &str,
     descriptor_bytes: usize,
-    receipt: &std::path::Path,
 ) -> Result<Value, Box<dyn Error>> {
     let manifest_bytes = ex2::BUILD_SOURCE_MANIFEST.as_bytes();
     let manifest: Value = serde_json::from_str(ex2::BUILD_SOURCE_MANIFEST)
         .map_err(|error| format!("embedded Doom build manifest is not JSON: {error}"))?;
-    let descriptor = validate_acceptance_descriptor(
+    let descriptor = validate_build_descriptor(
         descriptor_path,
         descriptor_sha256,
         descriptor_bytes,
         "sweep_native",
         executable,
-        receipt,
         &manifest,
         manifest_bytes,
     )?;
@@ -382,7 +379,7 @@ fn build_provenance(
     let z_zone_sha256 = manifest_sha(manifest_input(&manifest, Z_ZONE_PATH).unwrap(), "z_zone.c")?;
     let binary = fs::read(executable)?;
     Ok(serde_json::json!({
-        "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/3",
+        "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/4",
         "corrected_decoder_commit": CORRECTED_DECODER_COMMIT,
         "source_manifest_sha256": base::sha(manifest_bytes),
         "patch_0014_sha256": patch_sha256,
@@ -400,7 +397,7 @@ fn build_provenance(
         "source_profile": manifest["source_profile"],
         "build_metadata": manifest["build_metadata"],
         "compiler_flags": manifest["compiler_flags"],
-        "acceptance_descriptor": {
+        "build_descriptor": {
             "path": descriptor_path,
             "sha256": descriptor_sha256,
             "bytes": descriptor_bytes,
@@ -419,9 +416,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut seed = 0x5eed_d00d_2026_0922u64;
     let mut checkpoint_path: Option<PathBuf> = None;
     let mut sim1_receipt: Option<PathBuf> = None;
-    let mut acceptance_descriptor: Option<PathBuf> = None;
-    let mut acceptance_descriptor_sha256: Option<String> = None;
-    let mut acceptance_descriptor_bytes: Option<usize> = None;
+    let mut build_descriptor: Option<PathBuf> = None;
+    let mut build_descriptor_sha256: Option<String> = None;
+    let mut build_descriptor_bytes: Option<usize> = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("flag without value")?;
         match flag.as_str() {
@@ -429,20 +426,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--seed" => seed = u64::from_str_radix(value.trim_start_matches("0x"), 16)?,
             "--checkpoint" => checkpoint_path = Some(PathBuf::from(value).canonicalize()?),
             "--sim1-receipt" => sim1_receipt = Some(PathBuf::from(value).canonicalize()?),
-            "--acceptance-descriptor" => {
-                acceptance_descriptor = Some(PathBuf::from(value).canonicalize()?)
-            }
-            "--acceptance-descriptor-sha256" => acceptance_descriptor_sha256 = Some(value),
-            "--acceptance-descriptor-bytes" => acceptance_descriptor_bytes = Some(value.parse()?),
+            "--build-descriptor" => build_descriptor = Some(PathBuf::from(value).canonicalize()?),
+            "--build-descriptor-sha256" => build_descriptor_sha256 = Some(value),
+            "--build-descriptor-bytes" => build_descriptor_bytes = Some(value.parse()?),
             _ => return Err(format!("unknown flag {flag}").into()),
         }
     }
-    let acceptance_descriptor =
-        acceptance_descriptor.ok_or("--acceptance-descriptor is required")?;
-    let acceptance_descriptor_sha256 =
-        acceptance_descriptor_sha256.ok_or("--acceptance-descriptor-sha256 is required")?;
-    let acceptance_descriptor_bytes =
-        acceptance_descriptor_bytes.ok_or("--acceptance-descriptor-bytes is required")?;
+    let build_descriptor = build_descriptor.ok_or("--build-descriptor is required")?;
+    let build_descriptor_sha256 =
+        build_descriptor_sha256.ok_or("--build-descriptor-sha256 is required")?;
+    let build_descriptor_bytes =
+        build_descriptor_bytes.ok_or("--build-descriptor-bytes is required")?;
     if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
         return Err("receipt directory is not empty".into());
     }
@@ -450,10 +444,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let executable = env::current_exe()?.canonicalize()?;
     let provenance = build_provenance(
         &executable,
-        &acceptance_descriptor,
-        &acceptance_descriptor_sha256,
-        acceptance_descriptor_bytes,
-        &receipt,
+        &build_descriptor,
+        &build_descriptor_sha256,
+        build_descriptor_bytes,
     )?;
     fs::write(
         receipt.join("source-manifest.json"),
@@ -979,7 +972,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     common::write_json(
         &receipt.join("identity.json"),
         &serde_json::json!({
-            "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/3",
+            "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/4",
             "profile": "DOOM-SIM/2",
             "implementation": "host build of doom-sbf sim2 cores + host C session engine (same C source as SBF, host compiler, this process)",
             "command_line": argv,
@@ -996,7 +989,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "seed": format!("{seed:#x}"),
             "sim2_abi": sim2::ABI_DESCRIPTOR,
             "provenance": provenance,
-            "acceptance_descriptor": provenance["acceptance_descriptor"],
+            "build_descriptor": provenance["build_descriptor"],
             "source_manifest": "source-manifest.json",
             "source_manifest_sha256": source_manifest_sha256,
             "binary": binary_identity,

@@ -21,7 +21,64 @@ const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|acco
 const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
 const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
 const NATIVE_PROVENANCE_PROFILE: &str =
-    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/1";
+    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
+const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
+
+const NATIVE_ALLOWED_CARGO_FEATURES: &[&str] = &["ctx-engine"];
+const NATIVE_RUST_MODULE_CLOSURE: &[(&str, &[&str])] = &[
+    (
+        "sweep_native",
+        &[
+            "driver/src/bin/sweep_native.rs",
+            "driver/src/bin/continuation_split_sbf.rs",
+            "driver/src/sweep_common.rs",
+            "src/lib.rs",
+            "src/ex2.rs",
+            "src/continuation_split_sbf.rs",
+            "src/resource.rs",
+            "src/resource_sbf.rs",
+            "src/simulation.rs",
+            "src/sim2.rs",
+            "src/stage.rs",
+        ],
+    ),
+    (
+        "fresh_resume_probe",
+        &[
+            "driver/src/bin/fresh_resume_probe.rs",
+            "driver/src/bin/continuation_split_sbf.rs",
+            "driver/src/sweep_common.rs",
+            "src/lib.rs",
+            "src/ex2.rs",
+            "src/continuation_split_sbf.rs",
+            "src/resource.rs",
+            "src/resource_sbf.rs",
+            "src/simulation.rs",
+            "src/sim2.rs",
+            "src/stage.rs",
+        ],
+    ),
+];
+const NATIVE_C_TRANSLATION_UNITS: &[&str] = &[
+    "src/doom_hotloops.c",
+    "src/doom_sbf_platform.c",
+    "src/doom_sbf_ctx.c",
+    "src/doom_sbf_engine.c",
+    "src/doom_sbf_ex2.c",
+    "src/doom_sbf_resource.c",
+    "src/doom_resource.c",
+    "src/doom_resource_ri2.c",
+    "external/headless/doom_state.c",
+    "external/headless/doom_controller.c",
+    "external/headless/doom_ctx_init.c",
+];
+const NATIVE_BUILD_METADATA_FILES: &[&str] = &[
+    "repo/stunts/doom-sbf/build.rs",
+    "repo/stunts/doom-sbf/Cargo.toml",
+    "repo/stunts/doom-sbf/Cargo.lock",
+    "repo/stunts/doom-sbf/driver/Cargo.toml",
+    "repo/stunts/doom-sbf/driver/Cargo.lock",
+];
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -58,21 +115,80 @@ fn json_string(value: &str) -> String {
     escaped
 }
 
-fn command_version(path: &Path) -> String {
+fn command_version(path: &Path, required: bool) -> String {
     match Command::new(path).arg("--version").output() {
-        Ok(output) => {
+        Ok(output) if output.status.success() => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
             if !output.stderr.is_empty() {
                 text.push_str(&String::from_utf8_lossy(&output.stderr));
             }
-            text.trim().to_owned()
+            let text = text.trim().to_owned();
+            if required && text.is_empty() {
+                panic!(
+                    "tool {} returned an empty successful --version output",
+                    path.display()
+                );
+            }
+            text
         }
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            if required {
+                panic!(
+                    "tool {} --version failed ({}): {}",
+                    path.display(),
+                    output.status,
+                    detail.trim()
+                );
+            }
+            format!("failed: {}", output.status)
+        }
+        Err(error) if required => panic!("tool {} is unavailable: {error}", path.display()),
         Err(error) => format!("unavailable: {error}"),
     }
 }
 
 fn env_value(name: &str, fallback: &str) -> String {
     env::var(name).unwrap_or_else(|_| fallback.to_owned())
+}
+
+fn normalized_env(name: &str) -> String {
+    env::var(name)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalized_encoded_env(name: &str) -> Vec<String> {
+    env::var_os(name)
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split('\x1f')
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn json_static_array(values: &[&str]) -> String {
+    let owned = values
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    json_string_array(&owned)
 }
 
 fn build_metadata(target: &str, is_sbf: bool) -> String {
@@ -83,10 +199,21 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
     }
     let compiler = compiler_probe.get_compiler();
     let cc_path = compiler.path().to_string_lossy().into_owned();
-    let cc_version = command_version(compiler.path());
+    let strict = !is_sbf;
+    let cc_version = command_version(compiler.path(), strict);
     let rustc_path = PathBuf::from(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
     let cargo_path = PathBuf::from(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     let ar_path = PathBuf::from(env::var_os("AR").unwrap_or_else(|| "ar".into()));
+    let linker_path = env::var_os("RUSTC_LINKER")
+        .or_else(|| {
+            let key = format!(
+                "CARGO_TARGET_{}_LINKER",
+                target.replace('-', "_").to_ascii_uppercase()
+            );
+            env::var_os(key)
+        })
+        .map(PathBuf::from)
+        .unwrap_or_else(|| compiler.path().to_owned());
     let profile = env_value("PROFILE", "unknown");
     let opt_level = env_value("OPT_LEVEL", "unknown");
     let debug = env_value("DEBUG", "unknown");
@@ -107,17 +234,99 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
         env_value("CARGO_PROFILE_RELEASE_LTO", "true")
     };
     let codegen_units = env_value("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+    let enabled_features = [
+        ("ctx-engine", "CARGO_FEATURE_CTX_ENGINE"),
+        ("static-write-probe", "CARGO_FEATURE_STATIC_WRITE_PROBE"),
+        (
+            "account-address-probe",
+            "CARGO_FEATURE_ACCOUNT_ADDRESS_PROBE",
+        ),
+        ("zero-bss-probe", "CARGO_FEATURE_ZERO_BSS_PROBE"),
+        ("diagnostic-profile", "CARGO_FEATURE_DIAGNOSTIC_PROFILE"),
+        ("sim-transport", "CARGO_FEATURE_SIM_TRANSPORT"),
+        ("metered-sweep", "CARGO_FEATURE_METERED_SWEEP"),
+    ]
+    .into_iter()
+    .filter_map(|(feature, variable)| env::var_os(variable).map(|_| feature.to_owned()))
+    .collect::<Vec<_>>();
+    if strict
+        && enabled_features
+            != NATIVE_ALLOWED_CARGO_FEATURES
+                .iter()
+                .map(|v| (*v).to_owned())
+                .collect::<Vec<_>>()
+    {
+        panic!(
+            "native host provenance requires exactly Cargo features {:?}, got {:?}",
+            NATIVE_ALLOWED_CARGO_FEATURES, enabled_features
+        );
+    }
+    if strict && (profile != "release" || debug != "false" || debug_assertions != "false") {
+        panic!(
+            "native host provenance requires release/no-debug settings, got profile={profile} debug={debug} debug_assertions={debug_assertions}"
+        );
+    }
+    let rustflags = normalized_env("RUSTFLAGS");
+    let encoded_rustflags = normalized_encoded_env("CARGO_ENCODED_RUSTFLAGS");
+    let rustc_wrapper = env::var_os("RUSTC_WRAPPER")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let rustc_workspace_wrapper = env::var_os("RUSTC_WORKSPACE_WRAPPER")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cflags = normalized_env("CFLAGS");
+    let cppflags = normalized_env("CPPFLAGS");
+    let c_include_path = normalized_env("C_INCLUDE_PATH");
+    let cargo_features = json_string_array(&enabled_features);
+    let linker_version = command_version(&linker_path, strict);
+    let rustc_version = command_version(&rustc_path, strict);
+    let cargo_version = command_version(&cargo_path, strict);
+    let ar_version = command_version(&ar_path, strict);
+    let hotloop_defines = if env::var_os("CARGO_FEATURE_STATIC_WRITE_PROBE").is_some() {
+        vec!["DOOM_STATIC_WRITE_PROBE".to_owned()]
+    } else if env::var_os("CARGO_FEATURE_ZERO_BSS_PROBE").is_some() {
+        vec!["DOOM_ZERO_BSS_PROBE".to_owned()]
+    } else {
+        Vec::new()
+    };
+    let common_flags = vec![
+        "-O2",
+        "-std=gnu89",
+        "-DNORMALUNIX",
+        "-DHEADLESS_DOOM",
+        "-Wno-deprecated-non-prototype",
+        "-Wno-implicit-int",
+        "-Wno-int-conversion",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-format-security",
+    ];
+    let engine_flags = common_flags
+        .iter()
+        .map(|v| (*v).to_owned())
+        .collect::<Vec<_>>();
+    let hotloop_flags = Vec::<String>::new();
+    let host_c_defines = vec!["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()];
+    let host_c_tus = NATIVE_C_TRANSLATION_UNITS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    let module_closure = NATIVE_RUST_MODULE_CLOSURE
+        .iter()
+        .map(|(binary, paths)| format!("{}: {}", binary, paths.join(",")))
+        .collect::<Vec<_>>();
     format!(
-        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}}\n}}",
+        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {{\"path\": {}, \"version\": {}}},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"conservative-source-envelope\", \"header_scope\": \"conservative-source-envelope\"}},\n  \"rust_module_closure\": {},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
         json_string(target),
         json_string(&rustc_path.to_string_lossy()),
-        json_string(&command_version(&rustc_path)),
+        json_string(&rustc_version),
         json_string(&cargo_path.to_string_lossy()),
-        json_string(&command_version(&cargo_path)),
+        json_string(&cargo_version),
         json_string(&cc_path),
         json_string(&cc_version),
+        json_string(&linker_path.to_string_lossy()),
+        json_string(&linker_version),
         json_string(&ar_path.to_string_lossy()),
-        json_string(&command_version(&ar_path)),
+        json_string(&ar_version),
         json_string(&profile),
         json_string(&opt_level),
         json_string(&debug),
@@ -125,6 +334,20 @@ fn build_metadata(target: &str, is_sbf: bool) -> String {
         json_string(&overflow_checks),
         json_string(&lto),
         json_string(&codegen_units),
+        cargo_features,
+        json_string(&rustflags),
+        json_string_array(&encoded_rustflags),
+        json_string(&rustc_wrapper),
+        json_string(&rustc_workspace_wrapper),
+        json_string(&cflags),
+        json_string(&cppflags),
+        json_string(&c_include_path),
+        json_string_array(&hotloop_flags),
+        json_string_array(&hotloop_defines),
+        json_string_array(&engine_flags),
+        json_string_array(&host_c_defines),
+        json_string_array(&host_c_tus),
+        json_string_array(&module_closure),
     )
 }
 
@@ -256,7 +479,10 @@ fn source_manifest(
         .expect("repository root for Doom provenance");
     let compile_commit = git_query(&repo_root, &["rev-parse", "HEAD"]);
     let compile_tree = git_query(&repo_root, &["rev-parse", "HEAD^{tree}"]);
-    let compile_status = git_query(&repo_root, &["status", "--porcelain", "--untracked-files=all"]);
+    let compile_status = git_query(
+        &repo_root,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
     // A native provenance image must be compiled from the exact clean source
     // commit it records.  This is deliberately a build-time refusal: reading
     // HEAD in a later probe would only describe the caller's checkout, not the
@@ -335,6 +561,30 @@ fn source_manifest(
     }
     inputs.sort_by(|a, b| a.0.cmp(&b.0));
     let input_root = input_root(&inputs);
+    let enabled_features = [
+        ("ctx-engine", "CARGO_FEATURE_CTX_ENGINE"),
+        ("static-write-probe", "CARGO_FEATURE_STATIC_WRITE_PROBE"),
+        (
+            "account-address-probe",
+            "CARGO_FEATURE_ACCOUNT_ADDRESS_PROBE",
+        ),
+        ("zero-bss-probe", "CARGO_FEATURE_ZERO_BSS_PROBE"),
+        ("diagnostic-profile", "CARGO_FEATURE_DIAGNOSTIC_PROFILE"),
+        ("sim-transport", "CARGO_FEATURE_SIM_TRANSPORT"),
+        ("metered-sweep", "CARGO_FEATURE_METERED_SWEEP"),
+    ]
+    .into_iter()
+    .filter_map(|(feature, variable)| env::var_os(variable).map(|_| feature.to_owned()))
+    .collect::<Vec<_>>();
+    let header_inputs = inputs
+        .iter()
+        .filter(|(name, _)| name.ends_with(".h") || name.ends_with(".inc"))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let c_translation_units = NATIVE_C_TRANSLATION_UNITS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
     let source_profile = if tree.is_some() && !is_sbf {
         NATIVE_PROVENANCE_PROFILE
     } else if tree.is_some() {
@@ -347,7 +597,8 @@ fn source_manifest(
     writeln!(&mut manifest, "{{").unwrap();
     writeln!(
         &mut manifest,
-        "  \"schema\": \"DOOM-EX2-NATIVE-SOURCE-MANIFEST/2\","
+        "  \"schema\": {},",
+        json_string(NATIVE_SOURCE_MANIFEST_SCHEMA)
     )
     .unwrap();
     writeln!(&mut manifest, "  \"target\": \"{target}\",").unwrap();
@@ -356,6 +607,65 @@ fn source_manifest(
         &mut manifest,
         "  \"source_profile\": {},",
         json_string(source_profile)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"allowed_cargo_features\": {},",
+        json_static_array(NATIVE_ALLOWED_CARGO_FEATURES)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"enabled_cargo_features\": {},",
+        json_string_array(&enabled_features)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"input_scope\": \"conservative-source-envelope\","
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"rust_module_closure\": {{\"sweep_native\": {}, \"fresh_resume_probe\": {}}},",
+        json_string_array(
+            &NATIVE_RUST_MODULE_CLOSURE[0]
+                .1
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        ),
+        json_string_array(
+            &NATIVE_RUST_MODULE_CLOSURE[1]
+                .1
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        )
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"c_translation_units\": {},",
+        json_string_array(&c_translation_units)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"c_translation_units_scope\": \"conservative-source-envelope\","
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"c_headers\": {{\"scope\": \"conservative-source-envelope\", \"paths\": {}}},",
+        json_string_array(&header_inputs)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"build_scripts_and_locks\": {},",
+        json_static_array(NATIVE_BUILD_METADATA_FILES)
     )
     .unwrap();
     writeln!(
@@ -389,7 +699,12 @@ fn source_manifest(
     // The reproducible wrapper exports the git tree of `stunts/` at the
     // built commit; any other build records that it was not recorded.
     let source_tree = env::var("DOOM_SBF_SOURCE_TREE").unwrap_or_else(|_| "unrecorded".to_owned());
-    writeln!(&mut manifest, "  \"source_tree\": {},", json_string(&source_tree)).unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"source_tree\": {},",
+        json_string(&source_tree)
+    )
+    .unwrap();
     let profile = if env::var("CARGO_FEATURE_SIM_TRANSPORT").is_ok() {
         "sim-transport"
     } else {
@@ -466,12 +781,10 @@ fn write_identity(
     let manifest = source_manifest(crate_root, tree, target, is_sbf, common_flags, &metadata);
     let abi_id = digest(format!("DOOM-EX2-ABI-ID\0{ABI_DESCRIPTOR}").as_bytes());
     let sbf_abi_id = digest(format!("DOOM-E2S-ABI-ID\0{SBF_ABI_DESCRIPTOR}").as_bytes());
-    let resource_sbf_abi_id = digest(
-        format!("DOOM-E2R-ABI-ID\0{RESOURCE_SBF_ABI_DESCRIPTOR}").as_bytes(),
-    );
-    let resource_ri2_sbf_abi_id = digest(
-        format!("DOOM-E2R2-ABI-ID\0{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}").as_bytes(),
-    );
+    let resource_sbf_abi_id =
+        digest(format!("DOOM-E2R-ABI-ID\0{RESOURCE_SBF_ABI_DESCRIPTOR}").as_bytes());
+    let resource_ri2_sbf_abi_id =
+        digest(format!("DOOM-E2R2-ABI-ID\0{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}").as_bytes());
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
     let image_id = digest(&image_input);
@@ -555,7 +868,10 @@ fn write_sbf_ri2_source(out_dir: &Path, manifest: &Path) -> PathBuf {
         "/*\n * DOOM-RI2/2 initialized-resource capture",
         "#define R2_SCALAR",
     ));
-    generated.push_str(&take("static int r2_apply_scalar", "static int r2_apply_relocs"));
+    generated.push_str(&take(
+        "static int r2_apply_scalar",
+        "static int r2_apply_relocs",
+    ));
     generated.push_str(&take(
         "typedef struct {\n    uint32_t scalar[64];",
         "static int r2_v2_commit",
@@ -824,8 +1140,9 @@ fn compile_ctx_engine(target: &str) {
         } else {
             "doom_ctx_init_sbf.c"
         });
-        fs::write(&generated, source)
-            .unwrap_or_else(|err| panic!("write SBF ctx initializer {}: {err}", generated.display()));
+        fs::write(&generated, source).unwrap_or_else(|err| {
+            panic!("write SBF ctx initializer {}: {err}", generated.display())
+        });
         generated
     } else {
         tree.join("headless/doom_ctx_init.c")
@@ -856,8 +1173,7 @@ fn compile_ctx_engine(target: &str) {
         // permits only a 4 KiB frame, so move that plan into the bounded Doom
         // allocator for the SBF codec copy. This is a mechanical rewrite of
         // the existing decoder body; host ST1 behavior remains unchanged.
-        let mut state_source =
-            fs::read_to_string(&state).expect("read generated SBF state source");
+        let mut state_source = fs::read_to_string(&state).expect("read generated SBF state source");
         state_source = format!("#include \"doom_sbf_plan_layout.h\"\n{state_source}");
         // libc realloc cannot express the old allocation length, and the
         // monotonic SBF arena places the larger replacement immediately after
@@ -866,7 +1182,11 @@ fn compile_ctx_engine(target: &str) {
         // builds retain the source's libc realloc path and byte behavior.
         let state_grow_needle = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=realloc(b->p,cap); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
         let state_grow_replacement = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=malloc(cap); if(q && b->p && b->used) memcpy(q,b->p,b->used); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
-        assert_eq!(state_source.matches(state_grow_needle).count(), 1, "SBF state grow rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_grow_needle).count(),
+            1,
+            "SBF state grow rewrite must match once"
+        );
         state_source = state_source.replacen(state_grow_needle, state_grow_replacement, 1);
         // The SBF entry has a fixed ST1 output ceiling.  Reserve that exact
         // bounded space once, then use checked fixed-width readers/writers.
@@ -875,14 +1195,22 @@ fn compile_ctx_engine(target: &str) {
         // checks.  This is intentionally SBF-only; the host codec remains the
         // source oracle and keeps its original allocator behavior.
         let state_need_fast = "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; size_t cap; if (b->bad) return; if (n <= b->cap-b->used) return; cap=b->cap?b->cap:4096; while (n>cap-b->used) { if (cap>(size_t)-1/2) { b->bad=1; return; } cap*=2; } q=malloc(cap); if(q && b->p && b->used) memcpy(q,b->p,b->used); if(!q){b->bad=1;return;} b->p=q;b->cap=cap; }";
-        assert_eq!(state_source.matches(state_need_fast).count(), 1, "SBF state allocator rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_need_fast).count(),
+            1,
+            "SBF state allocator rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_need_fast,
             "static void ds_need(ds_buf_t *b, size_t n) { uint8_t *q; if (b->bad) return; if (n <= b->cap-b->used) return; if (b->p || n > 126976u) { b->bad=1; return; } q=malloc(126976u); if(!q){b->bad=1;return;} b->p=q; b->cap=126976u; }",
             1,
         );
         let state_writer_needle = "static void ds_u8(ds_buf_t *b, uint8_t x) { ds_need(b,1);if(!b->bad)b->p[b->used++]=x; }\nstatic void ds_u16(ds_buf_t *b, uint16_t x) { ds_u8(b,(uint8_t)x);ds_u8(b,(uint8_t)(x>>8)); }\nstatic void ds_u32(ds_buf_t *b, uint32_t x) { ds_u16(b,(uint16_t)x);ds_u16(b,(uint16_t)(x>>16)); }";
-        assert_eq!(state_source.matches(state_writer_needle).count(), 1, "SBF state writer rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_writer_needle).count(),
+            1,
+            "SBF state writer rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_writer_needle,
             // Each writer loads the cursor and base once and stores the new
@@ -894,7 +1222,11 @@ fn compile_ctx_engine(target: &str) {
             1,
         );
         let state_reader_needle = "static uint8_t ds_r8(ds_read_t *r) { if(r->bad||r->used==r->cap){r->bad=1;return 0;}return r->p[r->used++]; }\nstatic uint16_t ds_r16(ds_read_t *r) { uint16_t a=ds_r8(r),b=ds_r8(r);return (uint16_t)(a|(b<<8)); }\nstatic uint32_t ds_r32(ds_read_t *r) { uint32_t a=ds_r16(r),b=ds_r16(r);return a|(b<<16); }\nstatic int32_t ds_ri32(ds_read_t *r) { return (int32_t)ds_r32(r); }";
-        assert_eq!(state_source.matches(state_reader_needle).count(), 1, "SBF state reader rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_reader_needle).count(),
+            1,
+            "SBF state reader rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_reader_needle,
             "static uint8_t ds_r8(ds_read_t *r) { if(r->bad||r->used>=r->cap){r->bad=1;return 0;}return r->p[r->used++]; } static uint16_t ds_r16(ds_read_t *r) { uint16_t a,b; if(r->bad||r->cap-r->used<2u){r->bad=1;return 0;} a=r->p[r->used++]; b=r->p[r->used++]; return (uint16_t)(a|(b<<8)); } static uint32_t ds_r32(ds_read_t *r) { uint32_t a,b,c,d; if(r->bad||r->cap-r->used<4u){r->bad=1;return 0;} a=r->p[r->used++]; b=r->p[r->used++]; c=r->p[r->used++]; d=r->p[r->used++]; return a|(b<<8)|(c<<16)|(d<<24); } static int32_t ds_ri32(ds_read_t *r) { return (int32_t)ds_r32(r); }",
@@ -906,28 +1238,45 @@ fn compile_ctx_engine(target: &str) {
         // ST1 emits that field as the canonical zero, so the wire bytes do not
         // change and the context is not left with the temporary index.
         let state_mobj_id_needle = "static uint32_t ds_mobj_id(mobj_t **m, unsigned n, mobj_t *x) { unsigned i; if(!x)return 0;for(i=0;i<n;i++)if(m[i]==x)return i+1;return 0; }";
-        assert_eq!(state_source.matches(state_mobj_id_needle).count(), 1, "SBF mobj index rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_mobj_id_needle).count(),
+            1,
+            "SBF mobj index rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_mobj_id_needle,
             "static uint32_t ds_mobj_id(mobj_t **m, unsigned n, mobj_t *x) { unsigned value; (void)m; if(!x)return 0; value=(unsigned)x->validcount_m; return value && value<=n ? value : 0; } static void ds_mobj_index(mobj_t **m, unsigned n, int32_t *saved) { unsigned i; for(i=0;i<n;i++){saved[i]=m[i]->validcount_m;m[i]->validcount_m=(int32_t)(i+1);} } static void ds_mobj_restore(mobj_t **m, unsigned n, const int32_t *saved) { unsigned i; for(i=0;i<n;i++)m[i]->validcount_m=saved[i]; }",
             1,
         );
         let state_encode_decl = "ds_buf_t b; thinker_t *t; mobj_t **m; unsigned nm=0, ns=0, nr=0, nceil=0, nplat=0, i; int k; memset(&b,0,sizeof(b));";
-        assert_eq!(state_source.matches(state_encode_decl).count(), 1, "SBF encoder declaration rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_encode_decl).count(),
+            1,
+            "SBF encoder declaration rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_encode_decl,
             "ds_buf_t b; thinker_t *t; mobj_t **m; int32_t *mobj_validcount=0; unsigned nm=0, ns=0, nr=0, nceil=0, nplat=0, i; int k; memset(&b,0,sizeof(b));",
             1,
         );
         let state_encode_mobj = "m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;";
-        assert_eq!(state_source.matches(state_encode_mobj).count(), 1, "SBF encoder mobj setup rewrite must match once");
+        assert_eq!(
+            state_source.matches(state_encode_mobj).count(),
+            1,
+            "SBF encoder mobj setup rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_encode_mobj,
             "m=nm?calloc(nm,sizeof(*m)):0;if(nm&&!m){free(b.p);return -1;}mobj_validcount=nm?malloc(nm*sizeof(*mobj_validcount)):0;if(nm&&!mobj_validcount){free(m);free(b.p);return -1;}i=0;for(t=thinkercap.next;t!=&thinkercap;t=t->next)if(ds_kind(t)==DS_MOBJ)m[i++]=(mobj_t*)t;if(nm)ds_mobj_index(m,nm,mobj_validcount);",
             1,
         );
-        let state_encode_cleanup = "free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}";
-        assert_eq!(state_source.matches(state_encode_cleanup).count(), 1, "SBF encoder cleanup rewrite must match once");
+        let state_encode_cleanup =
+            "free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}";
+        assert_eq!(
+            state_source.matches(state_encode_cleanup).count(),
+            1,
+            "SBF encoder cleanup rewrite must match once"
+        );
         state_source = state_source.replacen(
             state_encode_cleanup,
             "if(nm)ds_mobj_restore(m,nm,mobj_validcount);free(mobj_validcount);free(m);if(b.bad||b.used>DS_MAX_IMAGE_BYTES){free(b.p);return -1;}",
@@ -989,7 +1338,8 @@ fn compile_ctx_engine(target: &str) {
                 .find("\nint DoomStateDecode")
                 .expect("find generated SBF decoder end");
         let mut profile = state_source[profile_start..profile_end].to_owned();
-        let plan_decl = "ds_plan_t p; ds_read_t r; unsigned i, j, mi=0, si=0; memset(&p,0,sizeof(p));";
+        let plan_decl =
+            "ds_plan_t p; ds_read_t r; unsigned i, j, mi=0, si=0; memset(&p,0,sizeof(p));";
         assert_eq!(
             profile.matches(plan_decl).count(),
             1,
@@ -1040,8 +1390,7 @@ fn compile_ctx_engine(target: &str) {
                 "if (ds_preflight(image,image_bytes,p,profile)) { doom_sbf_phase_marker(351); return -1; } doom_sbf_phase_marker(352); if (ds_plan_prepare(p)) { doom_sbf_phase_marker(353); return -1; } doom_sbf_phase_marker(354);",
                 1,
             );
-            let parse_fail =
-                "if (r.bad || r.used != r.cap || mi != p->nmo || si != p->nsp)";
+            let parse_fail = "if (r.bad || r.used != r.cap || mi != p->nmo || si != p->nsp)";
             assert_eq!(
                 profile.matches(parse_fail).count(),
                 1,
@@ -1091,7 +1440,7 @@ fn compile_ctx_engine(target: &str) {
             split_body
         );
         let old_split_plan = "static ds_plan_t *doom_state_split_plan(void) {\n    if (!DOOM_CTX->arena_base || DOOM_CTX->arena_bytes <= sizeof(ds_plan_t) + 4096u) return 0;\n    return (ds_plan_t *)((uint8_t *)DOOM_CTX->arena_base + DOOM_CTX->arena_bytes - sizeof(ds_plan_t) - 4096u);\n}";
-let new_split_plan = "_Static_assert(sizeof(ds_plan_t) <= RI2_SPLIT_DECODER_PLAN_RESERVE, \"decoder plan exceeds its reserved tail slice\");\nstatic ds_plan_t *doom_state_split_plan(void) {\n    if (!arena_base || arena_bytes == 0) return 0;\n    /* arena_bytes ends exactly at the decoder slice; the RI2 plan occupies\n     * the final 64 KiB of the 256 KiB reserved tail. */\n    return (ds_plan_t *)((uint8_t *)arena_base + arena_bytes);\n}";
+        let new_split_plan = "_Static_assert(sizeof(ds_plan_t) <= RI2_SPLIT_DECODER_PLAN_RESERVE, \"decoder plan exceeds its reserved tail slice\");\nstatic ds_plan_t *doom_state_split_plan(void) {\n    if (!arena_base || arena_bytes == 0) return 0;\n    /* arena_bytes ends exactly at the decoder slice; the RI2 plan occupies\n     * the final 64 KiB of the 256 KiB reserved tail. */\n    return (ds_plan_t *)((uint8_t *)arena_base + arena_bytes);\n}";
         assert_eq!(split_decoder.matches(old_split_plan).count(), 1);
         let split_decoder = split_decoder.replace(old_split_plan, new_split_plan);
         state_source.push_str(&split_decoder);
@@ -1109,8 +1458,8 @@ let new_split_plan = "_Static_assert(sizeof(ds_plan_t) <= RI2_SPLIT_DECODER_PLAN
         // from an account, so keep only the shared in-engine arm/apply path;
         // compiling fopen/fread/fgetc here would create a false libc
         // dependency and hide the actual engine boundary behind a shim.
-        let mut controller_source = fs::read_to_string(&controller)
-            .expect("read generated SBF controller source");
+        let mut controller_source =
+            fs::read_to_string(&controller).expect("read generated SBF controller source");
         let controller_host_needle = "static int read_account(";
         assert_eq!(
             controller_source.matches(controller_host_needle).count(),
@@ -1123,7 +1472,9 @@ let new_split_plan = "_Static_assert(sizeof(ds_plan_t) <= RI2_SPLIT_DECODER_PLAN
             1,
         );
         assert_eq!(
-            controller_source.matches("sizeof(controller_command)").count(),
+            controller_source
+                .matches("sizeof(controller_command)")
+                .count(),
             2,
             "SBF controller command-size rewrite must match both copies"
         );
