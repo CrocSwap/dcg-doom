@@ -26,6 +26,13 @@ use doom_sbf::{resource, resource_sbf, sim2};
 use serde_json::{json, Value};
 
 const CORRECTED_DECODER_COMMIT: &str = "53bd00225df56df8037fc95b884c542db633a09b";
+const PINNED_PATCH_0014_SHA256: &str =
+    "788a1a3f830a42e4d82c704db80fda6a281ac6b09dec22fcabd8b727e7d1e08e";
+const PINNED_UPSTREAM_COMMIT: &str = "a77dfb96cb91780ca334d0d4cfd86957558007e0";
+const ORACLE_IDENTITY_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/2";
+const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/1";
+const PATCH_0014_PATH: &str = "repo/stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch";
+const Z_ZONE_PATH: &str = "external/z_zone.c";
 const FORWARD_TICS: usize = 1000;
 const TRANSITIONS: usize = 999;
 const REQUIRED_RANGE: (usize, usize) = (598, 757);
@@ -124,6 +131,107 @@ fn source_identity(repo: &Path, expected_commit: &str) -> Result<Value, Box<dyn 
     }))
 }
 
+fn manifest_input<'a>(manifest: &'a Value, path: &str) -> Option<&'a Value> {
+    manifest["inputs"]
+        .as_array()?
+        .iter()
+        .find(|input| input["path"].as_str() == Some(path))
+}
+
+fn required_sha(value: &Value, label: &str) -> Result<String, Box<dyn Error>> {
+    let sha = value["sha256"]
+        .as_str()
+        .ok_or_else(|| format!("{label} is missing sha256"))?;
+    if sha.len() != 64 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{label} has an invalid sha256").into());
+    }
+    Ok(sha.to_owned())
+}
+
+fn validate_oracle_identity(oracle_path: &Path, identity: &Value) -> Result<Value, Box<dyn Error>> {
+    if identity["schema"] != ORACLE_IDENTITY_SCHEMA {
+        return Err("oracle identity schema is missing or unsupported".into());
+    }
+    let manifest_path = oracle_path.join("source-manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("cannot read retained oracle source manifest: {error}"))?;
+    let manifest_sha256 = sha(&manifest_bytes);
+    if identity["source_manifest_sha256"].as_str() != Some(manifest_sha256.as_str()) {
+        return Err("oracle source manifest hash does not match its identity".into());
+    }
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("oracle source manifest is not JSON: {error}"))?;
+    if manifest["schema"] != SOURCE_MANIFEST_SCHEMA
+        || manifest["upstream_commit"].as_str() != Some(PINNED_UPSTREAM_COMMIT)
+        || !manifest["build_metadata"].is_object()
+        || !manifest["compiler_flags"].is_array()
+    {
+        return Err("oracle source manifest is not the pinned complete engine manifest".into());
+    }
+    let patch = manifest_input(&manifest, PATCH_0014_PATH)
+        .ok_or("oracle source manifest omits patch 0014")?;
+    let patch_sha256 = required_sha(patch, "oracle patch 0014")?;
+    if patch_sha256 != PINNED_PATCH_0014_SHA256 {
+        return Err("oracle patch 0014 is not the pinned 53bd0022 blob".into());
+    }
+    let z_zone = manifest_input(&manifest, Z_ZONE_PATH)
+        .ok_or("oracle source manifest omits the patched z_zone.c")?;
+    let z_zone_sha256 = required_sha(z_zone, "oracle z_zone.c")?;
+    if z_zone["bytes"].as_u64().unwrap_or(0) == 0 {
+        return Err("oracle z_zone.c manifest entry is empty".into());
+    }
+    if identity["provenance"]["corrected_decoder_commit"].as_str() != Some(CORRECTED_DECODER_COMMIT)
+        || identity["provenance"]["patch_0014_sha256"].as_str() != Some(PINNED_PATCH_0014_SHA256)
+        || identity["provenance"]["z_zone_sha256"].as_str() != Some(z_zone_sha256.as_str())
+        || identity["provenance"]["source_manifest_sha256"].as_str()
+            != Some(manifest_sha256.as_str())
+        || identity["provenance"]["pinned_inputs"]["patch_0014"]["sha256"].as_str()
+            != Some(PINNED_PATCH_0014_SHA256)
+        || identity["provenance"]["pinned_inputs"]["z_zone"]["sha256"].as_str()
+            != Some(z_zone_sha256.as_str())
+        || identity["provenance"]["source_commit"]
+            .as_str()
+            .is_none_or(|commit| {
+                commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        || identity["provenance"]["source_tree_clean"] != true
+    {
+        return Err("oracle provenance commitments do not match its complete manifest".into());
+    }
+
+    let binary = identity["binary"]
+        .as_object()
+        .ok_or("oracle binary identity is missing")?;
+    let binary_path = binary["path"]
+        .as_str()
+        .ok_or("oracle binary path is missing")?;
+    let binary_path = PathBuf::from(binary_path).canonicalize().map_err(|error| {
+        format!("retained oracle binary is missing or not canonicalizable: {error}")
+    })?;
+    let binary_bytes = fs::read(&binary_path)
+        .map_err(|error| format!("cannot read retained oracle binary: {error}"))?;
+    let binary_sha256 = sha(&binary_bytes);
+    if binary["sha256"].as_str() != Some(binary_sha256.as_str())
+        || identity["provenance"]["binary"]["path"] != binary["path"]
+        || identity["provenance"]["binary"]["sha256"].as_str() != Some(binary_sha256.as_str())
+    {
+        return Err("retained oracle binary hash does not match its identity".into());
+    }
+    Ok(json!({
+        "passed": true,
+        "schema": ORACLE_IDENTITY_SCHEMA,
+        "source_manifest": manifest_path,
+        "source_manifest_sha256": manifest_sha256,
+        "upstream_commit": PINNED_UPSTREAM_COMMIT,
+        "corrected_decoder_commit": CORRECTED_DECODER_COMMIT,
+        "patch_0014_sha256": patch_sha256,
+        "z_zone_sha256": z_zone_sha256,
+        "source_commit": identity["provenance"]["source_commit"],
+        "source_tree_clean": true,
+        "binary": {"path": binary_path, "sha256": binary_sha256},
+    }))
+}
+
 fn first_difference(left: &[u8], right: &[u8]) -> Option<usize> {
     left.iter()
         .zip(right)
@@ -154,7 +262,9 @@ fn compare_step(
     wanted_state: &[u8],
     wanted_mirror: &[u8],
     wanted_root: &[u8],
-    cursor: usize,
+    input_cursor: usize,
+    output_cursor: usize,
+    command_index: usize,
 ) -> Result<Value, Box<dyn Error>> {
     let step_rc = session.step(command);
     let mut state = vec![0u8; resource_sbf::STATE_MAX_BYTES];
@@ -168,7 +278,9 @@ fn compare_step(
     let root_equal = actual_root == wanted_root;
     let ok = step_rc == 0 && published.is_ok() && state_equal && mirror_equal && root_equal;
     Ok(json!({
-        "cursor": cursor,
+        "input_cursor": input_cursor,
+        "output_cursor": output_cursor,
+        "command_index": command_index,
         "ok": ok,
         "step_rc": step_rc,
         "publish_rc": published.err(),
@@ -242,18 +354,26 @@ fn malformed_controls(
 fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = env::args().collect();
     let [_, capture, resource_path, oracle, receipt, rest @ ..] = &argv[..] else {
-        return Err("usage: fresh_resume_probe <capture> <resource> <oracle> <receipt> [--corrected-commit COMMIT]".into());
+        return Err("usage: fresh_resume_probe <capture> <resource> <oracle> <receipt> [--corrected-commit COMMIT] [--source-root ROOT]".into());
     };
     let mut corrected_commit = CORRECTED_DECODER_COMMIT.to_owned();
+    let mut source_root: Option<PathBuf> = None;
     let mut args = rest.iter();
     while let Some(flag) = args.next() {
-        if flag != "--corrected-commit" {
-            return Err(format!("unknown option {flag}").into());
+        match flag.as_str() {
+            "--corrected-commit" => {
+                corrected_commit = args
+                    .next()
+                    .ok_or("--corrected-commit needs a value")?
+                    .clone();
+            }
+            "--source-root" => {
+                source_root = Some(PathBuf::from(
+                    args.next().ok_or("--source-root needs a value")?,
+                ));
+            }
+            _ => return Err(format!("unknown option {flag}").into()),
         }
-        corrected_commit = args
-            .next()
-            .ok_or("--corrected-commit needs a value")?
-            .clone();
     }
     if corrected_commit != CORRECTED_DECODER_COMMIT {
         return Err("probe only accepts the corrected 53bd0022 decoder identity".into());
@@ -286,24 +406,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let oracle_identity: Value =
         serde_json::from_slice(&fs::read(oracle_path.join("identity.json"))?)?;
-    let oracle_patch_0014 = oracle_identity["sources"]
-        .get("stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch")
-        .cloned();
-    let oracle_binary_identity = oracle_identity["command_line"]
-        .as_array()
-        .and_then(|command_line| command_line.first())
-        .and_then(Value::as_str)
-        .and_then(|path| {
-            let path = PathBuf::from(path).canonicalize().ok()?;
-            let bytes = fs::read(&path).ok()?;
-            Some(json!({"path": path, "sha256": sha(&bytes)}))
-        })
-        .unwrap_or_else(|| json!({"path": Value::Null, "sha256": Value::Null}));
+    let oracle_provenance = validate_oracle_identity(&oracle_path, &oracle_identity)?;
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
+    let repo = source_root
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
         .canonicalize()?;
     let source = source_identity(&repo, &corrected_commit)?;
+    if source["matches_corrected_commit"] != true {
+        return Err("working decoder source does not match the pinned corrected commit".into());
+    }
     let executable = env::current_exe()?.canonicalize()?;
     let binary = fs::read(&executable)?;
     let mut forward_mismatches = Vec::new();
@@ -326,6 +437,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     wanted_mirror,
                     &wanted_root,
                     k,
+                    k + 1,
+                    k,
                 )?;
                 if comparison["ok"] != true {
                     forward_mismatches.push(comparison);
@@ -333,20 +446,44 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Value::Null
         }
-        Err(rc) => json!({"cursor": 0, "rc": rc}),
+        Err(rc) => json!({"input_cursor": 0, "output_cursor": 1, "command_index": 0, "rc": rc}),
+    };
+
+    let mut initial_resume_mismatch = Value::Null;
+    let initial_resume_open_failure = match resource::NativeSimSession::open(
+        capture.wad_refs(),
+        &capture.resource,
+        &capture.state,
+    ) {
+        Ok(mut session) => {
+            let command: [u8; 4] = commands[..4].try_into()?;
+            let wanted_state = &states[..resource_sbf::STATE_MAX_BYTES];
+            let wanted_mirror = &mirrors[..resource_sbf::MIRROR_BYTES];
+            let wanted_root =
+                hex_bytes(rows[0]["state_root"].as_str().ok_or("oracle state_root")?)?;
+            initial_resume_mismatch = compare_step(
+                &mut session,
+                &command,
+                wanted_state,
+                wanted_mirror,
+                &wanted_root,
+                0,
+                1,
+                0,
+            )?;
+            Value::Null
+        }
+        Err(rc) => json!({"input_cursor": 0, "output_cursor": 1, "command_index": 0, "rc": rc}),
     };
 
     let mut mismatches = Vec::new();
     let mut open_failures = Vec::new();
+    let mut transitions_executed = 0usize;
     for k in 0..TRANSITIONS {
-        let state_input = if k == 0 {
-            capture.state.clone()
-        } else {
-            // DoomStateDecode authenticates the encoded ST1 length and
-            // rejects the fixed account tail as input.  Reopen the retained
-            // encoded bytes while comparing the complete fixed output image.
-            state_row(&states, &rows, k - 1)?
-        };
+        // Exactly the retained-row chain: input rows 0..998, command
+        // indices 1..999, output rows 1..999.  The initial capture -> row 0
+        // check above is separate and is not one of these 999 transitions.
+        let state_input = state_row(&states, &rows, k)?;
         let mut session = match resource::NativeSimSession::open(
             capture.wad_refs(),
             &capture.resource,
@@ -354,23 +491,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         ) {
             Ok(session) => session,
             Err(rc) => {
-                open_failures.push(json!({"cursor": k, "rc": rc}));
+                open_failures.push(json!({
+                    "input_cursor": k + 1,
+                    "output_cursor": k + 2,
+                    "command_index": k + 1,
+                    "rc": rc
+                }));
                 continue;
             }
         };
-        let command: [u8; 4] = commands[k * 4..k * 4 + 4].try_into()?;
-        let state_start = k * resource_sbf::STATE_MAX_BYTES;
-        let mirror_start = k * resource_sbf::MIRROR_BYTES;
+        transitions_executed += 1;
+        let command_index = k + 1;
+        let output_row = k + 1;
+        let command: [u8; 4] = commands[command_index * 4..command_index * 4 + 4].try_into()?;
+        let state_start = output_row * resource_sbf::STATE_MAX_BYTES;
+        let mirror_start = output_row * resource_sbf::MIRROR_BYTES;
         let wanted_state = &states[state_start..state_start + resource_sbf::STATE_MAX_BYTES];
         let wanted_mirror = &mirrors[mirror_start..mirror_start + resource_sbf::MIRROR_BYTES];
-        let wanted_root = hex_bytes(rows[k]["state_root"].as_str().ok_or("oracle state_root")?)?;
+        let wanted_root = hex_bytes(
+            rows[output_row]["state_root"]
+                .as_str()
+                .ok_or("oracle state_root")?,
+        )?;
         let comparison = compare_step(
             &mut session,
             &command,
             wanted_state,
             wanted_mirror,
             &wanted_root,
-            k,
+            output_row,
+            output_row + 1,
+            command_index,
         )?;
         if comparison["ok"] != true {
             mismatches.push(comparison);
@@ -381,20 +532,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_array()
         .is_some_and(|controls| controls.iter().all(|control| control["passed"] == true));
     let forward_passed = forward_open_failure.is_null() && forward_mismatches.is_empty();
-    let fresh_passed = open_failures.is_empty() && mismatches.is_empty();
+    let initial_resume_passed =
+        initial_resume_open_failure.is_null() && initial_resume_mismatch["ok"] == true;
+    let fresh_passed =
+        transitions_executed == TRANSITIONS && open_failures.is_empty() && mismatches.is_empty();
+    let last_transition_executed = transitions_executed == TRANSITIONS;
     let result = json!({
         "schema": "basanos/doom-fresh-resume-probe/2",
-        "status": if forward_passed && fresh_passed && control_passed { "measured" } else { "failed" },
+        "status": if oracle_provenance["passed"] == true && source["matches_corrected_commit"] == true && forward_passed && initial_resume_passed && fresh_passed && control_passed { "measured" } else { "failed" },
         "decoder_entry_point": "DoomStateDecode via doom_resource_sim_session_open",
         "forward_trajectory": {
             "tics_checked": FORWARD_TICS,
-            "tic_cursors": [0, FORWARD_TICS - 1],
+            "tic_cursors": [1, FORWARD_TICS],
             "open_failure": forward_open_failure,
             "mismatches": forward_mismatches,
         },
+        "initial_capture_resume": {
+            "transition_cursors": [0, 1],
+            "command_index": 0,
+            "open_failure": initial_resume_open_failure,
+            "mismatch": initial_resume_mismatch,
+            "passed": initial_resume_passed,
+        },
         "fresh_resume": {
             "transitions_checked": TRANSITIONS,
-            "transition_cursors": [0, TRANSITIONS - 1],
+            "input_rows": [0, TRANSITIONS - 1],
+            "output_rows": [1, TRANSITIONS],
+            "command_indices": [1, TRANSITIONS],
+            "transition_cursors": [[1, 2], [TRANSITIONS, TRANSITIONS + 1]],
+            "last_transition": {"input_cursor": TRANSITIONS, "output_cursor": TRANSITIONS + 1, "command_index": TRANSITIONS, "executed": last_transition_executed},
+            "transitions_executed": transitions_executed,
+            "last_transition_executed": last_transition_executed,
             "open_failures": open_failures,
             "mismatches": mismatches,
         },
@@ -406,14 +574,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             "source": "retained cursor-598 ST1 layout; diagnostic label only",
         },
         "required_midrange": [REQUIRED_RANGE.0, REQUIRED_RANGE.1],
-        "midrange_checked": (REQUIRED_RANGE.0..=REQUIRED_RANGE.1).all(|cursor| cursor < TRANSITIONS),
+        "midrange_checked": (REQUIRED_RANGE.0..=REQUIRED_RANGE.1)
+            .all(|cursor| (1..=TRANSITIONS).contains(&cursor)),
         "native_controls": controls,
-        "oracle_identity": {
-            "recorded": oracle_identity,
-            "patch_0014_recorded": oracle_patch_0014.is_some(),
-            "patch_0014": oracle_patch_0014,
-            "binary": oracle_binary_identity,
-        },
+        "oracle_identity": oracle_identity,
+        "oracle_provenance": oracle_provenance,
         "source_identity": source,
         "binary_identity": {"path": executable, "sha256": sha(&binary)},
         "inputs": {
@@ -433,6 +598,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", serde_json::to_string_pretty(&result)?);
     if result["status"] != "measured"
         || result["source_identity"]["matches_corrected_commit"] != true
+        || result["oracle_provenance"]["passed"] != true
+        || result["fresh_resume"]["last_transition_executed"] != true
     {
         return Err("fresh resume probe failed".into());
     }

@@ -18,10 +18,11 @@ mod base;
 #[allow(dead_code)]
 mod common;
 
-use std::{cell::Cell, env, error::Error, fs, io::Write, path::PathBuf, rc::Rc};
+use std::{cell::Cell, env, error::Error, fs, io::Write, path::PathBuf, process::Command, rc::Rc};
 
 use common::{hex, Capture, CellBudget, NativeEngine, Rng};
-use doom_sbf::{resource, resource_sbf, sim2};
+use doom_sbf::{ex2, resource, resource_sbf, sim2};
+use serde_json::Value;
 use solana_program::program_error::ProgramError;
 use solana_pubkey::Pubkey;
 
@@ -39,6 +40,12 @@ const ATTACKER: Pubkey = Pubkey::new_from_array([0x27; 32]);
 const MODEL_TIC: u64 = 60_000;
 const MODEL_LIMIT: u64 = sim2::TIC_RESERVE_CU + sim2::PUBLISH_RESERVE_CU + 11 * MODEL_TIC;
 const HOLD: [u32; 2] = [37, 555];
+const CORRECTED_DECODER_COMMIT: &str = "53bd00225df56df8037fc95b884c542db633a09b";
+const PINNED_PATCH_0014_SHA256: &str =
+    "788a1a3f830a42e4d82c704db80fda6a281ac6b09dec22fcabd8b727e7d1e08e";
+const PINNED_UPSTREAM_COMMIT: &str = "a77dfb96cb91780ca334d0d4cfd86957558007e0";
+const PATCH_0014_PATH: &str = "repo/stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch";
+const Z_ZONE_PATH: &str = "external/z_zone.c";
 
 type Snapshot = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
@@ -186,6 +193,88 @@ fn check_against_oracle(harness: &Harness, oracle: &common::Oracle) -> Result<()
     Ok(())
 }
 
+fn manifest_input<'a>(manifest: &'a Value, path: &str) -> Option<&'a Value> {
+    manifest["inputs"]
+        .as_array()?
+        .iter()
+        .find(|input| input["path"].as_str() == Some(path))
+}
+
+fn manifest_sha(value: &Value, label: &str) -> Result<String, Box<dyn Error>> {
+    let sha = value["sha256"]
+        .as_str()
+        .ok_or_else(|| format!("{label} is missing sha256"))?;
+    if sha.len() != 64 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{label} has an invalid sha256").into());
+    }
+    Ok(sha.to_owned())
+}
+
+fn git_output(repo: &std::path::Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git {:?} failed", args).into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn build_provenance(executable: &std::path::Path) -> Result<Value, Box<dyn Error>> {
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .canonicalize()?;
+    let source_commit = git_output(&source_root, &["rev-parse", "HEAD"])?;
+    let source_status = git_output(&source_root, &["status", "--porcelain"])?;
+    if !source_status.is_empty() {
+        return Err("native oracle requires a clean repository source tree".into());
+    }
+    let manifest_bytes = ex2::BUILD_SOURCE_MANIFEST.as_bytes();
+    let manifest: Value = serde_json::from_str(ex2::BUILD_SOURCE_MANIFEST)
+        .map_err(|error| format!("embedded Doom build manifest is not JSON: {error}"))?;
+    if manifest["schema"] != "DOOM-EX2-NATIVE-SOURCE-MANIFEST/1"
+        || manifest["upstream_commit"].as_str() != Some(PINNED_UPSTREAM_COMMIT)
+        || !manifest["build_metadata"].is_object()
+        || !manifest["compiler_flags"].is_array()
+    {
+        return Err(
+            "embedded Doom build manifest is not the pinned complete engine manifest".into(),
+        );
+    }
+    let patch = manifest_input(&manifest, PATCH_0014_PATH)
+        .ok_or("embedded Doom build manifest omits patch 0014")?;
+    let patch_sha256 = manifest_sha(patch, "patch 0014")?;
+    if patch_sha256 != PINNED_PATCH_0014_SHA256 {
+        return Err("embedded patch 0014 is not the pinned 53bd0022 blob".into());
+    }
+    let z_zone = manifest_input(&manifest, Z_ZONE_PATH)
+        .ok_or("embedded Doom build manifest omits patched z_zone.c")?;
+    let z_zone_sha256 = manifest_sha(z_zone, "z_zone.c")?;
+    if z_zone["bytes"].as_u64().unwrap_or(0) == 0 {
+        return Err("embedded z_zone.c manifest entry is empty".into());
+    }
+    let binary = fs::read(executable)?;
+    Ok(serde_json::json!({
+        "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/2",
+        "corrected_decoder_commit": CORRECTED_DECODER_COMMIT,
+        "source_manifest_sha256": base::sha(manifest_bytes),
+        "patch_0014_sha256": patch_sha256,
+        "z_zone_sha256": z_zone_sha256,
+        "pinned_inputs": {
+            "patch_0014": {"path": PATCH_0014_PATH, "sha256": patch_sha256},
+            "z_zone": {"path": Z_ZONE_PATH, "sha256": z_zone_sha256},
+        },
+        "binary": {"path": executable, "sha256": base::sha(&binary), "bytes": binary.len()},
+        "manifest_schema": manifest["schema"],
+        "upstream_commit": PINNED_UPSTREAM_COMMIT,
+        "source_root": source_root,
+        "source_commit": source_commit,
+        "source_tree_clean": true,
+    }))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = env::args().collect();
     let mut args = argv.iter().skip(1);
@@ -210,6 +299,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("receipt directory is not empty".into());
     }
     fs::create_dir_all(&receipt)?;
+    let executable = env::current_exe()?.canonicalize()?;
+    let provenance = build_provenance(&executable)?;
+    fs::write(
+        receipt.join("source-manifest.json"),
+        ex2::BUILD_SOURCE_MANIFEST,
+    )?;
     let capture_data = Capture::load(&capture, &resource_path)?;
     let commands = capture_data.demo_commands(tics)?;
     let first_tic = base::u32_at(&capture_data.state, 20);
@@ -695,6 +790,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("final-mirror.mp1"), &harness.mirror)?;
     fs::write(receipt.join("final-meta.bin"), &harness.meta)?;
     fs::write(receipt.join("commands.bin"), &commands)?;
+    let binary_identity = provenance["binary"].clone();
+    let source_manifest_sha256 = provenance["source_manifest_sha256"].clone();
     common::write_json(
         &receipt.join("controls.json"),
         &serde_json::Value::Object(controls),
@@ -728,6 +825,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     common::write_json(
         &receipt.join("identity.json"),
         &serde_json::json!({
+            "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/2",
             "profile": "DOOM-SIM/2",
             "implementation": "host build of doom-sbf sim2 cores + host C session engine (same C source as SBF, host compiler, this process)",
             "command_line": argv,
@@ -743,6 +841,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "checkpoint_sha256": base::sha(&checkpoint),
             "seed": format!("{seed:#x}"),
             "sim2_abi": sim2::ABI_DESCRIPTOR,
+            "provenance": provenance,
+            "source_manifest": "source-manifest.json",
+            "source_manifest_sha256": source_manifest_sha256,
+            "binary": binary_identity,
             "sources": common::driver_identity(&[
                 ("driver/src/bin/sweep_native.rs", include_bytes!("sweep_native.rs")),
                 ("driver/src/sweep_common.rs", include_bytes!("../sweep_common.rs")),
