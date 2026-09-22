@@ -119,7 +119,7 @@ rm -f "$OUT/doom_sbf.2.so" "$OUT/doom_ex2_source_manifest.2.json"
 
 # Every manifest input must be committed (repo/) or come from the scratch
 # rebuilt from committed patches (external/).
-python3 - "$OUT/doom_ex2_source_manifest.json" "$REPO" "$COMMIT" "$SCRATCH/doom-src" "$OUT/input-verification.json" <<'PY'
+python3 - "$OUT/doom_ex2_source_manifest.json" "$REPO" "$COMMIT" "$SCRATCH/doom-src/linuxdoom-1.10" "$OUT/input-verification.json" <<'PY'
 import hashlib, json, subprocess, sys
 manifest, repo, commit, scratch, out = sys.argv[1:]
 data = json.load(open(manifest))
