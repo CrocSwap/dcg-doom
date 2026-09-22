@@ -21,6 +21,31 @@ RECEIPTS=${RECEIPTS:-$ROOT/out/runs/doom-effective-profile-fixes-20260922}
 PYTHON_BIN=${PYTHON_BIN:-$ROOT/.venv/bin/python}
 test -x "$PYTHON_BIN" || die "PYTHON_BIN is not executable: $PYTHON_BIN"
 
+sha256_file() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+sha256_stdin() {
+  "$PYTHON_BIN" -c '
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+for chunk in iter(lambda: sys.stdin.buffer.read(1024 * 1024), b""):
+    digest.update(chunk)
+print(digest.hexdigest())
+'
+}
+
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_COMMIT must be a 40-byte hexadecimal commit"
 [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_TREE must be a 40-byte hexadecimal tree"
 [[ ! -e "$SOURCE" ]] || die "source root is not fresh: $SOURCE"
@@ -74,7 +99,7 @@ PYTHONPATH="$SOURCE:$SOURCE/src" "$PYTHON_BIN" \
   --repo "$SOURCE" --source-commit "$SOURCE_COMMIT" \
   --upstream-tree "$SCRATCH/doom-src" --output "$EXPECTED" \
   >"$RECEIPTS/expected-profile.log" 2>&1
-sha256sum "$EXPECTED" | awk '{print $1}' >"$RECEIPTS/expected-build-configuration.sha256"
+sha256_file "$EXPECTED" >"$RECEIPTS/expected-build-configuration.sha256"
 wc -c <"$EXPECTED" | tr -d ' ' >"$RECEIPTS/expected-build-configuration.bytes"
 EXPECTED_SHA256=$(<"$RECEIPTS/expected-build-configuration.sha256")
 EXPECTED_BYTES=$(<"$RECEIPTS/expected-build-configuration.bytes")
@@ -85,7 +110,10 @@ cargo build --locked --manifest-path "$SOURCE/stunts/doom-sbf/driver/Cargo.toml"
   --release --features ctx-engine --bin sweep_native --bin fresh_resume_probe \
   >"$RECEIPTS/cargo-build.log" 2>&1
 
-mapfile -d '' MANIFESTS < <(find "$TARGET/release/build" -type f -name doom_ex2_source_manifest.json -print0)
+MANIFESTS=()
+while IFS= read -r -d '' candidate; do
+  MANIFESTS+=("$candidate")
+done < <(find "$TARGET/release/build" -type f -name doom_ex2_source_manifest.json -print0)
 test "${#MANIFESTS[@]}" -eq 1 || die "expected exactly one fresh source manifest"
 MANIFEST=${MANIFESTS[0]}
 SWEEP="$RECEIPTS/sweep_native"
@@ -101,7 +129,7 @@ PYTHONPATH="$SOURCE:$SOURCE/src" "$PYTHON_BIN" \
   --expected-build-configuration "$EXPECTED" \
   --sweep-binary "$SWEEP" --probe-binary "$PROBE" --output "$BUILD_DESCRIPTOR" \
   >"$RECEIPTS/source-build-descriptor.log" 2>&1
-BUILD_SHA256=$(sha256sum "$BUILD_DESCRIPTOR" | awk '{print $1}')
+BUILD_SHA256=$(sha256_file "$BUILD_DESCRIPTOR")
 BUILD_BYTES=$(wc -c <"$BUILD_DESCRIPTOR" | tr -d ' ')
 printf '%s\n' "$BUILD_SHA256" >"$RECEIPTS/source-build-descriptor.sha256"
 printf '%s\n' "$BUILD_BYTES" >"$RECEIPTS/source-build-descriptor.bytes"
@@ -117,14 +145,14 @@ printf '%q ' "$SWEEP" "$CAPTURE" "$RESOURCE" "$ORACLE" --tics 1000 \
   --build-descriptor-bytes "$BUILD_BYTES" >"$RECEIPTS/sweep_native.log" 2>&1
 
 FINAL_DESCRIPTOR="$RECEIPTS/final-acceptance-descriptor.json"
-PYTHONPATH="$SOURCE:$SOURCE/src" "$SOURCE/.venv/bin/python" \
+PYTHONPATH="$SOURCE:$SOURCE/src" "$PYTHON_BIN" \
   "$SOURCE/scripts/doom_native_provenance_descriptor.py" --stage acceptance \
   --build-descriptor "$BUILD_DESCRIPTOR" --build-descriptor-sha256 "$BUILD_SHA256" \
   --build-descriptor-bytes "$BUILD_BYTES" --oracle-directory "$ORACLE" \
   --capture "$CAPTURE" --resource "$RESOURCE" --sweep-binary "$SWEEP" \
   --probe-binary "$PROBE" --output "$FINAL_DESCRIPTOR" \
   >"$RECEIPTS/final-descriptor.log" 2>&1
-FINAL_SHA256=$(sha256sum "$FINAL_DESCRIPTOR" | awk '{print $1}')
+FINAL_SHA256=$(sha256_file "$FINAL_DESCRIPTOR")
 FINAL_BYTES=$(wc -c <"$FINAL_DESCRIPTOR" | tr -d ' ')
 printf '%s\n' "$FINAL_SHA256" >"$RECEIPTS/final-descriptor.sha256"
 printf '%s\n' "$FINAL_BYTES" >"$RECEIPTS/final-descriptor.bytes"
@@ -138,6 +166,15 @@ printf '%q ' "$PROBE" "$CAPTURE" "$RESOURCE" "$ORACLE" "$RECEIPTS/fresh-resume-p
   --final-descriptor-sha256 "$FINAL_SHA256" --final-descriptor-bytes "$FINAL_BYTES" \
   >"$RECEIPTS/fresh_resume_probe.log" 2>&1
 
+export BASANOS_DOOM_FRESH_RESUME_ACCEPTANCE=1
+export BASANOS_DOOM_FRESH_RESUME_PROBE="$PROBE"
+export BASANOS_DOOM_CAPTURE="$CAPTURE"
+export BASANOS_DOOM_RESOURCE="$RESOURCE"
+export BASANOS_DOOM_RESUME_ORACLE="$ORACLE"
+export BASANOS_DOOM_FINAL_DESCRIPTOR="$FINAL_DESCRIPTOR"
+export BASANOS_DOOM_FINAL_DESCRIPTOR_SHA256="$FINAL_SHA256"
+export BASANOS_DOOM_FINAL_DESCRIPTOR_BYTES="$FINAL_BYTES"
+
 FOCUSED_XML="$RECEIPTS/focused.xml"
 set +e
 PYTHONPATH="$SOURCE:$SOURCE/src" "$PYTHON_BIN" -m pytest -q \
@@ -146,7 +183,7 @@ PYTHONPATH="$SOURCE:$SOURCE/src" "$PYTHON_BIN" -m pytest -q \
 PYTEST_STATUS=$?
 set -e
 test "$PYTEST_STATUS" -eq 0 || die "focused pytest failed with exit $PYTEST_STATUS"
-test "$(python3 -c 'import sys,xml.etree.ElementTree as E; print(sum(int(x.attrib.get("skipped","0")) for x in E.parse(sys.argv[1]).getroot().iter("testsuite")))' "$FOCUSED_XML")" -eq 0 || die "focused pytest reported skips"
+test "$("$PYTHON_BIN" -c 'import sys,xml.etree.ElementTree as E; print(sum(int(x.attrib.get("skipped","0")) for x in E.parse(sys.argv[1]).getroot().iter("testsuite")))' "$FOCUSED_XML")" -eq 0 || die "focused pytest reported skips"
 
 git -C "$SOURCE" rev-parse HEAD >"$RECEIPTS/code-commit.txt"
 git -C "$SOURCE" rev-parse HEAD^{tree} >"$RECEIPTS/code-tree.txt"
@@ -155,9 +192,18 @@ git -C "$SOURCE" ls-files -s -- \
   stunts/doom-sbf/driver/src/bin/sweep_native.rs scripts/doom_native_provenance_descriptor.py \
   scripts/doom_native_expected_profile.py scripts/doom_native_provenance_acceptance.sh \
   stunts/doom-sbf/doom-native-host-profile-v2.json tests/test_doom_review_fixes.py \
-  | sha256sum >"$RECEIPTS/owned-files.sha256"
+  | sha256_stdin >"$RECEIPTS/owned-files.sha256"
 date -u +%Y-%m-%dT%H:%M:%SZ >"$RECEIPTS/finished-at.txt"
-find "$RECEIPTS" -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum >"$RECEIPTS/checksums.sha256"
+"$PYTHON_BIN" - "$RECEIPTS" >"$RECEIPTS/checksums.sha256" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+for path in sorted(path for path in root.rglob("*") if path.is_file() and path.name != "checksums.sha256"):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    print(f"{digest}  {path.relative_to(root)}")
+PY
 
 # All retained binaries and descriptors are in RECEIPTS before disposable
 # roots are removed. The explicit namespace checks above keep cleanup narrow.

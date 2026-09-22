@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The 41 patch-0007 engine translation units (mkctx TUS): the whole engine
 /// cut that runs on the host goldens, compiled for SBF with the context
@@ -23,6 +24,7 @@ const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operati
 const NATIVE_PROVENANCE_PROFILE: &str =
     "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
+const PORTABLE_ARCHIVER_PROBE: &str = "DOOM-NATIVE-ARCHIVER-PROBE/1";
 
 const NATIVE_ALLOWED_CARGO_FEATURES: &[&str] = &["ctx-engine"];
 const NATIVE_RUST_MODULE_CLOSURE: &[(&str, &[&str])] = &[
@@ -156,6 +158,63 @@ fn command_version(path: &Path, required: bool) -> String {
     }
 }
 
+/// Apple's system `ar` has no successful `--version` option. Keep the
+/// fallback policy identical to doom_native_expected_profile.py: exercise the
+/// selected archiver by creating and listing a real archive, then record a
+/// stable probe identity rather than pretending that usage text is a version.
+fn archiver_version(path: &Path, required: bool) -> String {
+    if let Ok(output) = Command::new(path).arg("--version").output() {
+        if output.status.success() {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !output.stderr.is_empty() {
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            let text = text.trim().to_owned();
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_nanos();
+    let probe_dir = env::temp_dir().join(format!(
+        "basanos-doom-ar-probe-{}-{nonce}",
+        std::process::id()
+    ));
+    let member = probe_dir.join("member.o");
+    let archive = probe_dir.join("libprobe.a");
+    let result = (|| {
+        fs::create_dir(&probe_dir).ok()?;
+        fs::write(&member, b"basanos-doom-archiver-probe\n").ok()?;
+        let create = Command::new(path)
+            .arg("-rcS")
+            .arg(&archive)
+            .arg(&member)
+            .output()
+            .ok()?;
+        let listing = Command::new(path).arg("-t").arg(&archive).output().ok()?;
+        let listed_member = String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .any(|line| line.trim() == "member.o");
+        (create.status.success() && listing.status.success() && archive.is_file() && listed_member)
+            .then_some(PORTABLE_ARCHIVER_PROBE.to_owned())
+    })();
+    let _ = fs::remove_dir_all(&probe_dir);
+    if let Some(identity) = result {
+        return identity;
+    }
+    if required {
+        panic!(
+            "tool {} --version and the portable archive create/list probe both failed",
+            path.display()
+        );
+    }
+    format!("failed: portable archive probe for {}", path.display())
+}
+
 fn env_value(name: &str, fallback: &str) -> String {
     env::var(name).unwrap_or_else(|_| fallback.to_owned())
 }
@@ -248,6 +307,7 @@ fn canonical_path(path: &Path) -> String {
 
 fn host_group_json(
     name: &str,
+    archive_output: &str,
     files: &[String],
     flags: &[String],
     defines: &[String],
@@ -260,8 +320,9 @@ fn host_group_json(
     archiver_version: &str,
 ) -> String {
     format!(
-        "{{\"name\": {}, \"files\": {}, \"flags\": {}, \"defines\": {}, \"forced_includes\": {}, \"include_root_keys\": {}, \"include_roots\": {}, \"compiler\": {}, \"archiver\": {}}}",
+        "{{\"name\": {}, \"archive_output\": {}, \"files\": {}, \"flags\": {}, \"defines\": {}, \"forced_includes\": {}, \"include_root_keys\": {}, \"include_roots\": {}, \"compiler\": {}, \"archiver\": {}}}",
         json_string(name),
+        json_string(archive_output),
         json_string_array(files),
         json_string_array(flags),
         json_string_array(defines),
@@ -335,6 +396,7 @@ fn host_groups_metadata(
     let groups = [
         host_group_json(
             "hotloop",
+            "libdoom_hotloops.a",
             &["repo/stunts/doom-sbf/src/doom_hotloops.c".to_owned()],
             &[],
             &hotloop_defines,
@@ -348,6 +410,7 @@ fn host_groups_metadata(
         ),
         host_group_json(
             "engine",
+            "libdoom_engine_ctx.a",
             &engine_files,
             &engine_flags,
             &["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()],
@@ -365,6 +428,7 @@ fn host_groups_metadata(
         ),
         host_group_json(
             "context",
+            "libdoom_engine_ctx_state.a",
             &context_files,
             &context_flags,
             &[
@@ -386,6 +450,7 @@ fn host_groups_metadata(
         ),
         host_group_json(
             "platform",
+            "libdoom_sbf_platform.a",
             &platform_files,
             &platform_flags,
             &["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()],
@@ -403,6 +468,7 @@ fn host_groups_metadata(
         ),
         host_group_json(
             "nativecodec",
+            "libdoom_engine_ex2_native.a",
             &native_codec_files,
             &native_codec_flags,
             &["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()],
@@ -533,7 +599,7 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
     let linker_version = command_version(&linker_path, strict);
     let rustc_version = command_version(&rustc_path, strict);
     let cargo_version = command_version(&cargo_path, strict);
-    let ar_version = command_version(&ar_path, strict);
+    let ar_version = archiver_version(&ar_path, strict);
     let hotloop_defines = if env::var_os("CARGO_FEATURE_STATIC_WRITE_PROBE").is_some() {
         vec!["DOOM_STATIC_WRITE_PROBE".to_owned()]
     } else if env::var_os("CARGO_FEATURE_ZERO_BSS_PROBE").is_some() {

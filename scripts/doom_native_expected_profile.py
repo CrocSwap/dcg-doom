@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 from typing import Any
 
 
@@ -22,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "stunts" / "doom-sbf" / "doom-native-host-profile-v2.json"
 UPSTREAM_COMMIT = "a77dfb96cb91780ca334d0d4cfd86957558007e0"
 SCHEMA = "DOOM-NATIVE-HOST-RELEASE-CONFIG/2"
+PORTABLE_ARCHIVER_PROBE = "DOOM-NATIVE-ARCHIVER-PROBE/1"
 
 
 def fail(message: str) -> None:
@@ -43,10 +45,49 @@ def probe(name: str, default: str) -> dict[str, str]:
     value = os.environ.get(name, default)
     if not value or any(char.isspace() for char in value):
         fail(f"{name} must name one executable without arguments")
+    if name == "AR":
+        return probe_archiver(value)
     result = subprocess.run([value, "--version"], check=False, capture_output=True, text=True)
     if result.returncode or not (result.stdout + result.stderr).strip():
         fail(f"{name} --version must succeed before the expected profile is generated")
     return {"path": value, "version": (result.stdout + result.stderr).strip()}
+
+
+def probe_archiver(value: str) -> dict[str, str]:
+    """Use the same portable identity policy as the Rust build script.
+
+    Apple's system ``ar`` has no successful ``--version`` option.  The
+    fallback is deliberately a genuine archive create/list operation, not a
+    mocked version string or a help-text check.
+    """
+
+    version = subprocess.run([value, "--version"], check=False, capture_output=True, text=True)
+    if version.returncode == 0 and (version.stdout + version.stderr).strip():
+        return {"path": value, "version": (version.stdout + version.stderr).strip()}
+    try:
+        with tempfile.TemporaryDirectory(prefix="basanos-doom-ar-probe-") as directory:
+            root = Path(directory)
+            member = root / "member.o"
+            archive = root / "libprobe.a"
+            member.write_bytes(b"basanos-doom-archiver-probe\n")
+            create = subprocess.run(
+                [value, "-rcS", str(archive), str(member)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            listing = subprocess.run(
+                [value, "-t", str(archive)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            listed_member = any(line.strip() == member.name for line in listing.stdout.splitlines())
+            if create.returncode == 0 and listing.returncode == 0 and archive.is_file() and listed_member:
+                return {"path": value, "version": PORTABLE_ARCHIVER_PROBE}
+    except OSError as error:
+        fail(f"AR portable archive probe could not execute: {error}")
+    fail("AR --version and the portable archive create/list probe both failed")
 
 
 def probe_path(value: str, label: str) -> dict[str, str]:

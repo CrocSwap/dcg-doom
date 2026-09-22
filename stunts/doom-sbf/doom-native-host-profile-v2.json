@@ -55,6 +55,7 @@
   "host_groups": [
     {
       "name": "hotloop",
+      "archive_output": "libdoom_hotloops.a",
       "files": ["repo/stunts/doom-sbf/src/doom_hotloops.c"],
       "flags": [],
       "defines": [],
@@ -63,6 +64,7 @@
     },
     {
       "name": "engine",
+      "archive_output": "libdoom_engine_ctx.a",
       "files": [
         "external/doomdef.c",
         "external/doomstat.c",
@@ -125,6 +127,7 @@
     },
     {
       "name": "context",
+      "archive_output": "libdoom_engine_ctx_state.a",
       "files": [
         "external/headless/doom_ctx_init.c",
         "repo/stunts/doom-sbf/src/doom_sbf_ctx.c",
@@ -150,6 +153,7 @@
     },
     {
       "name": "platform",
+      "archive_output": "libdoom_sbf_platform.a",
       "files": ["repo/stunts/doom-sbf/src/doom_sbf_platform.c"],
       "flags": [
         "-O2",
@@ -168,6 +172,7 @@
     },
     {
       "name": "nativecodec",
+      "archive_output": "libdoom_engine_ex2_native.a",
       "files": [
         "external/headless/doom_state.c",
         "external/headless/doom_controller.c",
