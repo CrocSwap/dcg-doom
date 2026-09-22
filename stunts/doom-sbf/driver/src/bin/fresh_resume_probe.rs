@@ -179,6 +179,15 @@ fn validate_file_table(
         .ok_or(format!("{label} file table is missing"))?;
     let mut actual = Vec::new();
     if exact {
+        // A deleted required file is reported by name before the exact
+        // directory-shape comparison below (which still refuses extras).
+        for record in expected_records {
+            let relative = record["path"]
+                .as_str()
+                .ok_or(format!("{label} file path"))?;
+            fs::symlink_metadata(root.join(relative))
+                .map_err(|error| format!("{label} required file {relative}: {error}"))?;
+        }
         collect_files(root, root, &mut actual)?;
     } else {
         for record in expected_records {
@@ -308,6 +317,24 @@ fn validate_final_descriptor(
         || binary["sha256"].as_str() != Some(sha(&actual_binary).as_str())
     {
         return Err(format!("{role} binary does not match the final descriptor").into());
+    }
+    // The retained oracle's sweep binary is pinned by the same descriptor;
+    // check it here with its own labeled refusal, before the oracle identity
+    // check can refuse it under a less specific message.
+    if role != "sweep_native" {
+        let sweep = descriptor["binaries"]["sweep_native"]
+            .as_object()
+            .ok_or("acceptance descriptor has no sweep_native binary")?;
+        let sweep_path = sweep["path"]
+            .as_str()
+            .ok_or("sweep_native binary path is missing")?;
+        let sweep_bytes = fs::read(sweep_path)
+            .map_err(|error| format!("sweep_native binary does not match the final descriptor: {error}"))?;
+        if sweep["bytes"].as_u64() != Some(sweep_bytes.len() as u64)
+            || sweep["sha256"].as_str() != Some(sha(&sweep_bytes).as_str())
+        {
+            return Err("sweep_native binary does not match the final descriptor".into());
+        }
     }
     let compile = descriptor["compile"]
         .as_object()
