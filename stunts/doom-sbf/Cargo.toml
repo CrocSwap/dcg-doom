@@ -39,6 +39,10 @@ diagnostic-profile = []
 # The deployable DOOM-SIM/2 transport profile: E2R/5 + DOOM-STG/1 + SIM/2
 # only (see transport_process_instruction).  Requires the engine.
 sim-transport = ["ctx-engine"]
+# Stop sweeps on the compute meter (`sol_remaining_compute_units`).  NOT
+# deployable on Fogo, which does not activate that syscall; for ProgramTest
+# and runtimes that do.  The default transport profile is count-capped.
+metered-sweep = ["sim-transport"]
 
 [dependencies]
 solana-program = "=2.3.0"

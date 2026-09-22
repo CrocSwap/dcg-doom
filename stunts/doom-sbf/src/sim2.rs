@@ -12,8 +12,9 @@
 //!   of the cursor.
 //! * ADVANCE reads the committed cursor from the meta, executes consecutive
 //!   written slots from the cursor through the resident BPF `G_Ticker`, stops
-//!   at the first empty slot, a halt, `max_tics`, or when the remaining compute
-//!   would not cover another tic plus publication, then derives ST1/MP1 once
+//!   at the first empty slot, a halt, or its tic cap (and, in `metered-sweep`
+//!   builds only, when the remaining compute would not cover another tic plus
+//!   publication), then derives ST1/MP1 once
 //!   and commits the new cursor, state root and input chain.  A sweep that
 //!   finds nothing staged is a cheap no-op.  After INIT, ADVANCE is the only
 //!   instruction that changes CONTEXT, STATE, MIRROR or META bytes.
@@ -45,7 +46,10 @@ pub const INIT: u8 = 1;
 pub const DEPOSIT: u8 = 2;
 pub const ADVANCE: u8 = 3;
 pub const SNAPSHOT: u8 = 4;
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=41088:5120x8|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(not(feature = "metered-sweep"))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=41088:5120x8|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(feature = "metered-sweep")]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=41088:5120x8|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
 pub const INIT_BYTES: usize = 404;
@@ -66,15 +70,45 @@ pub const BUFFER_BYTES: usize = BUFFER_HEADER_BYTES + BUFFER_CAPACITY * SLOT_BYT
 pub const SLOT_WRITTEN: u8 = 1;
 pub const BT_SPECIAL: u8 = 0x80;
 
-/// Compute reserved for one more tic before a sweep starts it.  Measured on
-/// SBF over the 1,000 DEMO1 tics of the gate (per-tic step = slot checks,
-/// ArmV2, G_Ticker, input chain): median 46,202, p99 127,303, max 223,333;
-/// the reserve is the max with a 1.34x margin.  See
-/// docs/experiments/doom-staged-sweep-2026-09-22.md.
+/// Tic cap of an ADVANCE that passes `max_tics = 0` on the count-capped
+/// (Fogo) profile.  Fogo does not activate the `remaining_compute_units`
+/// syscall (feature 5TuppMutoyzhUSfuYdhgzD47F92GL1g89KpCZQKqedxP inactive on
+/// testnet and mainnet, measured 2026-09-22), so a deployable sweep cannot
+/// read its own budget.  Measured on SBF over the 1,000 DEMO1 tics: the worst
+/// 8-tic window plus the worst pre-sweep, publication and post-publication
+/// costs is 1,137,509 CU, leaving 262,491 CU (more than the worst single tic,
+/// 223,333) under the 1,400,000 limit; the worst 11-tic window exceeds it.
+/// A sweep that does exceed its budget fails atomically and changes nothing;
+/// the sender retries with a smaller explicit `max_tics`.
+pub const DEFAULT_SWEEP_TICS: u32 = 8;
+/// Upper bound on tics per ADVANCE in every profile.
+pub const MAX_SWEEP_TICS: u32 = 64;
+
+/// The tic cap ADVANCE applies: `max_tics = 0` selects the profile default
+/// (count-capped: `DEFAULT_SWEEP_TICS`; metered: `MAX_SWEEP_TICS`, with the
+/// budget stop below it), and any request is capped at `MAX_SWEEP_TICS`.
+pub fn effective_max_tics(requested: u32) -> u32 {
+    let default = if cfg!(feature = "metered-sweep") {
+        MAX_SWEEP_TICS
+    } else {
+        DEFAULT_SWEEP_TICS
+    };
+    if requested == 0 {
+        default
+    } else {
+        requested.min(MAX_SWEEP_TICS)
+    }
+}
+
+/// `metered-sweep` only: compute reserved for one more tic before a sweep
+/// starts it.  Measured on SBF over the 1,000 DEMO1 tics of the gate
+/// (per-tic step = slot checks, ArmV2, G_Ticker, input chain): median
+/// 46,202, p99 127,303, max 223,333; the reserve is the max with a 1.34x
+/// margin.  See docs/experiments/doom-staged-sweep-2026-09-22.md.
 pub const TIC_RESERVE_CU: u64 = 300_000;
-/// Compute reserved for everything after the last tic: MP1 derive, ST1
-/// encode, copy, post-shape checks, the state-root hash, the meta write and
-/// the receipt log.  Measured on SBF: max 354,398 (publish) + 50,991 (post)
+/// `metered-sweep` only: compute reserved for everything after the last tic:
+/// MP1 derive, ST1 encode, copy, post-shape checks, the state-root hash, the
+/// meta write and the receipt log.  Measured on SBF: max 354,398 (publish) + 50,991 (post)
 /// with 212-216 mobjs; the reserve covers the thinker- and MP1-proportional
 /// parts scaled to the 384-slot MP1 cap (~530,000) plus margin.
 pub const PUBLISH_RESERVE_CU: u64 = 560_000;
@@ -842,17 +876,20 @@ impl Engine for ResidentEngine {
     }
 }
 
+/// The deployable budget: the compute meter where the runtime exposes it
+/// (`metered-sweep`), otherwise no budget stop (the tic cap bounds the sweep).
+/// The count-capped image references no `sol_remaining_compute_units`.
 struct ComputeMeter;
 
 impl Budget for ComputeMeter {
     fn remaining(&self) -> u64 {
-        #[cfg(target_os = "solana")]
+        #[cfg(all(target_os = "solana", feature = "metered-sweep"))]
         {
             solana_program::compute_units::sol_remaining_compute_units()
         }
-        #[cfg(not(target_os = "solana"))]
+        #[cfg(not(all(target_os = "solana", feature = "metered-sweep")))]
         {
-            0
+            u64::MAX
         }
     }
 }
@@ -1045,7 +1082,7 @@ fn process_advance(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     if !authority.is_signer {
         return Err(refuse(REFUSE_AUTHORITY));
     }
-    let max_tics = decode_advance(data)?;
+    let max_tics = effective_max_tics(decode_advance(data)?);
     let checkpoint = read_checkpoint(context)?;
     let mut meta_data = meta.try_borrow_mut_data()?;
     check_meta_address(program, context.key, meta.key, meta_data[M_BUMP])?;
@@ -1191,6 +1228,18 @@ mod tests {
             decode_deposit(&encode_deposit(0, &[0; 4 * (MAX_DEPOSIT_SLOTS + 1)])),
             Err(refuse(REFUSE_MALFORMED))
         );
+    }
+
+    #[test]
+    fn sweep_tic_cap_defaults_and_bounds() {
+        let default = if cfg!(feature = "metered-sweep") {
+            MAX_SWEEP_TICS
+        } else {
+            DEFAULT_SWEEP_TICS
+        };
+        assert_eq!(effective_max_tics(0), default);
+        assert_eq!(effective_max_tics(3), 3);
+        assert_eq!(effective_max_tics(u32::MAX), MAX_SWEEP_TICS);
     }
 
     #[test]

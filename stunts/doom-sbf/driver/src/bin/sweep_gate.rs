@@ -1382,12 +1382,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for &n in &tics_per_sweep {
         *hist.entry(n).or_default() += 1;
     }
-    // Budget-bound sweeps: those that stopped with slots still staged.
+    // Sweeps that stopped with slots still staged: on the budget (metered
+    // profile) or on the tic cap (count-capped profile).
     let mut budget_bound = Vec::new();
+    let mut cap_bound = Vec::new();
+    let mut stops = BTreeMap::<u8, usize>::new();
     for line in fs::read_to_string(receipt.join("sweeps.jsonl"))?.lines() {
         let v: serde_json::Value = serde_json::from_str(line)?;
-        if v["stop"] == sim2::Stop::Budget as u8 {
-            budget_bound.push((v["ran"].as_u64().unwrap(), v["cu"].as_u64().unwrap()));
+        let stop = v["stop"].as_u64().unwrap() as u8;
+        *stops.entry(stop).or_default() += 1;
+        let pair = (v["ran"].as_u64().unwrap(), v["cu"].as_u64().unwrap());
+        if stop == sim2::Stop::Budget as u8 {
+            budget_bound.push(pair);
+        } else if stop == sim2::Stop::MaxTics as u8 {
+            cap_bound.push(pair);
         }
     }
     let mut profile_summary = serde_json::Value::Null;
@@ -1465,6 +1473,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "tics_per_sweep_histogram": hist,
             "tics_per_sweep_max": tics_per_sweep.iter().max(),
             "budget_bound_sweeps_ran_cu": budget_bound,
+            "cap_bound_sweeps_ran_cu": cap_bound,
+            "stop_histogram_0none_1gap_2budget_3cap_4capacity_5halt_6halted": stops,
+            "effective_default_max_tics": sim2::effective_max_tics(0),
             "noop_sweep_cu": {"min": noop_units.iter().min(), "max": noop_units.iter().max(), "n": noop_units.len()},
             "final_cursor": view.cursor,
             "final_state_root": hex(&view.state_root),
