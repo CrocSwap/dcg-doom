@@ -20,6 +20,8 @@ const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC
 const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
 const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
 const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
+const NATIVE_PROVENANCE_PROFILE: &str =
+    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/1";
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -191,6 +193,54 @@ fn git_commit(tree: &Path) -> String {
     }
 }
 
+fn git_query(tree: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(tree.to_str().expect("git tree path is UTF-8"))
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("cannot run git {:?}: {err}", args));
+    if !output.status.success() {
+        panic!(
+            "git {:?} failed in {}: {}",
+            args,
+            tree.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+fn input_root(inputs: &[(String, PathBuf)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"DOOM-NATIVE-SOURCE-INPUT-ROOT/1\0");
+    for (name, path) in inputs {
+        let bytes = fs::read(path)
+            .unwrap_or_else(|err| panic!("cannot read build input {}: {err}", path.display()));
+        let sha = hex(&digest(&bytes));
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(sha.as_bytes());
+        hasher.update([b'\n']);
+    }
+    hex(&hasher.finalize())
+}
+
+fn add_input(inputs: &mut Vec<(String, PathBuf)>, name: String, path: PathBuf) {
+    if inputs.iter().any(|(existing, _)| existing == &name) {
+        panic!("duplicate embedded build input path {name}");
+    }
+    if !path.is_file() {
+        panic!("missing embedded build input {name}: {}", path.display());
+    }
+    inputs.push((name, path));
+}
+
 fn source_manifest(
     crate_root: &Path,
     tree: Option<&Path>,
@@ -200,11 +250,28 @@ fn source_manifest(
     metadata: &str,
 ) -> String {
     let mut inputs = Vec::<(String, PathBuf)>::new();
+    let repo_root = crate_root
+        .join("../..")
+        .canonicalize()
+        .expect("repository root for Doom provenance");
+    let compile_commit = git_query(&repo_root, &["rev-parse", "HEAD"]);
+    let compile_tree = git_query(&repo_root, &["rev-parse", "HEAD^{tree}"]);
+    let compile_status = git_query(&repo_root, &["status", "--porcelain", "--untracked-files=all"]);
+    // A native provenance image must be compiled from the exact clean source
+    // commit it records.  This is deliberately a build-time refusal: reading
+    // HEAD in a later probe would only describe the caller's checkout, not the
+    // sources which produced the binary.
+    if tree.is_some() && !compile_status.is_empty() {
+        panic!(
+            "native Doom provenance build requires a clean repository; dirty paths:\n{compile_status}"
+        );
+    }
     for name in ["build.rs", "Cargo.toml", "Cargo.lock"] {
-        inputs.push((
+        add_input(
+            &mut inputs,
             format!("repo/stunts/doom-sbf/{name}"),
             crate_root.join(name),
-        ));
+        );
     }
     collect_repo_inputs(
         crate_root,
@@ -223,7 +290,10 @@ fn source_manifest(
     for name in [
         "driver/Cargo.toml",
         "driver/Cargo.lock",
-        "driver/src/bin/ex2_native.rs",
+        "driver/src/bin/sweep_native.rs",
+        "driver/src/bin/fresh_resume_probe.rs",
+        "driver/src/bin/continuation_split_sbf.rs",
+        "driver/src/sweep_common.rs",
         "../doom-host/build.sh",
         "../doom-host/tools/doom_controller_producer.py",
         "../doom-host/tools/doom_account_image.py",
@@ -235,7 +305,7 @@ fn source_manifest(
         } else {
             format!("repo/stunts/doom-sbf/{name}")
         };
-        inputs.push((manifest_name, path));
+        add_input(&mut inputs, manifest_name, path);
     }
     let patch_dir = crate_root.join("../doom-host/patches");
     let mut patches = fs::read_dir(&patch_dir)
@@ -251,7 +321,11 @@ fn source_manifest(
     patches.sort();
     for path in patches {
         let name = path.file_name().unwrap().to_string_lossy();
-        inputs.push((format!("repo/stunts/doom-host/patches/{name}"), path));
+        add_input(
+            &mut inputs,
+            format!("repo/stunts/doom-host/patches/{name}"),
+            path,
+        );
     }
     let upstream_commit = tree
         .map(git_commit)
@@ -260,16 +334,53 @@ fn source_manifest(
         collect_inputs(tree, tree, &mut inputs);
     }
     inputs.sort_by(|a, b| a.0.cmp(&b.0));
+    let input_root = input_root(&inputs);
+    let source_profile = if tree.is_some() && !is_sbf {
+        NATIVE_PROVENANCE_PROFILE
+    } else if tree.is_some() {
+        "DOOM-SBF/ctx-engine/1"
+    } else {
+        "DOOM-EX2/legacy/1"
+    };
 
     let mut manifest = String::new();
     writeln!(&mut manifest, "{{").unwrap();
     writeln!(
         &mut manifest,
-        "  \"schema\": \"DOOM-EX2-NATIVE-SOURCE-MANIFEST/1\","
+        "  \"schema\": \"DOOM-EX2-NATIVE-SOURCE-MANIFEST/2\","
     )
     .unwrap();
     writeln!(&mut manifest, "  \"target\": \"{target}\",").unwrap();
     writeln!(&mut manifest, "  \"sbf\": {is_sbf},").unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"source_profile\": {},",
+        json_string(source_profile)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"binary_targets\": [\"sweep_native\", \"fresh_resume_probe\"],"
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"compile_source_commit\": {},",
+        json_string(&compile_commit)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"compile_source_tree\": {},",
+        json_string(&compile_tree)
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"compile_source_dirty\": {},",
+        !compile_status.is_empty()
+    )
+    .unwrap();
     writeln!(
         &mut manifest,
         "  \"upstream_commit\": \"{upstream_commit}\","
@@ -317,6 +428,13 @@ fn source_manifest(
         .unwrap();
     }
     writeln!(&mut manifest, "  ],").unwrap();
+    writeln!(&mut manifest, "  \"input_count\": {},", inputs.len()).unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"input_root\": {},",
+        json_string(&input_root)
+    )
+    .unwrap();
     writeln!(&mut manifest, "  \"inputs\": [").unwrap();
     for (index, (name, path)) in inputs.iter().enumerate() {
         let bytes = fs::read(path)

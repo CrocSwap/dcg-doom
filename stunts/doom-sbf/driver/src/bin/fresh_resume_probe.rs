@@ -29,8 +29,11 @@ const CORRECTED_DECODER_COMMIT: &str = "53bd00225df56df8037fc95b884c542db633a09b
 const PINNED_PATCH_0014_SHA256: &str =
     "788a1a3f830a42e4d82c704db80fda6a281ac6b09dec22fcabd8b727e7d1e08e";
 const PINNED_UPSTREAM_COMMIT: &str = "a77dfb96cb91780ca334d0d4cfd86957558007e0";
-const ORACLE_IDENTITY_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/2";
-const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/1";
+const ORACLE_IDENTITY_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/3";
+const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/2";
+const ACCEPTANCE_DESCRIPTOR_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ACCEPTANCE-DESCRIPTOR/1";
+const NATIVE_PROVENANCE_PROFILE: &str =
+    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/1";
 const PATCH_0014_PATH: &str = "repo/stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch";
 const Z_ZONE_PATH: &str = "external/z_zone.c";
 const FORWARD_TICS: usize = 1000;
@@ -43,18 +46,6 @@ const DIAGNOSTIC_STATE_ROW: usize = 597;
 const DIAGNOSTIC_PLAT_RECORD_OFFSET: usize = 59128;
 const DIAGNOSTIC_PLAT_COUNT_OFFSET: usize = 59149;
 const DS_PLAT: u8 = 5;
-const DECODER_SOURCE_FILES: &[&str] = &[
-    "stunts/doom-host/patches/0009-doom-state-import-preflight.patch",
-    "stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch",
-    "stunts/doom-sbf/src/doom_resource_ri2.c",
-    "stunts/doom-sbf/src/doom_sbf_resource_ri2.c",
-    "stunts/doom-sbf/src/doom_sim2_guard.h",
-    "stunts/doom-sbf/src/resource.rs",
-    "stunts/doom-sbf/src/resource_sbf.rs",
-    "stunts/doom-sbf/src/sim2.rs",
-    "stunts/doom-sbf/driver/src/sweep_common.rs",
-    "stunts/doom-sbf/driver/src/bin/continuation_split_sbf.rs",
-];
 
 fn sha(bytes: &[u8]) -> String {
     base::sha(bytes)
@@ -78,57 +69,55 @@ fn hex_bytes(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         .collect::<Result<Vec<_>, _>>()?)
 }
 
-fn current_head(repo: &Path) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            repo.to_str().ok_or("repo path is not UTF-8")?,
-            "rev-parse",
-            "HEAD",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err("git rev-parse HEAD failed".into());
+fn nonempty_metadata(metadata: &Value) -> bool {
+    let Some(metadata) = metadata.as_object() else {
+        return false;
+    };
+    if metadata.is_empty() {
+        return false;
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    for tool in ["rustc", "cargo", "c_compiler", "archiver"] {
+        let Some(tool) = metadata.get(tool).and_then(Value::as_object) else {
+            return false;
+        };
+        for field in ["path", "version"] {
+            if tool
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return false;
+            }
+        }
+    }
+    let Some(profile) = metadata.get("profile").and_then(Value::as_object) else {
+        return false;
+    };
+    !profile.is_empty()
+        && [
+            "name",
+            "opt_level",
+            "debug",
+            "debug_assertions",
+            "overflow_checks",
+            "lto",
+            "codegen_units",
+        ]
+        .iter()
+        .all(|field| {
+            profile
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.is_empty())
+        })
 }
 
-fn source_identity(repo: &Path, expected_commit: &str) -> Result<Value, Box<dyn Error>> {
-    let head = current_head(repo)?;
-    let mut files = serde_json::Map::new();
-    for relative in DECODER_SOURCE_FILES {
-        let current_path = repo.join(relative);
-        let current = fs::read(&current_path)?;
-        let expected = Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().ok_or("repo path is not UTF-8")?,
-                "show",
-                &format!("{expected_commit}:{relative}"),
-            ])
-            .output()?;
-        if !expected.status.success() {
-            return Err(format!("missing source blob {expected_commit}:{relative}").into());
-        }
-        let expected = expected.stdout;
-        files.insert(
-            (*relative).to_owned(),
-            json!({
-                "sha256": sha(&current),
-                "corrected_commit_sha256": sha(&expected),
-                "matches_corrected_commit": current == expected,
-            }),
-        );
-    }
-    let matches = files
-        .values()
-        .all(|file| file["matches_corrected_commit"] == true);
-    Ok(json!({
-        "corrected_decoder_commit": expected_commit,
-        "working_tree_head": head,
-        "files": files,
-        "matches_corrected_commit": matches,
-    }))
+fn descriptor_string(descriptor: &Value, path: &str) -> Result<String, Box<dyn Error>> {
+    descriptor[path]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("acceptance descriptor field {path} is missing").into())
 }
 
 fn manifest_input<'a>(manifest: &'a Value, path: &str) -> Option<&'a Value> {
@@ -148,7 +137,151 @@ fn required_sha(value: &Value, label: &str) -> Result<String, Box<dyn Error>> {
     Ok(sha.to_owned())
 }
 
-fn validate_oracle_identity(oracle_path: &Path, identity: &Value) -> Result<Value, Box<dyn Error>> {
+fn validate_acceptance_descriptor(
+    descriptor_path: &Path,
+    descriptor_sha256: &str,
+    descriptor_bytes: usize,
+    role: &str,
+    executable: &Path,
+    oracle_path: &Path,
+    manifest: &Value,
+    manifest_bytes: &[u8],
+) -> Result<Value, Box<dyn Error>> {
+    let bytes = fs::read(descriptor_path)?;
+    if descriptor_sha256.len() != 64
+        || !descriptor_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || bytes.len() != descriptor_bytes
+        || sha(&bytes) != descriptor_sha256
+    {
+        return Err("acceptance descriptor bytes/hash do not match the external pin".into());
+    }
+    let descriptor: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("acceptance descriptor is not JSON: {error}"))?;
+    if descriptor["schema"] != ACCEPTANCE_DESCRIPTOR_SCHEMA
+        || descriptor["profile"] != NATIVE_PROVENANCE_PROFILE
+        || descriptor_string(&descriptor, "oracle_directory")?
+            != oracle_path.canonicalize()?.display().to_string()
+    {
+        return Err("acceptance descriptor schema/profile/oracle path mismatch".into());
+    }
+    let binary = descriptor["binaries"][role]
+        .as_object()
+        .ok_or_else(|| format!("acceptance descriptor has no {role} binary"))?;
+    let actual_binary = fs::read(executable)?;
+    if binary["path"].as_str() != Some(executable.to_str().ok_or("binary path is not UTF-8")?)
+        || binary["bytes"].as_u64() != Some(actual_binary.len() as u64)
+        || binary["sha256"].as_str() != Some(sha(&actual_binary).as_str())
+    {
+        return Err(
+            format!("{role} binary does not match the external acceptance descriptor").into(),
+        );
+    }
+    let compile = descriptor["compile"]
+        .as_object()
+        .ok_or("acceptance descriptor compile section is missing")?;
+    if compile["target"] != manifest["target"]
+        || compile["sbf"] != manifest["sbf"]
+        || compile["source_profile"] != manifest["source_profile"]
+        || compile["source_commit"] != manifest["compile_source_commit"]
+        || compile["source_tree"] != manifest["compile_source_tree"]
+        || compile["source_dirty"] != manifest["compile_source_dirty"]
+        || compile["upstream_commit"] != manifest["upstream_commit"]
+        || compile["input_root"] != manifest["input_root"]
+        || compile["input_count"] != manifest["input_count"]
+        || compile["inputs"] != manifest["inputs"]
+        || compile["build_metadata"] != manifest["build_metadata"]
+        || compile["compiler_flags"] != manifest["compiler_flags"]
+        || compile["source_manifest_sha256"] != sha(manifest_bytes)
+    {
+        return Err(
+            "embedded build manifest differs from the external acceptance descriptor".into(),
+        );
+    }
+    if manifest["schema"] != SOURCE_MANIFEST_SCHEMA
+        || manifest["binary_targets"] != json!(["sweep_native", "fresh_resume_probe"])
+        || manifest["source_profile"] != NATIVE_PROVENANCE_PROFILE
+        || manifest["compile_source_dirty"] != false
+        || manifest["input_count"].as_u64() != manifest["inputs"].as_array().map(|v| v.len() as u64)
+        || !nonempty_metadata(&manifest["build_metadata"])
+        || manifest["compiler_flags"]
+            .as_array()
+            .is_none_or(|flags| flags.is_empty())
+    {
+        return Err(
+            "embedded source manifest is incomplete or has empty toolchain metadata".into(),
+        );
+    }
+    let patch = manifest_input(manifest, PATCH_0014_PATH).ok_or("manifest omits patch 0014")?;
+    let z_zone = manifest_input(manifest, Z_ZONE_PATH).ok_or("manifest omits patched z_zone.c")?;
+    if compile.get("patch_0014") != Some(patch) || compile.get("z_zone") != Some(z_zone) {
+        return Err(
+            "manifest patch/z_zone entries differ from independently built descriptor".into(),
+        );
+    }
+    if patch["sha256"] != json!(PINNED_PATCH_0014_SHA256) || z_zone["bytes"].as_u64() == Some(0) {
+        return Err("manifest patch/z_zone pin is invalid".into());
+    }
+    Ok(descriptor)
+}
+
+fn source_identity(repo: &Path, manifest: &Value) -> Result<Value, Box<dyn Error>> {
+    let mut files = serde_json::Map::new();
+    let mut matches = true;
+    for input in manifest["inputs"]
+        .as_array()
+        .ok_or("manifest inputs are missing")?
+    {
+        let path = input["path"].as_str().ok_or("manifest input path")?;
+        if !path.starts_with("repo/") {
+            continue;
+        }
+        let relative = &path[5..];
+        let current_path = repo.join(relative);
+        let current = match fs::read(&current_path) {
+            Ok(current) => current,
+            Err(_) => {
+                matches = false;
+                files.insert(relative.to_owned(), json!({"missing": true}));
+                continue;
+            }
+        };
+        let current_sha = sha(&current);
+        let expected_sha = input["sha256"].as_str().unwrap_or("");
+        let file_matches = current.len() == input["bytes"].as_u64().unwrap_or(u64::MAX) as usize
+            && current_sha == expected_sha;
+        matches &= file_matches;
+        files.insert(
+            relative.to_owned(),
+            json!({
+                "bytes": current.len(),
+                "sha256": current_sha,
+                "manifest_sha256": expected_sha,
+                "matches_compile_inputs": file_matches,
+                "matches_corrected_commit": file_matches,
+            }),
+        );
+    }
+    Ok(json!({
+        "corrected_decoder_commit": CORRECTED_DECODER_COMMIT,
+        "compile_source_commit": manifest["compile_source_commit"],
+        "compile_source_tree": manifest["compile_source_tree"],
+        "compile_source_dirty": manifest["compile_source_dirty"],
+        "files": files,
+        "matches_compile_inputs": matches,
+        "matches_corrected_commit": matches,
+    }))
+}
+
+fn validate_oracle_identity(
+    oracle_path: &Path,
+    identity: &Value,
+    descriptor: &Value,
+    descriptor_path: &Path,
+    descriptor_sha256: &str,
+    descriptor_bytes: usize,
+) -> Result<Value, Box<dyn Error>> {
     if identity["schema"] != ORACLE_IDENTITY_SCHEMA {
         return Err("oracle identity schema is missing or unsupported".into());
     }
@@ -156,31 +289,56 @@ fn validate_oracle_identity(oracle_path: &Path, identity: &Value) -> Result<Valu
     let manifest_bytes = fs::read(&manifest_path)
         .map_err(|error| format!("cannot read retained oracle source manifest: {error}"))?;
     let manifest_sha256 = sha(&manifest_bytes);
-    if identity["source_manifest_sha256"].as_str() != Some(manifest_sha256.as_str()) {
+    if identity["source_manifest_sha256"].as_str() != Some(manifest_sha256.as_str())
+        || manifest_sha256 != descriptor["compile"]["source_manifest_sha256"]
+    {
         return Err("oracle source manifest hash does not match its identity".into());
     }
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("oracle source manifest is not JSON: {error}"))?;
     if manifest["schema"] != SOURCE_MANIFEST_SCHEMA
-        || manifest["upstream_commit"].as_str() != Some(PINNED_UPSTREAM_COMMIT)
-        || !manifest["build_metadata"].is_object()
-        || !manifest["compiler_flags"].is_array()
+        || manifest["input_root"] != descriptor["compile"]["input_root"]
+        || manifest["inputs"] != descriptor["compile"]["inputs"]
+        || manifest["target"] != descriptor["compile"]["target"]
+        || manifest["sbf"] != descriptor["compile"]["sbf"]
+        || manifest["source_profile"] != descriptor["compile"]["source_profile"]
+        || manifest["compile_source_commit"] != descriptor["compile"]["source_commit"]
+        || manifest["compile_source_tree"] != descriptor["compile"]["source_tree"]
+        || manifest["compile_source_dirty"] != descriptor["compile"]["source_dirty"]
+        || manifest["upstream_commit"] != descriptor["compile"]["upstream_commit"]
+        || manifest["build_metadata"] != descriptor["compile"]["build_metadata"]
+        || manifest["compiler_flags"] != descriptor["compile"]["compiler_flags"]
+        || !nonempty_metadata(&manifest["build_metadata"])
     {
-        return Err("oracle source manifest is not the pinned complete engine manifest".into());
+        return Err(
+            "oracle source manifest is not the independently pinned complete manifest".into(),
+        );
     }
     let patch = manifest_input(&manifest, PATCH_0014_PATH)
         .ok_or("oracle source manifest omits patch 0014")?;
     let patch_sha256 = required_sha(patch, "oracle patch 0014")?;
-    if patch_sha256 != PINNED_PATCH_0014_SHA256 {
+    if patch_sha256 != PINNED_PATCH_0014_SHA256
+        || descriptor["compile"].get("patch_0014") != Some(patch)
+    {
         return Err("oracle patch 0014 is not the pinned 53bd0022 blob".into());
     }
     let z_zone = manifest_input(&manifest, Z_ZONE_PATH)
         .ok_or("oracle source manifest omits the patched z_zone.c")?;
     let z_zone_sha256 = required_sha(z_zone, "oracle z_zone.c")?;
-    if z_zone["bytes"].as_u64().unwrap_or(0) == 0 {
+    if z_zone["bytes"].as_u64().unwrap_or(0) == 0
+        || descriptor["compile"].get("z_zone") != Some(z_zone)
+    {
         return Err("oracle z_zone.c manifest entry is empty".into());
     }
-    if identity["provenance"]["corrected_decoder_commit"].as_str() != Some(CORRECTED_DECODER_COMMIT)
+    let expected_acceptance_descriptor = json!({
+        "path": descriptor_path.display().to_string(),
+        "sha256": descriptor_sha256,
+        "bytes": descriptor_bytes,
+    });
+    if identity["acceptance_descriptor"] != expected_acceptance_descriptor
+        || identity["provenance"]["acceptance_descriptor"] != expected_acceptance_descriptor
+        || identity["provenance"]["corrected_decoder_commit"].as_str()
+            != Some(CORRECTED_DECODER_COMMIT)
         || identity["provenance"]["patch_0014_sha256"].as_str() != Some(PINNED_PATCH_0014_SHA256)
         || identity["provenance"]["z_zone_sha256"].as_str() != Some(z_zone_sha256.as_str())
         || identity["provenance"]["source_manifest_sha256"].as_str()
@@ -189,12 +347,15 @@ fn validate_oracle_identity(oracle_path: &Path, identity: &Value) -> Result<Valu
             != Some(PINNED_PATCH_0014_SHA256)
         || identity["provenance"]["pinned_inputs"]["z_zone"]["sha256"].as_str()
             != Some(z_zone_sha256.as_str())
-        || identity["provenance"]["source_commit"]
-            .as_str()
-            .is_none_or(|commit| {
-                commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
-            })
-        || identity["provenance"]["source_tree_clean"] != true
+        || identity["provenance"]["compile_source_commit"] != descriptor["compile"]["source_commit"]
+        || identity["provenance"]["compile_source_tree"] != descriptor["compile"]["source_tree"]
+        || identity["provenance"]["compile_source_dirty"] != false
+        || identity["provenance"]["build_metadata"] != descriptor["compile"]["build_metadata"]
+        || identity["provenance"]["compiler_flags"] != descriptor["compile"]["compiler_flags"]
+        || identity["provenance"]["manifest_schema"] != SOURCE_MANIFEST_SCHEMA
+        || identity["provenance"]["upstream_commit"] != descriptor["compile"]["upstream_commit"]
+        || identity["provenance"]["source_profile"] != descriptor["compile"]["source_profile"]
+        || identity["provenance"]["descriptor_profile"] != descriptor["profile"]
     {
         return Err("oracle provenance commitments do not match its complete manifest".into());
     }
@@ -212,6 +373,9 @@ fn validate_oracle_identity(oracle_path: &Path, identity: &Value) -> Result<Valu
         .map_err(|error| format!("cannot read retained oracle binary: {error}"))?;
     let binary_sha256 = sha(&binary_bytes);
     if binary["sha256"].as_str() != Some(binary_sha256.as_str())
+        || binary["bytes"].as_u64() != Some(binary_bytes.len() as u64)
+        || Value::Object(binary.clone()) != descriptor["binaries"]["sweep_native"]
+        || identity["provenance"]["binary"] != Value::Object(binary.clone())
         || identity["provenance"]["binary"]["path"] != binary["path"]
         || identity["provenance"]["binary"]["sha256"].as_str() != Some(binary_sha256.as_str())
     {
@@ -226,8 +390,10 @@ fn validate_oracle_identity(oracle_path: &Path, identity: &Value) -> Result<Valu
         "corrected_decoder_commit": CORRECTED_DECODER_COMMIT,
         "patch_0014_sha256": patch_sha256,
         "z_zone_sha256": z_zone_sha256,
-        "source_commit": identity["provenance"]["source_commit"],
+        "source_commit": descriptor["compile"]["source_commit"],
+        "source_tree": descriptor["compile"]["source_tree"],
         "source_tree_clean": true,
+        "acceptance_descriptor_sha256": descriptor_sha256,
         "binary": {"path": binary_path, "sha256": binary_sha256},
     }))
 }
@@ -354,10 +520,13 @@ fn malformed_controls(
 fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = env::args().collect();
     let [_, capture, resource_path, oracle, receipt, rest @ ..] = &argv[..] else {
-        return Err("usage: fresh_resume_probe <capture> <resource> <oracle> <receipt> [--corrected-commit COMMIT] [--source-root ROOT]".into());
+        return Err("usage: fresh_resume_probe <capture> <resource> <oracle> <receipt> --acceptance-descriptor PATH --acceptance-descriptor-sha256 HEX --acceptance-descriptor-bytes N [--corrected-commit COMMIT] [--source-root ROOT]".into());
     };
     let mut corrected_commit = CORRECTED_DECODER_COMMIT.to_owned();
     let mut source_root: Option<PathBuf> = None;
+    let mut acceptance_descriptor: Option<PathBuf> = None;
+    let mut acceptance_descriptor_sha256: Option<String> = None;
+    let mut acceptance_descriptor_bytes: Option<usize> = None;
     let mut args = rest.iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -372,12 +541,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                     args.next().ok_or("--source-root needs a value")?,
                 ));
             }
+            "--acceptance-descriptor" => {
+                acceptance_descriptor = Some(PathBuf::from(
+                    args.next().ok_or("--acceptance-descriptor needs a value")?,
+                ));
+            }
+            "--acceptance-descriptor-sha256" => {
+                acceptance_descriptor_sha256 = Some(
+                    args.next()
+                        .ok_or("--acceptance-descriptor-sha256 needs a value")?
+                        .clone(),
+                );
+            }
+            "--acceptance-descriptor-bytes" => {
+                acceptance_descriptor_bytes = Some(
+                    args.next()
+                        .ok_or("--acceptance-descriptor-bytes needs a value")?
+                        .parse()?,
+                );
+            }
             _ => return Err(format!("unknown option {flag}").into()),
         }
     }
     if corrected_commit != CORRECTED_DECODER_COMMIT {
         return Err("probe only accepts the corrected 53bd0022 decoder identity".into());
     }
+    let acceptance_descriptor = acceptance_descriptor
+        .ok_or("--acceptance-descriptor is required")?
+        .canonicalize()?;
+    let acceptance_descriptor_sha256 =
+        acceptance_descriptor_sha256.ok_or("--acceptance-descriptor-sha256 is required")?;
+    let acceptance_descriptor_bytes =
+        acceptance_descriptor_bytes.ok_or("--acceptance-descriptor-bytes is required")?;
 
     let capture_path = PathBuf::from(capture).canonicalize()?;
     let resource_path = PathBuf::from(resource_path).canonicalize()?;
@@ -387,6 +582,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("receipt directory is not empty".into());
     }
     fs::create_dir_all(&receipt_path)?;
+    let executable = env::current_exe()?.canonicalize()?;
+    let manifest_bytes = ex2::BUILD_SOURCE_MANIFEST.as_bytes();
+    let build_manifest: Value = serde_json::from_str(ex2::BUILD_SOURCE_MANIFEST)
+        .map_err(|error| format!("embedded Doom build manifest is not JSON: {error}"))?;
+    let acceptance = validate_acceptance_descriptor(
+        &acceptance_descriptor,
+        &acceptance_descriptor_sha256,
+        acceptance_descriptor_bytes,
+        "fresh_resume_probe",
+        &executable,
+        &oracle_path,
+        &build_manifest,
+        manifest_bytes,
+    )?;
 
     let capture = Capture::load(&capture_path, &resource_path)?;
     let states = gunzip(&oracle_path.join("oracle-st1.bin.gz"))?;
@@ -406,16 +615,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let oracle_identity: Value =
         serde_json::from_slice(&fs::read(oracle_path.join("identity.json"))?)?;
-    let oracle_provenance = validate_oracle_identity(&oracle_path, &oracle_identity)?;
+    let oracle_provenance = validate_oracle_identity(
+        &oracle_path,
+        &oracle_identity,
+        &acceptance,
+        &acceptance_descriptor,
+        &acceptance_descriptor_sha256,
+        acceptance_descriptor_bytes,
+    )?;
 
     let repo = source_root
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
         .canonicalize()?;
-    let source = source_identity(&repo, &corrected_commit)?;
-    if source["matches_corrected_commit"] != true {
-        return Err("working decoder source does not match the pinned corrected commit".into());
+    let source = source_identity(&repo, &build_manifest)?;
+    if source["matches_compile_inputs"] != true {
+        return Err(
+            "working decoder source does not match the compile-time source manifest".into(),
+        );
     }
-    let executable = env::current_exe()?.canonicalize()?;
     let binary = fs::read(&executable)?;
     let mut forward_mismatches = Vec::new();
     let forward_open =

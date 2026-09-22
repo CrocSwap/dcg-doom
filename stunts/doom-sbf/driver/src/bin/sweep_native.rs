@@ -18,7 +18,7 @@ mod base;
 #[allow(dead_code)]
 mod common;
 
-use std::{cell::Cell, env, error::Error, fs, io::Write, path::PathBuf, process::Command, rc::Rc};
+use std::{cell::Cell, env, error::Error, fs, io::Write, path::PathBuf, rc::Rc};
 
 use common::{hex, Capture, CellBudget, NativeEngine, Rng};
 use doom_sbf::{ex2, resource, resource_sbf, sim2};
@@ -46,6 +46,10 @@ const PINNED_PATCH_0014_SHA256: &str =
 const PINNED_UPSTREAM_COMMIT: &str = "a77dfb96cb91780ca334d0d4cfd86957558007e0";
 const PATCH_0014_PATH: &str = "repo/stunts/doom-host/patches/0014-doom-zero-levspec-thinkers.patch";
 const Z_ZONE_PATH: &str = "external/z_zone.c";
+const SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/2";
+const ACCEPTANCE_DESCRIPTOR_SCHEMA: &str = "DOOM-SIM/2-NATIVE-ACCEPTANCE-DESCRIPTOR/1";
+const NATIVE_PROVENANCE_PROFILE: &str =
+    "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/1";
 
 type Snapshot = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
@@ -210,54 +214,175 @@ fn manifest_sha(value: &Value, label: &str) -> Result<String, Box<dyn Error>> {
     Ok(sha.to_owned())
 }
 
-fn git_output(repo: &std::path::Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("git {:?} failed", args).into());
+fn nonempty_metadata(metadata: &Value) -> bool {
+    let Some(metadata) = metadata.as_object() else {
+        return false;
+    };
+    if metadata.is_empty() {
+        return false;
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    for tool in ["rustc", "cargo", "c_compiler", "archiver"] {
+        let Some(tool) = metadata.get(tool).and_then(Value::as_object) else {
+            return false;
+        };
+        for field in ["path", "version"] {
+            if tool
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return false;
+            }
+        }
+    }
+    let Some(profile) = metadata.get("profile").and_then(Value::as_object) else {
+        return false;
+    };
+    !profile.is_empty()
+        && [
+            "name",
+            "opt_level",
+            "debug",
+            "debug_assertions",
+            "overflow_checks",
+            "lto",
+            "codegen_units",
+        ]
+        .iter()
+        .all(|field| {
+            profile
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.is_empty())
+        })
 }
 
-fn build_provenance(executable: &std::path::Path) -> Result<Value, Box<dyn Error>> {
-    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()?;
-    let source_commit = git_output(&source_root, &["rev-parse", "HEAD"])?;
-    let source_status = git_output(&source_root, &["status", "--porcelain"])?;
-    if !source_status.is_empty() {
-        return Err("native oracle requires a clean repository source tree".into());
+fn descriptor_string(descriptor: &Value, path: &str) -> Result<String, Box<dyn Error>> {
+    descriptor[path]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("acceptance descriptor field {path} is missing").into())
+}
+
+fn validate_acceptance_descriptor(
+    descriptor_path: &std::path::Path,
+    descriptor_sha256: &str,
+    descriptor_bytes: usize,
+    role: &str,
+    executable: &std::path::Path,
+    oracle_path: &std::path::Path,
+    manifest: &Value,
+    manifest_bytes: &[u8],
+) -> Result<Value, Box<dyn Error>> {
+    if descriptor_sha256.len() != 64
+        || !descriptor_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("acceptance descriptor SHA-256 is not hexadecimal".into());
     }
+    let bytes = fs::read(descriptor_path)?;
+    if bytes.len() != descriptor_bytes || base::sha(&bytes) != descriptor_sha256 {
+        return Err("acceptance descriptor bytes/hash do not match the external pin".into());
+    }
+    let descriptor: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("acceptance descriptor is not JSON: {error}"))?;
+    if descriptor["schema"] != ACCEPTANCE_DESCRIPTOR_SCHEMA
+        || descriptor["profile"] != NATIVE_PROVENANCE_PROFILE
+        || descriptor_string(&descriptor, "oracle_directory")?
+            != oracle_path.canonicalize()?.display().to_string()
+    {
+        return Err("acceptance descriptor schema/profile/oracle path mismatch".into());
+    }
+    let binary = descriptor["binaries"][role]
+        .as_object()
+        .ok_or_else(|| format!("acceptance descriptor has no {role} binary"))?;
+    let actual_binary = fs::read(executable)?;
+    if binary["path"].as_str() != Some(executable.to_str().ok_or("binary path is not UTF-8")?)
+        || binary["bytes"].as_u64() != Some(actual_binary.len() as u64)
+        || binary["sha256"].as_str() != Some(base::sha(&actual_binary).as_str())
+    {
+        return Err(
+            format!("{role} binary does not match the external acceptance descriptor").into(),
+        );
+    }
+    let compile = descriptor["compile"]
+        .as_object()
+        .ok_or("acceptance descriptor compile section is missing")?;
+    if compile["target"] != manifest["target"]
+        || compile["sbf"] != manifest["sbf"]
+        || compile["source_profile"] != manifest["source_profile"]
+        || compile["source_commit"] != manifest["compile_source_commit"]
+        || compile["source_tree"] != manifest["compile_source_tree"]
+        || compile["source_dirty"] != manifest["compile_source_dirty"]
+        || compile["upstream_commit"] != manifest["upstream_commit"]
+        || compile["input_root"] != manifest["input_root"]
+        || compile["input_count"] != manifest["input_count"]
+        || compile["inputs"] != manifest["inputs"]
+        || compile["build_metadata"] != manifest["build_metadata"]
+        || compile["compiler_flags"] != manifest["compiler_flags"]
+        || compile["source_manifest_sha256"] != base::sha(manifest_bytes)
+    {
+        return Err(
+            "embedded build manifest differs from the external acceptance descriptor".into(),
+        );
+    }
+    if manifest["schema"] != SOURCE_MANIFEST_SCHEMA
+        || manifest["binary_targets"] != serde_json::json!(["sweep_native", "fresh_resume_probe"])
+        || manifest["source_profile"] != NATIVE_PROVENANCE_PROFILE
+        || manifest["compile_source_dirty"] != false
+        || manifest["input_count"].as_u64() != manifest["inputs"].as_array().map(|v| v.len() as u64)
+        || !nonempty_metadata(&manifest["build_metadata"])
+        || manifest["compiler_flags"]
+            .as_array()
+            .is_none_or(|flags| flags.is_empty())
+    {
+        return Err(
+            "embedded source manifest is incomplete or has empty toolchain metadata".into(),
+        );
+    }
+    let patch = manifest_input(manifest, PATCH_0014_PATH).ok_or("manifest omits patch 0014")?;
+    let z_zone = manifest_input(manifest, Z_ZONE_PATH).ok_or("manifest omits patched z_zone.c")?;
+    if compile.get("patch_0014") != Some(patch) || compile.get("z_zone") != Some(z_zone) {
+        return Err(
+            "manifest patch/z_zone entries differ from independently built descriptor".into(),
+        );
+    }
+    if patch["sha256"] != PINNED_PATCH_0014_SHA256 || z_zone["bytes"].as_u64() == Some(0) {
+        return Err("manifest patch/z_zone pin is invalid".into());
+    }
+    Ok(descriptor)
+}
+
+fn build_provenance(
+    executable: &std::path::Path,
+    descriptor_path: &std::path::Path,
+    descriptor_sha256: &str,
+    descriptor_bytes: usize,
+    receipt: &std::path::Path,
+) -> Result<Value, Box<dyn Error>> {
     let manifest_bytes = ex2::BUILD_SOURCE_MANIFEST.as_bytes();
     let manifest: Value = serde_json::from_str(ex2::BUILD_SOURCE_MANIFEST)
         .map_err(|error| format!("embedded Doom build manifest is not JSON: {error}"))?;
-    if manifest["schema"] != "DOOM-EX2-NATIVE-SOURCE-MANIFEST/1"
-        || manifest["upstream_commit"].as_str() != Some(PINNED_UPSTREAM_COMMIT)
-        || !manifest["build_metadata"].is_object()
-        || !manifest["compiler_flags"].is_array()
-    {
-        return Err(
-            "embedded Doom build manifest is not the pinned complete engine manifest".into(),
-        );
-    }
-    let patch = manifest_input(&manifest, PATCH_0014_PATH)
-        .ok_or("embedded Doom build manifest omits patch 0014")?;
-    let patch_sha256 = manifest_sha(patch, "patch 0014")?;
-    if patch_sha256 != PINNED_PATCH_0014_SHA256 {
-        return Err("embedded patch 0014 is not the pinned 53bd0022 blob".into());
-    }
-    let z_zone = manifest_input(&manifest, Z_ZONE_PATH)
-        .ok_or("embedded Doom build manifest omits patched z_zone.c")?;
-    let z_zone_sha256 = manifest_sha(z_zone, "z_zone.c")?;
-    if z_zone["bytes"].as_u64().unwrap_or(0) == 0 {
-        return Err("embedded z_zone.c manifest entry is empty".into());
-    }
+    let descriptor = validate_acceptance_descriptor(
+        descriptor_path,
+        descriptor_sha256,
+        descriptor_bytes,
+        "sweep_native",
+        executable,
+        receipt,
+        &manifest,
+        manifest_bytes,
+    )?;
+    let patch_sha256 = manifest_sha(
+        manifest_input(&manifest, PATCH_0014_PATH).unwrap(),
+        "patch 0014",
+    )?;
+    let z_zone_sha256 = manifest_sha(manifest_input(&manifest, Z_ZONE_PATH).unwrap(), "z_zone.c")?;
     let binary = fs::read(executable)?;
     Ok(serde_json::json!({
-        "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/2",
+        "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/3",
         "corrected_decoder_commit": CORRECTED_DECODER_COMMIT,
         "source_manifest_sha256": base::sha(manifest_bytes),
         "patch_0014_sha256": patch_sha256,
@@ -269,9 +394,18 @@ fn build_provenance(executable: &std::path::Path) -> Result<Value, Box<dyn Error
         "binary": {"path": executable, "sha256": base::sha(&binary), "bytes": binary.len()},
         "manifest_schema": manifest["schema"],
         "upstream_commit": PINNED_UPSTREAM_COMMIT,
-        "source_root": source_root,
-        "source_commit": source_commit,
-        "source_tree_clean": true,
+        "compile_source_commit": manifest["compile_source_commit"],
+        "compile_source_tree": manifest["compile_source_tree"],
+        "compile_source_dirty": manifest["compile_source_dirty"],
+        "source_profile": manifest["source_profile"],
+        "build_metadata": manifest["build_metadata"],
+        "compiler_flags": manifest["compiler_flags"],
+        "acceptance_descriptor": {
+            "path": descriptor_path,
+            "sha256": descriptor_sha256,
+            "bytes": descriptor_bytes,
+        },
+        "descriptor_profile": descriptor["profile"],
     }))
 }
 
@@ -285,6 +419,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut seed = 0x5eed_d00d_2026_0922u64;
     let mut checkpoint_path: Option<PathBuf> = None;
     let mut sim1_receipt: Option<PathBuf> = None;
+    let mut acceptance_descriptor: Option<PathBuf> = None;
+    let mut acceptance_descriptor_sha256: Option<String> = None;
+    let mut acceptance_descriptor_bytes: Option<usize> = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("flag without value")?;
         match flag.as_str() {
@@ -292,15 +429,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--seed" => seed = u64::from_str_radix(value.trim_start_matches("0x"), 16)?,
             "--checkpoint" => checkpoint_path = Some(PathBuf::from(value).canonicalize()?),
             "--sim1-receipt" => sim1_receipt = Some(PathBuf::from(value).canonicalize()?),
+            "--acceptance-descriptor" => {
+                acceptance_descriptor = Some(PathBuf::from(value).canonicalize()?)
+            }
+            "--acceptance-descriptor-sha256" => acceptance_descriptor_sha256 = Some(value),
+            "--acceptance-descriptor-bytes" => acceptance_descriptor_bytes = Some(value.parse()?),
             _ => return Err(format!("unknown flag {flag}").into()),
         }
     }
+    let acceptance_descriptor =
+        acceptance_descriptor.ok_or("--acceptance-descriptor is required")?;
+    let acceptance_descriptor_sha256 =
+        acceptance_descriptor_sha256.ok_or("--acceptance-descriptor-sha256 is required")?;
+    let acceptance_descriptor_bytes =
+        acceptance_descriptor_bytes.ok_or("--acceptance-descriptor-bytes is required")?;
     if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
         return Err("receipt directory is not empty".into());
     }
     fs::create_dir_all(&receipt)?;
     let executable = env::current_exe()?.canonicalize()?;
-    let provenance = build_provenance(&executable)?;
+    let provenance = build_provenance(
+        &executable,
+        &acceptance_descriptor,
+        &acceptance_descriptor_sha256,
+        acceptance_descriptor_bytes,
+        &receipt,
+    )?;
     fs::write(
         receipt.join("source-manifest.json"),
         ex2::BUILD_SOURCE_MANIFEST,
@@ -825,7 +979,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     common::write_json(
         &receipt.join("identity.json"),
         &serde_json::json!({
-            "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/2",
+            "schema": "DOOM-SIM/2-NATIVE-ORACLE-IDENTITY/3",
             "profile": "DOOM-SIM/2",
             "implementation": "host build of doom-sbf sim2 cores + host C session engine (same C source as SBF, host compiler, this process)",
             "command_line": argv,
@@ -842,6 +996,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "seed": format!("{seed:#x}"),
             "sim2_abi": sim2::ABI_DESCRIPTOR,
             "provenance": provenance,
+            "acceptance_descriptor": provenance["acceptance_descriptor"],
             "source_manifest": "source-manifest.json",
             "source_manifest_sha256": source_manifest_sha256,
             "binary": binary_identity,
