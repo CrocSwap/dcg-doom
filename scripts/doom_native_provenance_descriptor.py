@@ -55,6 +55,17 @@ CAPTURE_REQUIRED_FILES = {
 RESOURCE_REQUIRED_FILES = {"resource-image.ri2"}
 EXPECTED_CARGO_FEATURES = ["ctx-engine"]
 EXPECTED_BINARY_TARGETS = ["sweep_native", "fresh_resume_probe"]
+EXPECTED_NATIVE_C_FLAGS = [
+    "-O2",
+    "-std=gnu89",
+    "-DNORMALUNIX",
+    "-DHEADLESS_DOOM",
+    "-Wno-deprecated-non-prototype",
+    "-Wno-implicit-int",
+    "-Wno-int-conversion",
+    "-Wno-incompatible-pointer-types",
+    "-Wno-format-security",
+]
 
 
 def run(args: list[str], cwd: Path | None = None, *, input_bytes: bytes | None = None) -> bytes:
@@ -232,7 +243,14 @@ def validate_expected_configuration(manifest: dict[str, object], expected: dict[
         raise SystemExit("native host release profile has unexpected Rust flags")
     if c_environment.get("cflags") or c_environment.get("cppflags") or c_environment.get("c_include_path"):
         raise SystemExit("native host release profile has unexpected C environment flags")
-    if c_compilation.get("hotloop_defines") or c_compilation.get("engine_defines") != ["NORMALUNIX", "HEADLESS_DOOM"]:
+    if manifest.get("compiler_flags") != EXPECTED_NATIVE_C_FLAGS:
+        raise SystemExit("native host release profile has unexpected compiler flags")
+    if (
+        c_compilation.get("hotloop_flags")
+        or c_compilation.get("hotloop_defines")
+        or c_compilation.get("engine_flags") != EXPECTED_NATIVE_C_FLAGS
+        or c_compilation.get("engine_defines") != ["NORMALUNIX", "HEADLESS_DOOM"]
+    ):
         raise SystemExit("native host release profile has unexpected C defines")
 
 
