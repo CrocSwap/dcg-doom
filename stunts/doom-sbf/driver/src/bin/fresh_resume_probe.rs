@@ -186,7 +186,9 @@ fn validate_file_table(
                 .as_str()
                 .ok_or(format!("{label} file path"))?;
             let path = root.join(relative);
-            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("{label} required file {relative}: {error}"))?;
+            if metadata.file_type().is_symlink() {
                 return Err(format!(
                     "final descriptor {label} required file {relative} is a symlink"
                 )
@@ -280,7 +282,10 @@ fn validate_final_descriptor(
         false,
         INPUT_FILE_TABLE_DOMAIN,
     )?;
-    if descriptor["resource"]["path"] != resource_path.canonicalize()?.display().to_string() {
+    // `resource_path` is already canonical (its parent was canonicalized in
+    // `main`), so a missing resource file reaches the labeled file-table
+    // refusal below instead of a bare I/O error here.
+    if descriptor["resource"]["path"] != resource_path.display().to_string() {
         return Err("final descriptor resource path mismatch".into());
     }
     let resource_parent = resource_path
@@ -709,7 +714,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         final_descriptor_bytes.ok_or("--final-descriptor-bytes is required")?;
 
     let capture_path = PathBuf::from(capture).canonicalize()?;
-    let resource_path = PathBuf::from(resource_path).canonicalize()?;
+    let resource_path = {
+        let given = PathBuf::from(resource_path);
+        let name = given.file_name().ok_or("resource path has no file name")?.to_owned();
+        let parent = given.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        parent.canonicalize()?.join(name)
+    };
     let oracle_path = PathBuf::from(oracle).canonicalize()?;
     let receipt_path = PathBuf::from(receipt);
     if receipt_path.exists() && fs::read_dir(&receipt_path)?.next().is_some() {
