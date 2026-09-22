@@ -173,7 +173,10 @@ fn normalized_env(name: &str) -> String {
 }
 
 fn normalized_encoded_env(name: &str) -> Vec<String> {
+    // Cargo sets CARGO_ENCODED_RUSTFLAGS to "" when there are no flags; that
+    // is zero flags, not one empty flag (matches doom_native_expected_profile.py).
     env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(|value| {
             value
                 .to_string_lossy()
