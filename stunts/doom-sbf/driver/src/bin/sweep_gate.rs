@@ -300,6 +300,20 @@ impl Gate {
         }
     }
 
+    fn advance_expected_ix(
+        &self,
+        state: Pubkey,
+        meta_key: Pubkey,
+        buffer: Pubkey,
+        authority: Pubkey,
+        expected_cursor: u32,
+        max_tics: u32,
+    ) -> Instruction {
+        let mut ix = self.advance_ix(state, meta_key, buffer, authority, max_tics);
+        ix.data = sim2::encode_advance_expected(expected_cursor, max_tics);
+        ix
+    }
+
     fn snapshot_ix(&self, cursor: u32, root: &[u8; 32]) -> Instruction {
         Instruction {
             program_id: base::PROGRAM,
@@ -344,6 +358,23 @@ impl Gate {
             self.keys.meta,
             self.keys.buffer.pubkey(),
             self.keys.authority.pubkey(),
+            max_tics,
+        );
+        let authority = self.keys.authority.insecure_clone();
+        self.send(vec![ix], &[&authority]).await
+    }
+
+    async fn advance_expected(
+        &mut self,
+        expected_cursor: u32,
+        max_tics: u32,
+    ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
+        let ix = self.advance_expected_ix(
+            self.keys.state.pubkey(),
+            self.keys.meta,
+            self.keys.buffer.pubkey(),
+            self.keys.authority.pubkey(),
+            expected_cursor,
             max_tics,
         );
         let authority = self.keys.authority.insecure_clone();
@@ -1195,14 +1226,100 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("expected to stall at {}, cursor {last_cursor}", HOLD[0]).into());
     }
 
+    // Exercise a future cursor arriving before its predecessor.  The first
+    // transaction must be refused atomically.  Once the current cursor is
+    // advanced, a fresh transaction for the same expected cursor succeeds.
+    let c = |seq: u32| commands[seq as usize * 4..seq as usize * 4 + 4].to_vec();
+    let future_cursor = HOLD[0] + 1;
+    let future = gate.advance_expected_ix(
+        state_kp.pubkey(),
+        meta_key,
+        buffer_key,
+        authority.pubkey(),
+        future_cursor,
+        1,
+    );
+    refused(
+        &mut gate,
+        &mut controls,
+        "advance_out_of_order_cursor",
+        sim2::REFUSE_CURSOR_MISMATCH,
+        vec![future],
+        &[&authority],
+    )
+    .await?;
+
+    let predecessor = gate.deposit(HOLD[0], &c(HOLD[0])).await?;
+    if predecessor.result.is_err() {
+        return Err(format!("deposit held predecessor {:?}", predecessor.result).into());
+    }
+    let predecessor_sweep = gate.advance_expected(HOLD[0], 1).await?;
+    if predecessor_sweep.result.is_err() {
+        return Err(format!(
+            "expected-cursor predecessor sweep {:?}",
+            predecessor_sweep.result
+        )
+        .into());
+    }
+    let predecessor_view =
+        sim2::MetaView::parse(&gate.data(meta_key).await?).ok_or("meta after predecessor")?;
+    let predecessor_oracle = &oracle.tics[predecessor_view.cursor as usize - 1];
+    if predecessor_view.cursor != future_cursor
+        || gate.data(state_kp.pubkey()).await? != predecessor_oracle.state
+        || gate.data(gate.keys.mirror.pubkey()).await? != predecessor_oracle.mirror
+        || predecessor_view.state_root != predecessor_oracle.state_root
+        || predecessor_view.input_chain != predecessor_oracle.chain
+    {
+        return Err("cursor-bound predecessor sweep differs from the oracle".into());
+    }
+    controls.insert(
+        "advance_expected_cursor_predecessor".into(),
+        serde_json::json!({"cursor":predecessor_view.cursor,"cu":base::units(&predecessor_sweep)?,"oracle_equal":true}),
+    );
+
+    let resent = gate.advance_expected(future_cursor, 1).await?;
+    if resent.result.is_err() {
+        return Err(format!("re-sent expected-cursor sweep {:?}", resent.result).into());
+    }
+    let resent_view =
+        sim2::MetaView::parse(&gate.data(meta_key).await?).ok_or("meta after re-send")?;
+    let resent_oracle = &oracle.tics[resent_view.cursor as usize - 1];
+    if resent_view.cursor != future_cursor + 1
+        || gate.data(state_kp.pubkey()).await? != resent_oracle.state
+        || gate.data(gate.keys.mirror.pubkey()).await? != resent_oracle.mirror
+        || resent_view.state_root != resent_oracle.state_root
+        || resent_view.input_chain != resent_oracle.chain
+    {
+        return Err("re-sent cursor-bound sweep differs from the oracle".into());
+    }
+    controls.insert(
+        "advance_refusal_resend".into(),
+        serde_json::json!({"refusal_code":sim2::REFUSE_CURSOR_MISMATCH,"cursor":resent_view.cursor,"cu":base::units(&resent)?,"fresh_transaction":true,"oracle_equal":true}),
+    );
+    last_cursor = resent_view.cursor;
+
+    // Continue to the later held slot, preserving a second gap for the
+    // existing no-op, duplicate and malformed-input controls below.
+    loop {
+        let (result, view) = run_sweep(&mut gate, &oracle, &mut sweeps, 0).await?;
+        sweep_count += 1;
+        let progressed = view.cursor > last_cursor;
+        record(&result, &view, &mut last_cursor)?;
+        if !progressed {
+            break;
+        }
+    }
+    if last_cursor != HOLD[1] {
+        return Err(format!("expected to stall at {}, cursor {last_cursor}", HOLD[1]).into());
+    }
+
     // --- mid-run controls (stalled at the first held slot) ----------------------
     let before = gate.durable().await?;
     let gap = gate.advance(0).await?;
     if gap.result.is_err() || gate.durable().await? != before {
         return Err(format!("sweep-during-gap {:?}", gap.result).into());
     }
-    controls.insert("sweep_during_gap".into(), serde_json::json!({"ok":true,"cursor":HOLD[0],"cu":base::units(&gap)?,"durable_preserved":true}));
-    let c = |seq: u32| commands[seq as usize * 4..seq as usize * 4 + 4].to_vec();
+    controls.insert("sweep_during_gap".into(), serde_json::json!({"ok":true,"cursor":HOLD[1],"cu":base::units(&gap)?,"durable_preserved":true}));
     let ix = gate.deposit_ix(buffer_key, authority.pubkey(), 5, &c(5));
     refused(
         &mut gate,
@@ -1213,7 +1330,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &[&authority],
     )
     .await?;
-    let ix = gate.deposit_ix(buffer_key, authority.pubkey(), HOLD[0] + 1, &c(HOLD[0] + 1));
+    let ix = gate.deposit_ix(buffer_key, authority.pubkey(), HOLD[1] + 1, &c(HOLD[1] + 1));
     refused(
         &mut gate,
         &mut controls,
@@ -1223,7 +1340,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &[&authority],
     )
     .await?;
-    let ix = gate.deposit_ix(buffer_key, attacker.pubkey(), HOLD[0], &c(HOLD[0]));
+    let ix = gate.deposit_ix(buffer_key, attacker.pubkey(), HOLD[1], &c(HOLD[1]));
     refused(
         &mut gate,
         &mut controls,
@@ -1270,7 +1387,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // otherwise run: stage the held slot, attempt, and confirm the refusal
     // left the committed state alone (the slot write itself is the one
     // durable change and is part of the schedule).
-    let result = gate.deposit(HOLD[0], &c(HOLD[0])).await?;
+    let result = gate.deposit(HOLD[1], &c(HOLD[1])).await?;
     if result.result.is_err() {
         return Err(format!("late deposit {:?}", result.result).into());
     }
