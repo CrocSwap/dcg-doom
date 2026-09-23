@@ -1545,34 +1545,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     // --- late arrivals; the long staged run measures budget-bound sweeps ------------
-    let mut late = Vec::new();
-    for (index, &held) in HOLD.iter().enumerate() {
-        if index > 0 {
-            let result = gate.deposit(held, &c(held)).await?;
-            if result.result.is_err() {
-                return Err(format!("late deposit {held}: {:?}", result.result).into());
-            }
+    // HOLD[0] was deposited above to prove ADVANCE/4 refusal and re-send.
+    // HOLD[1] was deposited before the account-substitution controls so those
+    // controls exercise a sweep that would otherwise execute.  Neither slot
+    // can be cleared, so don't try to recreate the first gap here or deposit
+    // HOLD[1] a second time.
+    let mut late = vec![serde_json::json!({
+        "seq": HOLD[0],
+        "stalled_cursor": HOLD[0],
+        "first_sweep_to": future_cursor,
+    })];
+    let held = HOLD[1];
+    let target = tics as u32;
+    let mut first_after = None;
+    while last_cursor < target {
+        let (result, view) = run_sweep(&mut gate, &oracle, &mut sweeps, 0).await?;
+        sweep_count += 1;
+        let progressed = view.cursor > last_cursor;
+        first_after.get_or_insert(view.cursor);
+        record(&result, &view, &mut last_cursor)?;
+        if !progressed {
+            break;
         }
-        let target = HOLD.get(index + 1).copied().unwrap_or(tics as u32);
-        let mut first_after = None;
-        loop {
-            let (result, view) = run_sweep(&mut gate, &oracle, &mut sweeps, 0).await?;
-            sweep_count += 1;
-            let progressed = view.cursor > last_cursor;
-            first_after.get_or_insert(view.cursor);
-            record(&result, &view, &mut last_cursor)?;
-            if !progressed || view.cursor >= target {
-                break;
-            }
-        }
-        late.push(
-            serde_json::json!({"seq":held,"stalled_cursor":held,"first_sweep_to":first_after}),
-        );
-        if last_cursor != target {
-            return Err(
-                format!("late arrival {held}: cursor {last_cursor}, expected {target}").into(),
-            );
-        }
+    }
+    late.push(serde_json::json!({
+        "seq": held,
+        "stalled_cursor": held,
+        "first_sweep_to": first_after,
+    }));
+    if last_cursor != target {
+        return Err(format!("late arrival {held}: cursor {last_cursor}, expected {target}").into());
     }
     controls.insert("late_arrival".into(), serde_json::Value::Array(late));
     let before = gate.durable().await?;
