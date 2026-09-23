@@ -1,7 +1,7 @@
 # DCG consensus fast path: SIM2 phase split — 2026-09-23
 
 Design: [`docs/design/dcg-consensus-mixed-mode-2026-09-23.md`](../design/dcg-consensus-mixed-mode-2026-09-23.md).
-Evidence: M1328.
+Evidence: M1329.
 Receipts: `/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-doom-consensus-design-20260923/`
 (`phase_split.py`, `phase-split.json`, `SHA256SUMS`).
 
