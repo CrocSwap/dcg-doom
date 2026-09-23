@@ -10,14 +10,16 @@
 //!   bound to the authority recorded in the buffer header, and independent of
 //!   simulation state: deposits may land in any order and any distance ahead
 //!   of the cursor.
-//! * ADVANCE reads the committed cursor from the meta, executes consecutive
-//!   written slots from the cursor through the resident BPF `G_Ticker`, stops
-//!   at the first empty slot, a halt, or its tic cap (and, in `metered-sweep`
-//!   builds only, when the remaining compute would not cover another tic plus
-//!   publication), then derives ST1/MP1 once
-//!   and commits the new cursor, state root and input chain.  A sweep that
-//!   finds nothing staged is a cheap no-op.  After INIT, ADVANCE is the only
-//!   instruction that changes CONTEXT, STATE, MIRROR or META bytes.
+//! * ADVANCE/3 reads the committed cursor from the meta.  ADVANCE/4 first
+//!   checks its signed expected cursor, then both forms execute consecutive
+//!   written slots through the resident BPF `G_Ticker`, stopping at the first
+//!   empty slot, a halt, or the tic cap (and, in `metered-sweep` builds only,
+//!   when the remaining compute would not cover another tic plus
+//!   publication), then derive ST1/MP1 once and commit the new cursor, state
+//!   root and input chain.  A future ADVANCE/4 that arrives out of order
+//!   refuses atomically.  A sweep that finds nothing staged is a cheap no-op.
+//!   After INIT, ADVANCE is the only instruction that changes CONTEXT, STATE,
+//!   MIRROR or META bytes.
 //! * INIT binds exactly one meta (a PDA of the context key) to the context,
 //!   the published E2R/5 reconstruction and its authority.  It refuses any
 //!   signer other than the reconstruction authority and any context that
@@ -47,14 +49,17 @@ pub const DEPOSIT: u8 = 2;
 pub const ADVANCE: u8 = 3;
 pub const SNAPSHOT: u8 = 4;
 pub const GROW_BUFFER: u8 = 5;
+/// Cursor-bound ADVANCE wire operation.  ADVANCE/3 remains unchanged for
+/// historical SIM/2 clients; new pipelined senders use this explicit form.
+pub const ADVANCE_EXPECTED_CURSOR: u8 = 6;
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "legacy-5120-buffer", not(feature = "metered-sweep")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "legacy-5120-buffer", feature = "metered-sweep"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
 #[cfg(not(feature = "legacy-5120-buffer"))]
@@ -182,6 +187,7 @@ pub const REFUSE_STATE_SHAPE: u32 = 281;
 pub const REFUSE_SNAPSHOT: u32 = 283;
 pub const REFUSE_TIC: u32 = 284;
 pub const REFUSE_BUFFER_GROWTH: u32 = 285;
+pub const REFUSE_CURSOR_MISMATCH: u32 = 286;
 
 pub const HALT_GAMESTATE: u8 = 1;
 pub const HALT_GAMEACTION: u8 = 2;
@@ -469,6 +475,23 @@ pub fn encode_advance(max_tics: u32) -> Vec<u8> {
     out.extend_from_slice(&max_tics.to_le_bytes());
     out.extend_from_slice(&[0; 4]);
     out
+}
+
+/// Encode cursor-bound ADVANCE/4.  This separate operation preserves the
+/// historical ADVANCE/3 wire contract while making an expected cursor part
+/// of each pipelined packet's signed message.
+pub fn encode_advance_expected(expected_cursor: u32, max_tics: u32) -> Vec<u8> {
+    let mut out = request_header(ADVANCE_EXPECTED_CURSOR).to_vec();
+    out.extend_from_slice(&expected_cursor.to_le_bytes());
+    out.extend_from_slice(&max_tics.to_le_bytes());
+    out
+}
+
+pub fn decode_advance_expected(data: &[u8]) -> Result<(u32, u32), ProgramError> {
+    if data.len() != ADVANCE_BYTES || !header_ok(data, ADVANCE_EXPECTED_CURSOR) {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    Ok((u32_at(data, 16), u32_at(data, 20)))
 }
 
 pub fn decode_advance(data: &[u8]) -> Result<u32, ProgramError> {
@@ -1249,7 +1272,12 @@ fn process_grow_buffer(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     buffer.realloc(next, true)
 }
 
-fn process_advance(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_advance(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    cursor_bound: bool,
+) -> ProgramResult {
     let [context, state, mirror, meta, buffer, authority] = accounts else {
         return Err(refuse(REFUSE_ACCOUNTS));
     };
@@ -1266,10 +1294,23 @@ fn process_advance(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     if !authority.is_signer {
         return Err(refuse(REFUSE_AUTHORITY));
     }
-    let max_tics = effective_max_tics(decode_advance(data)?);
+    let (expected_cursor, requested_max_tics) = if cursor_bound {
+        let (expected, max_tics) = decode_advance_expected(data)?;
+        (Some(expected), max_tics)
+    } else {
+        (None, decode_advance(data)?)
+    };
+    let max_tics = effective_max_tics(requested_max_tics);
     let checkpoint = read_checkpoint(context)?;
     let mut meta_data = meta.try_borrow_mut_data()?;
     check_meta_address(program, context.key, meta.key, meta_data[M_BUMP])?;
+    if expected_cursor.is_some_and(|expected| u32_at(&meta_data, M_CURSOR) != expected) {
+        // This check precedes every mutation.  A future packet that reaches
+        // the account before its predecessor is an atomic, fee-only refusal;
+        // the sender can re-sign that logical cursor with a fresh blockhash
+        // once readback reaches it.
+        return Err(refuse(REFUSE_CURSOR_MISMATCH));
+    }
     crate::diagnostic_phase(921);
     let buffer_data = buffer.try_borrow_data()?;
     let mut state_data = state.try_borrow_mut_data()?;
@@ -1338,7 +1379,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     match data[12] {
         INIT => process_init(program, accounts, data),
         DEPOSIT => process_deposit(program, accounts, data),
-        ADVANCE => process_advance(program, accounts, data),
+        ADVANCE => process_advance(program, accounts, data, false),
+        ADVANCE_EXPECTED_CURSOR => process_advance(program, accounts, data, true),
         SNAPSHOT => process_snapshot(program, accounts, data),
         #[cfg(not(feature = "legacy-5120-buffer"))]
         GROW_BUFFER => process_grow_buffer(program, accounts, data),
@@ -1404,6 +1446,9 @@ mod tests {
             Ok((DEFAULT_BUFFER_CAPACITY as u32, 10_240))
         );
         assert_eq!(decode_advance(&encode_advance(17)), Ok(17));
+        let expected_advance = encode_advance_expected(23, 7);
+        assert_eq!(expected_advance[12], ADVANCE_EXPECTED_CURSOR);
+        assert_eq!(decode_advance_expected(&expected_advance), Ok((23, 7)));
         assert_eq!(
             decode_snapshot(&encode_snapshot(5, &[9; 32])),
             Ok((5, [9; 32]))
