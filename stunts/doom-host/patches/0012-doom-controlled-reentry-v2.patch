@@ -54,7 +54,7 @@ diff --git a/linuxdoom-1.10/headless/doom_controller.c b/linuxdoom-1.10/headless
  int DoomControllerArm(const uint8_t command[4])
  {
      if (!command)
-@@ -57,16 +70,50 @@
+@@ -57,16 +70,64 @@
      return 0;
  }
  
@@ -101,6 +101,19 @@ diff --git a/linuxdoom-1.10/headless/doom_controller.c b/linuxdoom-1.10/headless
 +{
 +    if (!controller_v2_armed)
 +        return 0;
++#ifdef DOOM_SIM2_UNBOUNDED_INPUT
++    if (!cmd || !cursor || !*cursor) {
++        controller_v2_armed = 0;
++        return -1;
++    }
++    /* Continue accepting committed SIM/2 commands after DEMO1 ends. Keep
++     * demo_p at its valid end marker once there are no more captured tics. */
++    if (!DoomControllerValidateCapturedDemoCursor(*cursor))
++        *cursor += 4;
++    apply_command(cmd);
++    controller_v2_armed = 0;
++    return 1;
++#else
 +    if (!cmd || !cursor || !*cursor
 +        || DoomControllerValidateCapturedDemoCursor(*cursor)) {
 +        controller_v2_armed = 0;
@@ -110,6 +123,7 @@ diff --git a/linuxdoom-1.10/headless/doom_controller.c b/linuxdoom-1.10/headless
 +    apply_command(cmd);
 +    controller_v2_armed = 0;
 +    return 1;
++#endif
 +}
 diff --git a/linuxdoom-1.10/g_game.c b/linuxdoom-1.10/g_game.c
 --- a/linuxdoom-1.10/g_game.c

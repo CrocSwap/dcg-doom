@@ -13,8 +13,9 @@
  *   - gamestate != GS_LEVEL means the intermission/finale stubs own the tic;
  *   - paused makes P_Ticker a no-op (unreachable with BT_SPECIAL refused, but
  *     an imported ST1 could carry it);
- *   - an exhausted captured DEMO1 cursor (0x80 marker) ends the context's
- *     lifetime.
+ *   - in the versioned legacy SIM2INPT/2 profile only, an exhausted captured
+ *     DEMO1 cursor (0x80 marker) ends the context's lifetime. SIM2INPT/3
+ *     accepts the committed staged command stream independently of demo_p.
  *
  * Commands carrying BT_SPECIAL (buttons & 0x80: pause, save-game) are refused
  * as malformed input, not halted: the deposit boundary already refuses them.
@@ -42,8 +43,10 @@ static int doom_sim2_pretic_guard(const uint8_t *command)
     for (i = 0; i < MAXPLAYERS; i++)
         if (playeringame[i] && players[i].playerstate == PST_REBORN)
             return DOOM_SIM2_HALT_REBORN;
+#ifdef DOOM_SIM2_LEGACY_DEMO_CAP
     if (DoomControllerValidateCapturedDemoCursor(demo_p))
         return DOOM_SIM2_HALT_DEMO_END;
+#endif
     return 0;
 }
 
