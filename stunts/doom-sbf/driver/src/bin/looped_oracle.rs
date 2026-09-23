@@ -23,15 +23,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = PathBuf::from(args.next().ok_or("missing output directory")?);
     let context = Pubkey::from_str(&args.next().ok_or("missing context pubkey")?)?;
     let requested: usize = args.next().ok_or("missing tic count")?.parse()?;
+    let input_profile = args.next().unwrap_or_else(|| "demo-loop".to_owned());
     if requested == 0 || requested > sim2::MAX_BUFFER_CAPACITY {
         return Err(format!("tic count must be in 1..={}", sim2::MAX_BUFFER_CAPACITY).into());
+    }
+    if args.next().is_some() {
+        return Err("unexpected argument after input profile".into());
     }
     if output.exists() && fs::read_dir(&output)?.next().is_some() {
         return Err("output directory must be empty".into());
     }
     fs::create_dir_all(&output)?;
     let capture_data = Capture::load(&capture, &resource_path)?;
-    let (commands, cycle_len) = capture_data.looped_demo_commands(requested)?;
+    let (commands, cycle_len) = match input_profile.as_str() {
+        "demo-loop" => capture_data.looped_demo_commands(requested)?,
+        "neutral" => (vec![0; requested * 4], 0),
+        "orbit-fire" => {
+            let mut commands = Vec::with_capacity(requested * 4);
+            for seq in 0..requested {
+                let turn = if (seq / 256) % 2 == 0 { 1u8 } else { 255u8 };
+                let side = if (seq / 128) % 2 == 0 { 8u8 } else { 248u8 };
+                commands.extend_from_slice(&[16, side, turn, 1]);
+            }
+            (commands, 0)
+        }
+        profile => return Err(format!("unsupported input profile {profile:?}").into()),
+    };
     let mut session = resource::NativeSimSession::open(
         capture_data.wad_refs(),
         &capture_data.resource,
@@ -93,6 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "requested_tics": requested,
         "completed_tics": completed,
         "first_tic": first_tic,
+        "input_profile": input_profile,
         "demo_cycle_commands": cycle_len,
         "elapsed_seconds": elapsed,
         "tics_per_second": completed as f64 / elapsed,

@@ -49,6 +49,7 @@ const DECOY_META: Pubkey = Pubkey::new_from_array([0xb2; 32]);
 const STAGE_CHUNK: usize = 900;
 const HOLD: [u32; 2] = [37, 555];
 const PHASE_MAGIC: &str = "0x444f4f4d50484153";
+const SIM_TRANSPORT_E2R_VERSION: u32 = 5;
 
 fn wad_key(ordinal: usize) -> Pubkey {
     Pubkey::new_from_array([0xf0 + ordinal as u8; 32])
@@ -204,17 +205,23 @@ impl Gate {
             meta(continuation, true, false),
             meta(authority, false, true),
         ]);
+        let mut data = continuation_split_sbf::Request {
+            operation,
+            state_len,
+            cursor,
+            fault: 0,
+        }
+        .encode()
+        .to_vec();
+        // The host harness is built with the provenance-pinned `ctx-engine`
+        // feature only.  The loaded SBF image is DOOM-SIM/2 transport and
+        // therefore accepts E2R/5; both request versions have the same 32-byte
+        // field layout, with the version as the sole header difference.
+        data[8..12].copy_from_slice(&SIM_TRANSPORT_E2R_VERSION.to_le_bytes());
         Instruction {
             program_id: base::PROGRAM,
             accounts,
-            data: continuation_split_sbf::Request {
-                operation,
-                state_len,
-                cursor,
-                fault: 0,
-            }
-            .encode()
-            .to_vec(),
+            data,
         }
     }
 
