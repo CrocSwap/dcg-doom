@@ -71,7 +71,11 @@ required-features = ["ctx-engine"]
 
 [[bin]]
 name = "sweep_gate"
-required-features = ["sim-transport"]
+# The host gate uses ctx-engine helpers to prepare and inspect accounts.  It
+# loads the separately built SBF sim-transport image, so enabling that
+# dependency feature in the host process would violate build.rs' pinned
+# ctx-engine-only host provenance profile.
+required-features = ["ctx-engine"]
 
 [[bin]]
 name = "sim1_profile"

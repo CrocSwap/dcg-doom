@@ -49,6 +49,7 @@ const DECOY_META: Pubkey = Pubkey::new_from_array([0xb2; 32]);
 const STAGE_CHUNK: usize = 900;
 const HOLD: [u32; 2] = [37, 555];
 const PHASE_MAGIC: &str = "0x444f4f4d50484153";
+const SIM_TRANSPORT_E2R_VERSION: u32 = 5;
 
 fn wad_key(ordinal: usize) -> Pubkey {
     Pubkey::new_from_array([0xf0 + ordinal as u8; 32])
@@ -204,17 +205,23 @@ impl Gate {
             meta(continuation, true, false),
             meta(authority, false, true),
         ]);
+        let mut data = continuation_split_sbf::Request {
+            operation,
+            state_len,
+            cursor,
+            fault: 0,
+        }
+        .encode()
+        .to_vec();
+        // The host harness is built with the provenance-pinned `ctx-engine`
+        // feature only.  The loaded SBF image is DOOM-SIM/2 transport and
+        // therefore accepts E2R/5; both request versions have the same 32-byte
+        // field layout, with the version as the sole header difference.
+        data[8..12].copy_from_slice(&SIM_TRANSPORT_E2R_VERSION.to_le_bytes());
         Instruction {
             program_id: base::PROGRAM,
             accounts,
-            data: continuation_split_sbf::Request {
-                operation,
-                state_len,
-                cursor,
-                fault: 0,
-            }
-            .encode()
-            .to_vec(),
+            data,
         }
     }
 
@@ -260,6 +267,14 @@ impl Gate {
             program_id: base::PROGRAM,
             accounts: vec![meta(buffer, true, false), meta(authority, false, true)],
             data: sim2::encode_deposit(first, commands),
+        }
+    }
+
+    fn grow_buffer_ix(&self, buffer: Pubkey, capacity: u32, expected_len: u32) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![meta(buffer, true, true)],
+            data: sim2::encode_grow_buffer(capacity, expected_len),
         }
     }
 
@@ -751,6 +766,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // --- 3. SIM/2 INIT --------------------------------------------------------
     let buffer_kp = gate.keys.buffer.insecure_clone();
+    let buffer_capacity = sim2::DEFAULT_BUFFER_CAPACITY as u32;
+    let buffer_total = sim2::buffer_bytes(buffer_capacity as usize).ok_or("buffer capacity")?;
+    let mut buffer_len =
+        sim2::initial_buffer_bytes(buffer_capacity as usize).ok_or("initial buffer capacity")?;
+    let buffer_rent = solana_program::rent::Rent::default().minimum_balance(buffer_total);
     {
         let blockhash = gate.ctx.banks_client.get_latest_blockhash().await?;
         let tx = Transaction::new(
@@ -759,8 +779,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &[system_instruction::create_account(
                     &gate.ctx.payer.pubkey(),
                     &buffer_kp.pubkey(),
-                    1_000_000_000,
-                    sim2::BUFFER_BYTES as u64,
+                    buffer_rent,
+                    buffer_len as u64,
                     &base::PROGRAM,
                 )],
                 Some(&gate.ctx.payer.pubkey()),
@@ -769,6 +789,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             blockhash,
         );
         gate.ctx.banks_client.process_transaction(tx).await?;
+    }
+    let invalid_grow =
+        gate.grow_buffer_ix(buffer_kp.pubkey(), buffer_capacity, buffer_len as u32 - 1);
+    let invalid_grow_result = gate.send(vec![invalid_grow], &[&buffer_kp]).await?;
+    if custom_code(&invalid_grow_result) != Some(sim2::REFUSE_BUFFER_GROWTH)
+        || gate.data(buffer_kp.pubkey()).await?.len() != buffer_len
+    {
+        return Err(format!(
+            "wrong-size SIM2 GROW-BUFFER was not refused atomically: {:?}",
+            invalid_grow_result.result
+        )
+        .into());
+    }
+    let invalid_grow_units = base::units(&invalid_grow_result)?;
+    let mut buffer_grow_units = Vec::new();
+    while buffer_len < buffer_total {
+        let ix = gate.grow_buffer_ix(buffer_kp.pubkey(), buffer_capacity, buffer_len as u32);
+        let grown = gate.send(vec![ix], &[&buffer_kp]).await?;
+        if grown.result.is_err() {
+            return Err(format!("SIM2 GROW-BUFFER at {buffer_len}: {:?}", grown.result).into());
+        }
+        buffer_grow_units.push(base::units(&grown)?);
+        buffer_len = sim2::next_buffer_len(buffer_len, buffer_capacity as usize)
+            .ok_or("buffer growth stalled")?;
+    }
+    if gate.data(buffer_kp.pubkey()).await?.len() != buffer_total {
+        return Err("SIM2 input buffer did not reach its declared length".into());
     }
     let mut e2r_keys = [Pubkey::default(); sim2::INIT_KEY_COUNT];
     e2r_keys[0] = RESOURCE;
@@ -780,6 +827,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     e2r_keys[8] = continuation.pubkey();
     let init = sim2::InitRequest {
         bump: gate.keys.bump,
+        capacity: buffer_capacity,
         e2r_keys,
         resource_hash: solana_program::hash::hash(&capture_data.resource).to_bytes(),
         controller_hash: solana_program::hash::hash(&controller).to_bytes(),
@@ -878,6 +926,67 @@ async fn main() -> Result<(), Box<dyn Error>> {
     controls.insert(
         "init_prefunded_pda".into(),
         serde_json::json!({"ok":true,"cu":init_cu,"prefund_lamports":1_000_000}),
+    );
+    controls.insert(
+        "buffer_growth".into(),
+        serde_json::json!({
+            "capacity": buffer_capacity,
+            "bytes": buffer_total,
+            "initial_bytes": sim2::initial_buffer_bytes(buffer_capacity as usize),
+            "grow_instructions": buffer_grow_units.len(),
+            "grow_cu_max": buffer_grow_units.iter().max(),
+            "grow_cu_total": buffer_grow_units.iter().sum::<u64>(),
+            "wrong_size_refusal_code": sim2::REFUSE_BUFFER_GROWTH,
+            "wrong_size_refusal_cu": invalid_grow_units,
+            "rent_lamports": buffer_rent,
+        }),
+    );
+    let page_first = buffer_capacity - (sim2::MAX_DEPOSIT_SLOTS as u32 + 1);
+    let page_commands = commands[..4].repeat(sim2::MAX_DEPOSIT_SLOTS);
+    let page_deposit = gate.deposit_ix(
+        buffer_kp.pubkey(),
+        authority.pubkey(),
+        page_first,
+        &page_commands,
+    );
+    let page_result = gate.send(vec![page_deposit], &[&authority]).await?;
+    if page_result.result.is_err() {
+        return Err(format!("64-slot DEPOSIT near buffer end {:?}", page_result.result).into());
+    }
+    controls.insert(
+        "deposit_max_page_near_end".into(),
+        serde_json::json!({
+            "first_seq": page_first,
+            "count": sim2::MAX_DEPOSIT_SLOTS,
+            "cu": base::units(&page_result)?,
+            "readback_equal": gate.data(buffer_kp.pubkey()).await?
+                [sim2::BUFFER_HEADER_BYTES + page_first as usize * sim2::SLOT_BYTES
+                    ..sim2::BUFFER_HEADER_BYTES + (page_first as usize + sim2::MAX_DEPOSIT_SLOTS) * sim2::SLOT_BYTES]
+                .chunks_exact(sim2::SLOT_BYTES)
+                .all(|slot| slot[..4] == commands[..4] && slot[4] == sim2::SLOT_WRITTEN),
+        }),
+    );
+    let far_seq = buffer_capacity - 1;
+    let far_deposit = gate.deposit_ix(
+        buffer_kp.pubkey(),
+        authority.pubkey(),
+        far_seq,
+        &commands[..4],
+    );
+    let far_result = gate.send(vec![far_deposit], &[&authority]).await?;
+    if far_result.result.is_err() {
+        return Err(format!("DEPOSIT at final input slot {:?}", far_result.result).into());
+    }
+    let far_buffer = gate.data(buffer_kp.pubkey()).await?;
+    let far_offset = sim2::BUFFER_HEADER_BYTES + far_seq as usize * sim2::SLOT_BYTES;
+    if far_buffer[far_offset..far_offset + 4] != commands[..4]
+        || far_buffer[far_offset + 4] != sim2::SLOT_WRITTEN
+    {
+        return Err("far-end input slot did not persist".into());
+    }
+    controls.insert(
+        "deposit_far_end".into(),
+        serde_json::json!({"seq":far_seq,"cu":base::units(&far_result)?,"readback_equal":true}),
     );
     let ix = gate.init_ix(authority.pubkey(), meta_key, &init);
     refused(
@@ -1404,6 +1513,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("final SBF state differs from the sequential oracle".into());
     }
+    let first_grow_boundary =
+        ((sim2::MAX_BUFFER_GROWTH - sim2::BUFFER_HEADER_BYTES) / sim2::SLOT_BYTES) as u32;
+    let crossed_grow_boundary = fs::read_to_string(receipt.join("sweeps.jsonl"))?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|row| {
+            row["before"].as_u64().unwrap_or(0) < first_grow_boundary as u64
+                && row["after"].as_u64().unwrap_or(0) > first_grow_boundary as u64
+                && row["oracle_equal"].as_bool() == Some(true)
+        });
+    if tics as u32 > first_grow_boundary && !crossed_grow_boundary {
+        return Err("ADVANCE did not cross the first grown-buffer slot boundary".into());
+    }
+    controls.insert(
+        "advance_across_grown_buffer_boundary".into(),
+        serde_json::json!({"slot_boundary":first_grow_boundary,"crossed":crossed_grow_boundary,"oracle_equal":crossed_grow_boundary}),
+    );
     let ok = gate.snapshot_ix(view.cursor, &view.state_root);
     let result = gate.send(vec![ok], &[]).await?;
     if result.result.is_err() {
@@ -1501,6 +1627,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "e2r5_phase_units": phases,
             "stage_transactions": stage_txs,
             "init_cu": init_cu,
+            "buffer_capacity": view.capacity,
+            "buffer_bytes": buffer_total,
+            "buffer_grow_instructions": buffer_grow_units.len(),
+            "buffer_grow_cu_max": buffer_grow_units.iter().max(),
             "deposit_transactions": deposit_units.len(),
             "deposit_cu_max": deposit_units.iter().max(),
             "sweeps_sent": sweep_count,

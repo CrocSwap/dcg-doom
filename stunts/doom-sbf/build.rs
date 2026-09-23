@@ -1259,6 +1259,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DIAGNOSTIC_PROFILE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SIM_TRANSPORT");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LEGACY_5120_BUFFER");
     println!("cargo:rerun-if-env-changed=DOOM_SBF_SOURCE_TREE");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");
     println!("cargo:rerun-if-env-changed=CC");
@@ -1379,6 +1380,7 @@ fn compile_ctx_engine(target: &str) {
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
     let diagnostic_profile = is_sbf && env::var("CARGO_FEATURE_DIAGNOSTIC_PROFILE").is_ok();
+    let legacy_5120_buffer = env::var("CARGO_FEATURE_LEGACY_5120_BUFFER").is_ok();
     let out_dir =
         PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
     let identity_flags: Vec<&str> = if diagnostic_profile {
@@ -1854,6 +1856,11 @@ fn compile_ctx_engine(target: &str) {
         if diagnostic_profile {
             codec.define("DOOM_SBF_PHASE_PROFILE", None);
         }
+        if legacy_5120_buffer {
+            codec.define("DOOM_SIM2_LEGACY_DEMO_CAP", None);
+        } else if env::var_os("CARGO_FEATURE_SIM_TRANSPORT").is_some() {
+            codec.define("DOOM_SIM2_UNBOUNDED_INPUT", None);
+        }
         codec.compile("doom_engine_ctx_codec");
         println!(
             "cargo:rerun-if-changed={}",
@@ -1880,6 +1887,11 @@ fn compile_ctx_engine(target: &str) {
         }
         for relative in HOST_NATIVE_CODEC_REPO_FILES {
             native.file(manifest.join(relative));
+        }
+        if legacy_5120_buffer {
+            native.define("DOOM_SIM2_LEGACY_DEMO_CAP", None);
+        } else if env::var_os("CARGO_FEATURE_CTX_ENGINE").is_some() {
+            native.define("DOOM_SIM2_UNBOUNDED_INPUT", None);
         }
         native.compile("doom_engine_ex2_native");
     }

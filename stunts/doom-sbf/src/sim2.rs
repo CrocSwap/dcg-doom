@@ -46,16 +46,26 @@ pub const INIT: u8 = 1;
 pub const DEPOSIT: u8 = 2;
 pub const ADVANCE: u8 = 3;
 pub const SNAPSHOT: u8 = 4;
-#[cfg(not(feature = "metered-sweep"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=41088:5120x8|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(feature = "metered-sweep")]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=41088:5120x8|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const GROW_BUFFER: u8 = 5;
+#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer")))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer")))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(all(feature = "legacy-5120-buffer", not(feature = "metered-sweep")))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(all(feature = "legacy-5120-buffer", feature = "metered-sweep"))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
+#[cfg(not(feature = "legacy-5120-buffer"))]
+pub const INIT_BYTES: usize = 408;
+#[cfg(feature = "legacy-5120-buffer")]
 pub const INIT_BYTES: usize = 404;
 pub const INIT_KEY_COUNT: usize = 9;
 pub const DEPOSIT_HEADER_BYTES: usize = 24;
 pub const MAX_DEPOSIT_SLOTS: usize = 64;
+pub const GROW_BUFFER_BYTES: usize = 24;
+pub const MAX_BUFFER_GROWTH: usize = 10_240;
 pub const ADVANCE_BYTES: usize = 24;
 pub const SNAPSHOT_BYTES: usize = 56;
 
@@ -63,12 +73,53 @@ pub const META_SEED: &[u8] = b"DOOM-SIM2-META";
 pub const META_BYTES: usize = 384;
 pub const BUFFER_HEADER_BYTES: usize = 128;
 pub const SLOT_BYTES: usize = 8;
-/// Covers the whole captured DEMO1 lifetime: the retained lump holds 5,026
-/// ticcmd slots before its 0x80 marker, after which every tic halts.
+#[cfg(feature = "legacy-5120-buffer")]
 pub const BUFFER_CAPACITY: usize = 5_120;
+#[cfg(not(feature = "legacy-5120-buffer"))]
+pub const BUFFER_CAPACITY: usize = 65_536;
+#[cfg(feature = "legacy-5120-buffer")]
+pub const DEFAULT_BUFFER_CAPACITY: usize = 5_120;
+#[cfg(not(feature = "legacy-5120-buffer"))]
+pub const DEFAULT_BUFFER_CAPACITY: usize = 65_536;
+#[cfg(feature = "legacy-5120-buffer")]
+pub const MAX_BUFFER_CAPACITY: usize = 5_120;
+#[cfg(not(feature = "legacy-5120-buffer"))]
+pub const MAX_BUFFER_CAPACITY: usize = 65_536;
+#[cfg(feature = "legacy-5120-buffer")]
+pub const BUFFER_FORMAT_VERSION: u32 = 2;
+#[cfg(not(feature = "legacy-5120-buffer"))]
+pub const BUFFER_FORMAT_VERSION: u32 = 3;
 pub const BUFFER_BYTES: usize = BUFFER_HEADER_BYTES + BUFFER_CAPACITY * SLOT_BYTES;
+/// The pinned C Doom engine stores `gametic` and `leveltime` as signed `int`.
+/// Leave the one-past-session value representable when INIT binds a capacity.
+pub const MAX_GAME_TIC: u32 = i32::MAX as u32;
 pub const SLOT_WRITTEN: u8 = 1;
 pub const BT_SPECIAL: u8 = 0x80;
+
+pub fn buffer_bytes(capacity: usize) -> Option<usize> {
+    if capacity == 0 || capacity > MAX_BUFFER_CAPACITY {
+        return None;
+    }
+    capacity
+        .checked_mul(SLOT_BYTES)
+        .and_then(|slots| BUFFER_HEADER_BYTES.checked_add(slots))
+}
+
+pub fn initial_buffer_bytes(capacity: usize) -> Option<usize> {
+    buffer_bytes(capacity).map(|total| total.min(MAX_BUFFER_GROWTH))
+}
+
+/// Return the only valid next account length for a staged grow operation.
+/// The caller binds this to the observed current length in the instruction.
+pub fn next_buffer_len(current: usize, capacity: usize) -> Option<usize> {
+    let target = buffer_bytes(capacity)?;
+    if current == 0 || current >= target {
+        return None;
+    }
+    current
+        .checked_add(MAX_BUFFER_GROWTH)
+        .map(|next| next.min(target))
+}
 
 /// Tic cap of an ADVANCE that passes `max_tics = 0` on the count-capped
 /// (Fogo) profile.  Fogo does not activate the `remaining_compute_units`
@@ -130,6 +181,7 @@ pub const REFUSE_STATE_ROOT: u32 = 280;
 pub const REFUSE_STATE_SHAPE: u32 = 281;
 pub const REFUSE_SNAPSHOT: u32 = 283;
 pub const REFUSE_TIC: u32 = 284;
+pub const REFUSE_BUFFER_GROWTH: u32 = 285;
 
 pub const HALT_GAMESTATE: u8 = 1;
 pub const HALT_GAMEACTION: u8 = 2;
@@ -139,6 +191,7 @@ pub const HALT_DEMO_END: u8 = 5;
 
 const META_MAGIC: &[u8; 8] = b"SIM2META";
 const BUFFER_MAGIC: &[u8; 8] = b"SIM2INPT";
+const BUFFER_GROW_MAGIC: &[u8; 8] = b"SIM2GROW";
 const DOMAIN_STATE: &[u8] = b"DOOM-SIM/2-STATE\0";
 const DOMAIN_CHAIN: &[u8] = b"DOOM-SIM/2-INPUT-CHAIN\0";
 const DOMAIN_CHECKPOINT: &[u8] = b"DOOM-SIM/2-CHECKPOINT\0";
@@ -322,6 +375,9 @@ pub fn request_header(operation: u8) -> [u8; REQUEST_HEADER_BYTES] {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitRequest {
     pub bump: u8,
+    /// Slot count fixed by INIT.  SIM2INPT/2 legacy requests omit this and
+    /// imply the historical fixed 5,120-slot layout.
+    pub capacity: u32,
     /// E2R/5 account keys not present in the SIM/2 account list, in E2R/5
     /// order: resource, wad0..wad4, controller, frame, continuation.
     pub e2r_keys: [Pubkey; INIT_KEY_COUNT],
@@ -335,6 +391,8 @@ impl InitRequest {
         let mut out = request_header(INIT).to_vec();
         out.push(self.bump);
         out.extend_from_slice(&[0, 0, 0]);
+        #[cfg(not(feature = "legacy-5120-buffer"))]
+        out.extend_from_slice(&self.capacity.to_le_bytes());
         for key in &self.e2r_keys {
             out.extend_from_slice(key.as_ref());
         }
@@ -348,20 +406,42 @@ impl InitRequest {
         if data.len() != INIT_BYTES || !header_ok(data, INIT) || data[17..20] != [0, 0, 0] {
             return Err(refuse(REFUSE_MALFORMED));
         }
+        #[cfg(feature = "legacy-5120-buffer")]
+        let (capacity, keys_at) = (BUFFER_CAPACITY as u32, 20);
+        #[cfg(not(feature = "legacy-5120-buffer"))]
+        let (capacity, keys_at) = (u32_at(data, 20), 24);
+        if capacity == 0 || capacity as usize > MAX_BUFFER_CAPACITY {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
         let mut e2r_keys = [Pubkey::default(); INIT_KEY_COUNT];
         for (index, key) in e2r_keys.iter_mut().enumerate() {
-            let at = 20 + index * 32;
+            let at = keys_at + index * 32;
             *key = Pubkey::new_from_array(data[at..at + 32].try_into().unwrap());
         }
-        let hashes = 20 + INIT_KEY_COUNT * 32;
+        let hashes = keys_at + INIT_KEY_COUNT * 32;
         Ok(Self {
             bump: data[16],
+            capacity,
             e2r_keys,
             resource_hash: data[hashes..hashes + 32].try_into().unwrap(),
             controller_hash: data[hashes + 32..hashes + 64].try_into().unwrap(),
             frame_hash: data[hashes + 64..hashes + 96].try_into().unwrap(),
         })
     }
+}
+
+pub fn encode_grow_buffer(capacity: u32, expected_current_len: u32) -> Vec<u8> {
+    let mut out = request_header(GROW_BUFFER).to_vec();
+    out.extend_from_slice(&capacity.to_le_bytes());
+    out.extend_from_slice(&expected_current_len.to_le_bytes());
+    out
+}
+
+pub fn decode_grow_buffer(data: &[u8]) -> Result<(u32, u32), ProgramError> {
+    if data.len() != GROW_BUFFER_BYTES || !header_ok(data, GROW_BUFFER) {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    Ok((u32_at(data, 16), u32_at(data, 20)))
 }
 
 pub fn encode_deposit(first_seq: u32, commands: &[u8]) -> Vec<u8> {
@@ -425,6 +505,7 @@ pub struct InitParams {
     pub meta: Pubkey,
     pub authority: Pubkey,
     pub bump: u8,
+    pub capacity: u32,
     pub first_tic: u32,
     pub state_len: u32,
     pub state_root: [u8; 32],
@@ -434,17 +515,28 @@ pub struct InitParams {
 /// Writes the buffer header and the initial meta.  Both must be all zero:
 /// a context has exactly one meta and a buffer is bound exactly once.
 pub fn init_layout(meta: &mut [u8], buffer: &mut [u8], params: &InitParams) -> ProgramResult {
-    if meta.len() != META_BYTES || buffer.len() != BUFFER_BYTES {
+    let capacity = params.capacity as usize;
+    let Some(total_bytes) = buffer_bytes(capacity) else {
+        return Err(refuse(REFUSE_MALFORMED));
+    };
+    if meta.len() != META_BYTES || buffer.len() != total_bytes {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
-    if !exact_zero(meta) || !exact_zero(buffer) {
+    if params
+        .first_tic
+        .checked_add(params.capacity)
+        .is_none_or(|end| end > MAX_GAME_TIC)
+    {
+        return Err(refuse(REFUSE_TIC));
+    }
+    if !exact_zero(meta) || !preinit_buffer_ok(buffer, capacity) {
         return Err(refuse(REFUSE_ALREADY_INIT));
     }
     buffer[..8].copy_from_slice(BUFFER_MAGIC);
-    put_u32(buffer, 8, VERSION);
+    put_u32(buffer, 8, BUFFER_FORMAT_VERSION);
     put_u32(buffer, 12, BUFFER_HEADER_BYTES as u32);
-    put_u32(buffer, 16, BUFFER_BYTES as u32);
-    put_u32(buffer, B_CAPACITY, BUFFER_CAPACITY as u32);
+    put_u32(buffer, 16, total_bytes as u32);
+    put_u32(buffer, B_CAPACITY, params.capacity);
     put_u32(buffer, B_FIRST_TIC, params.first_tic);
     put_u32(buffer, B_SLOT_BYTES, SLOT_BYTES as u32);
     buffer[B_AUTHORITY..B_AUTHORITY + 32].copy_from_slice(params.authority.as_ref());
@@ -458,7 +550,7 @@ pub fn init_layout(meta: &mut [u8], buffer: &mut [u8], params: &InitParams) -> P
     meta[M_BUMP] = params.bump;
     put_u32(meta, M_FIRST_TIC, params.first_tic);
     put_u32(meta, M_STATE_LEN, params.state_len);
-    put_u32(meta, M_CAPACITY, BUFFER_CAPACITY as u32);
+    put_u32(meta, M_CAPACITY, params.capacity);
     meta[M_CONTEXT..M_CONTEXT + 32].copy_from_slice(params.context.as_ref());
     meta[M_STATE..M_STATE + 32].copy_from_slice(params.state.as_ref());
     meta[M_MIRROR..M_MIRROR + 32].copy_from_slice(params.mirror.as_ref());
@@ -472,13 +564,41 @@ pub fn init_layout(meta: &mut [u8], buffer: &mut [u8], params: &InitParams) -> P
 }
 
 fn buffer_header_ok(buffer: &[u8]) -> bool {
-    buffer.len() == BUFFER_BYTES
-        && &buffer[..8] == BUFFER_MAGIC
-        && u32_at(buffer, 8) == VERSION
+    if buffer.len() < BUFFER_HEADER_BYTES || &buffer[..8] != BUFFER_MAGIC {
+        return false;
+    }
+    let capacity = u32_at(buffer, B_CAPACITY) as usize;
+    let Some(expected_bytes) = buffer_bytes(capacity) else {
+        return false;
+    };
+    buffer.len() == expected_bytes
+        && u32_at(buffer, 8) == BUFFER_FORMAT_VERSION
         && u32_at(buffer, 12) as usize == BUFFER_HEADER_BYTES
-        && u32_at(buffer, 16) as usize == BUFFER_BYTES
-        && u32_at(buffer, B_CAPACITY) as usize == BUFFER_CAPACITY
+        && u32_at(buffer, 16) as usize == expected_bytes
         && u32_at(buffer, B_SLOT_BYTES) as usize == SLOT_BYTES
+}
+
+/// Before INIT, only GROW-BUFFER may have touched a large input account. Its
+/// fixed header marker proves the intended capacity and completed length;
+/// account creation and realloc zero-fill every slot byte. This avoids an
+/// O(524 KiB) zero scan inside INIT while keeping staged, pre-INIT writes out.
+fn preinit_buffer_ok(buffer: &[u8], capacity: usize) -> bool {
+    let Some(total) = buffer_bytes(capacity) else {
+        return false;
+    };
+    if buffer.len() != total || buffer.len() < BUFFER_HEADER_BYTES {
+        return false;
+    }
+    if total <= MAX_BUFFER_GROWTH {
+        return exact_zero(buffer);
+    }
+    &buffer[..8] == BUFFER_GROW_MAGIC
+        && u32_at(buffer, 8) == BUFFER_FORMAT_VERSION
+        && u32_at(buffer, 12) as usize == capacity
+        && u32_at(buffer, 16) as usize == total
+        && buffer[20..BUFFER_HEADER_BYTES]
+            .iter()
+            .all(|byte| *byte == 0)
 }
 
 fn slot(buffer: &[u8], seq: usize) -> &[u8] {
@@ -507,7 +627,7 @@ pub fn deposit(
     let first = first_seq as usize;
     if first
         .checked_add(count)
-        .is_none_or(|end| end > BUFFER_CAPACITY)
+        .is_none_or(|end| end > u32_at(buffer, B_CAPACITY) as usize)
     {
         return Err(refuse(REFUSE_SLOT_RANGE));
     }
@@ -605,7 +725,8 @@ pub fn validate_meta(meta: &[u8], keys: &SweepKeys, checkpoint: &[u8]) -> Progra
         || u32_at(meta, 12) as usize != META_BYTES
         || u32_at(meta, 16) as usize != META_BYTES
         || meta[22..24] != [0, 0]
-        || u32_at(meta, M_CAPACITY) as usize != BUFFER_CAPACITY
+        || u32_at(meta, M_CAPACITY) == 0
+        || u32_at(meta, M_CAPACITY) as usize > MAX_BUFFER_CAPACITY
         || meta[M_CONTEXT..M_CONTEXT + 32] != keys.context.as_ref()[..]
         || meta[M_STATE..M_STATE + 32] != keys.state.as_ref()[..]
         || meta[M_MIRROR..M_MIRROR + 32] != keys.mirror.as_ref()[..]
@@ -641,6 +762,7 @@ pub fn sweep(
 ) -> Result<SweepReport, ProgramError> {
     validate_meta(meta, keys, checkpoint)?;
     if !buffer_header_ok(buffer)
+        || u32_at(buffer, B_CAPACITY) != u32_at(meta, M_CAPACITY)
         || buffer[B_AUTHORITY..B_AUTHORITY + 32] != meta[M_AUTHORITY..M_AUTHORITY + 32]
         || buffer[B_CONTEXT..B_CONTEXT + 32] != keys.context.as_ref()[..]
         || buffer[B_META..B_META + 32] != keys.meta.as_ref()[..]
@@ -663,7 +785,8 @@ pub fn sweep(
         report.stop = Stop::Halted;
         return Ok(report);
     }
-    if cursor as usize >= BUFFER_CAPACITY {
+    let capacity = u32_at(meta, M_CAPACITY);
+    if cursor >= capacity {
         report.stop = Stop::Capacity;
         return Ok(report);
     }
@@ -685,7 +808,7 @@ pub fn sweep(
         if max_tics != 0 && ran == max_tics {
             break Stop::MaxTics;
         }
-        if next as usize >= BUFFER_CAPACITY {
+        if next >= capacity {
             break Stop::Capacity;
         }
         let staged = slot(buffer, next as usize);
@@ -995,13 +1118,16 @@ fn process_init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     let [context, state, mirror, meta, buffer, authority, system] = accounts else {
         return Err(refuse(REFUSE_ACCOUNTS));
     };
+    let request = InitRequest::decode(data)?;
+    let buffer_len =
+        buffer_bytes(request.capacity as usize).ok_or_else(|| refuse(REFUSE_MALFORMED))?;
     if meta.owner == program {
         return Err(refuse(REFUSE_ALREADY_INIT));
     }
     if !owned(program, context, resource_sbf::CONTEXT_BYTES, false)
         || !owned(program, state, resource_sbf::STATE_MAX_BYTES, false)
         || !owned(program, mirror, resource_sbf::MIRROR_BYTES, false)
-        || !owned(program, buffer, BUFFER_BYTES, true)
+        || !owned(program, buffer, buffer_len, true)
         || *meta.owner != solana_program::system_program::ID
         || meta.data_len() != 0
         || !meta.is_writable
@@ -1014,7 +1140,6 @@ fn process_init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     if !authority.is_signer || !authority.is_writable {
         return Err(refuse(REFUSE_AUTHORITY));
     }
-    let request = InitRequest::decode(data)?;
     check_meta_address(program, context.key, meta.key, request.bump)?;
     let checkpoint = read_checkpoint(context)?;
     let (state_len, root, first_tic) = {
@@ -1048,6 +1173,7 @@ fn process_init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
             meta: *meta.key,
             authority: *authority.key,
             bump: request.bump,
+            capacity: request.capacity,
             first_tic,
             state_len: state_len as u32,
             state_root: root,
@@ -1060,7 +1186,12 @@ fn process_deposit(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     let [buffer, authority] = accounts else {
         return Err(refuse(REFUSE_ACCOUNTS));
     };
-    if !owned(program, buffer, BUFFER_BYTES, true) || buffer.key == authority.key {
+    if buffer.owner != program
+        || buffer.data_len() < BUFFER_HEADER_BYTES
+        || !buffer.is_writable
+        || buffer.is_signer
+        || buffer.key == authority.key
+    {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
     if !authority.is_signer {
@@ -1071,6 +1202,53 @@ fn process_deposit(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     deposit(&mut buffer_data, authority.key, first_seq, commands)
 }
 
+fn process_grow_buffer(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [buffer] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    if buffer.owner != program || buffer.data_len() == 0 || !buffer.is_writable || !buffer.is_signer
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let (capacity, expected_current_len) = decode_grow_buffer(data)?;
+    let capacity = capacity as usize;
+    let current = buffer.data_len();
+    if current != expected_current_len as usize {
+        return Err(refuse(REFUSE_BUFFER_GROWTH));
+    }
+    let initial = initial_buffer_bytes(capacity).ok_or_else(|| refuse(REFUSE_MALFORMED))?;
+    if current < initial {
+        return Err(refuse(REFUSE_BUFFER_GROWTH));
+    }
+    let mut reached = initial;
+    while reached < current {
+        reached = next_buffer_len(reached, capacity).ok_or_else(|| refuse(REFUSE_BUFFER_GROWTH))?;
+    }
+    if reached != current {
+        return Err(refuse(REFUSE_BUFFER_GROWTH));
+    }
+    let next = next_buffer_len(current, capacity).ok_or_else(|| refuse(REFUSE_BUFFER_GROWTH))?;
+    {
+        let mut data = buffer.try_borrow_mut_data()?;
+        if current == initial && data[..8] == [0; 8] {
+            data[..8].copy_from_slice(BUFFER_GROW_MAGIC);
+            put_u32(&mut data, 8, BUFFER_FORMAT_VERSION);
+            put_u32(&mut data, 12, capacity as u32);
+            put_u32(&mut data, 16, next as u32);
+        } else if &data[..8] == BUFFER_GROW_MAGIC
+            && u32_at(&data, 8) == BUFFER_FORMAT_VERSION
+            && u32_at(&data, 12) as usize == capacity
+            && u32_at(&data, 16) as usize == current
+            && data[20..BUFFER_HEADER_BYTES].iter().all(|byte| *byte == 0)
+        {
+            put_u32(&mut data, 16, next as u32);
+        } else {
+            return Err(refuse(REFUSE_BUFFER_GROWTH));
+        }
+    }
+    buffer.realloc(next, true)
+}
+
 fn process_advance(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [context, state, mirror, meta, buffer, authority] = accounts else {
         return Err(refuse(REFUSE_ACCOUNTS));
@@ -1079,7 +1257,8 @@ fn process_advance(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         || !owned(program, state, resource_sbf::STATE_MAX_BYTES, true)
         || !owned(program, mirror, resource_sbf::MIRROR_BYTES, true)
         || !owned(program, meta, META_BYTES, true)
-        || !owned(program, buffer, BUFFER_BYTES, false)
+        || buffer.data_len() < BUFFER_HEADER_BYTES
+        || !owned(program, buffer, buffer.data_len(), false)
         || !distinct(accounts)
     {
         return Err(refuse(REFUSE_ACCOUNTS));
@@ -1161,6 +1340,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         DEPOSIT => process_deposit(program, accounts, data),
         ADVANCE => process_advance(program, accounts, data),
         SNAPSHOT => process_snapshot(program, accounts, data),
+        #[cfg(not(feature = "legacy-5120-buffer"))]
+        GROW_BUFFER => process_grow_buffer(program, accounts, data),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -1170,6 +1351,7 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 pub struct MetaView {
     pub first_tic: u32,
     pub cursor: u32,
+    pub capacity: u32,
     pub halt: u8,
     pub state_len: u32,
     pub sweeps: u32,
@@ -1186,6 +1368,7 @@ impl MetaView {
         Some(Self {
             first_tic: u32_at(meta, M_FIRST_TIC),
             cursor: u32_at(meta, M_CURSOR),
+            capacity: u32_at(meta, M_CAPACITY),
             halt: meta[M_HALT],
             state_len: u32_at(meta, M_STATE_LEN),
             sweeps: u32_at(meta, M_SWEEPS),
@@ -1204,6 +1387,7 @@ mod tests {
     fn requests_round_trip() {
         let init = InitRequest {
             bump: 254,
+            capacity: DEFAULT_BUFFER_CAPACITY as u32,
             e2r_keys: [Pubkey::new_from_array([7; 32]); INIT_KEY_COUNT],
             resource_hash: [1; 32],
             controller_hash: [2; 32],
@@ -1214,11 +1398,46 @@ mod tests {
         let commands = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let deposit_data = encode_deposit(9, &commands);
         assert_eq!(decode_deposit(&deposit_data), Ok((9, &commands[..])));
+        let grow_data = encode_grow_buffer(DEFAULT_BUFFER_CAPACITY as u32, 10_240);
+        assert_eq!(
+            decode_grow_buffer(&grow_data),
+            Ok((DEFAULT_BUFFER_CAPACITY as u32, 10_240))
+        );
         assert_eq!(decode_advance(&encode_advance(17)), Ok(17));
         assert_eq!(
             decode_snapshot(&encode_snapshot(5, &[9; 32])),
             Ok((5, [9; 32]))
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-5120-buffer"))]
+    fn capacity_sizes_and_incremental_growth_are_bounded() {
+        assert_eq!(DEFAULT_BUFFER_CAPACITY, 65_536);
+        assert_eq!(buffer_bytes(65_536), Some(524_416));
+        assert_eq!(buffer_bytes(5_120), Some(41_088));
+        assert_eq!(initial_buffer_bytes(65_536), Some(10_240));
+        assert_eq!(buffer_bytes(MAX_BUFFER_CAPACITY + 1), None);
+        let mut current = initial_buffer_bytes(DEFAULT_BUFFER_CAPACITY).unwrap();
+        let mut steps = 0;
+        while current < BUFFER_BYTES {
+            current = next_buffer_len(current, DEFAULT_BUFFER_CAPACITY).unwrap();
+            steps += 1;
+        }
+        assert_eq!(current, BUFFER_BYTES);
+        assert_eq!(steps, 51);
+        assert_eq!(next_buffer_len(current, DEFAULT_BUFFER_CAPACITY), None);
+        assert_eq!(next_buffer_len(0, DEFAULT_BUFFER_CAPACITY), None);
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-5120-buffer")]
+    fn legacy_5120_buffer_layout_remains_versioned() {
+        assert_eq!(BUFFER_FORMAT_VERSION, 2);
+        assert_eq!(BUFFER_CAPACITY, 5_120);
+        assert_eq!(BUFFER_BYTES, 41_088);
+        assert_eq!(INIT_BYTES, 404);
+        assert_eq!(ABI_DESCRIPTOR.contains("SIM2INPT/2:41088:5120x8"), true);
     }
 
     #[test]

@@ -554,6 +554,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             meta: META,
             authority: AUTHORITY,
             bump: 255,
+            capacity: sim2::BUFFER_CAPACITY as u32,
             first_tic,
             state_len: capture_data.state.len() as u32,
             state_root: oracle.initial_root,

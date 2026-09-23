@@ -103,6 +103,51 @@ impl Capture {
         }
         Err("DEMO1 lump not found".into())
     }
+
+    /// Repeat the captured DEMO1 tic commands to produce a deterministic
+    /// longer SIM/2 session after the new profile reaches its demo end marker.
+    pub fn looped_demo_commands(&self, count: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+        let mut payload = Vec::new();
+        for account in &self.wad {
+            let length = base::u32_at(account, 24) as usize;
+            payload.extend_from_slice(
+                &account[resource_sbf::WAD_HEADER_BYTES..resource_sbf::WAD_HEADER_BYTES + length],
+            );
+        }
+        let lump_count = base::u32_at(&payload, 4) as usize;
+        let directory = base::u32_at(&payload, 8) as usize;
+        let cursor = base::u32_at(&self.state, 24) as usize;
+        for index in 0..lump_count {
+            let at = directory + index * 16;
+            if &payload[at + 8..at + 13] != b"DEMO1" {
+                continue;
+            }
+            let offset = base::u32_at(&payload, at) as usize;
+            let length = base::u32_at(&payload, at + 4) as usize;
+            if cursor >= length {
+                return Err("DEMO1 cursor is past the command stream".into());
+            }
+            let available = (cursor..length)
+                .step_by(4)
+                .take_while(|&at| at + 4 <= length && payload[offset + at] != 0x80)
+                .count();
+            if available == 0 {
+                return Err("DEMO1 contains no loopable tic commands".into());
+            }
+            let cycle = payload[offset + cursor..offset + cursor + available * 4].to_vec();
+            if cycle.chunks_exact(4).any(|command| command[3] & 0x80 != 0) {
+                return Err("captured loop contains a special-button command".into());
+            }
+            let mut commands =
+                Vec::with_capacity(count.checked_mul(4).ok_or("command size overflow")?);
+            for _ in 0..count {
+                let index = (commands.len() / 4) % available;
+                commands.extend_from_slice(&cycle[index * 4..index * 4 + 4]);
+            }
+            return Ok((commands, available));
+        }
+        Err("DEMO1 lump not found".into())
+    }
 }
 
 /// `sim2::Engine` over the resident host session.  The budget cell models
