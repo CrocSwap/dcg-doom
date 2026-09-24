@@ -345,6 +345,109 @@ int doom_engine_ex2_resource_sbf_ri2_reconstruct(
         frame_out_len, arena_high_water_out, 0u, 0u);
 }
 
+/* Render from an immutable DOOM-RSN image without advancing a tic or
+ * publishing SIM2 state. The caller supplies a strip-owned writable context
+ * workspace, the pinned RI2/WAD inputs, and an 8,000-byte pixel destination. */
+int doom_engine_ex2_resource_sbf_ri2_render_strip(
+    uint8_t *context, const uint8_t *resource, unsigned long resource_bytes,
+    const uint8_t *wad_image, unsigned long wad_bytes,
+    uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    const uint8_t *state, unsigned long state_len,
+    const uint8_t *mirror, unsigned long mirror_len,
+    uint32_t strip_id, uint8_t *strip_out, unsigned long strip_cap,
+    unsigned long *arena_high_water_out)
+{
+    r2_section_t sections[5];
+    r2_v2_plan_t *plan;
+    uint8_t *frame = 0;
+    size_t strip_bytes = 40u * 200u;
+    int rc, y, x;
+
+    if (doom_ctx_guard(context)) return 199;
+    if (!resource || resource_bytes < RI2_HEADER_BYTES ||
+        !wad_image || wad_bytes != RI2_WAD_BYTES ||
+        !bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+        !state || !ri2_state_shape(state, (size_t)state_len) ||
+        !mirror || !ri2_mirror_shape(mirror, (size_t)mirror_len) ||
+        strip_id >= 8u || !strip_out || strip_cap != strip_bytes ||
+        ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_RESOURCE;
+
+    plan = (r2_v2_plan_t *)(bootstrap + bootstrap_bytes - sizeof(*plan));
+    if (((uintptr_t)plan & 15u) != 0 ||
+        r2_v2_preflight(resource, (size_t)resource_bytes, sections, plan))
+        return RI2_REFUSE_IMAGE;
+    RI2_PHASE(701);
+
+    memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+    doom_ctx_init();
+    if (!doom_sbf_bind_arena(bootstrap, bootstrap_bytes, RI2_ZONE_BYTES))
+        return RI2_REFUSE_ARENA;
+    gamemode = shareware; gamemission = doom; language = english;
+    DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0;
+    displayplayer = 0; myargc = 0; myargv = 0;
+    Z_Init();
+    P_InitThinkers();
+    W_InitAccountImage(wad_image, (int)wad_bytes);
+    if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
+                                       sections[R2_GRAPH].bytes))
+        return RI2_REFUSE_IMAGE;
+    lastanim = anims + plan->scalar[R2_SC_ANIMCOUNT];
+    numlinespecials = 0;
+    for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
+        if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
+    if (r2_walk(resource + sections[R2_SCALARS].offset,
+                sections[R2_SCALARS].bytes, sections[R2_SCALARS].count,
+                1, r2_apply_scalar, 0) ||
+        r2_v2_alloc_resources(plan) ||
+        r2_walk(resource + sections[R2_TABLES].offset,
+                sections[R2_TABLES].bytes, sections[R2_TABLES].count,
+                0, r2_v2_apply_table, 0) ||
+        r2_v2_apply_lights(plan) || r2_apply_functions(resource, sections))
+        return RI2_REFUSE_IMAGE;
+    RI2_PHASE(702);
+
+    frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
+    if (!frame) return RI2_REFUSE_OUTPUT;
+    screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES;
+    screens[2] = frame + 2u * RI2_FRAME_BYTES;
+    screens[3] = frame + 3u * RI2_FRAME_BYTES; screens[4] = 0;
+    viewimage = screens[0];
+    for (rc = 0; rc < viewheight; rc++)
+        ylookup[rc] = screens[0] + (size_t)rc * 320u;
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 :
+        (SCREENHEIGHT - 32 - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
+    pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
+    setsizeneeded = false;
+    DoomStateSetAllocationFailure(-1);
+    if (DoomStateDecode(state, (size_t)state_len)) {
+        free(frame); return RI2_REFUSE_STATE;
+    }
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 :
+        (SCREENHEIGHT - 32 - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
+    pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
+    setsizeneeded = false;
+    doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
+    R_RenderPlayerView(&players[displayplayer]);
+    RI2_PHASE(703);
+    if (doom_sbf_arena_exhausted()) {
+        free(frame); return RI2_REFUSE_ARENA;
+    }
+    for (y = 0; y < 200; y++)
+        for (x = 0; x < 40; x++)
+            strip_out[(size_t)y * 40u + (size_t)x] =
+                frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    RI2_PHASE(704);
+    free(frame);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* DOOM-E2R/4 split consumer                                           */
 /*

@@ -6,7 +6,7 @@
 
 use std::{env, error::Error, fs, path::{Path, PathBuf}};
 
-use doom_sbf::resource_sbf;
+use doom_sbf::{render_snapshot, resource_sbf, sim2};
 use sha2::{Digest, Sha256};
 use solana_account::Account;
 use solana_banks_interface::BanksTransactionResultWithMetadata;
@@ -52,6 +52,10 @@ fn read(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
 
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn json(value: &str) -> String { serde_json::to_string(value).unwrap() }
@@ -100,6 +104,19 @@ fn instruction(resource: Pubkey, controller: Pubkey, request_data: &[u8]) -> Ins
     Instruction { program_id: PROGRAM, accounts, data: request_data.to_vec() }
 }
 
+fn render_instruction(snapshot: Pubkey, strip_id: u8, request_data: &[u8]) -> Instruction {
+    let scratch = render_snapshot::scratch_address(&PROGRAM, &snapshot, strip_id).0;
+    let mut accounts = vec![meta(scratch, true), meta(RESOURCE, false)];
+    for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+        accounts.push(meta(Pubkey::new_from_array([0xe0 + ordinal as u8; 32]), false));
+    }
+    accounts.extend([
+        meta(snapshot, false),
+        meta(render_snapshot::strip_address(&PROGRAM, &snapshot, strip_id).0, true),
+    ]);
+    Instruction { program_id: PROGRAM, accounts, data: request_data.to_vec() }
+}
+
 async fn execute(
     client: &mut solana_banks_client::BanksClient,
     payer: &solana_keypair::Keypair,
@@ -120,6 +137,27 @@ async fn execute(
     Ok(client.process_transaction_with_metadata(tx).await?)
 }
 
+async fn execute_render(
+    client: &mut solana_banks_client::BanksClient,
+    payer: &solana_keypair::Keypair,
+    snapshot: Pubkey,
+    strip_id: u8,
+    request_data: &[u8],
+    limit: u32,
+) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
+    let blockhash = client.get_latest_blockhash().await?;
+    let tx = Transaction::new(
+        &[payer],
+        Message::new_with_blockhash(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(limit),
+                render_instruction(snapshot, strip_id, request_data)],
+            Some(&payer.pubkey()), &blockhash,
+        ),
+        blockhash,
+    );
+    Ok(client.process_transaction_with_metadata(tx).await?)
+}
+
 fn program_test(
     image: &Path,
     resource: &[u8],
@@ -129,6 +167,7 @@ fn program_test(
     mirror: &[u8],
     controller: &[u8],
     bad_controller: &[u8],
+    render_image: Option<(&[u8], u8)>,
     limit: u32,
 ) -> ProgramTest {
     env::set_var("BPF_OUT_DIR", image.parent().unwrap());
@@ -148,6 +187,14 @@ fn program_test(
     bank.add_account(CONTROLLER, account(controller.to_vec()));
     bank.add_account(BAD_CONTROLLER, account(bad_controller.to_vec()));
     bank.add_account(FRAME, account(vec![0; resource_sbf::RI2_FRAME_BYTES]));
+    if let Some((image, strip_id)) = render_image {
+        let snapshot = render_snapshot::snapshot_address(&PROGRAM, &CONTEXT).0;
+        bank.add_account(snapshot, account(image.to_vec()));
+        let scratch = render_snapshot::scratch_address(&PROGRAM, &snapshot, strip_id).0;
+        bank.add_account(scratch, account(vec![0; resource_sbf::CONTEXT_BYTES]));
+        let strip = render_snapshot::strip_address(&PROGRAM, &snapshot, strip_id).0;
+        bank.add_account(strip, account(vec![0; render_snapshot::STRIP_ACCOUNT_BYTES]));
+    }
     bank
 }
 
@@ -283,6 +330,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let native_report = String::from_utf8(read(&native.join("report.json"))?)?;
     if !native_report.contains("\"status\": \"measured\"") || expected_frame.len() != resource_sbf::RI2_FRAME_BYTES { return Err("native RI2 receipt is not measured".into()); }
     if expected_state.len() != state.len() || expected_mirror.len() != resource_sbf::MIRROR_BYTES { return Err("native RI2 output shape mismatch".into()); }
+    let render_snapshot_image = if let Some((1, strip_id)) = render_clip {
+        let padded = padded_state(&expected_state);
+        let (_, state_root) = sim2::verified_state_root(&padded, &expected_mirror)?;
+        let mut image = vec![0u8; render_snapshot::SNAPSHOT_BYTES];
+        render_snapshot::write_snapshot(
+            &mut image, u32_at(&expected_state, 20), &state_root, &padded, &expected_mirror,
+        )?;
+        Some((image, strip_id))
+    } else { None };
     let mut wad_accounts = Vec::new();
     let mut wad_payload = Vec::new();
     for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
@@ -303,7 +359,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bad_controller[28] = 1;
     let mut bad_resource = resource_image.clone();
     bad_resource[256..260].copy_from_slice(&u32::MAX.to_le_bytes());
-    let bank = program_test(&image, &resource_image, &bad_resource, &wad_accounts, &state, &mirror, &controller, &bad_controller, limit);
+    let bank = program_test(
+        &image, &resource_image, &bad_resource, &wad_accounts, &state, &mirror, &controller,
+        &bad_controller,
+        render_snapshot_image.as_ref().map(|(image, strip)| (image.as_slice(), *strip)),
+        limit,
+    );
     let (mut client, payer, _) = bank.start().await;
 
     let malformed_controller = execute(&mut client, &payer, RESOURCE, BAD_CONTROLLER, &request.encode(), NORMAL_LIMIT).await?;
@@ -386,6 +447,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if !state_equal || !mirror_equal || !frame_equal {
         write_report(&receipt, "failed-output-mismatch", "native-oracle-mismatch", NORMAL_LIMIT, if normal_limit_succeeded == Some(false) { DIAGNOSTIC_LIMIT } else { limit }, units, normal_limit_succeeded, &controller_text, &resource_text, &render_text, None, Some(state_equal), Some(mirror_equal), Some(frame_equal), render_clip.map(|x| x.0), render_clip.map(|x| x.1), if render_clip.is_some() { "40-column strip" } else { "full framebuffer" }, &image_actual_sha, &manifest_actual_sha, &abi)?;
         return Err(format!("actual RI2 SBF mismatch state={state_equal} mirror={mirror_equal} frame={frame_equal}").into());
+    }
+    if let Some((snapshot_image, strip_id)) = &render_snapshot_image {
+        let snapshot_key = render_snapshot::snapshot_address(&PROGRAM, &CONTEXT).0;
+        let snapshot = render_snapshot::validate_snapshot(snapshot_image)?;
+        let request = render_snapshot::RenderRequest {
+            strip_id: *strip_id, cursor: snapshot.cursor, snapshot_hash: snapshot.snapshot_hash,
+        }.encode();
+        let render = execute_render(
+            &mut client, &payer, snapshot_key, *strip_id, &request, DIAGNOSTIC_LIMIT,
+        ).await?;
+        let render_units = render.metadata.as_ref().map(|m| m.compute_units_consumed);
+        let render_logs = render.metadata.as_ref().map(|m| m.log_messages.join("\n")).unwrap_or_default();
+        fs::write(receipt.join("render-only-strip-logs.txt"), &render_logs)?;
+        let strip_key = render_snapshot::strip_address(&PROGRAM, &snapshot_key, *strip_id).0;
+        let strip_data = account_data(&client, strip_key).await?;
+        if strip_data.len() != render_snapshot::STRIP_ACCOUNT_BYTES {
+            return Err("standalone render strip account size mismatch".into());
+        }
+        let expected_pixels = (0..200).flat_map(|row| {
+            let start = row * 320 + usize::from(*strip_id) * 40;
+            expected_frame[start..start + 40].iter().copied()
+        }).collect::<Vec<_>>();
+        let strip_view = if render.result.is_ok() {
+            Some(render_snapshot::validate_strip(&strip_data)?)
+        } else { None };
+        let pixels_equal = strip_view.is_some_and(|view| {
+            view.strip_id == u32::from(*strip_id)
+                && view.cursor == snapshot.cursor
+                && view.gametic == snapshot.gametic
+                && view.snapshot_hash == snapshot.snapshot_hash
+                && view.state_root == snapshot.state_root
+                && view.pixels == expected_pixels
+        });
+        fs::write(receipt.join("render-only-strip.px8"), &strip_data[render_snapshot::STRIP_HEADER_BYTES..])?;
+        fs::write(receipt.join("render-only-strip-report.json"), format!(
+            "{{\n  \"status\": {},\n  \"compute_units_consumed\": {},\n  \"comparison_limit\": {},\n  \"strip_id\": {},\n  \"frame_tic\": {},\n  \"snapshot_hash\": {},\n  \"state_root\": {},\n  \"pixel_equal_native\": {},\n  \"transaction_ok\": {}\n}}\n",
+            json(if pixels_equal { "measured-equal" } else { "failed" }),
+            render_units.map_or("null".to_owned(), |value| value.to_string()),
+            NORMAL_LIMIT, strip_id, snapshot.gametic, json(&hex(&snapshot.snapshot_hash)),
+            json(&hex(&snapshot.state_root)), pixels_equal, render.result.is_ok(),
+        ))?;
+        if !pixels_equal { return Err(format!("standalone snapshot render mismatch: {render:?}").into()); }
     }
     let Some(units) = units else { return Err("actual SBF run did not report compute units".into()); };
     let status = if render_clip.is_some() && normal_limit_succeeded == Some(true) { "measured-within-normal-limit" } else if diagnostic { "measured-diagnostic-only-equality" } else if units > QUALIFICATION_MAX_UNITS { "failed-over-qualification-budget" } else { "measured-accepted-normal-budget" };

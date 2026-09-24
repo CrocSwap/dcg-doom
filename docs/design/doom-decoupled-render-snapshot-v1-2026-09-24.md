@@ -7,7 +7,8 @@ open.** This is the selected
 snapshot format for the clipped mode-1 renderer. It leaves the existing
 DOOM-SIM/2 DEPOSIT, ADVANCE/3, ADVANCE/4, and SNAPSHOT/4 wires unchanged.
 SNAPSHOT/4 remains a read-side consistency check. A separately versioned
-`DOOM-RSN/2` instruction writes the render snapshot. It supersedes the initial
+`DOOM-RSN/2` instruction writes the render snapshot and handles
+`RENDER(strip_id)`. It supersedes the initial
 `DOOM-RSN/1` design recorded in M1335 because the implementation copies MP1
 into the image so later render calls do not need live state accounts.
 
@@ -62,12 +63,25 @@ and rent are not yet recorded.
 
 ## RENDER and strip publication contract
 
-The planned `DOOM-RND/1 RENDER(strip_id)` reads the snapshot, the static RI2
-resource/WAD, and a strip-specific scratch account. It writes only the
-corresponding strip account and scratch account. The required scratch size is
-still open; it must be measured from the selected SBF renderer state before
-provisioning. Each strip account is exactly 8,128 bytes: 128-byte header plus
-8,000 palette-index pixels in column-major strip order.
+`DOOM-RSN/2 RENDER(strip_id)` reads the snapshot, static RI2 resource and five
+WAD accounts, and a strip-specific scratch account. Account order starts with
+the scratch (the legacy engine requires it at the pinned first-account data
+address), followed by RI2, WAD[0..4], snapshot, and strip. It writes only the
+corresponding strip account and scratch account. The implementation's scratch
+account is `resource_sbf::CONTEXT_BYTES` = 9,734,128 bytes. At the design rent
+rate of 6,960 lamports per byte, eight scratch accounts are **estimated** at
+541.996 FOGO, exceeding the 400 FOGO cap before other accounts. The rent rate
+and total are not measured on Fogo; this is a funding go/no-go that requires a
+smaller scratch representation before testnet provisioning.
+
+Each strip account is exactly 8,128 bytes: 128-byte header plus 8,000
+palette-index pixels in row-major strip order. The request is 52 bytes: the
+`DOOM-RSN` magic, version 2, operation 2, one-byte strip id, two reserved zero
+bytes, frame cursor, and expected snapshot hash. Scratch and strip PDAs are
+derived from the snapshot PDA and strip id, so different strip calls write
+disjoint accounts. The renderer reconstructs the legacy engine workspace for
+each call, does not run `G_Ticker`, and returns only the selected 40×200
+pixels.
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -84,8 +98,8 @@ provisioning. Each strip account is exactly 8,128 bytes: 128-byte header plus
 | 128 | 8,000 | PLAYPAL-indexed pixels |
 
 The strip hash is
-`SHA256("DOOM-RENDER-STRIP/1\\0" || strip_id || frame_id || gametic ||
-snapshot_hash || pixels)`. The renderer must match the native engine's 8,000
+`SHA256("DOOM-RENDER-STRIP/1\\0" || u32le(strip_id) || u32le(frame_id) ||
+u32le(gametic) || snapshot_hash || pixels)`. The renderer must match the native engine's 8,000
 bytes for every strip at the captured tic before this ABI is deployable.
 The browser groups strips by `(frame_id, snapshot_hash, state_root, gametic)`
 and paints only when all eight headers match; this prevents a snapshot update
@@ -94,7 +108,8 @@ from creating a torn frame.
 The target schedule is one snapshot write and eight independently submitted
 strip renders, or **9 transactions per frame (estimated)**. This remains
 conditional on every complete RENDER transaction, including snapshot hash
-verification, scratch/account checks, and strip writes, measuring below the
-configured 1,400,000-CU comparison meter. The diagnostic renderer phase alone
-measured 752,001 CU for strip 4; it does not establish that bound. No live
-transaction limit, rent, or fee is claimed here.
+verification, WAD checks/copy, engine reconstruction, scratch/account checks,
+and strip writes, measuring below the configured 1,400,000-CU comparison
+meter. The diagnostic renderer phase alone measured 752,001 CU for strip 4;
+it does not establish that bound. No live transaction limit, rent, or fee is
+claimed here.

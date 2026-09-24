@@ -317,7 +317,7 @@ fn copy_nonoverlapping(dst: &mut [u8], src: &[u8]) {
     sol_memcpy(dst, src, dst.len());
 }
 
-fn validate_wad_account(
+pub(crate) fn validate_wad_account(
     account: &AccountInfo,
     ordinal: usize,
     zeroes: &[u8],
@@ -358,7 +358,7 @@ fn validate_resource_header(account: &AccountInfo, expected_bytes: usize) -> Pro
     Ok(())
 }
 
-fn validate_resource_header_ri2(account: &AccountInfo, expected_bytes: usize) -> ProgramResult {
+pub(crate) fn validate_resource_header_ri2(account: &AccountInfo, expected_bytes: usize) -> ProgramResult {
     let data = account.try_borrow_data()?;
     if data.len() != expected_bytes
         || &data[..8] != b"DOOM-RI2"
