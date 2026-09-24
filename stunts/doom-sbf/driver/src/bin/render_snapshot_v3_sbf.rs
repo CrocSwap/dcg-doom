@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Local SBF ProgramTest gate for DOOM-RSN/3.
 //!
 //! The renderer input and pixel oracle are retained native RI2 outputs from
