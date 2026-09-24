@@ -26,6 +26,8 @@ pub mod simulation;
 #[cfg(feature = "ctx-engine")]
 pub mod sim2;
 #[cfg(feature = "ctx-engine")]
+pub mod render_snapshot;
+#[cfg(feature = "ctx-engine")]
 pub mod stage;
 
 pub const FRAME_BYTES: usize = 320 * 200;
@@ -140,7 +142,8 @@ entrypoint!(transport_process_instruction);
 /// SIM/1 (permissionless INIT, test-only ROLLBACK), the earlier E2R/E2S
 /// continuations, bring-up, CX1 and the hot-loop probes are not dispatched,
 /// so no other instruction in this image can write a context, ST1, MP1, meta
-/// or input-buffer account.
+/// or input-buffer account. DOOM-RSN/1 may only write its separate snapshot
+/// PDA after validating the committed SIM2 cursor/root.
 #[cfg(feature = "sim-transport")]
 pub fn transport_process_instruction(
     program_id: &Pubkey,
@@ -154,6 +157,11 @@ pub fn transport_process_instruction(
     };
     if instruction_data.starts_with(sim2::MAGIC) && version == sim2::VERSION {
         return sim2::process(program_id, accounts, instruction_data);
+    }
+    if instruction_data.starts_with(render_snapshot::MAGIC)
+        && version == render_snapshot::VERSION
+    {
+        return render_snapshot::process(program_id, accounts, instruction_data);
     }
     if instruction_data.starts_with(continuation_split_sbf::MAGIC)
         && version == continuation_split_sbf::VERSION
@@ -206,6 +214,14 @@ pub fn process_instruction(
     #[cfg(feature = "ctx-engine")]
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.len() >= 12
+        && instruction_data.starts_with(render_snapshot::MAGIC)
+        && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
+            == render_snapshot::VERSION
+    {
+        return render_snapshot::process(_program_id, accounts, instruction_data);
     }
     #[cfg(feature = "ctx-engine")]
     if instruction_data.len() >= 12

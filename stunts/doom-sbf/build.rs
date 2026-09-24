@@ -25,6 +25,7 @@ const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|acco
 const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
 const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
 const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = "DOOM-RC3/1|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView|render=diagnostic-strip40-modes1-full-scene2-solidseg-clipped";
+const RENDER_SNAPSHOT_ABI_DESCRIPTOR: &str = "DOOM-RSN/1|instruction=52|accounts=meta+ST1+MP1+snapshot|snapshot=PDA(DOOM-RENDER-SNAPSHOT/1,context):127168|header=192|payload=ST1:126976|root=SIM2(ST1,MP1-used)|hash=sha256|advance=unchanged";
 const NATIVE_PROVENANCE_PROFILE: &str =
     "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
@@ -1072,6 +1073,11 @@ fn source_manifest(
         "  \"resource_ri3_sbf_abi_descriptor\": \"{RESOURCE_RI3_SBF_ABI_DESCRIPTOR}\","
     )
     .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"render_snapshot_abi_descriptor\": \"{RENDER_SNAPSHOT_ABI_DESCRIPTOR}\","
+    )
+    .unwrap();
     writeln!(&mut manifest, "  \"build_metadata\": {metadata},").unwrap();
     writeln!(&mut manifest, "  \"compiler_flags\": [").unwrap();
     for (index, flag) in common_flags.iter().enumerate() {
@@ -1132,6 +1138,9 @@ fn write_identity(
         digest(format!("DOOM-E2R2-ABI-ID\0{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}").as_bytes());
     let resource_ri3_sbf_abi_id =
         digest(format!("DOOM-E2R3-ABI-ID\0{RESOURCE_RI3_SBF_ABI_DESCRIPTOR}").as_bytes());
+    let render_snapshot_abi_id = digest(
+        format!("DOOM-RENDER-SNAPSHOT-ABI-ID\0{RENDER_SNAPSHOT_ABI_DESCRIPTOR}").as_bytes(),
+    );
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
     let image_id = digest(&image_input);
@@ -1145,12 +1154,14 @@ fn write_identity(
          pub const RESOURCE_SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const RESOURCE_RI2_SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const RESOURCE_RI3_SBF_ABI_ID: [u8; 32] = [{}];\n\
+         pub const RENDER_SNAPSHOT_ABI_ID: [u8; 32] = [{}];\n\
          pub const SOURCE_MANIFEST_SHA256: &str = \"{manifest_id}\";\n\
          pub const ABI_DESCRIPTOR: &str = {ABI_DESCRIPTOR:?};\n\
          pub const SBF_ABI_DESCRIPTOR: &str = {SBF_ABI_DESCRIPTOR:?};\n\
          pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_SBF_ABI_DESCRIPTOR:?};\n\
          pub const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_RI2_SBF_ABI_DESCRIPTOR:?};\n\
          pub const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_RI3_SBF_ABI_DESCRIPTOR:?};\n\
+         pub const RENDER_SNAPSHOT_ABI_DESCRIPTOR: &str = {RENDER_SNAPSHOT_ABI_DESCRIPTOR:?};\n\
          pub const BUILD_SOURCE_MANIFEST: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/doom_ex2_source_manifest.json\"));\n",
         rust_array(&image_id),
         rust_array(&abi_id),
@@ -1158,6 +1169,7 @@ fn write_identity(
         rust_array(&resource_sbf_abi_id),
         rust_array(&resource_ri2_sbf_abi_id),
         rust_array(&resource_ri3_sbf_abi_id),
+        rust_array(&render_snapshot_abi_id),
     );
     fs::write(out_dir.join("doom_ex2_build_identity.rs"), generated)
         .expect("write Doom EX2 build identity");
