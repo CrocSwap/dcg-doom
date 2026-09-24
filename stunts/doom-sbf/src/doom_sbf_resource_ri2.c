@@ -1277,10 +1277,11 @@ int doom_sbf_sim2_publish(
 /* ------------------------------------------------------------------ */
 /* DOOM-RSR/1 static renderer resource account                         */
 
-#define RSR_HEADER_BYTES 320u
+#define RSR_HEADER_BYTES 512u
 #define RSR_ROOTS_OFFSET 160u
 #define RSR_ROOT_COUNT 32u
 #define RSR_REFUSE_LAYOUT 302u
+#define RSR_VERSION 2u
 
 static uint32_t rsr_get32(const uint8_t *p)
 {
@@ -1300,12 +1301,19 @@ static void rsr_put64(uint8_t *p, uint64_t value)
     for (i = 0; i < 8; i++) p[i] = (uint8_t)(value >> (i * 8u));
 }
 
+static uint64_t rsr_get64(const uint8_t *p)
+{
+    uint64_t value = 0;
+    unsigned i;
+    for (i = 0; i < 8; i++) value |= (uint64_t)p[i] << (i * 8u);
+    return value;
+}
+
 /* These are the top-level pointer roots for the imported RI2 graph, its
- * renderer tables, and the cached DEMO1 bytes.  The structures they reach
- * already contain native pointers.  Those remain valid because account zero
- * is pinned to DOOM_CTX's measured address on every BUILD/RENDER call; this
- * directory records the account-relative root offsets and reconstructs them
- * before each render. */
+ * renderer tables, and the cached DEMO1 bytes. The structures they reach
+ * contain native pointers that RSR/2 rebases when the static account moves.
+ * This directory records account-relative roots and reconstructs them before
+ * each render. */
 static void *rsr_root_value(unsigned index)
 {
     switch (index) {
@@ -1393,7 +1401,7 @@ static int rsr_write_layout(uint8_t *context, unsigned long account_bytes,
     if (!header || header_bytes != RSR_HEADER_BYTES || end < base) return -1;
     memset(header, 0, RSR_HEADER_BYTES);
     memcpy(header, "DOOM-RSR", 8);
-    rsr_put32(header + 8, 1u);
+    rsr_put32(header + 8, RSR_VERSION);
     rsr_put32(header + 12, RSR_HEADER_BYTES);
     rsr_put32(header + 40, RSR_ROOT_COUNT);
     rsr_put64(header + 112, (uint64_t)base);
@@ -1416,12 +1424,12 @@ static int rsr_rebind_layout(uint8_t *context, unsigned long account_bytes,
     uintptr_t base = (uintptr_t)context;
     unsigned i;
     if (!header || header_bytes != RSR_HEADER_BYTES ||
-        memcmp(header, "DOOM-RSR", 8) || rsr_get32(header + 8) != 1u ||
+        memcmp(header, "DOOM-RSR", 8) || rsr_get32(header + 8) != RSR_VERSION ||
         rsr_get32(header + 12) != RSR_HEADER_BYTES ||
         rsr_get32(header + 16) != account_bytes ||
         rsr_get32(header + 20) != sizeof(doom_ctx_t) ||
         rsr_get32(header + 40) != RSR_ROOT_COUNT ||
-        base != (uintptr_t)DOOM_CTX) return -1;
+        rsr_get64(header + 112) != (uint64_t)base) return -1;
     for (i = 0; i < RSR_ROOT_COUNT; i++) {
         uint32_t offset = rsr_get32(header + RSR_ROOTS_OFFSET + i * 4u);
         void *value = 0;
@@ -1434,7 +1442,8 @@ static int rsr_rebind_layout(uint8_t *context, unsigned long account_bytes,
     return 0;
 }
 
-int doom_engine_rsn3_build_static(
+int doom_engine_rsn3_build_static_phase(
+    uint32_t phase,
     uint8_t *context, unsigned long account_bytes,
     const uint8_t *resource, unsigned long resource_bytes,
     const uint8_t *wad_image, unsigned long wad_bytes,
@@ -1451,57 +1460,74 @@ int doom_engine_rsn3_build_static(
         wad_bytes != RI2_WAD_BYTES || !bootstrap ||
         bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !header ||
         header_bytes != RSR_HEADER_BYTES ||
-        account_bytes < sizeof(doom_ctx_t) ||
+        account_bytes < sizeof(doom_ctx_t) || phase > 5u ||
         ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_RESOURCE;
     plan = (r2_v2_plan_t *)(bootstrap + bootstrap_bytes - sizeof(*plan));
-    if (((uintptr_t)plan & 15u) != 0 ||
-        r2_v2_preflight(resource, (size_t)resource_bytes, sections, plan))
-        return RI2_REFUSE_IMAGE;
-    RI2_PHASE(1001);
+    if (((uintptr_t)plan & 15u) != 0) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_bytes(bootstrap_bytes)) return RI2_REFUSE_ARENA;
 
-    /* BUILD alone clears the context and creates all static renderer state.
-     * The account carries the live C structs, zone, WAD bytes, and malloc
-     * carrier at fixed offsets; later RENDER calls never repeat this setup. */
-    memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
-    doom_ctx_init();
-    if (!ri2_split_arena_bytes(bootstrap_bytes) ||
-        !doom_sbf_bind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
-                             RI2_ZONE_BYTES)) return RI2_REFUSE_ARENA;
-    gamemode = shareware; gamemission = doom; language = english;
-    DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0;
-    displayplayer = 0; myargc = 0; myargv = 0;
-    Z_Init(); P_InitThinkers();
-    W_InitAccountImage(wad_image, (int)wad_bytes);
-    if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
-                                       sections[R2_GRAPH].bytes))
-        return RI2_REFUSE_IMAGE;
-    lastanim = anims + plan->scalar[R2_SC_ANIMCOUNT];
-    numlinespecials = 0;
-    for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
-        if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
-    if (r2_walk(resource + sections[R2_SCALARS].offset,
-                sections[R2_SCALARS].bytes, sections[R2_SCALARS].count,
-                1, r2_apply_scalar, 0) ||
-        r2_v2_alloc_resources(plan) ||
-        r2_walk(resource + sections[R2_TABLES].offset,
-                sections[R2_TABLES].bytes, sections[R2_TABLES].count,
-                0, r2_v2_apply_table, 0) ||
-        r2_v2_apply_lights(plan) || r2_apply_functions(resource, sections))
-        return RI2_REFUSE_IMAGE;
-    lump = W_GetNumForName("DEMO1"); demo_len = W_LumpLength(lump);
-    if (demo_len < 17) return RI2_REFUSE_RESOURCE;
-    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
-    if (!demo) return RI2_REFUSE_RESOURCE;
-    defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo; demoend = demo + demo_len;
-    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
-    DoomStateSetAllocationFailure(-1);
-    if (doom_sbf_arena_exhausted() ||
-        rsr_write_layout(context, account_bytes, header, header_bytes))
-        return RSR_REFUSE_LAYOUT;
-    /* RENDER validates this prefix before applying any account-relative root
-     * offsets. Rust fills the remaining authenticated descriptor fields. */
-    rsr_put32(header + 16, (uint32_t)account_bytes);
-    rsr_put32(header + 20, (uint32_t)sizeof(doom_ctx_t));
+    if (phase == 0u) {
+        if (r2_v2_preflight(resource, (size_t)resource_bytes, sections, plan))
+            return RI2_REFUSE_IMAGE;
+        RI2_PHASE(1001);
+        memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+        doom_ctx_init();
+        if (!doom_sbf_bind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
+                                 RI2_ZONE_BYTES)) return RI2_REFUSE_ARENA;
+        gamemode = shareware; gamemission = doom; language = english;
+        DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0;
+        displayplayer = 0; myargc = 0; myargv = 0;
+        Z_Init(); P_InitThinkers();
+        W_InitAccountImage(wad_image, (int)wad_bytes);
+        RI2_PHASE(1002);
+    } else {
+        if (!doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
+                                   RI2_ZONE_BYTES)) return RI2_REFUSE_ARENA;
+        if (ri2_rebind_plan(resource, (size_t)resource_bytes, sections, plan))
+            return RI2_REFUSE_IMAGE;
+        if (phase == 1u) {
+            if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
+                                               sections[R2_GRAPH].bytes))
+                return RI2_REFUSE_IMAGE;
+            lastanim = anims + plan->scalar[R2_SC_ANIMCOUNT];
+            numlinespecials = 0;
+            for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
+                if (lines[rc].special == 48)
+                    linespeciallist[numlinespecials++] = &lines[rc];
+            RI2_PHASE(1003);
+        } else if (phase == 2u) {
+            if (r2_walk(resource + sections[R2_SCALARS].offset,
+                        sections[R2_SCALARS].bytes, sections[R2_SCALARS].count,
+                        1, r2_apply_scalar, 0) || r2_v2_alloc_resources(plan))
+                return RI2_REFUSE_IMAGE;
+            RI2_PHASE(1004);
+        } else if (phase == 3u) {
+            if (r2_walk(resource + sections[R2_TABLES].offset,
+                        sections[R2_TABLES].bytes, sections[R2_TABLES].count,
+                        0, r2_v2_apply_table, 0)) return RI2_REFUSE_IMAGE;
+            RI2_PHASE(1005);
+        } else if (phase == 4u) {
+            if (r2_v2_apply_lights(plan) || r2_apply_functions(resource, sections))
+                return RI2_REFUSE_IMAGE;
+            RI2_PHASE(1006);
+        } else {
+            lump = W_GetNumForName("DEMO1"); demo_len = W_LumpLength(lump);
+            if (demo_len < 17) return RI2_REFUSE_RESOURCE;
+            demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+            if (!demo) return RI2_REFUSE_RESOURCE;
+            defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo; demoend = demo + demo_len;
+            DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+            DoomStateSetAllocationFailure(-1);
+            if (doom_sbf_arena_exhausted() ||
+                rsr_write_layout(context, account_bytes, header, header_bytes))
+                return RSR_REFUSE_LAYOUT;
+            /* RENDER validates this prefix before applying account-relative root
+             * offsets. Rust fills the remaining authenticated descriptor fields. */
+            rsr_put32(header + 16, (uint32_t)account_bytes);
+            rsr_put32(header + 20, (uint32_t)sizeof(doom_ctx_t));
+            RI2_PHASE(1007);
+        }
+    }
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
 }

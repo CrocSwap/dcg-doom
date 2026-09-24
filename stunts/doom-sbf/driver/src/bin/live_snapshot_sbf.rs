@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 //! Captured-input SBF ProgramTest for E2R/5 + SIM/2 ADVANCE + SNAPSHOT-LIVE/3
-//! and DOOM-RSR/1 rendering. ProgramTest creates the state by staging captured
+//! and DOOM-RSR/2 rendering. ProgramTest creates the state by staging captured
 //! inputs and running the preceding real program instructions.
 
 use std::{env, error::Error, fs, path::PathBuf};
@@ -28,7 +28,6 @@ const PROGRAM: Pubkey = Pubkey::new_from_array([0xd2; 32]);
 const RESOURCE: Pubkey = Pubkey::new_from_array([0xe1; 32]);
 const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
 const COMPUTE_LIMIT: u32 = 1_400_000;
-const BUILD_LIMIT: u32 = 10_000_000;
 const STAGE_CHUNK: usize = 900;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -271,15 +270,23 @@ fn e2r_instruction(
     }
 }
 
-fn build_instruction(static_key: Pubkey) -> Instruction {
+fn build_instruction(static_key: Pubkey, cursor: u32) -> Instruction {
     let mut accounts = vec![meta(static_key, true, false), meta(RESOURCE, false, false)];
-    for ordinal in 0..rs::WAD_ACCOUNT_COUNT {
-        accounts.push(meta(wad_key(ordinal), false, false));
+    if (cursor as usize) < rsr::BUILD_WAD_CHUNKS as usize {
+        accounts.push(meta(wad_key(cursor as usize), false, false));
     }
     Instruction {
         program_id: PROGRAM,
         accounts,
-        data: rsr::Request::build().encode().to_vec(),
+        data: rsr::Request::build_chunk(cursor).encode().to_vec(),
+    }
+}
+
+fn relocation_instruction(static_key: Pubkey, cursor: u32) -> Instruction {
+    Instruction {
+        program_id: PROGRAM,
+        accounts: vec![meta(FRAME, false, false), meta(static_key, true, false)],
+        data: rsr::Request::relocate(cursor).encode().to_vec(),
     }
 }
 
@@ -315,6 +322,7 @@ fn render_instruction(
     Instruction {
         program_id: PROGRAM,
         accounts: vec![
+            meta(FRAME, false, false),
             meta(static_key, true, false),
             meta(snapshot, false, false),
             meta(strip, true, false),
@@ -743,15 +751,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("advance-state.st1"), &final_state.data)?;
     fs::write(receipt.join("advance-mirror.mp1"), &final_mirror.data)?;
 
-    let (build_units, build_logs) = submit(
-        &mut ctx.banks_client,
-        &payer,
-        &[],
-        build_instruction(static_key),
-        BUILD_LIMIT,
-    )
-    .await?;
-    fs::write(receipt.join("static-build-logs.txt"), build_logs)?;
+    let mut build_units = Vec::new();
+    let mut build_log_set = String::new();
+    for cursor in 0..=rsr::BUILD_FINAL_CURSOR {
+        let (units, logs) = submit(
+            &mut ctx.banks_client,
+            &payer,
+            &[],
+            build_instruction(static_key, cursor),
+            COMPUTE_LIMIT,
+        )
+        .await?;
+        if units > COMPUTE_LIMIT {
+            return Err(
+                format!("BUILD cursor {cursor} used {units} CU, over {COMPUTE_LIMIT}").into(),
+            );
+        }
+        build_log_set.push_str(&format!("=== BUILD cursor {cursor} ===\n{logs}\n"));
+        build_units.push(units);
+    }
+    fs::write(receipt.join("static-build-logs.txt"), build_log_set)?;
     let static_account = ctx
         .banks_client
         .get_account(static_key)
@@ -823,6 +842,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("SNAPSHOT-LIVE projection differs from the retained R3 snapshot".into());
     }
 
+    let old_base = u64::from_le_bytes(
+        static_account.data[rsr::HEADER_OFFSET + 112..rsr::HEADER_OFFSET + 120].try_into()?,
+    );
+    let mut relocation_units = Vec::new();
+    let mut relocation_logs = String::new();
+    let mut relocated_base = None;
+    for cursor in 0..rsr::RELOCATE_CHUNK_COUNT as u32 {
+        let (units, logs) = submit(
+            &mut ctx.banks_client,
+            &payer,
+            &[],
+            relocation_instruction(static_key, cursor),
+            COMPUTE_LIMIT,
+        )
+        .await?;
+        if units > COMPUTE_LIMIT {
+            return Err(
+                format!("RELOCATE cursor {cursor} used {units} CU, over {COMPUTE_LIMIT}").into(),
+            );
+        }
+        relocation_logs.push_str(&format!("=== RELOCATE cursor {cursor} ===\n{logs}\n"));
+        relocation_units.push(units);
+        if cursor == 0 {
+            let account = ctx
+                .banks_client
+                .get_account(static_key)
+                .await?
+                .ok_or("static account disappeared during relocation")?;
+            relocated_base = Some(u64::from_le_bytes(
+                account.data[rsr::HEADER_OFFSET + 344..rsr::HEADER_OFFSET + 352].try_into()?,
+            ));
+        }
+    }
+    fs::write(receipt.join("static-relocate-logs.txt"), relocation_logs)?;
+    let new_base = relocated_base.ok_or("relocation did not produce a new account base")?;
+    if old_base == new_base {
+        return Err("RELOCATE did not move the static account to a different address".into());
+    }
+    fs::write(
+        receipt.join("static-relocation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "old_base_hex":format!("0x{old_base:x}"),
+            "new_base_hex":format!("0x{new_base:x}"),
+            "different_address":old_base != new_base,
+            "chunk_bytes":rsr::RELOCATE_CHUNK_BYTES,
+            "transaction_count":relocation_units.len(),
+            "compute_units":relocation_units
+        }))?,
+    )?;
+
     let mut reconstructed = vec![0; rs::RI2_FRAME_BYTES];
     let mut render_units = Vec::new();
     let mut strip_results = Vec::new();
@@ -877,7 +946,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let report = json!({
         "status":"measured-byte-exact",
-        "profile":"DOOM-SIM/2 + SNAPSHOT-LIVE/3 + RSR/1 under SBF ProgramTest",
+        "profile":"DOOM-SIM/2 + SNAPSHOT-LIVE/3 + RSR/2 under SBF ProgramTest",
         "local_programtest_only":true,
         "network_calls":0,
         "image_sha256":sha(&image_bytes),
@@ -894,6 +963,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "advance_mirror_matches_legacy_r3":mirror_matches,
         "advance_root_matches_legacy_r3":root_matches,
         "static_build_compute_units":build_units,
+        "static_build_compute_units_max":build_units.iter().max(),
+        "static_build_all_transactions_under_target":build_units.iter().all(|units| *units <= COMPUTE_LIMIT),
         "static_build_account_bytes":rsr::ACCOUNT_BYTES,
         "static_build_account_preallocated":true,
         "static_build_rent_measured":false,
@@ -906,7 +977,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "sim2_init_compute_units":init_units,
         "deposit_compute_units":deposit_units,
         "stage_transactions":{"state":stage_state,"mirror":stage_mirror,"controller":stage_controller},
-        "build_transaction_count":1,
+        "build_transaction_count":build_units.len(),
+        "relocation_compute_units":relocation_units,
+        "relocation_compute_units_max":relocation_units.iter().max(),
+        "relocation_all_transactions_under_target":relocation_units.iter().all(|units| *units <= COMPUTE_LIMIT),
+        "relocation_transaction_count":relocation_units.len(),
+        "static_account_old_base_hex":format!("0x{old_base:x}"),
+        "static_account_new_base_hex":format!("0x{new_base:x}"),
+        "static_account_relocated":old_base != new_base,
         "snapshot_transaction_count":1,
         "render_transaction_count":8,
         "render_compute_units":render_units,

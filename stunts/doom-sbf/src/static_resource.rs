@@ -1,10 +1,9 @@
-//! DOOM-RSR/1: build renderer resources once into an account-resident C layout.
+//! DOOM-RSR/2: chunk-build renderer resources in a relocatable account layout.
 //!
 //! The static resource account is passed at account ordinal zero. The existing
-//! constant-address guard pins its data base to `DOOM_CTX`; its native pointers
-//! therefore remain account-relative across instructions. RSR/1 records the
-//! map/table/cache root offsets and fixes those roots from the account base on
-//! every render. The dynamic input remains the existing DOOM-RSN/3 payload.
+//! RSR/2 persists resumable BUILD phases and rebases account-internal C
+//! pointers when the static account is loaded at a different data address.
+//! RENDER still consumes the existing DOOM-RSN/3 dynamic payload.
 
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program_error::ProgramError,
@@ -14,17 +13,18 @@ use solana_program::{
 use crate::{render_snapshot_v3 as rsn3, resource_sbf};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-RSR";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const OP_BUILD: u8 = 0;
 pub const OP_RENDER: u8 = 1;
+pub const OP_RELOCATE: u8 = 2;
 pub const REQUEST_BYTES: usize = 52;
-pub const HEADER_BYTES: usize = 320;
+pub const HEADER_BYTES: usize = 512;
 pub const ROOTS_OFFSET: usize = 160;
 pub const ROOT_COUNT: usize = 32;
 pub const ROOT_BYTES: usize = ROOT_COUNT * 4;
 pub const ACCOUNT_BYTES: usize = resource_sbf::CONTEXT_BYTES;
 pub const HEADER_OFFSET: usize = resource_sbf::BOOTSTRAP_OFFSET;
-pub const STATIC_SEED: &[u8] = b"DOOM-STATIC-RESOURCE/1";
+pub const STATIC_SEED: &[u8] = b"DOOM-STATIC-RESOURCE/2";
 pub const REFUSE_MALFORMED: u32 = 301;
 pub const REFUSE_ACCOUNT: u32 = 302;
 pub const REFUSE_BUILT: u32 = 303;
@@ -49,9 +49,24 @@ const H_RESOURCE_HASH: usize = 80;
 const H_BASE_ADDRESS: usize = 112;
 const H_ABI_ID: usize = 120;
 const H_BUILD_ARENA_HIGH_WATER: usize = 152;
+const BUILD_MAGIC: &[u8; 8] = b"DOOM-BLD";
+pub const BUILD_WAD_CHUNKS: u32 = 5;
+const BUILD_C_PHASES: u32 = 6;
+pub const BUILD_FINAL_CURSOR: u32 = BUILD_WAD_CHUNKS + BUILD_C_PHASES - 1;
+pub const RELOCATE_CHUNK_BYTES: usize = 512 * 1024;
+pub const RELOCATE_CHUNK_COUNT: usize =
+    (ACCOUNT_BYTES + RELOCATE_CHUNK_BYTES - 1) / RELOCATE_CHUNK_BYTES;
 
-const RSR_ABI_DESCRIPTOR: &str =
-    "DOOM-RSR/1|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|base=DOOM_CTX-fixed|pin=WAD-SHA256|dynamic=DOOM-RSN/3";
+const H_BUILD_NEXT: usize = 288;
+const H_BUILD_WAD_USED: usize = 292;
+const H_BUILD_RESOURCE_HASH: usize = 296;
+const H_BUILD_BASE: usize = 328;
+const H_RELOCATE_OLD_BASE: usize = 336;
+const H_RELOCATE_NEW_BASE: usize = 344;
+const H_RELOCATE_NEXT: usize = 352;
+const H_RELOCATE_STATUS: usize = 356;
+
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=range-rebase-u64-chunks-512KiB|pin=WAD-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Request {
@@ -67,6 +82,24 @@ impl Request {
             operation: OP_BUILD,
             strip_id: 0,
             cursor: 0,
+            snapshot_hash: [0; 32],
+        }
+    }
+
+    pub const fn build_chunk(cursor: u32) -> Self {
+        Self {
+            operation: OP_BUILD,
+            strip_id: 0,
+            cursor,
+            snapshot_hash: [0; 32],
+        }
+    }
+
+    pub const fn relocate(cursor: u32) -> Self {
+        Self {
+            operation: OP_RELOCATE,
+            strip_id: 0,
+            cursor,
             snapshot_hash: [0; 32],
         }
     }
@@ -96,7 +129,7 @@ impl Request {
             || &data[..8] != MAGIC
             || u32_at(data, 8) != VERSION
             || data[14..16] != [0, 0]
-            || !matches!(data[12], OP_BUILD | OP_RENDER)
+            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_RELOCATE)
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -107,7 +140,16 @@ impl Request {
             snapshot_hash: data[20..52].try_into().unwrap(),
         };
         if request.operation == OP_BUILD
-            && (request.strip_id != 0 || request.cursor != 0 || request.snapshot_hash != [0; 32])
+            && (request.strip_id != 0
+                || request.cursor > BUILD_FINAL_CURSOR
+                || request.snapshot_hash != [0; 32])
+        {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
+        if request.operation == OP_RELOCATE
+            && (request.strip_id != 0
+                || request.cursor as usize >= RELOCATE_CHUNK_COUNT
+                || request.snapshot_hash != [0; 32])
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -130,8 +172,16 @@ fn u32_at(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
 
+fn u64_at(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
 fn put_u32(data: &mut [u8], offset: usize, value: u32) {
     data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(data: &mut [u8], offset: usize, value: u64) {
+    data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn owned(program: &Pubkey, account: &AccountInfo, bytes: usize, writable: bool) -> bool {
@@ -157,7 +207,10 @@ fn validate_static_account(
     Ok(())
 }
 
-fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
+fn validate_header_inner(
+    data: &[u8],
+    allow_relocating: bool,
+) -> Result<([u8; 32], [u8; 32]), ProgramError> {
     let end = HEADER_OFFSET
         .checked_add(HEADER_BYTES)
         .ok_or(refuse(REFUSE_STATIC))?;
@@ -180,9 +233,12 @@ fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
         || header[H_WAD_HASH..H_WAD_HASH + 32] != WAD_HASH
         || header[H_ABI_ID..H_ABI_ID + 32] != abi_id()
         || header[156..160] != [0, 0, 0, 0]
-        || header[ROOTS_OFFSET + ROOT_BYTES..HEADER_BYTES]
-            .iter()
-            .any(|byte| *byte != 0)
+        || u32_at(header, H_FLAGS) != 1
+        || u32_at(header, H_BUILD_NEXT) != BUILD_FINAL_CURSOR + 1
+        || u32_at(header, H_BUILD_WAD_USED) as usize != resource_sbf::WAD_IMAGE_BYTES
+        || header[H_BUILD_RESOURCE_HASH..H_BUILD_RESOURCE_HASH + 32]
+            != header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32]
+        || u64_at(header, H_BUILD_BASE) == 0
         || header[ROOTS_OFFSET..ROOTS_OFFSET + ROOT_BYTES]
             .chunks_exact(4)
             .any(|raw| {
@@ -192,11 +248,44 @@ fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
     {
         return Err(refuse(REFUSE_STATIC));
     }
+    let base = u64_at(header, H_BASE_ADDRESS);
+    let old_base = u64_at(header, H_RELOCATE_OLD_BASE);
+    let new_base = u64_at(header, H_RELOCATE_NEW_BASE);
+    let relocate_next = u32_at(header, H_RELOCATE_NEXT);
+    let relocate_status = u32_at(header, H_RELOCATE_STATUS);
+    if header[H_RELOCATE_STATUS + 4..HEADER_BYTES]
+        .iter()
+        .any(|byte| *byte != 0)
+        || match relocate_status {
+            0 => old_base != 0 || new_base != 0 || relocate_next != 0,
+            1 if allow_relocating => {
+                old_base == 0
+                    || new_base == 0
+                    || old_base == new_base
+                    || base != old_base
+                    || relocate_next as usize > RELOCATE_CHUNK_COUNT
+            }
+            2 => {
+                old_base == 0
+                    || new_base == 0
+                    || old_base == new_base
+                    || base != new_base
+                    || relocate_next != 0
+            }
+            _ => true,
+        }
+    {
+        return Err(refuse(REFUSE_STATIC));
+    }
     let resource_hash = header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32]
         .try_into()
         .unwrap();
     let wad_hash = header[H_WAD_HASH..H_WAD_HASH + 32].try_into().unwrap();
     Ok((wad_hash, resource_hash))
+}
+
+fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
+    validate_header_inner(data, false)
 }
 
 /// Read the WAD and RI2 commitments from a built static-resource account.
@@ -210,11 +299,38 @@ pub fn snapshot_binding_hashes(
     validate_header(&data)
 }
 
-fn process_build(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn initialize_build_header(header: &mut [u8], resource_hash: &[u8; 32], base: u64) {
+    header.fill(0);
+    header[..8].copy_from_slice(MAGIC);
+    put_u32(header, 8, VERSION);
+    put_u32(header, 12, HEADER_BYTES as u32);
+    put_u32(header, H_ACCOUNT_BYTES, ACCOUNT_BYTES as u32);
+    put_u32(
+        header,
+        H_CONTEXT_BYTES,
+        resource_sbf::CTX_STRUCT_BYTES as u32,
+    );
+    put_u32(header, H_WAD_OFFSET, resource_sbf::WAD_IMAGE_OFFSET as u32);
+    put_u32(header, H_WAD_BYTES, resource_sbf::WAD_IMAGE_BYTES as u32);
+    put_u32(header, H_BOOTSTRAP_OFFSET, HEADER_OFFSET as u32);
+    put_u32(
+        header,
+        H_BOOTSTRAP_BYTES,
+        resource_sbf::BOOTSTRAP_BYTES as u32,
+    );
+    put_u32(header, H_ROOT_COUNT, ROOT_COUNT as u32);
+    header[H_WAD_HASH..H_WAD_HASH + 32].copy_from_slice(&WAD_HASH);
+    header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32].copy_from_slice(resource_hash);
+    header[H_BUILD_RESOURCE_HASH..H_BUILD_RESOURCE_HASH + 32].copy_from_slice(resource_hash);
+    put_u64(header, H_BUILD_BASE, base);
+}
+
+fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
     const STATIC: usize = 0;
     const RESOURCE: usize = 1;
-    const WAD_FIRST: usize = 2;
-    if accounts.len() != WAD_FIRST + resource_sbf::WAD_ACCOUNT_COUNT || !distinct(accounts) {
+    const WAD: usize = 2;
+    let is_wad_chunk = (request.cursor as usize) < BUILD_WAD_CHUNKS as usize;
+    if accounts.len() != if is_wad_chunk { 3 } else { 2 } || !distinct(accounts) {
         return Err(refuse(REFUSE_ACCOUNT));
     }
     validate_static_account(program, &accounts[STATIC], true)?;
@@ -237,53 +353,82 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(refuse(REFUSE_BINDING));
     }
     let resource_hash = hashv(&[&resource_data]).to_bytes();
-
     let mut static_data = accounts[STATIC].try_borrow_mut_data()?;
-    if static_data[HEADER_OFFSET..HEADER_OFFSET + 8]
-        .iter()
-        .any(|byte| *byte != 0)
+    let static_base = static_data.as_ptr() as u64;
+    let (_, rest) = static_data.split_at_mut(HEADER_OFFSET);
+    let (header, _) = rest.split_at_mut(HEADER_BYTES);
+    if request.cursor == 0 {
+        if header.iter().any(|byte| *byte != 0) {
+            return Err(refuse(REFUSE_BUILT));
+        }
+        initialize_build_header(header, &resource_hash, static_base);
+    } else if &header[..8] != MAGIC
+        || u32_at(header, 8) != VERSION
+        || u32_at(header, H_BUILD_NEXT) != request.cursor
+        || header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32] != resource_hash
+        || u64_at(header, H_BUILD_BASE) != static_base
+        || u32_at(header, H_FLAGS) != 0
     {
         return Err(refuse(REFUSE_BUILT));
     }
-    let wad_start = resource_sbf::WAD_IMAGE_OFFSET;
-    let wad_end = wad_start + resource_sbf::WAD_IMAGE_BYTES;
-    let mut wad_cursor = wad_start;
-    let zeroes = [0u8; 256];
-    for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
-        let account = &accounts[WAD_FIRST + ordinal];
-        if !owned(program, account, resource_sbf::WAD_ACCOUNT_BYTES, false) {
+
+    if is_wad_chunk {
+        let ordinal = request.cursor as usize;
+        let account = &accounts[WAD];
+        if !owned(program, account, resource_sbf::WAD_ACCOUNT_BYTES, false) || account.is_signer {
             return Err(refuse(REFUSE_ACCOUNT));
         }
+        let zeroes = [0u8; 256];
         resource_sbf::validate_wad_account(account, ordinal, &zeroes)?;
         let wad_data = account.try_borrow_data()?;
         let payload_bytes = u32_at(&wad_data, 24) as usize;
-        let payload_end = resource_sbf::WAD_HEADER_BYTES + payload_bytes;
-        let destination_end = wad_cursor + payload_bytes;
-        if destination_end > wad_end {
+        let used = u32_at(header, H_BUILD_WAD_USED) as usize;
+        let destination_end = used
+            .checked_add(payload_bytes)
+            .ok_or(refuse(REFUSE_BINDING))?;
+        if destination_end > resource_sbf::WAD_IMAGE_BYTES {
             return Err(refuse(REFUSE_BINDING));
         }
-        static_data[wad_cursor..destination_end]
-            .copy_from_slice(&wad_data[resource_sbf::WAD_HEADER_BYTES..payload_end]);
-        wad_cursor = destination_end;
-    }
-    if wad_cursor != wad_end || hashv(&[&static_data[wad_start..wad_end]]).to_bytes() != WAD_HASH {
-        return Err(refuse(REFUSE_BINDING));
+        let start = resource_sbf::WAD_IMAGE_OFFSET + used;
+        static_data[start..start + payload_bytes].copy_from_slice(
+            &wad_data
+                [resource_sbf::WAD_HEADER_BYTES..resource_sbf::WAD_HEADER_BYTES + payload_bytes],
+        );
+        put_u32(header, H_BUILD_WAD_USED, destination_end as u32);
+        put_u32(header, H_BUILD_NEXT, request.cursor + 1);
+        if ordinal + 1 == resource_sbf::WAD_ACCOUNT_COUNT {
+            if destination_end != resource_sbf::WAD_IMAGE_BYTES
+                || hashv(&[&static_data[resource_sbf::WAD_IMAGE_OFFSET
+                    ..resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES]])
+                .to_bytes()
+                    != WAD_HASH
+            {
+                return Err(refuse(REFUSE_BINDING));
+            }
+        }
+        return Ok(());
     }
 
+    if u32_at(header, H_BUILD_WAD_USED) as usize != resource_sbf::WAD_IMAGE_BYTES {
+        return Err(refuse(REFUSE_BUILT));
+    }
+    let phase = request.cursor - BUILD_WAD_CHUNKS;
     let (before_header, rest) = static_data.split_at_mut(HEADER_OFFSET);
     let (header, bootstrap) = rest.split_at_mut(HEADER_BYTES);
     let context = before_header.as_mut_ptr();
-    let wad = &before_header[wad_start..wad_end];
     let resource = resource_data.as_ptr();
     let resource_bytes = resource_data.len();
-    let bootstrap_len = bootstrap.len();
+    let wad = &before_header[resource_sbf::WAD_IMAGE_OFFSET
+        ..resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES];
     let bootstrap_ptr = bootstrap.as_mut_ptr();
+    let bootstrap_len = bootstrap.len();
     let header_ptr = header.as_mut_ptr();
     let header_len = header.len();
     let mut arena_high_water = 0usize;
     #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
     let rc = unsafe {
-        doom_engine_rsn3_build_static(
+        doom_engine_rsn3_build_static_phase(
+            phase,
             context,
             ACCOUNT_BYTES,
             resource,
@@ -302,50 +447,156 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
-    let base_address = header[H_BASE_ADDRESS..H_BASE_ADDRESS + 8].to_vec();
-    header[..ROOTS_OFFSET].fill(0);
-    header[..8].copy_from_slice(MAGIC);
-    put_u32(header, 8, VERSION);
-    put_u32(header, 12, HEADER_BYTES as u32);
-    put_u32(header, H_ACCOUNT_BYTES, ACCOUNT_BYTES as u32);
-    put_u32(
-        header,
-        H_CONTEXT_BYTES,
-        resource_sbf::CTX_STRUCT_BYTES as u32,
-    );
-    put_u32(header, H_WAD_OFFSET, resource_sbf::WAD_IMAGE_OFFSET as u32);
-    put_u32(header, H_WAD_BYTES, resource_sbf::WAD_IMAGE_BYTES as u32);
-    put_u32(header, H_BOOTSTRAP_OFFSET, HEADER_OFFSET as u32);
-    put_u32(
-        header,
-        H_BOOTSTRAP_BYTES,
-        resource_sbf::BOOTSTRAP_BYTES as u32,
-    );
-    put_u32(header, H_ROOT_COUNT, ROOT_COUNT as u32);
-    put_u32(header, H_FLAGS, 1);
-    header[H_WAD_HASH..H_WAD_HASH + 32].copy_from_slice(&WAD_HASH);
-    header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32].copy_from_slice(&resource_hash);
-    header[H_BASE_ADDRESS..H_BASE_ADDRESS + 8].copy_from_slice(&base_address);
-    header[H_ABI_ID..H_ABI_ID + 32].copy_from_slice(&abi_id());
-    put_u32(
-        header,
-        H_BUILD_ARENA_HIGH_WATER,
-        arena_high_water.min(u32::MAX as usize) as u32,
-    );
-    if header[H_BASE_ADDRESS..H_BASE_ADDRESS + 8]
-        .iter()
-        .all(|byte| *byte == 0)
+    if phase == BUILD_C_PHASES - 1 {
+        let roots = header[ROOTS_OFFSET..ROOTS_OFFSET + ROOT_BYTES].to_vec();
+        let base = u64_at(header, H_BASE_ADDRESS);
+        header.fill(0);
+        header[ROOTS_OFFSET..ROOTS_OFFSET + ROOT_BYTES].copy_from_slice(&roots);
+        header[..8].copy_from_slice(MAGIC);
+        put_u32(header, 8, VERSION);
+        put_u32(header, 12, HEADER_BYTES as u32);
+        put_u32(header, H_ACCOUNT_BYTES, ACCOUNT_BYTES as u32);
+        put_u32(
+            header,
+            H_CONTEXT_BYTES,
+            resource_sbf::CTX_STRUCT_BYTES as u32,
+        );
+        put_u32(header, H_WAD_OFFSET, resource_sbf::WAD_IMAGE_OFFSET as u32);
+        put_u32(header, H_WAD_BYTES, resource_sbf::WAD_IMAGE_BYTES as u32);
+        put_u32(header, H_BOOTSTRAP_OFFSET, HEADER_OFFSET as u32);
+        put_u32(
+            header,
+            H_BOOTSTRAP_BYTES,
+            resource_sbf::BOOTSTRAP_BYTES as u32,
+        );
+        put_u32(header, H_ROOT_COUNT, ROOT_COUNT as u32);
+        put_u32(header, H_FLAGS, 1);
+        header[H_WAD_HASH..H_WAD_HASH + 32].copy_from_slice(&WAD_HASH);
+        header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32].copy_from_slice(&resource_hash);
+        header[H_ABI_ID..H_ABI_ID + 32].copy_from_slice(&abi_id());
+        put_u32(
+            header,
+            H_BUILD_ARENA_HIGH_WATER,
+            arena_high_water.min(u32::MAX as usize) as u32,
+        );
+        put_u32(header, H_BUILD_NEXT, BUILD_FINAL_CURSOR + 1);
+        put_u32(
+            header,
+            H_BUILD_WAD_USED,
+            resource_sbf::WAD_IMAGE_BYTES as u32,
+        );
+        header[H_BUILD_RESOURCE_HASH..H_BUILD_RESOURCE_HASH + 32].copy_from_slice(&resource_hash);
+        put_u64(header, H_BUILD_BASE, static_base);
+        put_u64(header, H_BASE_ADDRESS, base);
+    } else {
+        put_u32(header, H_BUILD_NEXT, request.cursor + 1);
+        put_u32(
+            header,
+            H_BUILD_WAD_USED,
+            resource_sbf::WAD_IMAGE_BYTES as u32,
+        );
+        put_u32(header, H_FLAGS, 0);
+        header[H_BUILD_RESOURCE_HASH..H_BUILD_RESOURCE_HASH + 32].copy_from_slice(&resource_hash);
+        put_u64(header, H_BUILD_BASE, static_base);
+    }
+    Ok(())
+}
+
+fn rebase_chunk(data: &mut [u8], chunk_start: usize, old_base: u64, new_base: u64) {
+    let chunk_end = (chunk_start + RELOCATE_CHUNK_BYTES).min(data.len());
+    let old_end = old_base + ACCOUNT_BYTES as u64;
+    let regions = [
+        (0usize, resource_sbf::WAD_IMAGE_OFFSET),
+        (HEADER_OFFSET + HEADER_BYTES, ACCOUNT_BYTES),
+    ];
+    for (region_start, region_end) in regions {
+        let start = chunk_start.max(region_start).saturating_add(7) & !7;
+        let end = chunk_end.min(region_end) & !7;
+        let mut offset = start;
+        while offset + 8 <= end {
+            let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            if (old_base..old_end).contains(&value) {
+                let rebased = new_base + (value - old_base);
+                data[offset..offset + 8].copy_from_slice(&rebased.to_le_bytes());
+            }
+            offset += 8;
+        }
+    }
+}
+
+fn process_relocate(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
+    const STATIC: usize = 1;
+    if accounts.len() != 2
+        || !distinct(accounts)
+        || accounts[0].is_signer
+        || accounts[0].is_writable
     {
-        return Err(refuse(REFUSE_STATIC));
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    validate_static_account(program, &accounts[STATIC], true)?;
+    if accounts.iter().any(|account| account.is_signer) {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    let mut data = accounts[STATIC].try_borrow_mut_data()?;
+    let current_base = data.as_mut_ptr() as u64;
+    validate_header_inner(&data, true)?;
+    if request.cursor == 0 {
+        let header = &data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+        if u32_at(header, H_RELOCATE_STATUS) != 0 {
+            return Err(refuse(REFUSE_BINDING));
+        }
+        let old_base = u64_at(header, H_BASE_ADDRESS);
+        if old_base == current_base {
+            return Err(refuse(REFUSE_BINDING));
+        }
+        current_base
+            .checked_add(ACCOUNT_BYTES as u64)
+            .ok_or(refuse(REFUSE_BINDING))?;
+        let header = &mut data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+        put_u64(header, H_RELOCATE_OLD_BASE, old_base);
+        put_u64(header, H_RELOCATE_NEW_BASE, current_base);
+        put_u32(header, H_RELOCATE_NEXT, 0);
+        put_u32(header, H_RELOCATE_STATUS, 1);
+    }
+    let (old_base, new_base, next) = {
+        let header = &data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+        (
+            u64_at(header, H_RELOCATE_OLD_BASE),
+            u64_at(header, H_RELOCATE_NEW_BASE),
+            u32_at(header, H_RELOCATE_NEXT),
+        )
+    };
+    if current_base != new_base || request.cursor != next {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    rebase_chunk(
+        &mut data,
+        request.cursor as usize * RELOCATE_CHUNK_BYTES,
+        old_base,
+        new_base,
+    );
+    let header = &mut data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+    let next = request.cursor + 1;
+    if next as usize == RELOCATE_CHUNK_COUNT {
+        put_u32(header, H_RELOCATE_NEXT, 0);
+        put_u32(header, H_RELOCATE_STATUS, 2);
+        put_u64(header, H_BASE_ADDRESS, new_base);
+    } else {
+        put_u32(header, H_RELOCATE_NEXT, next);
     }
     Ok(())
 }
 
 fn process_render(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
-    const STATIC: usize = 0;
-    const SNAPSHOT: usize = 1;
-    const STRIP: usize = 2;
-    if accounts.len() != 3 || !distinct(accounts) {
+    const PREFIX: usize = 0;
+    const STATIC: usize = 1;
+    const SNAPSHOT: usize = 2;
+    const STRIP: usize = 3;
+    if accounts.len() != 4
+        || !distinct(accounts)
+        || accounts[PREFIX].is_signer
+        || accounts[PREFIX].is_writable
+    {
         return Err(refuse(REFUSE_ACCOUNT));
     }
     validate_static_account(program, &accounts[STATIC], true)?;
@@ -367,7 +618,11 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], request: Request) 
     }
     let (static_wad_hash, static_resource_hash) = {
         let data = accounts[STATIC].try_borrow_data()?;
-        validate_header(&data)?
+        let hashes = validate_header(&data)?;
+        if u64_at(&data, HEADER_OFFSET + H_BASE_ADDRESS) != data.as_ptr() as u64 {
+            return Err(refuse(REFUSE_BINDING));
+        }
+        hashes
     };
     if static_wad_hash != snapshot.wad_hash || static_resource_hash != snapshot.resource_hash {
         return Err(refuse(REFUSE_BINDING));
@@ -432,7 +687,8 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], request: Request) 
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let request = Request::decode(data)?;
     match request.operation {
-        OP_BUILD => process_build(program, accounts),
+        OP_BUILD => process_build(program, accounts, request),
+        OP_RELOCATE => process_relocate(program, accounts, request),
         OP_RENDER => process_render(program, accounts, request),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
@@ -440,7 +696,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 
 #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
 unsafe extern "C" {
-    fn doom_engine_rsn3_build_static(
+    fn doom_engine_rsn3_build_static_phase(
+        phase: u32,
         context: *mut u8,
         account_bytes: usize,
         resource: *const u8,
