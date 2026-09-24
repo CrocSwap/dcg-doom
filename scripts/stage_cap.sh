@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Usage: scripts/stage_cap.sh <ledger.jsonl> <stage-name> <cap_seconds> <cmd...>
-# Project rule (AGENTS.md "On-chain step time cap"): an on-chain step may run at most 90 s unless the user granted a variance. At the cap the whole
+# docs/project-rules.md rule 3: an on-chain step may run at most 90 s unless the user agreed a variance. At the cap the whole
 # process tree is killed (exit 124) — no exceptions. Every attempt (pass, fail, killed) is appended to the ledger.
 ledger=$1; stage=$2; cap=$3; shift 3
 start=$(python3 -c 'import time;print(time.time())')
