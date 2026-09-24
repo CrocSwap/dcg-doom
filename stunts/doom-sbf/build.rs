@@ -24,7 +24,7 @@ const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC
 const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
 const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
 const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
-const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/3|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView|render=diagnostic-strip40-modes1-full-scene2-solidseg-clipped";
+const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = "DOOM-RC3/1|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView|render=diagnostic-strip40-modes1-full-scene2-solidseg-clipped";
 const NATIVE_PROVENANCE_PROFILE: &str =
     "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
@@ -554,6 +554,10 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
         ("zero-bss-probe", "CARGO_FEATURE_ZERO_BSS_PROBE"),
         ("diagnostic-profile", "CARGO_FEATURE_DIAGNOSTIC_PROFILE"),
         ("sim-transport", "CARGO_FEATURE_SIM_TRANSPORT"),
+        (
+            "render-clip-measurement",
+            "CARGO_FEATURE_RENDER_CLIP_MEASUREMENT",
+        ),
         ("metered-sweep", "CARGO_FEATURE_METERED_SWEEP"),
     ]
     .into_iter()

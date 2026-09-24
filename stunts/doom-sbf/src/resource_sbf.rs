@@ -19,8 +19,11 @@ pub const ABI_ID: [u8; 32] = super::ex2::RESOURCE_SBF_ABI_ID;
 pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = super::ex2::RESOURCE_SBF_ABI_DESCRIPTOR;
 pub const RI2_VERSION: u32 = 2;
 /// Diagnostic-only clipped-render measurement ABI. Deployable images leave
-/// `render-clip-measurement` disabled and reject this version.
+/// `render-clip-measurement` disabled and reject this request.
 pub const RI3_VERSION: u32 = 3;
+/// Separate magic prevents the measurement request from colliding with the
+/// retained DOOM-E2R/3 continuation instruction at the top-level dispatcher.
+pub const RI3_MAGIC: &[u8; 8] = b"DOOM-RC3";
 pub const RI2_ABI_ID: [u8; 32] = super::ex2::RESOURCE_RI2_SBF_ABI_ID;
 pub const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str =
     super::ex2::RESOURCE_RI2_SBF_ABI_DESCRIPTOR;
@@ -214,7 +217,7 @@ pub struct Ri3Request {
 impl Ri3Request {
     pub fn decode(data: &[u8]) -> Result<Self, ProgramError> {
         if data.len() != INSTRUCTION_BYTES
-            || &data[..8] != MAGIC
+            || &data[..8] != RI3_MAGIC
             || u32_at(data, 8) != RI3_VERSION
             || data[12] != TIC
             || !(1..=2).contains(&data[13])
@@ -243,7 +246,7 @@ impl Ri3Request {
 
     pub fn encode(self) -> [u8; INSTRUCTION_BYTES] {
         let mut out = [0u8; INSTRUCTION_BYTES];
-        out[..8].copy_from_slice(MAGIC);
+        out[..8].copy_from_slice(RI3_MAGIC);
         out[8..12].copy_from_slice(&RI3_VERSION.to_le_bytes());
         out[12] = TIC;
         out[13] = self.render_mode;
@@ -564,12 +567,17 @@ fn process_ri2(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let (request, render_mode, strip_id) = if instruction_data.len() >= 12
+        && instruction_data.starts_with(RI3_MAGIC)
         && u32_at(instruction_data, 8) == RI3_VERSION
     {
         if !cfg!(feature = "render-clip-measurement") {
+            msg!("DOOM-RC3 disabled");
             return Err(ProgramError::InvalidInstructionData);
         }
-        let clipped = Ri3Request::decode(instruction_data)?;
+        let clipped = Ri3Request::decode(instruction_data).map_err(|error| {
+            msg!("DOOM-RC3 decode refused");
+            error
+        })?;
         (
             Ri2Request {
                 resource_bytes: clipped.resource_bytes,

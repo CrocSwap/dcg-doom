@@ -216,6 +216,14 @@ pub fn process_instruction(
     }
     #[cfg(feature = "ctx-engine")]
     if instruction_data.len() >= 12
+        && instruction_data.starts_with(resource_sbf::RI3_MAGIC)
+        && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
+            == resource_sbf::RI3_VERSION
+    {
+        return resource_sbf::process(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.len() >= 12
         && instruction_data.starts_with(continuation_split_sbf::MAGIC)
         && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
             == continuation_split_sbf::VERSION
