@@ -239,6 +239,7 @@ fn e2r_instruction(
     continuation: Pubkey,
     authority: Pubkey,
     operation: u8,
+    cursor: u32,
     state_len: usize,
 ) -> Instruction {
     let mut accounts = vec![meta(context, true, operation == e2r::PREPARE)];
@@ -257,7 +258,7 @@ fn e2r_instruction(
     let mut data = e2r::Request {
         operation,
         state_len,
-        cursor: 0,
+        cursor,
         fault: 0,
     }
     .encode()
@@ -540,6 +541,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             continuation.pubkey(),
             authority.pubkey(),
             operation,
+            cursor,
             state_len,
         );
         let signers: Vec<&solana_keypair::Keypair> = if cursor == 0 {
