@@ -10,23 +10,25 @@ use solana_program::{
 };
 
 pub mod bring_up;
-pub mod ex2;
 #[cfg(feature = "ctx-engine")]
 pub mod continuation_sbf;
 #[cfg(feature = "ctx-engine")]
 pub mod continuation_split_sbf;
-#[cfg(feature = "ctx-engine")]
-pub mod resource;
+pub mod ex2;
 #[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
 #[cfg(feature = "ctx-engine")]
-pub mod resource_sbf;
+pub mod render_snapshot;
 #[cfg(feature = "ctx-engine")]
-pub mod simulation;
+pub mod render_snapshot_v3;
+#[cfg(feature = "ctx-engine")]
+pub mod resource;
+#[cfg(feature = "ctx-engine")]
+pub mod resource_sbf;
 #[cfg(feature = "ctx-engine")]
 pub mod sim2;
 #[cfg(feature = "ctx-engine")]
-pub mod render_snapshot;
+pub mod simulation;
 #[cfg(feature = "ctx-engine")]
 pub mod stage;
 
@@ -158,9 +160,12 @@ pub fn transport_process_instruction(
     if instruction_data.starts_with(sim2::MAGIC) && version == sim2::VERSION {
         return sim2::process(program_id, accounts, instruction_data);
     }
-    if instruction_data.starts_with(render_snapshot::MAGIC)
-        && version == render_snapshot::VERSION
+    if instruction_data.starts_with(render_snapshot_v3::MAGIC)
+        && version == render_snapshot_v3::VERSION
     {
+        return render_snapshot_v3::process(program_id, accounts, instruction_data);
+    }
+    if instruction_data.starts_with(render_snapshot::MAGIC) && version == render_snapshot::VERSION {
         return render_snapshot::process(program_id, accounts, instruction_data);
     }
     if instruction_data.starts_with(continuation_split_sbf::MAGIC)
@@ -216,6 +221,13 @@ pub fn process_instruction(
         return process_ctx_probe(_program_id, accounts, instruction_data);
     }
     #[cfg(feature = "ctx-engine")]
+    if instruction_data.len() >= 12
+        && instruction_data.starts_with(render_snapshot_v3::MAGIC)
+        && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
+            == render_snapshot_v3::VERSION
+    {
+        return render_snapshot_v3::process(_program_id, accounts, instruction_data);
+    }
     if instruction_data.len() >= 12
         && instruction_data.starts_with(render_snapshot::MAGIC)
         && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
