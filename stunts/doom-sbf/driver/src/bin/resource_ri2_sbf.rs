@@ -345,6 +345,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let logs = normal.metadata.as_ref().map(|m| m.log_messages.join("\n")).unwrap_or_default();
     fs::write(receipt.join("tic-logs.txt"), logs)?;
     let units = normal.metadata.as_ref().map(|m| m.compute_units_consumed);
+    let normal_limit_succeeded = if render_clip.is_some() {
+        let fits = units.map(|value| value <= u64::from(NORMAL_LIMIT));
+        if fits == Some(false) {
+            fs::write(receipt.join("normal-limit-attempt.txt"), format!(
+                "Measured CU exceeds the {NORMAL_LIMIT} CU threshold; ProgramTest bank maximum is {limit} CU, so this is a CU-fit comparison, not a limit-enforced success.\n"
+            ))?;
+        }
+        fits
+    } else {
+        normal_limit_succeeded
+    };
     if normal.result.is_err() {
         let text = format!("{normal:?}");
         write_report(&receipt, if diagnostic { "failed-diagnostic-runtime" } else { "failed-normal-budget" }, "actual-sbf-resource-tic", NORMAL_LIMIT, if normal_limit_succeeded == Some(false) { DIAGNOSTIC_LIMIT } else { limit }, units, normal_limit_succeeded, &controller_text, &resource_text, &render_text, Some(&text), None, None, None, render_clip.map(|x| x.0), render_clip.map(|x| x.1), if render_clip.is_some() { "40-column strip" } else { "full framebuffer" }, &image_actual_sha, &manifest_actual_sha, &abi)?;
@@ -377,7 +388,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("actual RI2 SBF mismatch state={state_equal} mirror={mirror_equal} frame={frame_equal}").into());
     }
     let Some(units) = units else { return Err("actual SBF run did not report compute units".into()); };
-    let status = if render_clip.is_some() && normal_limit_succeeded == Some(true) { "measured-normal-limit-equality" } else if diagnostic { "measured-diagnostic-only-equality" } else if units > QUALIFICATION_MAX_UNITS { "failed-over-qualification-budget" } else { "measured-accepted-normal-budget" };
+    let status = if render_clip.is_some() && normal_limit_succeeded == Some(true) { "measured-within-normal-limit" } else if diagnostic { "measured-diagnostic-only-equality" } else if units > QUALIFICATION_MAX_UNITS { "failed-over-qualification-budget" } else { "measured-accepted-normal-budget" };
     let blocker = if diagnostic && normal_limit_succeeded != Some(true) { "diagnostic-not-normal-limit" } else if units > QUALIFICATION_MAX_UNITS { "compute-units-over-qualification-threshold" } else { "none" };
     write_report(&receipt, status, blocker, NORMAL_LIMIT, if normal_limit_succeeded == Some(false) { DIAGNOSTIC_LIMIT } else { limit }, Some(units), normal_limit_succeeded, &controller_text, &resource_text, &render_text, None, Some(true), Some(true), Some(frame_equal), render_clip.map(|x| x.0), render_clip.map(|x| x.1), if render_clip.is_some() { "40-column strip" } else { "full framebuffer" }, &image_actual_sha, &manifest_actual_sha, &abi)?;
     println!("RI2 SBF {status}: units={units} receipt={}", receipt.display());
