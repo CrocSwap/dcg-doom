@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let snapshot_view = render_snapshot::validate_snapshot(&snapshot_account.data)?;
     if snapshot_view.cursor != meta_view.cursor
         || snapshot_view.state_root != meta_view.state_root
-        || snapshot_view.state != state[..sim2::state_len_checked(&state)?]
+        || snapshot_view.state != &state[..sim2::state_len_checked(&state)?]
         || snapshot_view.mirror != mirror
     {
         return Err("SNAPSHOT output differs from the captured SIM2 state".into());
