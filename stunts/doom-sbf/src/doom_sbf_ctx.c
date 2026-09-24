@@ -11,8 +11,9 @@
  * those variadic): those live in doom_sbf_platform.c, which never sees
  * doom_ctx.h.
  *
- * No mutable global, no const-pointer table: the image stays 0 .data +
- * 0 .bss.  memcpy comes from doom_sbf_platform.c; doom_sbf_panic from Rust.
+ * The one SBF writable static is doom_ctx_active, an instruction-local binding
+ * reset by every entry guard.  Engine state remains account resident.
+ * memcpy comes from doom_sbf_platform.c; doom_sbf_panic from Rust.
  */
 
 #include <stddef.h>
@@ -38,13 +39,23 @@ void *memcpy(void *dst, const void *src, size_t n);
 #define DOOM_CTX_GUARD_REFUSED 199
 #define DOOM_SBF_ALLOC_ALIGNMENT 16u
 
-/* The context account's data must map at the pinned address (M1021: the
- * first account's data at a fixed layout).  Any other mapping means the
- * instruction's account order changed, and dereferencing DOOM_CTX would
- * corrupt whatever account did map there: refuse instead. */
+#ifdef DOOM_SBF_BUILD
+doom_ctx_t *doom_ctx_active;
+#endif
+
+/* Bind the engine's account-resident globals to this instruction's context
+ * mapping.  Account ownership, key, size, and alignment are validated by the
+ * Rust caller before entering C. */
 int doom_ctx_guard(const void *data)
 {
+#ifdef DOOM_SBF_BUILD
+    if (!data || ((uintptr_t)data & (DOOM_SBF_ALLOC_ALIGNMENT - 1u)))
+	return DOOM_CTX_GUARD_REFUSED;
+    doom_ctx_active = (doom_ctx_t *)data;
+    return 0;
+#else
     return data == (const void *)DOOM_CTX ? 0 : DOOM_CTX_GUARD_REFUSED;
+#endif
 }
 
 /* The engine image must KEEP the whole 0007 cut resident: static archives
