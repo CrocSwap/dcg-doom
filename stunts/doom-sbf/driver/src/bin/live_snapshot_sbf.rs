@@ -73,6 +73,56 @@ fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
         .collect()
 }
 
+struct LegacySnapshot<'a> {
+    cursor: u32,
+    gametic: u32,
+    state_root: [u8; 32],
+    wad_hash: [u8; 32],
+    resource_hash: [u8; 32],
+    snapshot_hash: [u8; 32],
+    payload: &'a [u8],
+}
+
+fn parse_legacy_snapshot(data: &[u8]) -> Result<LegacySnapshot<'_>, Box<dyn Error>> {
+    if data.len() != rsn3::SNAPSHOT_BYTES
+        || &data[..8] != rsn3::MAGIC
+        || u32::from_le_bytes(data[8..12].try_into()?) != rsn3::VERSION
+        || u32::from_le_bytes(data[12..16].try_into()?) as usize != rsn3::HEADER_BYTES
+        || u32::from_le_bytes(data[16..20].try_into()?) as usize != rsn3::SNAPSHOT_BYTES
+    {
+        return Err("retained R3 snapshot has an invalid header".into());
+    }
+    let payload_bytes = u32::from_le_bytes(data[28..32].try_into()?) as usize;
+    let payload_end = rsn3::HEADER_BYTES
+        .checked_add(payload_bytes)
+        .ok_or("retained R3 snapshot payload size overflow")?;
+    if payload_bytes > rsn3::MAX_PAYLOAD_BYTES
+        || payload_end > data.len()
+        || data[payload_end..].iter().any(|byte| *byte != 0)
+    {
+        return Err("retained R3 snapshot payload bounds or padding are invalid".into());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(rsn3::HASH_DOMAIN);
+    hasher.update(&data[..128]);
+    hasher.update([0; 32]);
+    hasher.update(&data[160..rsn3::HEADER_BYTES]);
+    hasher.update(&data[rsn3::HEADER_BYTES..payload_end]);
+    let snapshot_hash: [u8; 32] = hasher.finalize().into();
+    if data[128..160] != snapshot_hash {
+        return Err("retained R3 snapshot hash is invalid".into());
+    }
+    Ok(LegacySnapshot {
+        cursor: u32::from_le_bytes(data[20..24].try_into()?),
+        gametic: u32::from_le_bytes(data[24..28].try_into()?),
+        state_root: data[32..64].try_into()?,
+        wad_hash: data[64..96].try_into()?,
+        resource_hash: data[96..128].try_into()?,
+        snapshot_hash,
+        payload: &data[rsn3::HEADER_BYTES..payload_end],
+    })
+}
+
 async fn submit(
     banks: &mut BanksClient,
     payer: &solana_keypair::Keypair,
@@ -352,7 +402,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("captured controller command differs from first DEMO1 command".into());
     }
     let r3_snapshot_bytes = fs::read(r3_root.join("snapshot-rsn3.bin"))?;
-    let r3_snapshot = rsn3::validate_snapshot(&r3_snapshot_bytes)?;
+    let r3_snapshot = parse_legacy_snapshot(&r3_snapshot_bytes)?;
     let r3_native_state = fs::read(r3_root.join("inputs/native-imported-state.st1"))?;
     let r3_native_mirror = fs::read(r3_root.join("inputs/native-imported-mirror.mp1"))?;
     let r3_frame = fs::read(r3_root.join("inputs/native-imported-frame.fb1"))?;
