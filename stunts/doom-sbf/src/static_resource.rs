@@ -34,6 +34,34 @@ pub const WAD_HASH: [u8; 32] = [
     0x1d, 0x7d, 0x43, 0xbe, 0x50, 0x1e, 0x67, 0xd9, 0x27, 0xe4, 0x15, 0xe0, 0xb8, 0xf3, 0xe2, 0x9c,
     0x3b, 0xf3, 0x30, 0x75, 0xe8, 0x59, 0x72, 0x18, 0x16, 0xf6, 0x52, 0xa5, 0x26, 0xca, 0xc7, 0x71,
 ];
+const WAD_CHUNK_BYTES: [usize; 5] = [1_048_544, 1_048_544, 1_048_544, 1_048_544, 1_844];
+const WAD_CHUNK_HASHES: [[u8; 32]; 5] = [
+    [
+        0xb5, 0x75, 0xf1, 0x6c, 0x92, 0x6d, 0x32, 0x44, 0x23, 0x0f, 0xbd, 0x34, 0x84, 0xa9, 0x99,
+        0x01, 0x30, 0x91, 0x45, 0x57, 0x73, 0x8a, 0xb2, 0x7c, 0x0f, 0x69, 0x3c, 0xcc, 0x97, 0x3f,
+        0x9d, 0x25,
+    ],
+    [
+        0xc9, 0x49, 0xad, 0xc4, 0xb0, 0x0c, 0x45, 0xce, 0x2a, 0x08, 0x84, 0xd1, 0xaf, 0xd3, 0x8d,
+        0x9c, 0xb1, 0x0d, 0xd5, 0x09, 0xdd, 0x33, 0x94, 0x44, 0xf7, 0x76, 0x64, 0xd4, 0xc9, 0xd2,
+        0xf3, 0x43,
+    ],
+    [
+        0xdf, 0x8a, 0x3f, 0x4a, 0x92, 0x23, 0x59, 0x26, 0x39, 0xbe, 0x6c, 0xa2, 0x69, 0x1a, 0x04,
+        0x16, 0xa3, 0x8f, 0x4b, 0x92, 0x29, 0x86, 0x14, 0xc3, 0x8e, 0x95, 0xc8, 0x75, 0x98, 0x1d,
+        0x22, 0xd1,
+    ],
+    [
+        0x27, 0x37, 0x08, 0x7b, 0xd1, 0xb2, 0x1b, 0x63, 0x49, 0x80, 0xd6, 0x56, 0x99, 0x90, 0xfb,
+        0xc1, 0x01, 0xc4, 0x6f, 0xb2, 0xf2, 0xe8, 0xd0, 0x08, 0x30, 0x6a, 0x3b, 0xd1, 0xf4, 0x32,
+        0xd4, 0xc0,
+    ],
+    [
+        0x4f, 0x72, 0xa8, 0x3f, 0xba, 0xe0, 0xe6, 0xaa, 0xbd, 0xfd, 0x8b, 0xda, 0xf2, 0x00, 0x08,
+        0x98, 0x6d, 0x5d, 0x2c, 0x6d, 0x07, 0x62, 0x07, 0xcf, 0x78, 0x54, 0x1e, 0xd1, 0xb6, 0x96,
+        0x23, 0x35,
+    ],
+];
 
 const H_ACCOUNT_BYTES: usize = 16;
 const H_CONTEXT_BYTES: usize = 20;
@@ -57,7 +85,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Request {
@@ -319,10 +347,22 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
         if !owned(program, account, resource_sbf::WAD_ACCOUNT_BYTES, false) || account.is_signer {
             return Err(refuse(REFUSE_ACCOUNT));
         }
-        let zeroes = [0u8; 256];
-        resource_sbf::validate_wad_account(account, ordinal, &zeroes)?;
         let wad_data = account.try_borrow_data()?;
         let payload_bytes = u32_at(&wad_data, 24) as usize;
+        if wad_data.len() != resource_sbf::WAD_ACCOUNT_BYTES
+            || &wad_data[..8] != b"DOOM-WC1"
+            || u32_at(&wad_data, 8) != 1
+            || u32_at(&wad_data, 12) as usize != resource_sbf::WAD_HEADER_BYTES
+            || u32_at(&wad_data, 16) as usize != resource_sbf::WAD_ACCOUNT_BYTES
+            || u32_at(&wad_data, 20) as usize != ordinal
+            || payload_bytes != WAD_CHUNK_BYTES[ordinal]
+            || hashv(&[&wad_data
+                [resource_sbf::WAD_HEADER_BYTES..resource_sbf::WAD_HEADER_BYTES + payload_bytes]])
+            .to_bytes()
+                != WAD_CHUNK_HASHES[ordinal]
+        {
+            return Err(refuse(REFUSE_BINDING));
+        }
         let used = u32_at(header, H_BUILD_WAD_USED) as usize;
         let destination_end = used
             .checked_add(payload_bytes)
@@ -338,12 +378,7 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
         put_u32(header, H_BUILD_WAD_USED, destination_end as u32);
         put_u32(header, H_BUILD_NEXT, request.cursor + 1);
         if ordinal + 1 == resource_sbf::WAD_ACCOUNT_COUNT {
-            if destination_end != resource_sbf::WAD_IMAGE_BYTES
-                || hashv(&[&pre_header[resource_sbf::WAD_IMAGE_OFFSET
-                    ..resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES]])
-                .to_bytes()
-                    != WAD_HASH
-            {
+            if destination_end != resource_sbf::WAD_IMAGE_BYTES {
                 return Err(refuse(REFUSE_BINDING));
             }
         }
