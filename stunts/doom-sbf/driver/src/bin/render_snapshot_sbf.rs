@@ -174,30 +174,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bank.add_account(meta_key, account(program, meta.clone()));
     bank.add_account(state_key, account(program, state.clone()));
     bank.add_account(mirror_key, account(program, mirror.clone()));
+    let snapshot = render_snapshot::snapshot_address(&program, &context).0;
+    // ProgramTest preallocates this test fixture. OP_INIT's 192,704-byte CPI
+    // allocation exceeds the runtime's 10,240-byte inner-instruction limit.
+    bank.add_account(
+        snapshot,
+        account(program, vec![0; render_snapshot::SNAPSHOT_BYTES]),
+    );
     let mut client = bank.start_with_context().await;
     let payer = client.payer.insecure_clone();
-
-    let snapshot = render_snapshot::snapshot_address(&program, &context).0;
-    let init = Instruction {
-        program_id: program,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(meta_key, false),
-            AccountMeta::new(snapshot, false),
-            AccountMeta::new_readonly(solana_program::system_program::id(), false),
-        ],
-        data: render_snapshot::encode_init().to_vec(),
-    };
-    let (init_cu, init_logs) = submit(
-        &mut client.banks_client,
-        &payer,
-        &[
-            ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_LIMIT),
-            init,
-        ],
-    )
-    .await?;
-    fs::write(receipt.join("snapshot-init-logs.txt"), init_logs)?;
 
     let request = render_snapshot::SnapshotRequest {
         cursor: meta_view.cursor,
@@ -244,10 +229,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::write(
         receipt.join("snapshot-report.json"),
         format!(
-            "{{\n  \"status\": \"measured\",\n  \"program_id\": {},\n  \"cursor\": {},\n  \"init_compute_units\": {},\n  \"snapshot_compute_units\": {},\n  \"snapshot_account_bytes\": {},\n  \"snapshot_matches_captured_state\": true,\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"meta_sha256\": {},\n  \"state_sha256\": {},\n  \"mirror_sha256\": {}\n}}\n",
+            "{{\n  \"status\": \"measured\",\n  \"program_id\": {},\n  \"cursor\": {},\n  \"snapshot_compute_units\": {},\n  \"snapshot_account_bytes\": {},\n  \"snapshot_account_preallocated_by_programtest\": true,\n  \"snapshot_init_status\": \"not measured; ProgramTest rejects the 192704-byte CPI allocation\",\n  \"snapshot_matches_captured_state\": true,\n  \"image_sha256\": {},\n  \"manifest_sha256\": {},\n  \"meta_sha256\": {},\n  \"state_sha256\": {},\n  \"mirror_sha256\": {}\n}}\n",
             serde_json::to_string(&program.to_string())?,
             meta_view.cursor,
-            init_cu,
             snapshot_cu,
             snapshot_account.data.len(),
             serde_json::to_string(&image_sha)?,
