@@ -55,14 +55,17 @@ pub const GROW_BUFFER: u8 = 5;
 pub const ADVANCE_EXPECTED_CURSOR: u8 = 6;
 /// Extend a live input buffer and its bound meta by one bounded realloc.
 pub const EXTEND_CAPACITY: u8 = 7;
-#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer")))]
+#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
 pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer")))]
+#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
 pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(all(feature = "legacy-5120-buffer", not(feature = "metered-sweep")))]
+#[cfg(feature = "legacy-5120-buffer")]
 pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(all(feature = "legacy-5120-buffer", feature = "metered-sweep"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
 #[cfg(not(feature = "legacy-5120-buffer"))]
@@ -1368,6 +1371,7 @@ fn process_grow_buffer(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
 /// Extend an initialized SIM2 input buffer without replacing its session.
 /// The capacity and account length change atomically, and one instruction may
 /// add at most the runtime's 10,240-byte account-growth limit.
+#[cfg(feature = "capacity-extension")]
 #[cold]
 #[inline(never)]
 fn process_extend_capacity(
@@ -1588,7 +1592,7 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         SNAPSHOT => process_snapshot(program, accounts, data),
         #[cfg(not(feature = "legacy-5120-buffer"))]
         GROW_BUFFER => process_grow_buffer(program, accounts, data),
-        #[cfg(not(feature = "legacy-5120-buffer"))]
+        #[cfg(all(feature = "capacity-extension", not(feature = "legacy-5120-buffer")))]
         EXTEND_CAPACITY => process_extend_capacity(program, accounts, data),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
