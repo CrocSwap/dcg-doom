@@ -1,4 +1,4 @@
-# Doom decoupled render snapshot v1 — 2026-09-24
+# Doom decoupled render snapshot — 2026-09-24
 
 ## Status and boundary
 
@@ -7,7 +7,9 @@ open.** This is the selected
 snapshot format for the clipped mode-1 renderer. It leaves the existing
 DOOM-SIM/2 DEPOSIT, ADVANCE/3, ADVANCE/4, and SNAPSHOT/4 wires unchanged.
 SNAPSHOT/4 remains a read-side consistency check. A separately versioned
-`DOOM-RSN/1` instruction writes the render snapshot.
+`DOOM-RSN/2` instruction writes the render snapshot. It supersedes the initial
+`DOOM-RSN/1` design recorded in M1335 because the implementation copies MP1
+into the image so later render calls do not need live state accounts.
 
 The render-only transaction measurement remains a gate. The captured DEMO1
 state has a measured ST1 length of 59,604 bytes. The maximum account allocation
@@ -19,7 +21,7 @@ the future renderer the actor mirror bound by the committed SIM2 state root.
 ## Snapshot account
 
 One program-owned PDA per game context is derived with seeds
-`[b"DOOM-RENDER-SNAPSHOT/1", context_pubkey]`. Provision it at exactly 192,704
+`[b"DOOM-RENDER-SNAPSHOT/2", context_pubkey]`. Provision it at exactly 192,704
 data bytes before use. The account is reused for later snapshots. All integers
 are unsigned little-endian; all reserved bytes and the unused ST1 and MP1 tails
 are zero.
@@ -42,14 +44,14 @@ are zero.
 | 127,168 | 65,536 | complete MP1 account image, including zero padding |
 
 The snapshot hash is
-`SHA256("DOOM-RENDER-SNAPSHOT/1\\0" || header[0..128] || zero32 ||
+`SHA256("DOOM-RENDER-SNAPSHOT/2\\0" || header[0..128] || zero32 ||
 header[160..192] || padded_ST1 || MP1)`. The writer validates the current SIM2
 meta/state/mirror binding and cursor/root with the existing `snapshot_check`,
 checks the render snapshot PDA, validates ST1 and MP1 shapes, and copies both
 account images. The renderer must separately compare the snapshot WAD digest
 with the static RI2 resource's pinned WAD before rendering.
 
-`DOOM-RSN/1` takes read locks on meta, ST1, and MP1, and a write lock on the
+`DOOM-RSN/2` takes read locks on meta, ST1, and MP1, and a write lock on the
 snapshot. ADVANCE never reads or writes the snapshot. Snapshot and ADVANCE
 therefore serialize only through the existing meta/state/mirror accounts; no
 new dependency is added to the tic path. RENDER reads only the snapshot and

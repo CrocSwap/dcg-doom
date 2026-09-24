@@ -1,4 +1,4 @@
-//! DOOM-RENDER-SNAPSHOT/1: bind one render snapshot to a committed SIM2 tic.
+//! DOOM-RENDER-SNAPSHOT/2: bind one render snapshot to a committed SIM2 tic.
 //!
 //! The operation reads the existing SIM2 meta/ST1/MP1 accounts and writes a
 //! separate context-derived snapshot PDA. SIM2 ADVANCE does not receive or
@@ -20,16 +20,16 @@ use solana_program::{
 use crate::{ex2, resource_sbf, sim2};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-RSN";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const OP_INIT: u8 = 0;
 pub const OP_SNAPSHOT: u8 = 1;
 pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
-pub const SNAPSHOT_SEED: &[u8] = b"DOOM-RENDER-SNAPSHOT/1";
+pub const SNAPSHOT_SEED: &[u8] = b"DOOM-RENDER-SNAPSHOT/2";
 pub const HEADER_BYTES: usize = 192;
 pub const SNAPSHOT_BYTES: usize =
     HEADER_BYTES + resource_sbf::STATE_MAX_BYTES + resource_sbf::MIRROR_BYTES;
-pub const HASH_DOMAIN: &[u8] = b"DOOM-RENDER-SNAPSHOT/1\0";
+pub const HASH_DOMAIN: &[u8] = b"DOOM-RENDER-SNAPSHOT/2\0";
 pub const ABI_DESCRIPTOR: &str = ex2::RENDER_SNAPSHOT_ABI_DESCRIPTOR;
 pub const ABI_ID: [u8; 32] = ex2::RENDER_SNAPSHOT_ABI_ID;
 
@@ -440,5 +440,13 @@ mod tests {
         assert_eq!(view.wad_hash, wad_hash);
         assert_eq!(view.state, &state[..64]);
         assert_eq!(view.mirror, mirror);
+
+        let mut wrong_root = snapshot.clone();
+        wrong_root[H_STATE_ROOT] ^= 1;
+        assert!(validate_snapshot(&wrong_root).is_err());
+
+        let mut changed_actor_mirror = snapshot;
+        changed_actor_mirror[H_MP1 + 4_096] ^= 1;
+        assert!(validate_snapshot(&changed_actor_mirror).is_err());
     }
 }
