@@ -424,6 +424,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("reconstructed RSN/3 framebuffer differs from native oracle".into());
     }
     fs::write(receipt.join("reconstructed-frame.fb1"), &reconstructed)?;
+
+    let mut wrong_snapshot_hash = snapshot_hash;
+    wrong_snapshot_hash[0] ^= 1;
+    let wrong_request = rsn3::RenderRequest {
+        strip_id: 0,
+        cursor,
+        snapshot_hash: wrong_snapshot_hash,
+    }
+    .encode();
+    let blockhash = client.banks_client.get_latest_blockhash().await?;
+    let tx = Transaction::new(
+        &[&payer],
+        Message::new_with_blockhash(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_LIMIT),
+                render_instruction(program, snapshot, 0, &wrong_request),
+            ],
+            Some(&payer.pubkey()),
+            &blockhash,
+        ),
+        blockhash,
+    );
+    let bad_hash = client
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await?;
+    let bad_hash_logs = bad_hash
+        .metadata
+        .as_ref()
+        .map_or_else(String::new, |m| m.log_messages.join("\n"));
+    let refusal = bad_hash
+        .result
+        .err()
+        .ok_or("wrong snapshot hash was accepted")?;
+    if !format!("{refusal:?}").contains("Custom(299)") {
+        return Err(
+            format!("wrong snapshot hash refused with unexpected error: {refusal:?}").into(),
+        );
+    }
+    fs::write(
+        receipt.join("malformed-snapshot-hash-logs.txt"),
+        bad_hash_logs,
+    )?;
     let total_frame_units = snapshot_units + render_units_total;
     let report = json!({
         "status": "measured-equal",
@@ -451,6 +494,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "strip_render_units_at_or_below_target": strip_results.iter().all(|r| r["compute_units"].as_u64().unwrap_or(u64::MAX) <= 1_400_000),
         "all_eight_strips_match_native": true,
         "reconstructed_frame_matches_native": full_parity,
+        "malformed_snapshot_hash_refused_custom_299": true,
         "static_resource_account_step": "not implemented in this result; RENDER still imports RI2/WAD graph and renderer resources",
         "render_validates_resource_image_hash_each_call": true,
         "render_decodes_st1": false,
