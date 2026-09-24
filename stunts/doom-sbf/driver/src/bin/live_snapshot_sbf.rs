@@ -358,7 +358,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let r3_frame = fs::read(r3_root.join("inputs/native-imported-frame.fb1"))?;
     if r3_native_state.len() != state_capture.len()
         || r3_native_mirror.len() != rs::MIRROR_BYTES
-        || r3_frame.len() != rs::FRAME_BYTES
+        || r3_frame.len() != rs::RI2_FRAME_BYTES
     {
         return Err("retained R3 native state, mirror, or frame has the wrong size".into());
     }
