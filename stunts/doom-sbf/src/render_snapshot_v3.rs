@@ -572,6 +572,12 @@ fn process_snapshot(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     if wad_cursor != wad_end {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
+    let expected_wad_hash: [u8; 32] = mirror_data[36..68].try_into().unwrap();
+    if hashv(&[&scratch_data[resource_sbf::WAD_IMAGE_OFFSET..wad_end]]).to_bytes()
+        != expected_wad_hash
+    {
+        return Err(refuse(REFUSE_BINDING));
+    }
     let resource_data = accounts[RESOURCE].try_borrow_data()?;
     let mut snapshot_data = accounts[SNAPSHOT].try_borrow_mut_data()?;
     let old_payload_bytes =
@@ -710,6 +716,11 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
     if wad_cursor != wad_end {
         return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    if hashv(&[&scratch_data[resource_sbf::WAD_IMAGE_OFFSET..wad_end]]).to_bytes()
+        != snapshot.wad_hash
+    {
+        return Err(refuse(REFUSE_BINDING));
     }
     let (context_mem, tail) = scratch_data.split_at_mut(resource_sbf::WAD_IMAGE_OFFSET);
     let (wad_image, tail) = tail.split_at_mut(resource_sbf::WAD_IMAGE_BYTES);

@@ -139,7 +139,8 @@ are not copied into RSN/3.
 
 `SNAPSHOT/3` validates the SIM2 root and cursor, reconstructs the captured
 engine state once, and writes this projection. `RENDER/3` validates the
-snapshot hash and RI2 account hash, then applies the projection without
+snapshot hash, the RI2 account hash, and the reconstructed WAD digest against
+the snapshot pin, then applies the projection without
 decoding ST1. This is only the dynamic-state portion of the redesign: the
 current RENDER path still copies and parses WAD data, preflights RI2, imports
 the map graph, and rebuilds renderer tables on every call. No zero-copy static
