@@ -59,6 +59,10 @@ name = "static_resource_sbf"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "live_snapshot_sbf"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "continuation_sbf"
 required-features = ["ctx-engine"]
 
