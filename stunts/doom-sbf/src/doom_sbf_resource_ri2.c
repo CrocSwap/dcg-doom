@@ -682,6 +682,24 @@ int doom_engine_ex2_resource_sbf_ri2_snapshot_rsn3(
     return rsn3_encode_dynamic(payload_out, payload_cap, payload_len_out);
 }
 
+/* Read the dynamic projection from the engine context that ADVANCE already
+ * owns and keeps resident. Unlike the reconstruction snapshot above, this
+ * entry does not reset DOOM_CTX, import RI2/WAD, or decode ST1. */
+int doom_engine_ex2_resource_sbf_ri2_snapshot_rsn3_live(
+    uint8_t *context, uint8_t *payload_out, unsigned long payload_cap,
+    unsigned long *payload_len_out)
+{
+    if (doom_ctx_guard(context)) return 199;
+    if (!payload_out || payload_cap < RSN3_DATA_HEADER_BYTES || !payload_len_out)
+        return RSN3_REFUSE_SNAPSHOT;
+    RI2_PHASE(804);
+    {
+        int rc = rsn3_encode_dynamic(payload_out, payload_cap, payload_len_out);
+        RI2_PHASE(805);
+        return rc;
+    }
+}
+
 static int rsn3_apply_dynamic(const uint8_t *image, size_t image_bytes)
 {
     uint32_t nsectors, nsides, ntextures, nflats, nmobj, npsprite;

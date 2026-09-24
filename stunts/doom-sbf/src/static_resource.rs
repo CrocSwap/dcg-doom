@@ -199,6 +199,17 @@ fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
     Ok((wad_hash, resource_hash))
 }
 
+/// Read the WAD and RI2 commitments from a built static-resource account.
+/// The account key and owner are checked before its header is trusted.
+pub fn snapshot_binding_hashes(
+    program: &Pubkey,
+    account: &AccountInfo,
+) -> Result<([u8; 32], [u8; 32]), ProgramError> {
+    validate_static_account(program, account, false)?;
+    let data = account.try_borrow_data()?;
+    validate_header(&data)
+}
+
 fn process_build(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     const STATIC: usize = 0;
     const RESOURCE: usize = 1;

@@ -143,11 +143,34 @@ snapshot output. It validates the SIM2 root and cursor, reconstructs the capture
 engine state once, and writes this projection. `RENDER/3` validates the
 snapshot hash, the RI2 account hash, and the reconstructed WAD digest against
 the snapshot pin, then applies the projection without
-decoding ST1. This is only the dynamic-state portion of the redesign: the
-current RENDER path still copies and parses WAD data, preflights RI2, imports
-the map graph, and rebuilds renderer tables on every call. No zero-copy static
-resource account or BUILD instruction is implemented in this result. RENDER
-also still hashes the complete RI2 account to check the snapshot pin.
+decoding ST1. The first RSN/3 implementation reconstructs the engine for each
+snapshot. The later RSR/1 path stores the imported graph, WAD cache, and
+renderer tables in a static account so RENDER can reuse them. Its BUILD
+operation is currently one transaction; RSR/1's nested C pointers still depend
+on the fixed `DOOM_CTX` account data address. The original RENDER path hashes
+the complete RI2 account when checking the snapshot's resource pin.
+
+### SNAPSHOT-LIVE/3
+
+`SNAPSHOT-LIVE/3` is a separate RSN/3 operation (operation byte 3). The
+legacy `SNAPSHOT/3`, `ADVANCE/3`, and their wire layouts remain unchanged.
+Its accounts are, in order: read-only resident context, SIM2 meta, ST1, MP1,
+the built RSR/1 static account, and the writable RSN/3 output PDA. It validates
+the published E2R checkpoint, SIM2 meta PDA and account bindings, committed
+cursor and root, state length and tic, snapshot PDA, and both RSR/1 hash
+bindings before reading the live renderer fields. The RSN/3 payload is encoded
+from the context that E2R/5 and `ADVANCE/3` already keep resident. This path
+does not reset the context, copy WAD bytes, re-import RI2, reconstruct the
+graph, or decode ST1. It still validates and hashes the bounded SIM2 state and
+mirror inputs, so its final CU remains an empirical question until a local SBF
+ProgramTest runs with a captured published context.
+
+The context, meta, ST1, MP1, and static resource accounts are read-only for
+this instruction; only the snapshot PDA is writable. That lets snapshot
+serialization take a read lock against context updates under the account
+runtime. **Open:** transaction cost, parity from an ADVANCE-produced context,
+and behavior at a relocated context data base require ProgramTest evidence.
+Source presence alone establishes no affordability or testnet claim.
 
 The current OP_INIT requests the full snapshot-account allocation in one
 system CPI. ProgramTest therefore preallocates the large snapshot account as a

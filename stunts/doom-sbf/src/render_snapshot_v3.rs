@@ -2,8 +2,9 @@
 //!
 //! RSN/3 contains no ST1 or MP1 bytes. SNAPSHOT validates the committed SIM2
 //! state, projects the renderer's dynamic inputs, and pins the source resource
-//! image. RENDER validates the RSN/3 digest and resource pin before applying
-//! the compact payload.
+//! image. SNAPSHOT-LIVE reads the same projection from an already-resident
+//! E2R/5 and ADVANCE context. RENDER validates the RSN/3 digest and resource
+//! pin before applying the compact payload.
 
 use solana_program::{
     account_info::AccountInfo,
@@ -17,13 +18,14 @@ use solana_program::{
     sysvar::Sysvar,
 };
 
-use crate::{ex2, resource_sbf, sim2};
+use crate::{ex2, resource_sbf, sim2, static_resource};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-RSN";
 pub const VERSION: u32 = 3;
 pub const OP_INIT: u8 = 0;
 pub const OP_SNAPSHOT: u8 = 1;
 pub const OP_RENDER: u8 = 2;
+pub const OP_SNAPSHOT_LIVE: u8 = 3;
 pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 192;
@@ -104,8 +106,23 @@ impl SnapshotRequest {
         encode_request(OP_SNAPSHOT, 0, self.cursor, &self.state_root)
     }
 
+    pub fn encode_live(self) -> [u8; REQUEST_BYTES] {
+        encode_request(OP_SNAPSHOT_LIVE, 0, self.cursor, &self.state_root)
+    }
+
     pub fn decode(data: &[u8]) -> Result<Self, ProgramError> {
         validate_request(data, OP_SNAPSHOT)?;
+        if data[13..16] != [0, 0, 0] {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
+        Ok(Self {
+            cursor: u32_at(data, 16),
+            state_root: data[20..52].try_into().unwrap(),
+        })
+    }
+
+    pub fn decode_live(data: &[u8]) -> Result<Self, ProgramError> {
+        validate_request(data, OP_SNAPSHOT_LIVE)?;
         if data[13..16] != [0, 0, 0] {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -453,6 +470,12 @@ unsafe extern "C" {
         payload_cap: usize,
         payload_len_out: *mut usize,
     ) -> i32;
+    fn doom_engine_ex2_resource_sbf_ri2_snapshot_rsn3_live(
+        context: *mut u8,
+        payload_out: *mut u8,
+        payload_cap: usize,
+        payload_len_out: *mut usize,
+    ) -> i32;
     fn doom_engine_ex2_resource_sbf_ri2_render_rsn3(
         context: *mut u8,
         resource: *const u8,
@@ -638,6 +661,98 @@ fn process_snapshot(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     Ok(())
 }
 
+fn process_snapshot_live(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let request = SnapshotRequest::decode_live(data)?;
+    const CONTEXT: usize = 0;
+    const META: usize = 1;
+    const STATE: usize = 2;
+    const MIRROR: usize = 3;
+    const STATIC: usize = 4;
+    const SNAPSHOT: usize = 5;
+    if accounts.len() != 6 || !distinct(accounts) || accounts.iter().any(|a| a.is_signer) {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    if !owned(
+        program,
+        &accounts[CONTEXT],
+        resource_sbf::CONTEXT_BYTES,
+        false,
+    ) || !owned(program, &accounts[META], sim2::META_BYTES, false)
+        || !owned(
+            program,
+            &accounts[STATE],
+            resource_sbf::STATE_MAX_BYTES,
+            false,
+        )
+        || !owned(
+            program,
+            &accounts[MIRROR],
+            resource_sbf::MIRROR_BYTES,
+            false,
+        )
+        || !owned(
+            program,
+            &accounts[STATIC],
+            static_resource::ACCOUNT_BYTES,
+            false,
+        )
+        || !owned(program, &accounts[SNAPSHOT], SNAPSHOT_BYTES, true)
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    sim2::validate_live_snapshot_state(
+        program,
+        &accounts[CONTEXT],
+        &accounts[META],
+        &accounts[STATE],
+        &accounts[MIRROR],
+        request.cursor,
+        &request.state_root,
+    )?;
+    let context_key = accounts[CONTEXT].key;
+    let (expected_snapshot, _) = snapshot_address(program, context_key);
+    if accounts[SNAPSHOT].key != &expected_snapshot {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    let (wad_hash, resource_hash) =
+        static_resource::snapshot_binding_hashes(program, &accounts[STATIC])?;
+
+    let state_data = accounts[STATE].try_borrow_data()?;
+    let gametic = u32_at(&state_data, 20);
+    let context_data = accounts[CONTEXT].try_borrow_data()?;
+    let mut snapshot_data = accounts[SNAPSHOT].try_borrow_mut_data()?;
+    if snapshot_data.len() != SNAPSHOT_BYTES {
+        return Err(refuse(REFUSE_SNAPSHOT));
+    }
+    if snapshot_data[..HEADER_BYTES].iter().any(|byte| *byte != 0) {
+        validate_snapshot(&snapshot_data)?;
+    }
+    let mut payload_len = 0usize;
+    #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
+    let rc = unsafe {
+        doom_engine_ex2_resource_sbf_ri2_snapshot_rsn3_live(
+            context_data.as_ptr() as *mut u8,
+            snapshot_data[HEADER_BYTES..].as_mut_ptr(),
+            MAX_PAYLOAD_BYTES,
+            &mut payload_len,
+        )
+    };
+    #[cfg(not(all(feature = "ctx-engine", target_os = "solana")))]
+    let rc: i32 = -1;
+    if rc != 0 {
+        return Err(ProgramError::Custom(rc.unsigned_abs()));
+    }
+    write_snapshot_header(
+        &mut snapshot_data,
+        request.cursor,
+        &request.state_root,
+        &wad_hash,
+        &resource_hash,
+        gametic,
+        payload_len,
+    )
+}
+
 fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let request = RenderRequest::decode(data)?;
     const SCRATCH: usize = 0;
@@ -790,6 +905,7 @@ pub fn process(
         OP_INIT => process_init(program, accounts, instruction_data),
         OP_SNAPSHOT => process_snapshot(program, accounts, instruction_data),
         OP_RENDER => process_render(program, accounts, instruction_data),
+        OP_SNAPSHOT_LIVE => process_snapshot_live(program, accounts, instruction_data),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -811,6 +927,19 @@ mod tests {
             snapshot_hash: [0x22; 32],
         };
         assert_eq!(RenderRequest::decode(&render.encode()).unwrap(), render);
+    }
+
+    #[test]
+    fn live_snapshot_request_uses_a_distinct_operation_byte() {
+        let request = SnapshotRequest {
+            cursor: 42,
+            state_root: [0x33; 32],
+        };
+        let encoded = request.encode_live();
+        assert_eq!(encoded[12], OP_SNAPSHOT_LIVE);
+        assert_eq!(SnapshotRequest::decode_live(&encoded).unwrap(), request);
+        assert!(SnapshotRequest::decode(&encoded).is_err());
+        assert!(SnapshotRequest::decode_live(&request.encode()).is_err());
     }
 
     #[test]

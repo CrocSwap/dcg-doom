@@ -923,6 +923,73 @@ pub fn snapshot_check(
     Ok(())
 }
 
+/// Validate the committed SIM2 state and the already-resident Doom context
+/// for a render snapshot. This reads the engine context produced by E2R/5 and
+/// ADVANCE; it deliberately does not reconstruct it from ST1 or WAD accounts.
+pub fn validate_live_snapshot_state(
+    program: &Pubkey,
+    context: &AccountInfo,
+    meta: &AccountInfo,
+    state: &AccountInfo,
+    mirror: &AccountInfo,
+    cursor: u32,
+    root: &[u8; 32],
+) -> ProgramResult {
+    if !owned(program, context, resource_sbf::CONTEXT_BYTES, false)
+        || !owned(program, meta, META_BYTES, false)
+        || !owned(program, state, resource_sbf::STATE_MAX_BYTES, false)
+        || !owned(program, mirror, resource_sbf::MIRROR_BYTES, false)
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let meta_data = meta.try_borrow_data()?;
+    if meta_data.len() != META_BYTES
+        || &meta_data[..8] != META_MAGIC
+        || u32_at(&meta_data, 8) != VERSION
+        || u32_at(&meta_data, 12) as usize != META_BYTES
+        || u32_at(&meta_data, 16) as usize != META_BYTES
+        || meta_data[22..24] != [0, 0]
+        || !exact_zero(&meta_data[M_RESERVED..])
+        || meta_data[M_CONTEXT..M_CONTEXT + 32] != context.key.as_ref()[..]
+        || meta_data[M_STATE..M_STATE + 32] != state.key.as_ref()[..]
+        || meta_data[M_MIRROR..M_MIRROR + 32] != mirror.key.as_ref()[..]
+    {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    check_meta_address(program, context.key, meta.key, meta_data[M_BUMP])?;
+    let checkpoint = read_checkpoint(context)?;
+    if !checkpoint_published(&checkpoint)
+        || meta_data[M_CHECKPOINT..M_CHECKPOINT + 32]
+            != checkpoint_hash(context.key, &checkpoint)
+    {
+        return Err(refuse(REFUSE_CONTEXT));
+    }
+    if u32_at(&meta_data, M_CURSOR) != cursor
+        || meta_data[M_STATE_ROOT..M_STATE_ROOT + 32] != root[..]
+    {
+        return Err(refuse(REFUSE_SNAPSHOT));
+    }
+    let state_data = state.try_borrow_data()?;
+    let state_len = state_len_checked(&state_data)?;
+    if state_len != u32_at(&meta_data, M_STATE_LEN) as usize
+        || u32_at(&state_data, 20)
+            != u32_at(&meta_data, M_FIRST_TIC)
+                .checked_add(cursor)
+                .ok_or(refuse(REFUSE_TIC))?
+    {
+        return Err(refuse(REFUSE_TIC));
+    }
+    snapshot_check(
+        &meta_data,
+        &state_data,
+        &mirror.try_borrow_data()?,
+        state.key,
+        mirror.key,
+        cursor,
+        root,
+    )
+}
+
 /// INIT binding: the context is a published E2R/5 reconstruction whose
 /// account set (all 13 keys, including STATE, MIRROR and the authority) and
 /// component commitment (including the live ST1/MP1 bytes) are exactly the
