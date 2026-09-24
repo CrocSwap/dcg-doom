@@ -149,11 +149,11 @@ fn context_from_meta(program: &Pubkey, meta: &AccountInfo) -> Result<Pubkey, Pro
     Ok(context)
 }
 
-fn initialize_account(
+fn initialize_account<'a>(
     program: &Pubkey,
-    payer: &AccountInfo,
-    snapshot: &AccountInfo,
-    system: &AccountInfo,
+    payer: &AccountInfo<'a>,
+    snapshot: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
     context: &Pubkey,
 ) -> ProgramResult {
     let (expected_snapshot, bump) = snapshot_address(program, context);
