@@ -614,7 +614,7 @@ fn process_snapshot(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         )
     };
     #[cfg(not(all(feature = "ctx-engine", target_os = "solana")))]
-    let rc = -1;
+    let rc: i32 = -1;
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
@@ -736,7 +736,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         )
     };
     #[cfg(not(all(feature = "ctx-engine", target_os = "solana")))]
-    let rc = -1;
+    let rc: i32 = -1;
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
@@ -762,16 +762,6 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     strip_data[96..128].copy_from_slice(&strip_hash);
     let _ = arena_high_water;
     Ok(())
-}
-
-#[cfg(not(all(feature = "ctx-engine", target_os = "solana")))]
-fn process_snapshot(_: &Pubkey, _: &[AccountInfo], _: &[u8]) -> ProgramResult {
-    Err(ProgramError::InvalidInstructionData)
-}
-
-#[cfg(not(all(feature = "ctx-engine", target_os = "solana")))]
-fn process_render(_: &Pubkey, _: &[AccountInfo], _: &[u8]) -> ProgramResult {
-    Err(ProgramError::InvalidInstructionData)
 }
 
 pub fn process(
