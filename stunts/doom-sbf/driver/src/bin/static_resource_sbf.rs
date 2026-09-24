@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Local SBF ProgramTest measurement for DOOM-RSR/1 BUILD and RENDER.
 //!
 //! The RSN/3 dynamic snapshot and native framebuffer are retained outputs from
