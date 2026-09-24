@@ -2,18 +2,19 @@
 
 ## Status and boundary
 
-**Implemented as a local SBF program-test instruction; render-only use remains
-open.** This is the selected
-snapshot format for the clipped mode-1 renderer. It leaves the existing
+**Implemented and measured locally; NO-GO at the configured per-transaction
+comparison.** Standalone DOOM-RSN/2 RENDER of strip 4 succeeded and matched
+the native pixels, but consumed 3,871,073 CU against a 1,400,000-CU
+comparison. This is the selected snapshot format for the clipped mode-1
+renderer. It leaves the existing
 DOOM-SIM/2 DEPOSIT, ADVANCE/3, ADVANCE/4, and SNAPSHOT/4 wires unchanged.
 SNAPSHOT/4 remains a read-side consistency check. A separately versioned
 `DOOM-RSN/2` instruction writes the render snapshot and handles
 `RENDER(strip_id)`. It supersedes the initial
-`DOOM-RSN/1` design recorded in M1335 because the implementation copies MP1
+`DOOM-RSN/1` design recorded in M1338 because the implementation copies MP1
 into the image so later render calls do not need live state accounts.
 
-The render-only transaction measurement remains a gate. The captured DEMO1
-state has a measured ST1 length of 59,604 bytes. The maximum account allocation
+The captured DEMO1 state has a measured ST1 length of 59,604 bytes. The maximum account allocation
 is 192,704 bytes: a 192-byte header, the bounded 126,976-byte ST1 image, and
 the 65,536-byte MP1 image. Both account images are copied into the snapshot;
 the ST1 and MP1 unused tails retain their canonical zero padding. This gives
@@ -106,11 +107,13 @@ The browser groups strips by `(frame_id, snapshot_hash, state_root, gametic)`
 and paints only when all eight headers match; this prevents a snapshot update
 from creating a torn frame.
 
-The target schedule is one snapshot write and eight independently submitted
-strip renders, or **9 transactions per frame (estimated)**. This remains
-conditional on every complete RENDER transaction, including snapshot hash
-verification, WAD checks/copy, engine reconstruction, scratch/account checks,
-and strip writes, measuring below the configured 1,400,000-CU comparison
-meter. The diagnostic renderer phase alone measured 752,001 CU for strip 4;
-it does not establish that bound. No live transaction limit, rent, or fee is
-claimed here.
+The designed schedule is one snapshot write and eight independently submitted
+strip renders, or **9 transactions per frame (designed)**. The measured strip
+4 RENDER consumes 3,871,073 CU, 2.76× the configured 1,400,000-CU comparison,
+so this schedule fails that comparator. Dividing the measured strip CU by the
+comparison meter gives **25 transaction equivalents/frame (estimated)** for
+eight strips plus one snapshot write, assuming ideal splitting and one-meter
+snapshot cost; the current RENDER ABI has no split operation, and a split
+renderer would add reconstruction and instruction overhead. The local bank's
+30,000,000-CU cap allowed the measured instruction to succeed; no live Fogo
+transaction limit, rent, or fee is claimed here.
