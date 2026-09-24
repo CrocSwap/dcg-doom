@@ -1255,3 +1255,282 @@ int doom_sbf_sim2_publish(
     RI2_PHASE(913);
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* DOOM-RSR/1 static renderer resource account                         */
+
+#define RSR_HEADER_BYTES 320u
+#define RSR_ROOTS_OFFSET 160u
+#define RSR_ROOT_COUNT 32u
+#define RSR_REFUSE_LAYOUT 302u
+
+static uint32_t rsr_get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void rsr_put32(uint8_t *p, uint32_t value)
+{
+    p[0] = (uint8_t)value; p[1] = (uint8_t)(value >> 8);
+    p[2] = (uint8_t)(value >> 16); p[3] = (uint8_t)(value >> 24);
+}
+
+static void rsr_put64(uint8_t *p, uint64_t value)
+{
+    unsigned i;
+    for (i = 0; i < 8; i++) p[i] = (uint8_t)(value >> (i * 8u));
+}
+
+/* These are the top-level pointer roots for the imported RI2 graph, its
+ * renderer tables, and the cached DEMO1 bytes.  The structures they reach
+ * already contain native pointers.  Those remain valid because account zero
+ * is pinned to DOOM_CTX's measured address on every BUILD/RENDER call; this
+ * directory records the account-relative root offsets and reconstructs them
+ * before each render. */
+static void *rsr_root_value(unsigned index)
+{
+    switch (index) {
+    case 0: return vertexes;
+    case 1: return sectors;
+    case 2: return sides;
+    case 3: return lines;
+    case 4: return segs;
+    case 5: return subsectors;
+    case 6: return nodes;
+    case 7: return blockmaplump;
+    case 8: return blockmap;
+    case 9: return rejectmatrix;
+    case 10: return blocklinks;
+    case 11: return textures;
+    case 12: return texturecolumnlump;
+    case 13: return texturecolumnofs;
+    case 14: return texturecomposite;
+    case 15: return texturecompositesize;
+    case 16: return textureheight;
+    case 17: return texturetranslation;
+    case 18: return texturewidthmask;
+    case 19: return flattranslation;
+    case 20: return spritewidth;
+    case 21: return spriteoffset;
+    case 22: return spritetopoffset;
+    case 23: return sprites;
+    case 24: return colormaps;
+    case 25: return translationtables;
+    case 26: return spritelights;
+    case 27: return walllights;
+    case 28: return planezlight;
+    case 29: return demobuffer;
+    case 30: return demo_p;
+    case 31: return demoend;
+    default: return 0;
+    }
+}
+
+static int rsr_root_assign(unsigned index, void *value)
+{
+    switch (index) {
+    case 0: vertexes = (vertex_t *)value; break;
+    case 1: sectors = (sector_t *)value; break;
+    case 2: sides = (side_t *)value; break;
+    case 3: lines = (line_t *)value; break;
+    case 4: segs = (seg_t *)value; break;
+    case 5: subsectors = (subsector_t *)value; break;
+    case 6: nodes = (node_t *)value; break;
+    case 7: blockmaplump = (short *)value; break;
+    case 8: blockmap = (short *)value; break;
+    case 9: rejectmatrix = (byte *)value; break;
+    case 10: blocklinks = (mobj_t **)value; break;
+    case 11: textures = (texture_t **)value; break;
+    case 12: texturecolumnlump = (short **)value; break;
+    case 13: texturecolumnofs = (unsigned short **)value; break;
+    case 14: texturecomposite = (byte **)value; break;
+    case 15: texturecompositesize = (int *)value; break;
+    case 16: textureheight = (fixed_t *)value; break;
+    case 17: texturetranslation = (int *)value; break;
+    case 18: texturewidthmask = (int *)value; break;
+    case 19: flattranslation = (int *)value; break;
+    case 20: spritewidth = (fixed_t *)value; break;
+    case 21: spriteoffset = (fixed_t *)value; break;
+    case 22: spritetopoffset = (fixed_t *)value; break;
+    case 23: sprites = (spritedef_t *)value; break;
+    case 24: colormaps = (lighttable_t *)value; break;
+    case 25: translationtables = (byte *)value; break;
+    case 26: spritelights = (lighttable_t *)value; break;
+    case 27: walllights = (lighttable_t *)value; break;
+    case 28: planezlight = (lighttable_t *)value; break;
+    case 29: demobuffer = (byte *)value; break;
+    case 30: demo_p = (byte *)value; break;
+    case 31: demoend = (byte *)value; break;
+    default: return -1;
+    }
+    return 0;
+}
+
+static int rsr_write_layout(uint8_t *context, unsigned long account_bytes,
+                            uint8_t *header, unsigned long header_bytes)
+{
+    uintptr_t base = (uintptr_t)context, end = base + account_bytes;
+    unsigned i;
+    if (!header || header_bytes != RSR_HEADER_BYTES || end < base) return -1;
+    memset(header, 0, RSR_HEADER_BYTES);
+    memcpy(header, "DOOM-RSR", 8);
+    rsr_put32(header + 8, 1u);
+    rsr_put32(header + 12, RSR_HEADER_BYTES);
+    rsr_put32(header + 40, RSR_ROOT_COUNT);
+    rsr_put64(header + 112, (uint64_t)base);
+    for (i = 0; i < RSR_ROOT_COUNT; i++) {
+        uintptr_t pointer = (uintptr_t)rsr_root_value(i);
+        uint32_t offset = 0xffffffffu;
+        if (pointer) {
+            if (pointer < base || pointer >= end || pointer - base > 0xffffffffu)
+                return -1;
+            offset = (uint32_t)(pointer - base);
+        }
+        rsr_put32(header + RSR_ROOTS_OFFSET + i * 4u, offset);
+    }
+    return 0;
+}
+
+static int rsr_rebind_layout(uint8_t *context, unsigned long account_bytes,
+                             const uint8_t *header, unsigned long header_bytes)
+{
+    uintptr_t base = (uintptr_t)context;
+    unsigned i;
+    if (!header || header_bytes != RSR_HEADER_BYTES ||
+        memcmp(header, "DOOM-RSR", 8) || rsr_get32(header + 8) != 1u ||
+        rsr_get32(header + 12) != RSR_HEADER_BYTES ||
+        rsr_get32(header + 16) != account_bytes ||
+        rsr_get32(header + 20) != sizeof(doom_ctx_t) ||
+        rsr_get32(header + 40) != RSR_ROOT_COUNT ||
+        base != (uintptr_t)DOOM_CTX) return -1;
+    for (i = 0; i < RSR_ROOT_COUNT; i++) {
+        uint32_t offset = rsr_get32(header + RSR_ROOTS_OFFSET + i * 4u);
+        void *value = 0;
+        if (offset != 0xffffffffu) {
+            if (offset >= account_bytes) return -1;
+            value = context + offset;
+        }
+        if (rsr_root_assign(i, value)) return -1;
+    }
+    return 0;
+}
+
+int doom_engine_rsn3_build_static(
+    uint8_t *context, unsigned long account_bytes,
+    const uint8_t *resource, unsigned long resource_bytes,
+    const uint8_t *wad_image, unsigned long wad_bytes,
+    uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    uint8_t *header, unsigned long header_bytes,
+    unsigned long *arena_high_water_out)
+{
+    r2_section_t sections[5];
+    r2_v2_plan_t *plan;
+    uint8_t *demo;
+    int lump, demo_len, rc;
+    if (doom_ctx_guard(context)) return 199;
+    if (!resource || resource_bytes < RI2_HEADER_BYTES || !wad_image ||
+        wad_bytes != RI2_WAD_BYTES || !bootstrap ||
+        bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !header ||
+        header_bytes != RSR_HEADER_BYTES ||
+        account_bytes < sizeof(doom_ctx_t) ||
+        ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_RESOURCE;
+    plan = (r2_v2_plan_t *)(bootstrap + bootstrap_bytes - sizeof(*plan));
+    if (((uintptr_t)plan & 15u) != 0 ||
+        r2_v2_preflight(resource, (size_t)resource_bytes, sections, plan))
+        return RI2_REFUSE_IMAGE;
+    RI2_PHASE(1001);
+
+    /* BUILD alone clears the context and creates all static renderer state.
+     * The account carries the live C structs, zone, WAD bytes, and malloc
+     * carrier at fixed offsets; later RENDER calls never repeat this setup. */
+    memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+    doom_ctx_init();
+    if (!ri2_split_arena_bytes(bootstrap_bytes) ||
+        !doom_sbf_bind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
+                             RI2_ZONE_BYTES)) return RI2_REFUSE_ARENA;
+    gamemode = shareware; gamemission = doom; language = english;
+    DOOM_CTX->deathmatch = 0; DOOM_CTX->consoleplayer = 0;
+    displayplayer = 0; myargc = 0; myargv = 0;
+    Z_Init(); P_InitThinkers();
+    W_InitAccountImage(wad_image, (int)wad_bytes);
+    if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
+                                       sections[R2_GRAPH].bytes))
+        return RI2_REFUSE_IMAGE;
+    lastanim = anims + plan->scalar[R2_SC_ANIMCOUNT];
+    numlinespecials = 0;
+    for (rc = 0; rc < DOOM_CTX->numlines && numlinespecials < MAXLINEANIMS; rc++)
+        if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
+    if (r2_walk(resource + sections[R2_SCALARS].offset,
+                sections[R2_SCALARS].bytes, sections[R2_SCALARS].count,
+                1, r2_apply_scalar, 0) ||
+        r2_v2_alloc_resources(plan) ||
+        r2_walk(resource + sections[R2_TABLES].offset,
+                sections[R2_TABLES].bytes, sections[R2_TABLES].count,
+                0, r2_v2_apply_table, 0) ||
+        r2_v2_apply_lights(plan) || r2_apply_functions(resource, sections))
+        return RI2_REFUSE_IMAGE;
+    lump = W_GetNumForName("DEMO1"); demo_len = W_LumpLength(lump);
+    if (demo_len < 17) return RI2_REFUSE_RESOURCE;
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+    if (!demo) return RI2_REFUSE_RESOURCE;
+    defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo; demoend = demo + demo_len;
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    DoomStateSetAllocationFailure(-1);
+    if (doom_sbf_arena_exhausted() ||
+        rsr_write_layout(context, account_bytes, header, header_bytes))
+        return RSR_REFUSE_LAYOUT;
+    /* RENDER validates this prefix before applying any account-relative root
+     * offsets. Rust fills the remaining authenticated descriptor fields. */
+    rsr_put32(header + 16, (uint32_t)account_bytes);
+    rsr_put32(header + 20, (uint32_t)sizeof(doom_ctx_t));
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    return 0;
+}
+
+int doom_engine_rsn3_render_static(
+    uint8_t *context, unsigned long account_bytes,
+    const uint8_t *header, unsigned long header_bytes,
+    uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    const uint8_t *payload, unsigned long payload_bytes, uint32_t strip_id,
+    uint8_t *strip_out, unsigned long strip_cap,
+    unsigned long *arena_high_water_out)
+{
+    uint8_t *frame;
+    size_t strip_bytes = 40u * 200u;
+    int rc, y, x;
+    if (doom_ctx_guard(context)) return 199;
+    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !payload ||
+        !strip_out || strip_cap != strip_bytes || strip_id >= 8u ||
+        ((uintptr_t)bootstrap & 15u) != 0 ||
+        rsr_rebind_layout(context, account_bytes, header, header_bytes))
+        return RSR_REFUSE_LAYOUT;
+    /* The first header bytes are account metadata; the remaining static
+     * bootstrap tail is re-bound as per-call transient render scratch. */
+    if (!doom_sbf_bind_arena(bootstrap, bootstrap_bytes, RI2_ZONE_BYTES))
+        return RI2_REFUSE_ARENA;
+    rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
+    if (rc) return rc;
+    frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
+    if (!frame) return RI2_REFUSE_OUTPUT;
+    screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES;
+    screens[2] = frame + 2u * RI2_FRAME_BYTES;
+    screens[3] = frame + 3u * RI2_FRAME_BYTES; screens[4] = 0;
+    viewimage = screens[0];
+    for (rc = 0; rc < viewheight; rc++) ylookup[rc] = screens[0] + (size_t)rc * 320u;
+    viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 :
+        (SCREENHEIGHT - 32 - viewheight) >> 1;
+    pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
+    pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+    clipangle = xtoviewangle[0]; viewactive = true;
+    doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
+    R_RenderPlayerView(&players[displayplayer]);
+    if (doom_sbf_arena_exhausted()) { free(frame); return RI2_REFUSE_ARENA; }
+    for (y = 0; y < 200; y++) for (x = 0; x < 40; x++)
+        strip_out[(size_t)y * 40u + (size_t)x] =
+            frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    free(frame);
+    return 0;
+}

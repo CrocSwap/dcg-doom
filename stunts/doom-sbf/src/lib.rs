@@ -31,6 +31,8 @@ pub mod sim2;
 pub mod simulation;
 #[cfg(feature = "ctx-engine")]
 pub mod stage;
+#[cfg(feature = "ctx-engine")]
+pub mod static_resource;
 
 pub const FRAME_BYTES: usize = 320 * 200;
 pub const STATE_BYTES: usize = 4_608;
@@ -165,6 +167,9 @@ pub fn transport_process_instruction(
     {
         return render_snapshot_v3::process(program_id, accounts, instruction_data);
     }
+    if instruction_data.starts_with(static_resource::MAGIC) && version == static_resource::VERSION {
+        return static_resource::process(program_id, accounts, instruction_data);
+    }
     if instruction_data.starts_with(render_snapshot::MAGIC) && version == render_snapshot::VERSION {
         return render_snapshot::process(program_id, accounts, instruction_data);
     }
@@ -219,6 +224,14 @@ pub fn process_instruction(
     #[cfg(feature = "ctx-engine")]
     if instruction_data.starts_with(CTX_MAGIC) {
         return process_ctx_probe(_program_id, accounts, instruction_data);
+    }
+    #[cfg(feature = "ctx-engine")]
+    if instruction_data.len() >= 12
+        && instruction_data.starts_with(static_resource::MAGIC)
+        && u32::from_le_bytes(instruction_data[8..12].try_into().unwrap())
+            == static_resource::VERSION
+    {
+        return static_resource::process(_program_id, accounts, instruction_data);
     }
     #[cfg(feature = "ctx-engine")]
     if instruction_data.len() >= 12
