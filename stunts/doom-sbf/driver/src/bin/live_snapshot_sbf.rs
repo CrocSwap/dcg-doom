@@ -321,11 +321,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("retained RI2 image has the wrong account size".into());
     }
     let state_capture = fs::read(capture.join("dumped-doom-st1.bin"))?;
-    let state_image = {
-        let mut bytes = vec![0; rs::STATE_MAX_BYTES];
-        bytes[..state_capture.len()].copy_from_slice(&state_capture);
-        bytes
-    };
     let mirror_capture = fs::read(capture.join("mobj_pool.bin"))?;
     let controller = fs::read(&controller_path)?;
     if controller.len() != rs::CONTROLLER_BYTES || &controller[..8] != b"DOOM-CI2" {
