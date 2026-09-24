@@ -464,6 +464,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (meta_key, bump) = sim2::meta_address(&PROGRAM, &context.pubkey());
     let static_key = rsr::static_address(&PROGRAM).0;
     let snapshot_key = rsn3::snapshot_address(&PROGRAM, &context.pubkey()).0;
+    env::set_var("BPF_OUT_DIR", image.parent().ok_or("SBF image parent")?);
+    env::set_var("SBF_OUT_DIR", image.parent().ok_or("SBF image parent")?);
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
     bank.set_compute_max_units(30_000_000);
@@ -506,8 +508,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bank.add_account(key, account(PROGRAM, vec![0; rsn3::STRIP_ACCOUNT_BYTES]));
     }
 
-    env::set_var("BPF_OUT_DIR", image.parent().ok_or("SBF image parent")?);
-    env::set_var("SBF_OUT_DIR", image.parent().ok_or("SBF image parent")?);
     let mut ctx = bank.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let staged_state = {
