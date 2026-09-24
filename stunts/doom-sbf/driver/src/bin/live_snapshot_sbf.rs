@@ -762,7 +762,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             COMPUTE_LIMIT,
         )
         .await?;
-        if units > COMPUTE_LIMIT {
+        if units > u64::from(COMPUTE_LIMIT) {
             return Err(
                 format!("BUILD cursor {cursor} used {units} CU, over {COMPUTE_LIMIT}").into(),
             );
@@ -857,7 +857,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             COMPUTE_LIMIT,
         )
         .await?;
-        if units > COMPUTE_LIMIT {
+        if units > u64::from(COMPUTE_LIMIT) {
             return Err(
                 format!("RELOCATE cursor {cursor} used {units} CU, over {COMPUTE_LIMIT}").into(),
             );
@@ -964,7 +964,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "advance_root_matches_legacy_r3":root_matches,
         "static_build_compute_units":build_units,
         "static_build_compute_units_max":build_units.iter().max(),
-        "static_build_all_transactions_under_target":build_units.iter().all(|units| *units <= COMPUTE_LIMIT),
+        "static_build_all_transactions_under_target":build_units.iter().all(|units| *units <= u64::from(COMPUTE_LIMIT)),
         "static_build_account_bytes":rsr::ACCOUNT_BYTES,
         "static_build_account_preallocated":true,
         "static_build_rent_measured":false,
@@ -980,7 +980,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "build_transaction_count":build_units.len(),
         "relocation_compute_units":relocation_units,
         "relocation_compute_units_max":relocation_units.iter().max(),
-        "relocation_all_transactions_under_target":relocation_units.iter().all(|units| *units <= COMPUTE_LIMIT),
+        "relocation_all_transactions_under_target":relocation_units.iter().all(|units| *units <= u64::from(COMPUTE_LIMIT)),
         "relocation_transaction_count":relocation_units.len(),
         "static_account_old_base_hex":format!("0x{old_base:x}"),
         "static_account_new_base_hex":format!("0x{new_base:x}"),
@@ -1017,7 +1017,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     println!(
-        "SNAPSHOT-LIVE/3 measured {snapshot_units} CU; BUILD={build_units} CU; render max={} CU; 8/8 strips byte exact; receipt={}",
+        "SNAPSHOT-LIVE/3 measured {snapshot_units} CU; BUILD={} transactions with max={} CU; render max={} CU; 8/8 strips byte exact; receipt={}",
+        build_units.len(),
+        build_units.iter().max().copied().unwrap_or(0),
         render_units.iter().max().copied().unwrap_or(0),
         receipt.display()
     );
