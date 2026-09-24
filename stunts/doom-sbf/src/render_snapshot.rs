@@ -6,15 +6,23 @@
 //! adding a read or write dependency to the live tic instruction.
 
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program_error::ProgramError,
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    hash::hashv,
+    program::{invoke, invoke_signed},
+    program_error::ProgramError,
     pubkey::Pubkey,
+    rent::Rent,
+    system_instruction, system_program,
 };
 
 use crate::{ex2, resource_sbf, sim2};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-RSN";
 pub const VERSION: u32 = 1;
+pub const OP_INIT: u8 = 0;
 pub const OP_SNAPSHOT: u8 = 1;
+pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const SNAPSHOT_SEED: &[u8] = b"DOOM-RENDER-SNAPSHOT/1";
 pub const HEADER_BYTES: usize = 192;
@@ -74,6 +82,14 @@ impl SnapshotRequest {
     }
 }
 
+pub fn encode_init() -> [u8; INIT_BYTES] {
+    let mut out = [0u8; INIT_BYTES];
+    out[..8].copy_from_slice(MAGIC);
+    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    out[12] = OP_INIT;
+    out
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotView<'a> {
     pub cursor: u32,
@@ -110,6 +126,89 @@ fn distinct(accounts: &[AccountInfo]) -> bool {
 
 fn owned(program: &Pubkey, account: &AccountInfo, bytes: usize, writable: bool) -> bool {
     account.owner == program && account.data_len() == bytes && account.is_writable == writable
+}
+
+fn context_from_meta(program: &Pubkey, meta: &AccountInfo) -> Result<Pubkey, ProgramError> {
+    if !owned(program, meta, sim2::META_BYTES, false) {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let data = meta.try_borrow_data()?;
+    if &data[..8] != b"SIM2META" || u32_at(&data, 8) != sim2::VERSION {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    let context = Pubkey::new_from_array(
+        data[sim2::M_CONTEXT..sim2::M_CONTEXT + 32]
+            .try_into()
+            .unwrap(),
+    );
+    let (expected_meta, bump) = sim2::meta_address(program, &context);
+    if meta.key != &expected_meta || data[sim2::M_BUMP] != bump {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    Ok(context)
+}
+
+fn initialize_account(
+    program: &Pubkey,
+    payer: &AccountInfo,
+    snapshot: &AccountInfo,
+    system: &AccountInfo,
+    context: &Pubkey,
+) -> ProgramResult {
+    let (expected_snapshot, bump) = snapshot_address(program, context);
+    if snapshot.key != &expected_snapshot || !snapshot.is_writable {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    if !payer.is_signer
+        || !payer.is_writable
+        || system.key != &system_program::id()
+        || snapshot.owner != &system_program::id()
+        || snapshot.data_len() != 0
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let rent_lamports = Rent::get()?.minimum_balance(SNAPSHOT_BYTES);
+    let shortfall = rent_lamports.saturating_sub(snapshot.lamports());
+    if shortfall != 0 {
+        let transfer = system_instruction::transfer(payer.key, snapshot.key, shortfall);
+        invoke(
+            &transfer,
+            &[payer.clone(), snapshot.clone(), system.clone()],
+        )?;
+    }
+    let bump_seed = [bump];
+    let signer_seeds: &[&[u8]] = &[SNAPSHOT_SEED, context.as_ref(), &bump_seed];
+    let allocate = system_instruction::allocate(snapshot.key, SNAPSHOT_BYTES as u64);
+    invoke_signed(
+        &allocate,
+        &[snapshot.clone(), system.clone()],
+        &[signer_seeds],
+    )?;
+    let assign = system_instruction::assign(snapshot.key, program);
+    invoke_signed(
+        &assign,
+        &[snapshot.clone(), system.clone()],
+        &[signer_seeds],
+    )
+}
+
+fn process_init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if data.len() != INIT_BYTES
+        || &data[..8] != MAGIC
+        || u32_at(data, 8) != VERSION
+        || data[12] != OP_INIT
+        || data[13..16] != [0, 0, 0]
+    {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    let [payer, meta, snapshot, system] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    if !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let context = context_from_meta(program, meta)?;
+    initialize_account(program, payer, snapshot, system, &context)
 }
 
 /// Hash an entire fixed-size image with its hash field treated as zero.
@@ -207,7 +306,7 @@ pub fn write_snapshot(
     Ok(())
 }
 
-pub fn process(
+fn process_snapshot(
     program: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
@@ -224,23 +323,12 @@ pub fn process(
     {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
-    let meta_data = meta.try_borrow_data()?;
-    if &meta_data[..8] != b"SIM2META" || u32_at(&meta_data, 8) != sim2::VERSION {
-        return Err(refuse(REFUSE_BINDING));
-    }
-    let context = Pubkey::new_from_array(
-        meta_data[sim2::M_CONTEXT..sim2::M_CONTEXT + 32]
-            .try_into()
-            .unwrap(),
-    );
-    let (expected_meta, meta_bump) = sim2::meta_address(program, &context);
+    let context = context_from_meta(program, meta)?;
     let (expected_snapshot, _) = snapshot_address(program, &context);
-    if meta.key != &expected_meta
-        || meta_data[sim2::M_BUMP] != meta_bump
-        || snapshot.key != &expected_snapshot
-    {
+    if snapshot.key != &expected_snapshot {
         return Err(refuse(REFUSE_BINDING));
     }
+    let meta_data = meta.try_borrow_data()?;
     let state_data = state.try_borrow_data()?;
     let mirror_data = mirror.try_borrow_data()?;
     let state_len = sim2::state_len_checked(&state_data)?;
@@ -264,6 +352,24 @@ pub fn process(
         &state_data,
         &mirror_data,
     )
+}
+
+pub fn process(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() < 13
+        || !instruction_data.starts_with(MAGIC)
+        || u32_at(instruction_data, 8) != VERSION
+    {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    match instruction_data[12] {
+        OP_INIT => process_init(program, accounts, instruction_data),
+        OP_SNAPSHOT => process_snapshot(program, accounts, instruction_data),
+        _ => Err(refuse(REFUSE_MALFORMED)),
+    }
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ mod common;
 use std::{collections::BTreeMap, env, error::Error, fs, io::Write, path::PathBuf};
 
 use common::{hex, Capture, Rng};
-use doom_sbf::{continuation_split_sbf, resource_sbf, sim2, stage};
+use doom_sbf::{continuation_split_sbf, render_snapshot, resource_sbf, sim2, stage};
 use solana_account::Account;
 use solana_banks_interface::BanksTransactionResultWithMetadata;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -323,6 +323,41 @@ impl Gate {
                 meta(self.keys.mirror.pubkey(), false, false),
             ],
             data: sim2::encode_snapshot(cursor, root),
+        }
+    }
+
+    fn render_snapshot_address(&self) -> Pubkey {
+        render_snapshot::snapshot_address(&base::PROGRAM, &self.keys.context.pubkey()).0
+    }
+
+    fn init_render_snapshot_ix(&self) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.ctx.payer.pubkey(), true, true),
+                meta(self.keys.meta, false, false),
+                meta(self.render_snapshot_address(), true, false),
+                meta(system_program::id(), false, false),
+            ],
+            data: render_snapshot::encode_init().to_vec(),
+        }
+    }
+
+    fn write_render_snapshot_ix(&self, cursor: u32, root: &[u8; 32]) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.meta, false, false),
+                meta(self.keys.state.pubkey(), false, false),
+                meta(self.keys.mirror.pubkey(), false, false),
+                meta(self.render_snapshot_address(), true, false),
+            ],
+            data: render_snapshot::SnapshotRequest {
+                cursor,
+                state_root: *root,
+            }
+            .encode()
+            .to_vec(),
         }
     }
 
@@ -1523,6 +1558,79 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "snapshot_committed_cursor".into(),
         serde_json::json!({"ok":true,"cursor":view.cursor,"cu":base::units(&result)?}),
     );
+    // DOOM-RSN/1 initialization and write are exercised on the same real
+    // SIM2 state produced by the preceding DEPOSIT/ADVANCE instructions.
+    let init_snapshot = gate.init_render_snapshot_ix();
+    let init_result = gate.send(vec![init_snapshot], &[]).await?;
+    if init_result.result.is_err() {
+        return Err(format!("render snapshot init {:?}", init_result.result).into());
+    }
+    let snapshot_key = gate.render_snapshot_address();
+    let init_lamports = gate
+        .ctx
+        .banks_client
+        .get_account(snapshot_key)
+        .await?
+        .ok_or("render snapshot PDA missing after init")?
+        .lamports;
+    let durable_before_snapshot = gate.durable().await?;
+    let write_snapshot = gate.write_render_snapshot_ix(view.cursor, &view.state_root);
+    let write_result = gate.send(vec![write_snapshot], &[]).await?;
+    if write_result.result.is_err() {
+        return Err(format!("render snapshot at committed cursor {:?}", write_result.result).into());
+    }
+    let snapshot_bytes = gate.data(snapshot_key).await?;
+    let snapshot = render_snapshot::validate_snapshot(&snapshot_bytes)?;
+    let state_bytes = gate.data(state_kp.pubkey()).await?;
+    if snapshot.cursor != view.cursor
+        || snapshot.state_root != view.state_root
+        || snapshot.state.as_ref() != &state_bytes[..snapshot.state_len]
+        || gate.durable().await? != durable_before_snapshot
+    {
+        return Err("render snapshot differs from the committed SIM2 state".into());
+    }
+    controls.insert(
+        "render_snapshot_committed_cursor".into(),
+        serde_json::json!({
+            "ok": true,
+            "cursor": snapshot.cursor,
+            "gametic": snapshot.gametic,
+            "state_len": snapshot.state_len,
+            "snapshot_bytes": snapshot_bytes.len(),
+            "snapshot_hash": hex(&snapshot.snapshot_hash),
+            "snapshot_rent_lamports": init_lamports,
+            "init_cu": base::units(&init_result)?,
+            "write_cu": base::units(&write_result)?,
+            "tic_accounts_unchanged": true
+        }),
+    );
+    let committed_snapshot = snapshot_bytes;
+    let stale_render_snapshot = gate.write_render_snapshot_ix(view.cursor - 1, &view.state_root);
+    refused(
+        &mut gate,
+        &mut controls,
+        "render_snapshot_stale_cursor",
+        sim2::REFUSE_SNAPSHOT,
+        vec![stale_render_snapshot],
+        &[],
+    )
+    .await?;
+    if gate.data(snapshot_key).await? != committed_snapshot {
+        return Err("stale render snapshot request changed the committed snapshot".into());
+    }
+    let wrong_render_snapshot = gate.write_render_snapshot_ix(view.cursor, &oracle.tics[0].state_root);
+    refused(
+        &mut gate,
+        &mut controls,
+        "render_snapshot_wrong_root",
+        sim2::REFUSE_SNAPSHOT,
+        vec![wrong_render_snapshot],
+        &[],
+    )
+    .await?;
+    if gate.data(snapshot_key).await? != committed_snapshot {
+        return Err("wrong-root render snapshot request changed the committed snapshot".into());
+    }
     let stale = gate.snapshot_ix(view.cursor - 1, &view.state_root);
     refused(
         &mut gate,
