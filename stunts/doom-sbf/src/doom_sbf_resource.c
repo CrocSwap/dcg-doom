@@ -225,18 +225,22 @@ static int e2r_import_graph(const uint8_t *image, const e2r_section_t s[RI_SECTI
     memset(no,0,nn*sizeof(*no)); memset(bm,0,nb*sizeof(*bm)); memset(rj,0,(nr?nr:1));
     memset(sl,0,(nli?nli:1)*sizeof(*sl));
     memset(bl,0,(size_t)e2r_u32(image+156)*e2r_u32(image+160)*sizeof(*bl));
+    E2R_PHASE(731); /* native arrays allocated and zeroed */
     p=image+s[RI_VERTEXES].offset; for(i=0;i<nv;i++){v[i].x=e2r_i32(p+i*8);v[i].y=e2r_i32(p+i*8+4);}
     p=image+s[RI_SIDES].offset; for(i=0;i<nsi;i++){sd[i].textureoffset=e2r_i32(p+i*20);sd[i].rowoffset=e2r_i32(p+i*20+4);sd[i].toptexture=(short)e2r_u16(p+i*20+8);sd[i].bottomtexture=(short)e2r_u16(p+i*20+10);sd[i].midtexture=(short)e2r_u16(p+i*20+12);sd[i].sector=&sc[e2r_u32(p+i*20+16)];}
     p=image+s[RI_LINES].offset; for(i=0;i<nl;i++){ln[i].v1=&v[e2r_u32(p+i*64)];ln[i].v2=&v[e2r_u32(p+i*64+4)];ln[i].dx=e2r_i32(p+i*64+8);ln[i].dy=e2r_i32(p+i*64+12);ln[i].flags=(short)e2r_u16(p+i*64+16);ln[i].special=(short)e2r_u16(p+i*64+18);ln[i].tag=(short)e2r_u16(p+i*64+20);ln[i].sidenum[0]=(short)e2r_u16(p+i*64+22);ln[i].sidenum[1]=(short)e2r_u16(p+i*64+24);for(j=0;j<4;j++)ln[i].bbox[j]=e2r_i32(p+i*64+26+j*4);ln[i].slopetype=(slopetype_t)e2r_u32(p+i*64+42);ln[i].frontsector_m=e2r_u32(p+i*64+46)==RI_NULL?0:&sc[e2r_u32(p+i*64+46)];ln[i].backsector_m=e2r_u32(p+i*64+50)==RI_NULL?0:&sc[e2r_u32(p+i*64+50)];ln[i].validcount_m=e2r_i32(p+i*64+54);}
     p=image+s[RI_SECTORS].offset; for(i=0;i<ns;i++){sc[i].floorheight=e2r_i32(p+i*64);sc[i].ceilingheight=e2r_i32(p+i*64+4);sc[i].floorpic=(short)e2r_u16(p+i*64+8);sc[i].ceilingpic=(short)e2r_u16(p+i*64+10);sc[i].lightlevel=(short)e2r_u16(p+i*64+12);sc[i].special=(short)e2r_u16(p+i*64+14);sc[i].tag=(short)e2r_u16(p+i*64+16);for(j=0;j<4;j++)sc[i].blockbox[j]=e2r_i32(p+i*64+20+j*4);sc[i].soundorg.x=e2r_i32(p+i*64+36);sc[i].soundorg.y=e2r_i32(p+i*64+40);sc[i].soundorg.z=e2r_i32(p+i*64+44);sc[i].lines_m=nli?&sl[e2r_u32(p+i*64+48)]:0;sc[i].linecount=(int)e2r_u32(p+i*64+52);}
     p=image+s[RI_SECTOR_LINES].offset; for(i=0;i<nli;i++) sl[i]=&ln[e2r_u32(p+i*4)];
+    E2R_PHASE(732); /* vertex, sector, side, line, and sector-line structs imported */
     p=image+s[RI_SEGS].offset; for(i=0;i<ng;i++){sg[i].v1=&v[e2r_u32(p+i*48)];sg[i].v2=&v[e2r_u32(p+i*48+4)];sg[i].offset=e2r_i32(p+i*48+8);sg[i].angle=e2r_u32(p+i*48+12);sg[i].sidedef_m=&sd[e2r_u32(p+i*48+16)];sg[i].linedef_m=&ln[e2r_u32(p+i*48+20)];sg[i].frontsector_m=&sc[e2r_u32(p+i*48+24)];sg[i].backsector_m=e2r_u32(p+i*48+28)==RI_NULL?0:&sc[e2r_u32(p+i*48+28)];}
     p=image+s[RI_SUBSECTORS].offset; for(i=0;i<nss;i++){ss[i].sector=&sc[e2r_u32(p+i*16)];ss[i].numlines=(short)e2r_u16(p+i*16+8);ss[i].firstline=(short)e2r_u16(p+i*16+10);}
     p=image+s[RI_NODES].offset; for(i=0;i<nn;i++){no[i].x=e2r_i32(p+i*64);no[i].y=e2r_i32(p+i*64+4);no[i].dx=e2r_i32(p+i*64+8);no[i].dy=e2r_i32(p+i*64+12);for(j=0;j<2;j++){for(unsigned k=0;k<4;k++)no[i].bbox[j][k]=e2r_i32(p+i*64+16+j*16+k*4);no[i].children[j]=e2r_u16(p+i*64+48+j*2);}}
+    E2R_PHASE(733); /* seg, subsector, and BSP-node structs imported */
     p=image+s[RI_BLOCKMAP].offset; for(i=0;i<nb;i++)bm[i]=(short)e2r_i32(p+i*4); memcpy(rj,image+s[RI_REJECT].offset,nr);
     vertexes=v; sectors=sc; sides=sd; lines=ln; segs=sg; subsectors=ss; nodes=no; blockmaplump=bm; blockmap=nb>=4?bm+4:0; rejectmatrix=rj; blocklinks=bl;
     numvertexes=(int)nv; numsectors=(int)ns; numsides=(int)nsi; DOOM_CTX->numlines=(int)nl; numsegs=(int)ng; numsubsectors=(int)nss; DOOM_CTX->numnodes=(int)nn;
     bmaporgx=(fixed_t)e2r_i32(image+164); bmaporgy=(fixed_t)e2r_i32(image+168); bmapwidth=(int)e2r_u32(image+156); bmapheight=(int)e2r_u32(image+160);
+    E2R_PHASE(734); /* blockmap, reject matrix, block links, and globals bound */
 #undef RS_ALLOC
     return 0;
 }

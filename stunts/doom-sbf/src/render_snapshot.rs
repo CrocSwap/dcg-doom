@@ -494,6 +494,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     const ACCOUNT_COUNT: usize = 9;
 
     let request = RenderRequest::decode(data)?;
+    crate::diagnostic_phase(901); // request decoded
     if request.strip_id >= 8 || accounts.len() != ACCOUNT_COUNT {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -531,6 +532,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if accounts[SCRATCH].key != &expected_scratch || accounts[STRIP].key != &expected_strip {
         return Err(refuse(REFUSE_BINDING));
     }
+    crate::diagnostic_phase(902); // account shapes and derived PDAs validated
 
     let zeroes = [0u8; 256];
     resource_sbf::validate_resource_header_ri2(
@@ -545,6 +547,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if snapshot.cursor != request.cursor || snapshot.snapshot_hash != request.snapshot_hash {
         return Err(refuse(REFUSE_BINDING));
     }
+    crate::diagnostic_phase(903); // RI2, five WAD accounts, and RSN hash/root validated
 
     let mut scratch_data = accounts[SCRATCH].try_borrow_mut_data()?;
     let wad_end = resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES;
@@ -565,6 +568,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if wad_cursor != wad_end {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
+    crate::diagnostic_phase(904); // WAD account payloads copied into scratch image
 
     let resource_data = accounts[RESOURCE].try_borrow_data()?;
     let mut strip_data = accounts[STRIP].try_borrow_mut_data()?;
@@ -597,6 +601,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if rc != 0 {
         return Err(ProgramError::Custom(rc as u32));
     }
+    crate::diagnostic_phase(905); // C engine setup, decode, draw, and strip extraction complete
 
     strip_data[..STRIP_HEADER_BYTES].fill(0);
     strip_data[..8].copy_from_slice(b"DOOM-RS1");
@@ -618,6 +623,7 @@ fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     ])
     .to_bytes();
     strip_data[96..128].copy_from_slice(&strip_hash);
+    crate::diagnostic_phase(906); // strip header and commitment written
     let _ = arena_high_water;
     Ok(())
 }

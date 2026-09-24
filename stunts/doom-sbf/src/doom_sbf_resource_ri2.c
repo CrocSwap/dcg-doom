@@ -387,16 +387,20 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
     displayplayer = 0; myargc = 0; myargv = 0;
     Z_Init();
     P_InitThinkers();
+    RI2_PHASE(710); /* context, zone, and thinkers initialized */
     W_InitAccountImage(wad_image, (int)wad_bytes);
+    RI2_PHASE(711); /* WAD directory parsed and account image bound */
     lump = W_GetNumForName("DEMO1");
     demo_len = W_LumpLength(lump);
     if (demo_len < 17) return RI2_REFUSE_RESOURCE;
+    RI2_PHASE(712); /* demo lump looked up */
     demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
     defdemoname = "DEMO1";
     demobuffer = demo;
     demo_p = demo;
     demoend = demo + demo_len;
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    RI2_PHASE(713); /* demo cache and captured bounds initialized */
     if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
                                        sections[R2_GRAPH].bytes))
         return RI2_REFUSE_IMAGE;
@@ -406,13 +410,19 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
         if (lines[rc].special == 48) linespeciallist[numlinespecials++] = &lines[rc];
     if (r2_walk(resource + sections[R2_SCALARS].offset,
                 sections[R2_SCALARS].bytes, sections[R2_SCALARS].count,
-                1, r2_apply_scalar, 0) ||
-        r2_v2_alloc_resources(plan) ||
-        r2_walk(resource + sections[R2_TABLES].offset,
-                sections[R2_TABLES].bytes, sections[R2_TABLES].count,
-                0, r2_v2_apply_table, 0) ||
-        r2_v2_apply_lights(plan) || r2_apply_functions(resource, sections))
+                1, r2_apply_scalar, 0))
         return RI2_REFUSE_IMAGE;
+    RI2_PHASE(741); /* scalar level and renderer globals imported */
+    if (r2_v2_alloc_resources(plan)) return RI2_REFUSE_IMAGE;
+    RI2_PHASE(7427); /* texture, patch, sprite, and colormap resources allocated */
+    if (r2_walk(resource + sections[R2_TABLES].offset,
+                sections[R2_TABLES].bytes, sections[R2_TABLES].count,
+                0, r2_v2_apply_table, 0))
+        return RI2_REFUSE_IMAGE;
+    RI2_PHASE(743); /* remaining renderer lookup tables imported */
+    if (r2_v2_apply_lights(plan) || r2_apply_functions(resource, sections))
+        return RI2_REFUSE_IMAGE;
+    RI2_PHASE(744); /* light selectors and function relocations applied */
     RI2_PHASE(702);
 
     frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
@@ -430,10 +440,12 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
     setsizeneeded = false;
+    RI2_PHASE(750); /* frame surfaces and initial view bases prepared */
     DoomStateSetAllocationFailure(-1);
     if (DoomStateDecode(state, (size_t)state_len)) {
         free(frame); return RI2_REFUSE_STATE;
     }
+    RI2_PHASE(760); /* committed ST1 decoded into mutable engine structs */
     viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
     viewwindowy = scaledviewwidth == SCREENWIDTH ? 0 :
         (SCREENHEIGHT - 32 - viewheight) >> 1;
@@ -441,9 +453,10 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
     setsizeneeded = false;
+    RI2_PHASE(770); /* per-frame view bases rebuilt from decoded state */
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
     R_RenderPlayerView(&players[displayplayer]);
-    RI2_PHASE(703);
+    RI2_PHASE(780); /* draw completed */
     if (doom_sbf_arena_exhausted()) {
         free(frame); return RI2_REFUSE_ARENA;
     }
@@ -451,6 +464,7 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
         for (x = 0; x < 40; x++)
             strip_out[(size_t)y * 40u + (size_t)x] =
                 frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
+    RI2_PHASE(790); /* requested 40x200 pixel strip extracted */
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     RI2_PHASE(704);
     free(frame);

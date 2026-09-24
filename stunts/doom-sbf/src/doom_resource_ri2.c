@@ -27,6 +27,13 @@
 #include "doom_state.h"
 #include "doom_controller.h"
 
+#ifdef DOOM_SBF_PHASE_PROFILE
+extern void doom_sbf_phase_marker(unsigned long phase);
+#define R2_PHASE(phase) doom_sbf_phase_marker((unsigned long)(phase))
+#else
+#define R2_PHASE(phase) ((void)0)
+#endif
+
 extern int doom_engine_ex2_make_wad(
     const unsigned char *const accounts[5], const unsigned long lens[5],
     uint8_t **out, size_t *out_bytes, uint8_t hash[32]);
@@ -1149,6 +1156,7 @@ static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
                    !texturecompositesize || !textureheight || !texturetranslation || !texturewidthmask)) ||
         !flattranslation || (lumps && (!spritewidth || !spriteoffset || !spritetopoffset)) ||
         (sprites_count && !sprites) || !blocklinks) return -1;
+    R2_PHASE(7421); /* engine pointer arrays and per-map blocks allocated */
 
     raw = r2_v2_zalloc((size_t)plan->table_bytes[R2_T_COLORMAPS] + 255u);
     if (!raw) return -1;
@@ -1156,6 +1164,7 @@ static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
     raw = r2_v2_zalloc(256u * 3u + 255u);
     if (!raw) return -1;
     translationtables = (byte *)(((uintptr_t)raw + 255u) & ~(uintptr_t)255u);
+    R2_PHASE(7422); /* colormap and translation storage allocated */
 
     p = plan->table[R2_T_TEXTUREDEFS]; n = plan->table_bytes[R2_T_TEXTUREDEFS];
     if (r2_v2_parse_count(p, n, (uint32_t)count, &at)) return -1;
@@ -1176,6 +1185,7 @@ static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
         }
     }
     if (at != n) return -1;
+    R2_PHASE(7423); /* texture definitions and patch references reconstructed */
     for (j = 0; j < 2; j++) {
         uint32_t id = j ? R2_T_TEXTURECOLUMNOFS : R2_T_TEXTURECOLUMNLUMP;
         p = plan->table[id]; n = plan->table_bytes[id];
@@ -1190,6 +1200,7 @@ static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
         }
         if (at != n) return -1;
     }
+    R2_PHASE(7424); /* texture column lookup arrays copied */
     p = plan->table[R2_T_TEXTURECOMPOSITEBYTES]; n = plan->table_bytes[R2_T_TEXTURECOMPOSITEBYTES];
     if (r2_v2_parse_count(p, n, (uint32_t)count, &at)) return -1;
     for (i = 0; i < count; i++) { bytes = r2_u32(p + at); at += 4u; if (bytes) {
@@ -1197,6 +1208,7 @@ static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
         memcpy(texturecomposite[i], p + at, bytes);
     } at += bytes; }
     if (at != n) return -1;
+    R2_PHASE(7425); /* texture composites and patch cache bytes copied */
     p = plan->table[R2_T_SPRITEDEFS]; n = plan->table_bytes[R2_T_SPRITEDEFS];
     if (r2_v2_parse_count(p, n, (uint32_t)sprites_count, &at)) return -1;
     for (i = 0; i < sprites_count; i++) {
@@ -1209,6 +1221,7 @@ static int r2_v2_alloc_resources(const r2_v2_plan_t *plan)
         }
     }
     if (at != n) return -1;
+    R2_PHASE(7426); /* sprite definitions and frame caches reconstructed */
     memcpy(colormaps, plan->table[R2_T_COLORMAPS], plan->table_bytes[R2_T_COLORMAPS]);
     memcpy(translationtables, plan->table[R2_T_TRANSLATIONTABLEBYTES], 256u * 3u);
     return 0;
