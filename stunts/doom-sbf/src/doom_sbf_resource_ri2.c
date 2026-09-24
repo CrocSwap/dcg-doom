@@ -1498,6 +1498,7 @@ int doom_engine_rsn3_render_static(
 {
     uint8_t *frame;
     size_t strip_bytes = 40u * 200u;
+    unsigned long transient_mark;
     int rc, y, x;
     if (doom_ctx_guard(context)) return 199;
     if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !payload ||
@@ -1512,6 +1513,7 @@ int doom_engine_rsn3_render_static(
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
                                RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
+    transient_mark = doom_sbf_arena_mark();
     rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
     if (rc) return rc;
     frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
@@ -1529,11 +1531,16 @@ int doom_engine_rsn3_render_static(
     clipangle = xtoviewangle[0]; viewactive = true;
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
     R_RenderPlayerView(&players[displayplayer]);
-    if (doom_sbf_arena_exhausted()) { free(frame); return RI2_REFUSE_ARENA; }
+    if (doom_sbf_arena_exhausted()) {
+        free(frame);
+        (void)doom_sbf_arena_rewind(transient_mark);
+        return RI2_REFUSE_ARENA;
+    }
     for (y = 0; y < 200; y++) for (x = 0; x < 40; x++)
         strip_out[(size_t)y * 40u + (size_t)x] =
             frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     free(frame);
+    if (!doom_sbf_arena_rewind(transient_mark)) return RI2_REFUSE_ARENA;
     return 0;
 }
