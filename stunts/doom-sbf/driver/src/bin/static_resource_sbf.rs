@@ -307,6 +307,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("BUILD readback did not contain a valid static resource header".into());
     }
     let static_account_sha_after_build = sha(&built.data);
+    fs::write(
+        receipt.join("static-resource-account-after-build.bin"),
+        &built.data,
+    )?;
     let build_high_water = u32_at(&built.data, rsr::HEADER_OFFSET + 152);
     let header_roots = &built.data[rsr::HEADER_OFFSET + rsr::ROOTS_OFFSET
         ..rsr::HEADER_OFFSET + rsr::ROOTS_OFFSET + rsr::ROOT_BYTES];

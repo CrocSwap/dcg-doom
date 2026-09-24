@@ -1505,9 +1505,12 @@ int doom_engine_rsn3_render_static(
         ((uintptr_t)bootstrap & 15u) != 0 ||
         rsr_rebind_layout(context, account_bytes, header, header_bytes))
         return RSR_REFUSE_LAYOUT;
-    /* The first header bytes are account metadata; the remaining static
-     * bootstrap tail is re-bound as per-call transient render scratch. */
-    if (!doom_sbf_bind_arena(bootstrap, bootstrap_bytes, RI2_ZONE_BYTES))
+    /* BUILD leaves cached lump metadata and renderer tables at the front of
+     * this carrier.  Preserve its allocation cursor so the per-frame mobj
+     * and framebuffer allocations cannot overwrite those static resources. */
+    if (!ri2_split_arena_bytes(bootstrap_bytes) ||
+        !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
+                               RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
     rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
     if (rc) return rc;
