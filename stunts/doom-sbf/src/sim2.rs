@@ -1368,6 +1368,8 @@ fn process_grow_buffer(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
 /// Extend an initialized SIM2 input buffer without replacing its session.
 /// The capacity and account length change atomically, and one instruction may
 /// add at most the runtime's 10,240-byte account-growth limit.
+#[cold]
+#[inline(never)]
 fn process_extend_capacity(
     program: &Pubkey,
     accounts: &[AccountInfo],
