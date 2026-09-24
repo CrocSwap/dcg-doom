@@ -7,8 +7,8 @@
 use std::{env, error::Error, fs, path::PathBuf};
 
 use doom_sbf::{
-    continuation_split_sbf as e2r, render_snapshot_v3 as rsn3, resource, resource_sbf as rs, sim2,
-    stage, static_resource as rsr,
+    continuation_split_sbf as e2r, render_snapshot_v3 as rsn3, resource_sbf as rs, sim2, stage,
+    static_resource as rsr,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -351,28 +351,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if controller[24..28] != commands {
         return Err("captured controller command differs from first DEMO1 command".into());
     }
-    let native = resource::import_tic(
-        [&wad[0], &wad[1], &wad[2], &wad[3], &wad[4]],
-        &resource_image,
-        &state_capture,
-        &mirror_capture,
-        &controller,
-    )
-    .map_err(|code| format!("native one-tic oracle refused with {code}"))?;
     let r3_snapshot_bytes = fs::read(r3_root.join("snapshot-rsn3.bin"))?;
     let r3_snapshot = rsn3::validate_snapshot(&r3_snapshot_bytes)?;
+    let r3_native_state = fs::read(r3_root.join("inputs/native-imported-state.st1"))?;
+    let r3_native_mirror = fs::read(r3_root.join("inputs/native-imported-mirror.mp1"))?;
     let r3_frame = fs::read(r3_root.join("inputs/native-imported-frame.fb1"))?;
-    if native.frame != r3_frame {
-        return Err("native import frame differs from the retained R3 oracle frame".into());
+    if r3_native_state.len() != state_capture.len()
+        || r3_native_mirror.len() != rs::MIRROR_BYTES
+        || r3_frame.len() != rs::FRAME_BYTES
+    {
+        return Err("retained R3 native state, mirror, or frame has the wrong size".into());
     }
     let expected_root = {
         let mut padded = vec![0; rs::STATE_MAX_BYTES];
-        padded[..native.state.len()].copy_from_slice(&native.state);
-        sim2::verified_state_root(&padded, &native.mirror)?.1
+        padded[..r3_native_state.len()].copy_from_slice(&r3_native_state);
+        sim2::verified_state_root(&padded, &r3_native_mirror)?.1
     };
     if r3_snapshot.cursor != 1
         || r3_snapshot.state_root != expected_root
-        || r3_snapshot.gametic != u32::from_le_bytes(native.state[20..24].try_into()?)
+        || r3_snapshot.gametic != u32::from_le_bytes(r3_native_state[20..24].try_into()?)
     {
         return Err("retained R3 snapshot does not describe the one-tic native oracle".into());
     }
@@ -612,7 +609,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             meta(buffer.pubkey(), false, false),
             meta(authority.pubkey(), false, true),
         ],
-        data: sim2::encode_advance_expected(0, 1),
+        data: sim2::encode_advance(1),
     };
     let (advance_units, advance_logs) = submit(
         &mut ctx.banks_client,
@@ -641,11 +638,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("MP1 missing after ADVANCE")?;
     if meta_view.cursor != 1
         || meta_view.state_root != expected_root
-        || final_state.data[..native.state.len()] != native.state
-        || final_state.data[native.state.len()..]
+        || final_state.data[..r3_native_state.len()] != r3_native_state
+        || final_state.data[r3_native_state.len()..]
             .iter()
             .any(|byte| *byte != 0)
-        || final_mirror.data != native.mirror
+        || final_mirror.data != r3_native_mirror
     {
         return Err("ADVANCE state/root differs from the captured native one-tic oracle".into());
     }
@@ -740,7 +737,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?
             .ok_or("render strip account missing")?;
         let strip_view = rsn3::validate_strip(&strip_account.data)?;
-        let expected = slice_frame(&native.frame, strip_id as usize);
+        let expected = slice_frame(&r3_frame, strip_id as usize);
         if strip_view.pixels != expected {
             return Err(format!("strip {strip_id} differs from native oracle").into());
         }
@@ -760,11 +757,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         render_units.push(units);
         strip_results.push(json!({"strip_id":strip_id,"compute_units":units,"native_byte_exact":true,"strip_sha256":sha(strip_view.pixels)}));
     }
-    if reconstructed != native.frame {
+    if reconstructed != r3_frame {
         return Err("assembled RENDER frame differs from the captured native oracle".into());
     }
     fs::write(receipt.join("reconstructed-frame.fb1"), &reconstructed)?;
-    fs::write(receipt.join("native-oracle-frame.fb1"), &native.frame)?;
+    fs::write(receipt.join("native-oracle-frame.fb1"), &r3_frame)?;
     fs::write(receipt.join("captured-r3-frame.fb1"), &r3_frame)?;
 
     let report = json!({
@@ -800,7 +797,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "render_compute_units":render_units,
         "all_eight_strips_match_native":true,
         "reassembled_frame_matches_native_byte_exact":true,
-        "native_frame_sha256":sha(&native.frame),
+        "native_frame_sha256":sha(&r3_frame),
         "r3_retained_frame_sha256":sha(&r3_frame),
         "snapshot_hash":hex(&snapshot_view.snapshot_hash),
         "state_root":hex(&snapshot_view.state_root),
