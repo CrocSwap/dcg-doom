@@ -27,7 +27,8 @@ pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const SNAPSHOT_SEED: &[u8] = b"DOOM-RENDER-SNAPSHOT/1";
 pub const HEADER_BYTES: usize = 192;
-pub const SNAPSHOT_BYTES: usize = HEADER_BYTES + resource_sbf::STATE_MAX_BYTES;
+pub const SNAPSHOT_BYTES: usize =
+    HEADER_BYTES + resource_sbf::STATE_MAX_BYTES + resource_sbf::MIRROR_BYTES;
 pub const HASH_DOMAIN: &[u8] = b"DOOM-RENDER-SNAPSHOT/1\0";
 pub const ABI_DESCRIPTOR: &str = ex2::RENDER_SNAPSHOT_ABI_DESCRIPTOR;
 pub const ABI_ID: [u8; 32] = ex2::RENDER_SNAPSHOT_ABI_ID;
@@ -44,6 +45,7 @@ const H_RESOURCE_ABI_ID: usize = 96;
 const H_SNAPSHOT_HASH: usize = 128;
 const H_RESERVED: usize = 160;
 const H_ST1: usize = HEADER_BYTES;
+const H_MP1: usize = H_ST1 + resource_sbf::STATE_MAX_BYTES;
 
 pub const REFUSE_MALFORMED: u32 = 287;
 pub const REFUSE_ACCOUNTS: u32 = 288;
@@ -101,6 +103,7 @@ pub struct SnapshotView<'a> {
     pub resource_abi_id: [u8; 32],
     pub snapshot_hash: [u8; 32],
     pub state: &'a [u8],
+    pub mirror: &'a [u8],
 }
 
 pub fn snapshot_address(program: &Pubkey, context: &Pubkey) -> (Pubkey, u8) {
@@ -242,17 +245,21 @@ pub fn validate_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> 
     if !(64..=resource_sbf::STATE_MAX_BYTES).contains(&state_len) {
         return Err(refuse(REFUSE_SNAPSHOT));
     }
-    let state = &data[H_ST1..H_ST1 + state_len];
-    let padded_state = &data[H_ST1..];
+    let padded_state = &data[H_ST1..H_MP1];
+    let state = &padded_state[..state_len];
+    let mirror = &data[H_MP1..];
     if &state[..8] != b"DOOM-ST1"
         || u32_at(state, 8) != 0
         || u32_at(state, 12) != 64
         || u32_at(state, 16) as usize != state_len
         || u32_at(state, 20) != u32_at(data, H_GAMETIC)
         || state[32..64] != data[H_WAD_HASH..H_WAD_HASH + 32]
-        || padded_state[state_len..].iter().any(|&byte| byte != 0)
         || data[H_RESOURCE_ABI_ID..H_SNAPSHOT_HASH] != ABI_ID
     {
+        return Err(refuse(REFUSE_SNAPSHOT));
+    }
+    let (_, root) = sim2::verified_state_root(padded_state, mirror)?;
+    if root != data[H_STATE_ROOT..H_WAD_HASH] {
         return Err(refuse(REFUSE_SNAPSHOT));
     }
     let expected_hash = image_hash(data)?;
@@ -268,6 +275,7 @@ pub fn validate_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> 
         resource_abi_id: data[H_RESOURCE_ABI_ID..H_SNAPSHOT_HASH].try_into().unwrap(),
         snapshot_hash: data[H_SNAPSHOT_HASH..H_RESERVED].try_into().unwrap(),
         state,
+        mirror,
     })
 }
 
@@ -301,7 +309,8 @@ pub fn write_snapshot(
     out[H_STATE_ROOT..H_WAD_HASH].copy_from_slice(state_root);
     out[H_WAD_HASH..H_RESOURCE_ABI_ID].copy_from_slice(&mirror[36..68]);
     out[H_RESOURCE_ABI_ID..H_SNAPSHOT_HASH].copy_from_slice(&ABI_ID);
-    out[H_ST1..H_ST1 + state_len].copy_from_slice(&state[..state_len]);
+    out[H_ST1..H_MP1].copy_from_slice(state);
+    out[H_MP1..].copy_from_slice(mirror);
     let digest = image_hash(out)?;
     out[H_SNAPSHOT_HASH..H_RESERVED].copy_from_slice(&digest);
     Ok(())
@@ -390,8 +399,11 @@ mod tests {
 
     #[test]
     fn snapshot_account_layout_is_bounded_crafted_fixture() {
-        assert_eq!(SNAPSHOT_BYTES, 127_168);
-        assert_eq!(HEADER_BYTES + resource_sbf::STATE_MAX_BYTES, SNAPSHOT_BYTES);
+        assert_eq!(SNAPSHOT_BYTES, 192_704);
+        assert_eq!(
+            HEADER_BYTES + resource_sbf::STATE_MAX_BYTES + resource_sbf::MIRROR_BYTES,
+            SNAPSHOT_BYTES
+        );
     }
 
     #[test]
@@ -418,7 +430,7 @@ mod tests {
         mirror[36..68].copy_from_slice(&wad_hash);
 
         let mut snapshot = vec![0; SNAPSHOT_BYTES];
-        let root = [0x37; 32];
+        let (_, root) = sim2::verified_state_root(&state, &mirror).unwrap();
         write_snapshot(&mut snapshot, 91, &root, &state, &mirror).unwrap();
         let view = validate_snapshot(&snapshot).unwrap();
         assert_eq!(view.cursor, 91);
@@ -427,5 +439,6 @@ mod tests {
         assert_eq!(view.state_root, root);
         assert_eq!(view.wad_hash, wad_hash);
         assert_eq!(view.state, &state[..64]);
+        assert_eq!(view.mirror, mirror);
     }
 }

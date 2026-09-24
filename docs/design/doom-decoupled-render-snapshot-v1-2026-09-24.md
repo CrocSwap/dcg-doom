@@ -2,34 +2,34 @@
 
 ## Status and boundary
 
-**Designed; not implemented or measured on chain.** This is the selected
+**Implemented as a local SBF program-test instruction; render-only use remains
+open.** This is the selected
 snapshot format for the clipped mode-1 renderer. It leaves the existing
 DOOM-SIM/2 DEPOSIT, ADVANCE/3, ADVANCE/4, and SNAPSHOT/4 wires unchanged.
 SNAPSHOT/4 remains a read-side consistency check. A separately versioned
 `DOOM-RSN/1` instruction writes the render snapshot.
 
-The design is gated on a render-only transaction measurement. The captured
-DEMO1 state has a measured ST1 length of 59,604 bytes. The maximum account
-allocation is 127,168 bytes: a 192-byte header and the bounded 126,976-byte
-ST1 image, with zero padding. The retained MP1 is read and verified while
-writing the snapshot, but is not copied: the existing C consumer rehydrates
-renderer state through `DoomStateDecode(ST1)` and uses MP1 as a mirror/root
-check. That boundary must be confirmed by the new render-only entry point.
+The render-only transaction measurement remains a gate. The captured DEMO1
+state has a measured ST1 length of 59,604 bytes. The maximum account allocation
+is 192,704 bytes: a 192-byte header, the bounded 126,976-byte ST1 image, and
+the 65,536-byte MP1 image. Both account images are copied into the snapshot;
+the ST1 and MP1 unused tails retain their canonical zero padding. This gives
+the future renderer the actor mirror bound by the committed SIM2 state root.
 
 ## Snapshot account
 
 One program-owned PDA per game context is derived with seeds
-`[b"DOOM-RENDER-SNAPSHOT/1", context_pubkey]`. Provision it at exactly 127,168
+`[b"DOOM-RENDER-SNAPSHOT/1", context_pubkey]`. Provision it at exactly 192,704
 data bytes before use. The account is reused for later snapshots. All integers
-are unsigned little-endian; all reserved bytes and the unused ST1 tail are
-zero.
+are unsigned little-endian; all reserved bytes and the unused ST1 and MP1 tails
+are zero.
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 8 | magic `DOOM-RSN` |
 | 8 | 4 | version `1` |
 | 12 | 4 | header bytes `192` |
-| 16 | 4 | total account bytes `127168` |
+| 16 | 4 | total account bytes `192704` |
 | 20 | 4 | SIM2 committed cursor; frame id |
 | 24 | 4 | ST1 gametic copied from offset 20 of ST1 |
 | 28 | 4 | used ST1 length, range 64–126,976 |
@@ -39,20 +39,24 @@ zero.
 | 128 | 32 | snapshot hash |
 | 160 | 32 | reserved zero |
 | 192 | 126,976 | ST1 image followed by zero padding |
+| 127,168 | 65,536 | complete MP1 account image, including zero padding |
 
 The snapshot hash is
 `SHA256("DOOM-RENDER-SNAPSHOT/1\\0" || header[0..128] || zero32 ||
-header[160..192] || padded_ST1)`. The writer validates the current SIM2
+header[160..192] || padded_ST1 || MP1)`. The writer validates the current SIM2
 meta/state/mirror binding and cursor/root with the existing `snapshot_check`,
-checks the render snapshot PDA, validates ST1 and MP1 shapes, and requires the
-WAD digest to equal the renderer's pinned WAD. It writes the complete header
-and padded ST1 only after all checks pass.
+checks the render snapshot PDA, validates ST1 and MP1 shapes, and copies both
+account images. The renderer must separately compare the snapshot WAD digest
+with the static RI2 resource's pinned WAD before rendering.
 
 `DOOM-RSN/1` takes read locks on meta, ST1, and MP1, and a write lock on the
 snapshot. ADVANCE never reads or writes the snapshot. Snapshot and ADVANCE
 therefore serialize only through the existing meta/state/mirror accounts; no
 new dependency is added to the tic path. RENDER reads only the snapshot and
-static resource/WAD accounts, so ADVANCE does not wait on rendering.
+static resource/WAD accounts, so ADVANCE does not wait on rendering. The
+program-test path initializes the PDA through a payer-funded system CPI and
+then writes it from the committed SIM2 accounts; its measured transaction CU
+and rent are not yet recorded.
 
 ## RENDER and strip publication contract
 
