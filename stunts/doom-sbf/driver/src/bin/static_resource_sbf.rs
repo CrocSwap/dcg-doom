@@ -180,7 +180,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let image = PathBuf::from(
         args.next()
-            .ok_or("usage: static_resource_sbf IMAGE SOURCE_MANIFEST R3_RECEIPT_DIR RECEIPT_DIR")?,
+            .ok_or("usage: static_resource_sbf IMAGE SOURCE_MANIFEST R3_RECEIPT_DIR RECEIPT_DIR (local SBF ProgramTest; pinned-base RSR/2; each BUILD transaction uses a 1,400,000-CU limit)")?,
     );
     let manifest = PathBuf::from(args.next().ok_or("missing source manifest")?);
     let r3_root = PathBuf::from(args.next().ok_or("missing R3 receipt root")?);

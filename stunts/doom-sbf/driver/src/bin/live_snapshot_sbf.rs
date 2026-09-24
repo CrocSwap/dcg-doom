@@ -155,6 +155,44 @@ async fn submit(
     Ok((units, logs))
 }
 
+async fn submit_expect_custom(
+    banks: &mut BanksClient,
+    payer: &solana_keypair::Keypair,
+    instruction: Instruction,
+    limit: u32,
+    expected_code: u32,
+) -> Result<(u64, String), Box<dyn Error>> {
+    let blockhash = banks.get_latest_blockhash().await?;
+    let instructions = [
+        ComputeBudgetInstruction::set_compute_unit_limit(limit),
+        instruction,
+    ];
+    let tx = Transaction::new(
+        &[payer],
+        Message::new_with_blockhash(&instructions, Some(&payer.pubkey()), &blockhash),
+        blockhash,
+    );
+    let result = banks.process_transaction_with_metadata(tx).await?;
+    let logs = result
+        .metadata
+        .as_ref()
+        .map_or_else(String::new, |metadata| metadata.log_messages.join("\n"));
+    let Some(error) = result.result.err() else {
+        return Err(
+            format!("expected Custom({expected_code}) refusal, transaction succeeded").into(),
+        );
+    };
+    if !format!("{error:?}").contains(&format!("Custom({expected_code})")) {
+        return Err(format!("expected Custom({expected_code}), got {error:?}\n{logs}").into());
+    }
+    let units = result
+        .metadata
+        .as_ref()
+        .ok_or("ProgramTest omitted refusal transaction metadata")?
+        .compute_units_consumed;
+    Ok((units, logs))
+}
+
 async fn stage_account(
     ctx: &mut ProgramTestContext,
     payer: &solana_keypair::Keypair,
@@ -326,7 +364,7 @@ fn render_instruction(
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let image = PathBuf::from(args.next().ok_or(
-        "usage: live_snapshot_sbf IMAGE MANIFEST CAPTURE RESOURCE CONTROLLER R3_RECEIPT RECEIPT",
+        "usage: live_snapshot_sbf IMAGE MANIFEST CAPTURE RESOURCE CONTROLLER R3_RECEIPT RECEIPT (local SBF ProgramTest; pinned-base RSR/2 keeps the static account at ordinal zero; each BUILD transaction uses a 1,400,000-CU limit)",
     )?);
     let manifest = PathBuf::from(args.next().ok_or("missing SBF source manifest")?);
     let capture = PathBuf::from(args.next().ok_or("missing retained capture directory")?);
@@ -510,6 +548,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut ctx = bank.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
+    let (out_of_order_build_units, refusal_logs) = submit_expect_custom(
+        &mut ctx.banks_client,
+        &payer,
+        build_instruction(static_key, 1),
+        COMPUTE_LIMIT,
+        rsr::REFUSE_BUILT,
+    )
+    .await?;
+    fs::write(receipt.join("out-of-order-build-refusal.log"), refusal_logs)?;
+    let untouched_static = ctx
+        .banks_client
+        .get_account(static_key)
+        .await?
+        .ok_or("static resource account missing after refusal control")?;
+    if untouched_static.data.iter().any(|byte| *byte != 0) {
+        return Err("out-of-order BUILD refusal changed the static account".into());
+    }
+    fs::write(
+        receipt.join("out-of-order-build-refusal.json"),
+        serde_json::to_vec_pretty(&json!({
+            "cursor":1,
+            "expected_custom_code":rsr::REFUSE_BUILT,
+            "compute_units":out_of_order_build_units,
+            "account_unchanged":true
+        }))?,
+    )?;
     let staged_state = {
         let mut bytes = vec![0; rs::STATE_MAX_BYTES];
         bytes[..state_capture.len()].copy_from_slice(&state_capture);
@@ -923,6 +987,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "deposit_compute_units":deposit_units,
         "stage_transactions":{"state":stage_state,"mirror":stage_mirror,"controller":stage_controller},
         "build_transaction_count":build_units.len(),
+        "out_of_order_build_refused_without_mutation":true,
         "static_account_context_base_hex":format!("0x{static_context_base:x}"),
         "static_account_relocatable":false,
         "relocation_boundary":"not implemented: SBF loader rejects writable .bss, so the account must remain at ordinal zero and the pinned DOOM_CTX base",
