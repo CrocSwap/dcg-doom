@@ -22,7 +22,6 @@ pub const OP_RENDER: u8 = 2;
 pub const OP_SNAPSHOT_LIVE: u8 = 3;
 pub const OP_GROW: u8 = 4;
 pub const OP_INIT_STRIP: u8 = 5;
-pub const OP_SNAPSHOT_LIVE_LATEST: u8 = 6;
 pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 192;
@@ -127,21 +126,6 @@ impl SnapshotRequest {
         Ok(Self {
             cursor: u32_at(data, 16),
             state_root: data[20..52].try_into().unwrap(),
-        })
-    }
-
-    pub fn encode_live_latest() -> [u8; REQUEST_BYTES] {
-        encode_request(OP_SNAPSHOT_LIVE_LATEST, 0, 0, &[0; 32])
-    }
-
-    pub fn decode_live_latest(data: &[u8]) -> Result<Self, ProgramError> {
-        validate_request(data, OP_SNAPSHOT_LIVE_LATEST)?;
-        if data[13..16] != [0, 0, 0] || u32_at(data, 16) != 0 || data[20..52] != [0; 32] {
-            return Err(refuse(REFUSE_MALFORMED));
-        }
-        Ok(Self {
-            cursor: 0,
-            state_root: [0; 32],
         })
     }
 }
@@ -761,17 +745,8 @@ fn process_snapshot(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     Ok(())
 }
 
-fn process_snapshot_live(
-    program: &Pubkey,
-    accounts: &[AccountInfo],
-    data: &[u8],
-    latest: bool,
-) -> ProgramResult {
-    let request = if latest {
-        SnapshotRequest::decode_live_latest(data)?
-    } else {
-        SnapshotRequest::decode_live(data)?
-    };
+fn process_snapshot_live(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let request = SnapshotRequest::decode_live(data)?;
     const CONTEXT: usize = 0;
     const META: usize = 1;
     const STATE: usize = 2;
@@ -809,17 +784,12 @@ fn process_snapshot_live(
     {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
-    let (cursor, state_root) = if latest {
-        let meta_data = accounts[META].try_borrow_data()?;
-        (
-            u32_at(&meta_data, sim2::M_CURSOR),
-            meta_data[sim2::M_STATE_ROOT..sim2::M_STATE_ROOT + 32]
-                .try_into()
-                .unwrap(),
-        )
-    } else {
-        (request.cursor, request.state_root)
-    };
+    let meta_data = accounts[META].try_borrow_data()?;
+    let cursor = u32_at(&meta_data, sim2::M_CURSOR);
+    let state_root = meta_data[sim2::M_STATE_ROOT..sim2::M_STATE_ROOT + 32]
+        .try_into()
+        .unwrap();
+    drop(meta_data);
     sim2::validate_live_snapshot_state(
         program,
         &accounts[CONTEXT],
@@ -1025,8 +995,7 @@ pub fn process(
         OP_INIT => process_init(program, accounts, instruction_data),
         OP_SNAPSHOT => process_snapshot(program, accounts, instruction_data),
         OP_RENDER => process_render(program, accounts, instruction_data),
-        OP_SNAPSHOT_LIVE => process_snapshot_live(program, accounts, instruction_data, false),
-        OP_SNAPSHOT_LIVE_LATEST => process_snapshot_live(program, accounts, instruction_data, true),
+        OP_SNAPSHOT_LIVE => process_snapshot_live(program, accounts, instruction_data),
         OP_GROW => process_grow(program, accounts, instruction_data),
         OP_INIT_STRIP => process_init_strip(program, accounts, instruction_data),
         _ => Err(refuse(REFUSE_MALFORMED)),
@@ -1063,21 +1032,6 @@ mod tests {
         assert_eq!(SnapshotRequest::decode_live(&encoded).unwrap(), request);
         assert!(SnapshotRequest::decode(&encoded).is_err());
         assert!(SnapshotRequest::decode_live(&request.encode()).is_err());
-    }
-
-    #[test]
-    fn latest_snapshot_request_has_zero_cursor_and_root() {
-        let encoded = SnapshotRequest::encode_live_latest();
-        assert_eq!(encoded[12], OP_SNAPSHOT_LIVE_LATEST);
-        assert_eq!(u32_at(&encoded, 16), 0);
-        assert_eq!(encoded[20..52], [0; 32]);
-        assert_eq!(
-            SnapshotRequest::decode_live_latest(&encoded)
-                .unwrap()
-                .cursor,
-            0
-        );
-        assert!(SnapshotRequest::decode_live(&encoded).is_err());
     }
 
     #[test]
