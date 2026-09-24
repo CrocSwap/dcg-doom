@@ -6,8 +6,9 @@
 //! unsupported by the SBF loader because writable .bss is not accepted.
 
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program_error::ProgramError,
-    pubkey::Pubkey,
+    account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program::invoke_signed,
+    program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, system_program,
+    sysvar::Sysvar,
 };
 
 use crate::{render_snapshot_v3 as rsn3, resource_sbf};
@@ -16,6 +17,8 @@ pub const MAGIC: &[u8; 8] = b"DOOM-RSR";
 pub const VERSION: u32 = 2;
 pub const OP_BUILD: u8 = 0;
 pub const OP_RENDER: u8 = 1;
+pub const OP_INIT: u8 = 2;
+pub const OP_GROW: u8 = 3;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
 pub const ROOTS_OFFSET: usize = 160;
@@ -85,7 +88,8 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Request {
@@ -110,6 +114,24 @@ impl Request {
             operation: OP_BUILD,
             strip_id: 0,
             cursor,
+            snapshot_hash: [0; 32],
+        }
+    }
+
+    pub const fn init() -> Self {
+        Self {
+            operation: OP_INIT,
+            strip_id: 0,
+            cursor: 0,
+            snapshot_hash: [0; 32],
+        }
+    }
+
+    pub const fn grow() -> Self {
+        Self {
+            operation: OP_GROW,
+            strip_id: 0,
+            cursor: 0,
             snapshot_hash: [0; 32],
         }
     }
@@ -139,7 +161,7 @@ impl Request {
             || &data[..8] != MAGIC
             || u32_at(data, 8) != VERSION
             || data[14..16] != [0, 0]
-            || !matches!(data[12], OP_BUILD | OP_RENDER)
+            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_INIT | OP_GROW)
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -159,12 +181,93 @@ impl Request {
         if request.operation == OP_RENDER && request.strip_id >= 8 {
             return Err(refuse(REFUSE_MALFORMED));
         }
+        if matches!(request.operation, OP_INIT | OP_GROW)
+            && (request.strip_id != 0 || request.cursor != 0 || request.snapshot_hash != [0; 32])
+        {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn account_provision_requests_round_trip() {
+        for request in [Request::init(), Request::grow()] {
+            assert_eq!(Request::decode(&request.encode()), Ok(request));
+        }
+    }
+
+    #[test]
+    fn account_provision_requests_reject_nonzero_payload_fields() {
+        let mut bytes = Request::grow().encode();
+        bytes[16] = 1;
+        assert_eq!(Request::decode(&bytes), Err(refuse(REFUSE_MALFORMED)));
     }
 }
 
 pub fn static_address(program: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[STATIC_SEED, &WAD_HASH], program)
+}
+
+fn process_init(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    const STATIC: usize = 0;
+    const PAYER: usize = 1;
+    const SYSTEM: usize = 2;
+    if accounts.len() != 3 || !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    let static_account = &accounts[STATIC];
+    let payer = &accounts[PAYER];
+    let system = &accounts[SYSTEM];
+    let (expected, bump) = static_address(program);
+    if static_account.key != &expected
+        || !static_account.is_writable
+        || !payer.is_signer
+        || !payer.is_writable
+        || system.key != &system_program::id()
+    {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    if static_account.owner == program && static_account.data_len() == 0 {
+        return Ok(());
+    }
+    if static_account.owner != &system_program::id() || static_account.data_len() != 0 {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    let rent = Rent::get()?.minimum_balance(ACCOUNT_BYTES);
+    let bump_seed = [bump];
+    let seeds: &[&[u8]] = &[STATIC_SEED, &WAD_HASH, &bump_seed];
+    invoke_signed(
+        &system_instruction::create_account(payer.key, static_account.key, rent, 0, program),
+        &[payer.clone(), static_account.clone(), system.clone()],
+        &[seeds],
+    )
+}
+
+fn process_grow(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [static_account] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNT));
+    };
+    let (expected, _) = static_address(program);
+    let current = static_account.data_len();
+    if static_account.key != &expected
+        || static_account.owner != program
+        || !static_account.is_writable
+        || current > ACCOUNT_BYTES
+    {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    let next = current
+        .saturating_add(MAX_ACCOUNT_GROWTH)
+        .min(ACCOUNT_BYTES);
+    if next != current {
+        static_account.realloc(next, false)?;
+    }
+    Ok(())
 }
 
 fn abi_id() -> [u8; 32] {
@@ -575,6 +678,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     match request.operation {
         OP_BUILD => process_build(program, accounts, request),
         OP_RENDER => process_render(program, accounts, request),
+        OP_INIT => process_init(program, accounts),
+        OP_GROW => process_grow(program, accounts),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }

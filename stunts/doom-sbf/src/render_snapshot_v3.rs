@@ -7,14 +7,8 @@
 //! pin before applying the compact payload.
 
 use solana_program::{
-    account_info::AccountInfo,
-    entrypoint::ProgramResult,
-    hash::hashv,
-    program::{invoke, invoke_signed},
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    rent::Rent,
-    system_instruction, system_program,
+    account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program::invoke_signed,
+    program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, system_program,
     sysvar::Sysvar,
 };
 
@@ -26,6 +20,8 @@ pub const OP_INIT: u8 = 0;
 pub const OP_SNAPSHOT: u8 = 1;
 pub const OP_RENDER: u8 = 2;
 pub const OP_SNAPSHOT_LIVE: u8 = 3;
+pub const OP_GROW: u8 = 4;
+pub const OP_INIT_STRIP: u8 = 5;
 pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 192;
@@ -39,6 +35,7 @@ pub const STRIP_HASH_DOMAIN: &[u8] = b"DOOM-RENDER-STRIP/1\0";
 pub const STRIP_HEADER_BYTES: usize = 128;
 pub const STRIP_PIXELS_BYTES: usize = 40 * 200;
 pub const STRIP_ACCOUNT_BYTES: usize = STRIP_HEADER_BYTES + STRIP_PIXELS_BYTES;
+const MAX_ACCOUNT_GROWTH: usize = 10_240;
 pub const ABI_ID: [u8; 32] = ex2::RENDER_SNAPSHOT_V3_ABI_ID;
 pub const ABI_DESCRIPTOR: &str = ex2::RENDER_SNAPSHOT_V3_ABI_DESCRIPTOR;
 
@@ -178,6 +175,23 @@ pub fn encode_init() -> [u8; INIT_BYTES] {
     out[..8].copy_from_slice(MAGIC);
     out[8..12].copy_from_slice(&VERSION.to_le_bytes());
     out[12] = OP_INIT;
+    out
+}
+
+pub fn encode_grow() -> [u8; INIT_BYTES] {
+    let mut out = [0; INIT_BYTES];
+    out[..8].copy_from_slice(MAGIC);
+    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    out[12] = OP_GROW;
+    out
+}
+
+pub fn encode_init_strip(strip_id: u8) -> [u8; INIT_BYTES] {
+    let mut out = [0; INIT_BYTES];
+    out[..8].copy_from_slice(MAGIC);
+    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    out[12] = OP_INIT_STRIP;
+    out[13] = strip_id;
     out
 }
 
@@ -403,33 +417,103 @@ fn initialize_account<'a>(
     if snapshot.key != &expected || !snapshot.is_writable {
         return Err(refuse(REFUSE_BINDING));
     }
-    if !payer.is_signer
-        || !payer.is_writable
-        || system.key != &system_program::id()
-        || snapshot.owner != &system_program::id()
-        || snapshot.data_len() != 0
-    {
+    if !payer.is_signer || !payer.is_writable || system.key != &system_program::id() {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    if snapshot.owner == program && snapshot.data_len() == 0 {
+        return Ok(());
+    }
+    if snapshot.owner != &system_program::id() || snapshot.data_len() != 0 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
     let rent_lamports = Rent::get()?.minimum_balance(SNAPSHOT_BYTES);
-    let shortfall = rent_lamports.saturating_sub(snapshot.lamports());
-    if shortfall != 0 {
-        invoke(
-            &system_instruction::transfer(payer.key, snapshot.key, shortfall),
-            &[payer.clone(), snapshot.clone(), system.clone()],
-        )?;
-    }
     let bump_seed = [bump];
     let signer_seeds: &[&[u8]] = &[SNAPSHOT_SEED, context.as_ref(), &bump_seed];
     invoke_signed(
-        &system_instruction::allocate(snapshot.key, SNAPSHOT_BYTES as u64),
-        &[snapshot.clone(), system.clone()],
+        &system_instruction::create_account(payer.key, snapshot.key, rent_lamports, 0, program),
+        &[payer.clone(), snapshot.clone(), system.clone()],
         &[signer_seeds],
-    )?;
+    )
+}
+
+fn process_grow(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if data.len() != INIT_BYTES
+        || &data[..8] != MAGIC
+        || u32_at(data, 8) != VERSION
+        || data[12] != OP_GROW
+        || data[13..16] != [0; 3]
+    {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    let [snapshot, meta] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    let context = context_from_meta(program, meta)?;
+    let (expected, _) = snapshot_address(program, &context);
+    let current = snapshot.data_len();
+    if snapshot.key != &expected
+        || snapshot.owner != program
+        || !snapshot.is_writable
+        || current > SNAPSHOT_BYTES
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let next = current
+        .saturating_add(MAX_ACCOUNT_GROWTH)
+        .min(SNAPSHOT_BYTES);
+    if next != current {
+        snapshot.realloc(next, false)?;
+    }
+    Ok(())
+}
+
+fn process_init_strip(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if data.len() != INIT_BYTES
+        || &data[..8] != MAGIC
+        || u32_at(data, 8) != VERSION
+        || data[12] != OP_INIT_STRIP
+        || data[13] >= 8
+        || data[14..16] != [0; 2]
+    {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    let [strip, payer, snapshot, system] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    if !distinct(accounts)
+        || snapshot.owner != program
+        || snapshot.data_len() != SNAPSHOT_BYTES
+        || !payer.is_signer
+        || !payer.is_writable
+        || !strip.is_writable
+        || system.key != &system_program::id()
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let strip_id = data[13];
+    let (expected, bump) = strip_address(program, snapshot.key, strip_id);
+    if strip.key != &expected {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    if strip.owner == program && strip.data_len() == STRIP_ACCOUNT_BYTES {
+        return Ok(());
+    }
+    if strip.owner != &system_program::id() || strip.data_len() != 0 {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let rent = Rent::get()?.minimum_balance(STRIP_ACCOUNT_BYTES);
+    let bump_seed = [bump];
+    let seeds: &[&[u8]] = &[STRIP_SEED, snapshot.key.as_ref(), &[strip_id], &bump_seed];
     invoke_signed(
-        &system_instruction::assign(snapshot.key, program),
-        &[snapshot.clone(), system.clone()],
-        &[signer_seeds],
+        &system_instruction::create_account(
+            payer.key,
+            strip.key,
+            rent,
+            STRIP_ACCOUNT_BYTES as u64,
+            program,
+        ),
+        &[payer.clone(), strip.clone(), system.clone()],
+        &[seeds],
     )
 }
 
@@ -906,6 +990,8 @@ pub fn process(
         OP_SNAPSHOT => process_snapshot(program, accounts, instruction_data),
         OP_RENDER => process_render(program, accounts, instruction_data),
         OP_SNAPSHOT_LIVE => process_snapshot_live(program, accounts, instruction_data),
+        OP_GROW => process_grow(program, accounts, instruction_data),
+        OP_INIT_STRIP => process_init_strip(program, accounts, instruction_data),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -940,6 +1026,20 @@ mod tests {
         assert_eq!(SnapshotRequest::decode_live(&encoded).unwrap(), request);
         assert!(SnapshotRequest::decode(&encoded).is_err());
         assert!(SnapshotRequest::decode_live(&request.encode()).is_err());
+    }
+
+    #[test]
+    fn account_provision_instructions_have_distinct_wires() {
+        let grow = encode_grow();
+        let strip = encode_init_strip(7);
+        assert_eq!(&grow[..8], MAGIC);
+        assert_eq!(u32_at(&grow, 8), VERSION);
+        assert_eq!(grow[12], OP_GROW);
+        assert_eq!(grow[13..16], [0; 3]);
+        assert_eq!(strip[12], OP_INIT_STRIP);
+        assert_eq!(strip[13], 7);
+        assert_eq!(strip[14..16], [0; 2]);
+        assert_eq!(encode_init().len(), INIT_BYTES);
     }
 
     #[test]
