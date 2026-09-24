@@ -355,7 +355,7 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
     let resource_hash = hashv(&[&resource_data]).to_bytes();
     let mut static_data = accounts[STATIC].try_borrow_mut_data()?;
     let static_base = static_data.as_ptr() as u64;
-    let (_, rest) = static_data.split_at_mut(HEADER_OFFSET);
+    let (pre_header, rest) = static_data.split_at_mut(HEADER_OFFSET);
     let (header, _) = rest.split_at_mut(HEADER_BYTES);
     if request.cursor == 0 {
         if header.iter().any(|byte| *byte != 0) {
@@ -390,7 +390,7 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
             return Err(refuse(REFUSE_BINDING));
         }
         let start = resource_sbf::WAD_IMAGE_OFFSET + used;
-        static_data[start..start + payload_bytes].copy_from_slice(
+        pre_header[start..start + payload_bytes].copy_from_slice(
             &wad_data
                 [resource_sbf::WAD_HEADER_BYTES..resource_sbf::WAD_HEADER_BYTES + payload_bytes],
         );
@@ -398,7 +398,7 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
         put_u32(header, H_BUILD_NEXT, request.cursor + 1);
         if ordinal + 1 == resource_sbf::WAD_ACCOUNT_COUNT {
             if destination_end != resource_sbf::WAD_IMAGE_BYTES
-                || hashv(&[&static_data[resource_sbf::WAD_IMAGE_OFFSET
+                || hashv(&[&pre_header[resource_sbf::WAD_IMAGE_OFFSET
                     ..resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES]])
                 .to_bytes()
                     != WAD_HASH
