@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 //! Captured-input SBF ProgramTest for E2R/5 + SIM/2 ADVANCE + SNAPSHOT-LIVE/3
-//! and DOOM-RSR/2 rendering. ProgramTest creates the state by staging captured
+//! and pinned-base DOOM-RSR/2 rendering. ProgramTest creates the state by staging captured
 //! inputs and running the preceding real program instructions.
 
 use std::{env, error::Error, fs, path::PathBuf};
@@ -282,14 +282,6 @@ fn build_instruction(static_key: Pubkey, cursor: u32) -> Instruction {
     }
 }
 
-fn relocation_instruction(static_key: Pubkey, cursor: u32) -> Instruction {
-    Instruction {
-        program_id: PROGRAM,
-        accounts: vec![meta(FRAME, false, false), meta(static_key, true, false)],
-        data: rsr::Request::relocate(cursor).encode().to_vec(),
-    }
-}
-
 fn snapshot_live_instruction(
     context: Pubkey,
     meta_key: Pubkey,
@@ -322,7 +314,6 @@ fn render_instruction(
     Instruction {
         program_id: PROGRAM,
         accounts: vec![
-            meta(FRAME, false, false),
             meta(static_key, true, false),
             meta(snapshot, false, false),
             meta(strip, true, false),
@@ -842,55 +833,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("SNAPSHOT-LIVE projection differs from the retained R3 snapshot".into());
     }
 
-    let old_base = u64::from_le_bytes(
+    let static_context_base = u64::from_le_bytes(
         static_account.data[rsr::HEADER_OFFSET + 112..rsr::HEADER_OFFSET + 120].try_into()?,
     );
-    let mut relocation_units = Vec::new();
-    let mut relocation_logs = String::new();
-    let mut relocated_base = None;
-    for cursor in 0..rsr::RELOCATE_CHUNK_COUNT as u32 {
-        let (units, logs) = submit(
-            &mut ctx.banks_client,
-            &payer,
-            &[],
-            relocation_instruction(static_key, cursor),
-            COMPUTE_LIMIT,
-        )
-        .await?;
-        if units > u64::from(COMPUTE_LIMIT) {
-            return Err(
-                format!("RELOCATE cursor {cursor} used {units} CU, over {COMPUTE_LIMIT}").into(),
-            );
-        }
-        relocation_logs.push_str(&format!("=== RELOCATE cursor {cursor} ===\n{logs}\n"));
-        relocation_units.push(units);
-        if cursor == 0 {
-            let account = ctx
-                .banks_client
-                .get_account(static_key)
-                .await?
-                .ok_or("static account disappeared during relocation")?;
-            relocated_base = Some(u64::from_le_bytes(
-                account.data[rsr::HEADER_OFFSET + 344..rsr::HEADER_OFFSET + 352].try_into()?,
-            ));
-        }
-    }
-    fs::write(receipt.join("static-relocate-logs.txt"), relocation_logs)?;
-    let new_base = relocated_base.ok_or("relocation did not produce a new account base")?;
-    if old_base == new_base {
-        return Err("RELOCATE did not move the static account to a different address".into());
-    }
-    fs::write(
-        receipt.join("static-relocation.json"),
-        serde_json::to_vec_pretty(&json!({
-            "old_base_hex":format!("0x{old_base:x}"),
-            "new_base_hex":format!("0x{new_base:x}"),
-            "different_address":old_base != new_base,
-            "chunk_bytes":rsr::RELOCATE_CHUNK_BYTES,
-            "transaction_count":relocation_units.len(),
-            "compute_units":relocation_units
-        }))?,
-    )?;
 
     let mut reconstructed = vec![0; rs::RI2_FRAME_BYTES];
     let mut render_units = Vec::new();
@@ -945,8 +890,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("captured-r3-frame.fb1"), &r3_frame)?;
 
     let report = json!({
-        "status":"measured-byte-exact",
-        "profile":"DOOM-SIM/2 + SNAPSHOT-LIVE/3 + RSR/2 under SBF ProgramTest",
+        "status":"measured-pinned-layout-byte-exact",
+        "profile":"DOOM-SIM/2 + SNAPSHOT-LIVE/3 + pinned-base RSR/2 under SBF ProgramTest",
         "local_programtest_only":true,
         "network_calls":0,
         "image_sha256":sha(&image_bytes),
@@ -978,13 +923,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "deposit_compute_units":deposit_units,
         "stage_transactions":{"state":stage_state,"mirror":stage_mirror,"controller":stage_controller},
         "build_transaction_count":build_units.len(),
-        "relocation_compute_units":relocation_units,
-        "relocation_compute_units_max":relocation_units.iter().max(),
-        "relocation_all_transactions_under_target":relocation_units.iter().all(|units| *units <= u64::from(COMPUTE_LIMIT)),
-        "relocation_transaction_count":relocation_units.len(),
-        "static_account_old_base_hex":format!("0x{old_base:x}"),
-        "static_account_new_base_hex":format!("0x{new_base:x}"),
-        "static_account_relocated":old_base != new_base,
+        "static_account_context_base_hex":format!("0x{static_context_base:x}"),
+        "static_account_relocatable":false,
+        "relocation_boundary":"not implemented: SBF loader rejects writable .bss, so the account must remain at ordinal zero and the pinned DOOM_CTX base",
         "snapshot_transaction_count":1,
         "render_transaction_count":8,
         "render_compute_units":render_units,
@@ -1017,7 +958,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     println!(
-        "SNAPSHOT-LIVE/3 measured {snapshot_units} CU; BUILD={} transactions with max={} CU; render max={} CU; 8/8 strips byte exact; receipt={}",
+        "SNAPSHOT-LIVE/3 measured {snapshot_units} CU; BUILD={} transactions with max={} CU; render max={} CU; pinned DOOM_CTX base; 8/8 strips byte exact; receipt={}",
         build_units.len(),
         build_units.iter().max().copied().unwrap_or(0),
         render_units.iter().max().copied().unwrap_or(0),

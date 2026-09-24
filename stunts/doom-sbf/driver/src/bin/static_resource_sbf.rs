@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-//! Local SBF ProgramTest measurement for DOOM-RSR/1 BUILD and RENDER.
+//! Local SBF ProgramTest measurement for pinned-base DOOM-RSR/2 BUILD and RENDER.
 //!
 //! The RSN/3 dynamic snapshot and native framebuffer are retained outputs from
 //! the R3 capture. ProgramTest preallocates the static account as a fixture;
@@ -27,7 +27,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
-const COMPUTE_LIMIT: u32 = 30_000_000;
+const COMPUTE_LIMIT: u32 = 1_400_000;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/static_resource_sbf.rs"
@@ -111,18 +111,18 @@ async fn submit(
     Ok((units, logs))
 }
 
-fn build_instruction(program: Pubkey, static_key: Pubkey) -> Instruction {
+fn build_instruction(program: Pubkey, static_key: Pubkey, cursor: u32) -> Instruction {
     let mut accounts = vec![meta(static_key, true), meta(RESOURCE, false)];
-    for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+    if cursor < rsr::BUILD_WAD_CHUNKS {
         accounts.push(meta(
-            Pubkey::new_from_array([0xe0 + ordinal as u8; 32]),
+            Pubkey::new_from_array([0xe0 + cursor as u8; 32]),
             false,
         ));
     }
     Instruction {
         program_id: program,
         accounts,
-        data: rsr::Request::build().encode().to_vec(),
+        data: rsr::Request::build_chunk(cursor).encode().to_vec(),
     }
 }
 
@@ -286,12 +286,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut client = bank.start_with_context().await;
     let payer = client.payer.insecure_clone();
-    let (build_units, build_logs) = submit(
-        &mut client.banks_client,
-        &payer,
-        build_instruction(program, static_key),
-    )
-    .await?;
+    let mut build_units = Vec::new();
+    let mut build_logs = String::new();
+    for cursor in 0..=rsr::BUILD_FINAL_CURSOR {
+        let (units, logs) = submit(
+            &mut client.banks_client,
+            &payer,
+            build_instruction(program, static_key, cursor),
+        )
+        .await?;
+        if units > u64::from(COMPUTE_LIMIT) {
+            return Err(
+                format!("BUILD cursor {cursor} used {units} CU, over {COMPUTE_LIMIT}").into(),
+            );
+        }
+        build_logs.push_str(&format!("=== BUILD cursor {cursor} ===\n{logs}\n"));
+        build_units.push(units);
+    }
     fs::write(receipt.join("build-logs.txt"), build_logs)?;
 
     let built = client
@@ -373,12 +384,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "transaction_ok": true
         }));
         if !equal {
-            return Err(format!("RSR/1 native pixel mismatch in strip {strip_id}").into());
+            return Err(format!("RSR/2 native pixel mismatch in strip {strip_id}").into());
         }
     }
     let full_parity = reconstructed == native_frame;
     if !full_parity {
-        return Err("reconstructed RSR/1 frame differs from native oracle".into());
+        return Err("reconstructed RSR/2 frame differs from native oracle".into());
     }
     fs::write(receipt.join("reconstructed-frame.fb1"), &reconstructed)?;
     let static_account = client
@@ -404,7 +415,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mean_after = render_units_total / strip_results.len() as u64;
     let report = json!({
         "status": "measured-equal",
-        "profile": "DOOM-RSR/1-SBF-PROGRAMTEST",
+        "profile": "DOOM-RSR/2-pinned-base-SBF-PROGRAMTEST",
         "local_programtest_only": true,
         "network_calls": 0,
         "baseline_profile": baseline_report["profile"],
@@ -423,8 +434,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "static_resource_layout_roots": rsr::ROOT_COUNT,
         "static_account_sha256_after_build": static_account_sha_after_build,
         "static_account_sha256_after_render": static_account_sha_after_render,
-        "build_transaction_count": 1,
+        "build_transaction_count": build_units.len(),
         "build_compute_units": build_units,
+        "build_compute_units_max": build_units.iter().max(),
+        "build_all_transactions_under_target": build_units.iter().all(|units| *units <= u64::from(COMPUTE_LIMIT)),
         "build_arena_high_water_bytes": build_high_water,
         "build_account_preallocated_by_programtest": true,
         "build_account_allocation_and_rent_measured": false,
@@ -432,6 +445,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "render_decodes_st1": false,
         "render_rebuilds_wad_graph_or_tables": false,
         "render_uses_zero_copy_static_account": true,
+        "static_account_relocatable": false,
         "render_transaction_count": 8,
         "render_cu_before_total": before_total,
         "render_cu_after_total": render_units_total,
@@ -445,7 +459,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "pixel_parity": "exact byte equality",
         "snapshot_transaction_included": false,
         "snapshot_profile_boundary": "captured and hash-validated DOOM-RSN/3 account from the R3 ProgramTest receipt",
-        "static_account_address_boundary": "the account is ordinal zero and the existing DOOM_CTX guard fixes the data base; embedded C pointers are base-relative; the header stores 32 map/resource/cache root offsets",
+        "static_account_address_boundary": "the account is ordinal zero and the existing DOOM_CTX guard pins the data base; embedded C pointers require that base; the header stores 32 map/resource/cache root offsets; relocation is not supported",
         "account_provisioning_boundary": "ProgramTest genesis preallocated the program-owned static resource account; allocation or rent behavior is unmeasured",
         "wad_manifest": wad_manifest,
         "strips": strip_results
@@ -469,7 +483,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     println!(
-        "RSR/1 ProgramTest measured: BUILD={build_units} CU; RENDER mean={mean_before} -> {mean_after} CU; 8/8 strips exact; receipts={}",
+        "RSR/2 ProgramTest measured: BUILD={} transactions, max={} CU; RENDER mean={mean_before} -> {mean_after} CU; 8/8 strips exact; receipts={}",
+        build_units.len(),
+        build_units.iter().max().copied().unwrap_or(0),
         receipt.display()
     );
     Ok(())

@@ -1275,7 +1275,7 @@ int doom_sbf_sim2_publish(
 }
 
 /* ------------------------------------------------------------------ */
-/* DOOM-RSR/1 static renderer resource account                         */
+/* DOOM-RSR/2 pinned-base static renderer resource account              */
 
 #define RSR_HEADER_BYTES 512u
 #define RSR_ROOTS_OFFSET 160u
@@ -1311,9 +1311,9 @@ static uint64_t rsr_get64(const uint8_t *p)
 
 /* These are the top-level pointer roots for the imported RI2 graph, its
  * renderer tables, and the cached DEMO1 bytes. The structures they reach
- * contain native pointers that RSR/2 rebases when the static account moves.
- * This directory records account-relative roots and reconstructs them before
- * each render. */
+ * contain native pointers, so the static account must retain the pinned
+ * DOOM_CTX base. This directory records account-relative roots and validates
+ * them before each render. */
 static void *rsr_root_value(unsigned index)
 {
     switch (index) {

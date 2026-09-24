@@ -1,9 +1,9 @@
-//! DOOM-RSR/2: chunk-build renderer resources in a relocatable account layout.
+//! DOOM-RSR/2: chunk-build renderer resources in the pinned account layout.
 //!
-//! The static resource account is passed at account ordinal zero. The existing
-//! RSR/2 persists resumable BUILD phases and rebases account-internal C
-//! pointers when the static account is loaded at a different data address.
-//! RENDER still consumes the existing DOOM-RSN/3 dynamic payload.
+//! The static resource account must be account ordinal zero so SBF maps its
+//! data at the measured DOOM_CTX address. RSR/2 persists resumable BUILD
+//! phases and validates the pinned base before RENDER. Relocation remains
+//! unsupported by the SBF loader because writable .bss is not accepted.
 
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program_error::ProgramError,
@@ -16,7 +16,6 @@ pub const MAGIC: &[u8; 8] = b"DOOM-RSR";
 pub const VERSION: u32 = 2;
 pub const OP_BUILD: u8 = 0;
 pub const OP_RENDER: u8 = 1;
-pub const OP_RELOCATE: u8 = 2;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
 pub const ROOTS_OFFSET: usize = 160;
@@ -53,20 +52,12 @@ const BUILD_MAGIC: &[u8; 8] = b"DOOM-BLD";
 pub const BUILD_WAD_CHUNKS: u32 = 5;
 const BUILD_C_PHASES: u32 = 6;
 pub const BUILD_FINAL_CURSOR: u32 = BUILD_WAD_CHUNKS + BUILD_C_PHASES - 1;
-pub const RELOCATE_CHUNK_BYTES: usize = 512 * 1024;
-pub const RELOCATE_CHUNK_COUNT: usize =
-    (ACCOUNT_BYTES + RELOCATE_CHUNK_BYTES - 1) / RELOCATE_CHUNK_BYTES;
 
 const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const H_RELOCATE_OLD_BASE: usize = 336;
-const H_RELOCATE_NEW_BASE: usize = 344;
-const H_RELOCATE_NEXT: usize = 352;
-const H_RELOCATE_STATUS: usize = 356;
-
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=range-rebase-u64-chunks-512KiB|pin=WAD-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Request {
@@ -89,15 +80,6 @@ impl Request {
     pub const fn build_chunk(cursor: u32) -> Self {
         Self {
             operation: OP_BUILD,
-            strip_id: 0,
-            cursor,
-            snapshot_hash: [0; 32],
-        }
-    }
-
-    pub const fn relocate(cursor: u32) -> Self {
-        Self {
-            operation: OP_RELOCATE,
             strip_id: 0,
             cursor,
             snapshot_hash: [0; 32],
@@ -129,7 +111,7 @@ impl Request {
             || &data[..8] != MAGIC
             || u32_at(data, 8) != VERSION
             || data[14..16] != [0, 0]
-            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_RELOCATE)
+            || !matches!(data[12], OP_BUILD | OP_RENDER)
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -142,13 +124,6 @@ impl Request {
         if request.operation == OP_BUILD
             && (request.strip_id != 0
                 || request.cursor > BUILD_FINAL_CURSOR
-                || request.snapshot_hash != [0; 32])
-        {
-            return Err(refuse(REFUSE_MALFORMED));
-        }
-        if request.operation == OP_RELOCATE
-            && (request.strip_id != 0
-                || request.cursor as usize >= RELOCATE_CHUNK_COUNT
                 || request.snapshot_hash != [0; 32])
         {
             return Err(refuse(REFUSE_MALFORMED));
@@ -207,10 +182,7 @@ fn validate_static_account(
     Ok(())
 }
 
-fn validate_header_inner(
-    data: &[u8],
-    allow_relocating: bool,
-) -> Result<([u8; 32], [u8; 32]), ProgramError> {
+fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
     let end = HEADER_OFFSET
         .checked_add(HEADER_BYTES)
         .ok_or(refuse(REFUSE_STATIC))?;
@@ -238,7 +210,9 @@ fn validate_header_inner(
         || u32_at(header, H_BUILD_WAD_USED) as usize != resource_sbf::WAD_IMAGE_BYTES
         || header[H_BUILD_RESOURCE_HASH..H_BUILD_RESOURCE_HASH + 32]
             != header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32]
+        || u64_at(header, H_BASE_ADDRESS) == 0
         || u64_at(header, H_BUILD_BASE) == 0
+        || header[336..HEADER_BYTES].iter().any(|byte| *byte != 0)
         || header[ROOTS_OFFSET..ROOTS_OFFSET + ROOT_BYTES]
             .chunks_exact(4)
             .any(|raw| {
@@ -248,44 +222,11 @@ fn validate_header_inner(
     {
         return Err(refuse(REFUSE_STATIC));
     }
-    let base = u64_at(header, H_BASE_ADDRESS);
-    let old_base = u64_at(header, H_RELOCATE_OLD_BASE);
-    let new_base = u64_at(header, H_RELOCATE_NEW_BASE);
-    let relocate_next = u32_at(header, H_RELOCATE_NEXT);
-    let relocate_status = u32_at(header, H_RELOCATE_STATUS);
-    if header[H_RELOCATE_STATUS + 4..HEADER_BYTES]
-        .iter()
-        .any(|byte| *byte != 0)
-        || match relocate_status {
-            0 => old_base != 0 || new_base != 0 || relocate_next != 0,
-            1 if allow_relocating => {
-                old_base == 0
-                    || new_base == 0
-                    || old_base == new_base
-                    || base != old_base
-                    || relocate_next as usize > RELOCATE_CHUNK_COUNT
-            }
-            2 => {
-                old_base == 0
-                    || new_base == 0
-                    || old_base == new_base
-                    || base != new_base
-                    || relocate_next != 0
-            }
-            _ => true,
-        }
-    {
-        return Err(refuse(REFUSE_STATIC));
-    }
     let resource_hash = header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32]
         .try_into()
         .unwrap();
     let wad_hash = header[H_WAD_HASH..H_WAD_HASH + 32].try_into().unwrap();
     Ok((wad_hash, resource_hash))
-}
-
-fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
-    validate_header_inner(data, false)
 }
 
 /// Read the WAD and RI2 commitments from a built static-resource account.
@@ -502,101 +443,11 @@ fn process_build(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
     Ok(())
 }
 
-fn rebase_chunk(data: &mut [u8], chunk_start: usize, old_base: u64, new_base: u64) {
-    let chunk_end = (chunk_start + RELOCATE_CHUNK_BYTES).min(data.len());
-    let old_end = old_base + ACCOUNT_BYTES as u64;
-    let regions = [
-        (0usize, resource_sbf::WAD_IMAGE_OFFSET),
-        (HEADER_OFFSET + HEADER_BYTES, ACCOUNT_BYTES),
-    ];
-    for (region_start, region_end) in regions {
-        let start = chunk_start.max(region_start).saturating_add(7) & !7;
-        let end = chunk_end.min(region_end) & !7;
-        let mut offset = start;
-        while offset + 8 <= end {
-            let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-            if (old_base..old_end).contains(&value) {
-                let rebased = new_base + (value - old_base);
-                data[offset..offset + 8].copy_from_slice(&rebased.to_le_bytes());
-            }
-            offset += 8;
-        }
-    }
-}
-
-fn process_relocate(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
-    const STATIC: usize = 1;
-    if accounts.len() != 2
-        || !distinct(accounts)
-        || accounts[0].is_signer
-        || accounts[0].is_writable
-    {
-        return Err(refuse(REFUSE_ACCOUNT));
-    }
-    validate_static_account(program, &accounts[STATIC], true)?;
-    if accounts.iter().any(|account| account.is_signer) {
-        return Err(refuse(REFUSE_ACCOUNT));
-    }
-    let mut data = accounts[STATIC].try_borrow_mut_data()?;
-    let current_base = data.as_mut_ptr() as u64;
-    validate_header_inner(&data, true)?;
-    if request.cursor == 0 {
-        let header = &data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
-        if u32_at(header, H_RELOCATE_STATUS) != 0 {
-            return Err(refuse(REFUSE_BINDING));
-        }
-        let old_base = u64_at(header, H_BASE_ADDRESS);
-        if old_base == current_base {
-            return Err(refuse(REFUSE_BINDING));
-        }
-        current_base
-            .checked_add(ACCOUNT_BYTES as u64)
-            .ok_or(refuse(REFUSE_BINDING))?;
-        let header = &mut data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
-        put_u64(header, H_RELOCATE_OLD_BASE, old_base);
-        put_u64(header, H_RELOCATE_NEW_BASE, current_base);
-        put_u32(header, H_RELOCATE_NEXT, 0);
-        put_u32(header, H_RELOCATE_STATUS, 1);
-    }
-    let (old_base, new_base, next) = {
-        let header = &data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
-        (
-            u64_at(header, H_RELOCATE_OLD_BASE),
-            u64_at(header, H_RELOCATE_NEW_BASE),
-            u32_at(header, H_RELOCATE_NEXT),
-        )
-    };
-    if current_base != new_base || request.cursor != next {
-        return Err(refuse(REFUSE_BINDING));
-    }
-    rebase_chunk(
-        &mut data,
-        request.cursor as usize * RELOCATE_CHUNK_BYTES,
-        old_base,
-        new_base,
-    );
-    let header = &mut data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
-    let next = request.cursor + 1;
-    if next as usize == RELOCATE_CHUNK_COUNT {
-        put_u32(header, H_RELOCATE_NEXT, 0);
-        put_u32(header, H_RELOCATE_STATUS, 2);
-        put_u64(header, H_BASE_ADDRESS, new_base);
-    } else {
-        put_u32(header, H_RELOCATE_NEXT, next);
-    }
-    Ok(())
-}
-
 fn process_render(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
-    const PREFIX: usize = 0;
-    const STATIC: usize = 1;
-    const SNAPSHOT: usize = 2;
-    const STRIP: usize = 3;
-    if accounts.len() != 4
-        || !distinct(accounts)
-        || accounts[PREFIX].is_signer
-        || accounts[PREFIX].is_writable
-    {
+    const STATIC: usize = 0;
+    const SNAPSHOT: usize = 1;
+    const STRIP: usize = 2;
+    if accounts.len() != 3 || !distinct(accounts) {
         return Err(refuse(REFUSE_ACCOUNT));
     }
     validate_static_account(program, &accounts[STATIC], true)?;
@@ -688,7 +539,6 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     let request = Request::decode(data)?;
     match request.operation {
         OP_BUILD => process_build(program, accounts, request),
-        OP_RELOCATE => process_relocate(program, accounts, request),
         OP_RENDER => process_render(program, accounts, request),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
