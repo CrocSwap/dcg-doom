@@ -117,3 +117,38 @@ snapshot cost; the current RENDER ABI has no split operation, and a split
 renderer would add reconstruction and instruction overhead. The local bank's
 30,000,000-CU cap allowed the measured instruction to succeed; no live Fogo
 transaction limit, rent, or fee is claimed here.
+
+## DOOM-RSN/3 render-ready projection
+
+`DOOM-RSN/3` is a separate experimental ABI. It leaves SIM2 and RSN/2
+unchanged. Its fixed account size is 1,048,768 bytes: the same 192-byte
+header followed by a one-MiB bounded payload area. The header keeps the cursor,
+gametic, SIM2 state root, and WAD digest, and adds the active payload length,
+the complete RI2 account SHA-256, and a versioned RSN/3 ABI id. The snapshot
+hash commits the header with its own hash field zeroed and the active payload;
+unused payload capacity is outside the hash.
+
+The payload begins with a 128-byte `R3-DATA` header. It records player/view
+coordinates, angle, view height, extra light and fixed colormap; psprite state
+indices and positions; flat and texture translations; each sector's floor and
+ceiling heights, textures and light level; each side's texture offsets and
+texture indices; and the active thinker list's mobj render fields. The pinned
+Doom profile has no pitch field, so pitch is encoded as zero. Counts and the
+derived exact payload length are bounded before rendering. ST1 and MP1 bytes
+are not copied into RSN/3.
+
+`SNAPSHOT/3` validates the SIM2 root and cursor, reconstructs the captured
+engine state once, and writes this projection. `RENDER/3` validates the
+snapshot hash and RI2 account hash, then applies the projection without
+decoding ST1. This is only the dynamic-state portion of the redesign: the
+current RENDER path still copies and parses WAD data, preflights RI2, imports
+the map graph, and rebuilds renderer tables on every call. No zero-copy static
+resource account or BUILD instruction is implemented in this result. RENDER
+also still hashes the complete RI2 account to check the snapshot pin.
+
+The current OP_INIT requests the full snapshot-account allocation in one
+system CPI. ProgramTest therefore preallocates the large snapshot account as a
+local fixture; OP_INIT allocation, rent, and live-account provisioning remain
+unmeasured. The RSN/3 ProgramTest report identifies any crafted SIM2 meta
+fixture and its input provenance. This prototype does not establish deployable
+account provisioning or on-chain affordability.
