@@ -142,7 +142,7 @@ entrypoint!(transport_process_instruction);
 /// SIM/1 (permissionless INIT, test-only ROLLBACK), the earlier E2R/E2S
 /// continuations, bring-up, CX1 and the hot-loop probes are not dispatched,
 /// so no other instruction in this image can write a context, ST1, MP1, meta
-/// or input-buffer account. DOOM-RSN/1 may only write its separate snapshot
+/// or input-buffer account. DOOM-RSN/2 may only write its separate snapshot
 /// PDA after validating the committed SIM2 cursor/root.
 #[cfg(feature = "sim-transport")]
 pub fn transport_process_instruction(

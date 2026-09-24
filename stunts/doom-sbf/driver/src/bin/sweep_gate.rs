@@ -1558,7 +1558,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "snapshot_committed_cursor".into(),
         serde_json::json!({"ok":true,"cursor":view.cursor,"cu":base::units(&result)?}),
     );
-    // DOOM-RSN/1 initialization and write are exercised on the same real
+    // DOOM-RSN/2 initialization and write are exercised on the same real
     // SIM2 state produced by the preceding DEPOSIT/ADVANCE instructions.
     let init_snapshot = gate.init_render_snapshot_ix();
     let init_result = gate.send(vec![init_snapshot], &[]).await?;

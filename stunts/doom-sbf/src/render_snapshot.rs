@@ -353,7 +353,7 @@ pub fn validate_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> 
         || u32_at(state, 12) != 64
         || u32_at(state, 16) as usize != state_len
         || u32_at(state, 20) != u32_at(data, H_GAMETIC)
-        || state[32..64] != data[H_WAD_HASH..H_WAD_HASH + 32]
+        || mirror[36..68] != data[H_WAD_HASH..H_WAD_HASH + 32]
         || data[H_RESOURCE_ABI_ID..H_SNAPSHOT_HASH] != resource_sbf::RI2_ABI_ID
     {
         return Err(refuse(REFUSE_SNAPSHOT));
@@ -394,7 +394,6 @@ pub fn write_snapshot(
     let _mirror_used = sim2::mirror_used_checked(mirror)?;
     if state.len() != resource_sbf::STATE_MAX_BYTES
         || state_len > resource_sbf::STATE_MAX_BYTES
-        || state[32..64] != mirror[36..68]
     {
         return Err(refuse(REFUSE_SNAPSHOT));
     }
@@ -695,7 +694,7 @@ mod tests {
         state[12..16].copy_from_slice(&64u32.to_le_bytes());
         state[16..20].copy_from_slice(&64u32.to_le_bytes());
         state[20..24].copy_from_slice(&17u32.to_le_bytes());
-        state[32..64].copy_from_slice(&wad_hash);
+        state[32..64].fill(0xa5);
 
         let mut mirror = vec![0; resource_sbf::MIRROR_BYTES];
         mirror[..8].copy_from_slice(b"DOOM-MP1");
@@ -718,6 +717,12 @@ mod tests {
         assert_eq!(view.resource_abi_id, resource_sbf::RI2_ABI_ID);
         assert_eq!(view.state, &state[..64]);
         assert_eq!(view.mirror, mirror);
+
+        let mut wrong_wad_binding = snapshot.clone();
+        wrong_wad_binding[H_WAD_HASH] ^= 1;
+        let digest = image_hash(&wrong_wad_binding).unwrap();
+        wrong_wad_binding[H_SNAPSHOT_HASH..H_RESERVED].copy_from_slice(&digest);
+        assert!(validate_snapshot(&wrong_wad_binding).is_err());
 
         let mut wrong_root = snapshot.clone();
         wrong_root[H_STATE_ROOT] ^= 1;

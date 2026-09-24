@@ -30,14 +30,14 @@ are zero.
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 8 | magic `DOOM-RSN` |
-| 8 | 4 | version `1` |
+| 8 | 4 | version `2` |
 | 12 | 4 | header bytes `192` |
 | 16 | 4 | total account bytes `192704` |
 | 20 | 4 | SIM2 committed cursor; frame id |
 | 24 | 4 | ST1 gametic copied from offset 20 of ST1 |
 | 28 | 4 | used ST1 length, range 64–126,976 |
 | 32 | 32 | SIM2 state root over ST1 and the used MP1 prefix |
-| 64 | 32 | WAD SHA-256, checked against MP1 bytes 36–67 |
+| 64 | 32 | WAD SHA-256, copied from MP1 bytes 36–67 and checked against MP1 on read |
 | 96 | 32 | render resource ABI id |
 | 128 | 32 | snapshot hash |
 | 160 | 32 | reserved zero |
@@ -49,8 +49,9 @@ The snapshot hash is
 header[160..192] || padded_ST1 || MP1)`. The writer validates the current SIM2
 meta/state/mirror binding and cursor/root with the existing `snapshot_check`,
 checks the render snapshot PDA, validates ST1 and MP1 shapes, and copies both
-account images. The renderer must separately compare the snapshot WAD digest
-with the static RI2 resource's pinned WAD before rendering.
+account images. ST1 has no WAD digest field: the snapshot copies that digest
+from MP1 bytes 36–67, and the renderer compares it with the static RI2
+resource's pinned WAD before rendering.
 
 `DOOM-RSN/2` takes read locks on meta, ST1, and MP1, and a write lock on the
 snapshot. ADVANCE never reads or writes the snapshot. Snapshot and ADVANCE
