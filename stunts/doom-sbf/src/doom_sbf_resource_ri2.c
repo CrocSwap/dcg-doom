@@ -359,9 +359,9 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
 {
     r2_section_t sections[5];
     r2_v2_plan_t *plan;
-    uint8_t *frame = 0;
+    uint8_t *frame = 0, *demo;
     size_t strip_bytes = 40u * 200u;
-    int rc, y, x;
+    int rc, y, x, lump, demo_len;
 
     if (doom_ctx_guard(context)) return 199;
     if (!resource || resource_bytes < RI2_HEADER_BYTES ||
@@ -388,6 +388,15 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
     Z_Init();
     P_InitThinkers();
     W_InitAccountImage(wad_image, (int)wad_bytes);
+    lump = W_GetNumForName("DEMO1");
+    demo_len = W_LumpLength(lump);
+    if (demo_len < 17) return RI2_REFUSE_RESOURCE;
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+    defdemoname = "DEMO1";
+    demobuffer = demo;
+    demo_p = demo;
+    demoend = demo + demo_len;
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
     if (doom_sbf_resource_import_graph(resource + sections[R2_GRAPH].offset,
                                        sections[R2_GRAPH].bytes))
         return RI2_REFUSE_IMAGE;
