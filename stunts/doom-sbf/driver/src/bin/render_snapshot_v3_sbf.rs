@@ -36,6 +36,12 @@ fn read(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     fs::read(path).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
+fn retain_file(source: &Path, directory: &Path, name: &str) -> Result<(), Box<dyn Error>> {
+    fs::copy(source, directory.join(name))
+        .map(|_| ())
+        .map_err(|e| format!("retain {}: {e}", source.display()).into())
+}
+
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -219,6 +225,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let image_sha = sha(&source_bytes);
     let manifest_sha = sha(&manifest_bytes);
     let driver_sha = sha(DRIVER_SOURCE);
+    let retained = receipt.join("inputs");
+    fs::create_dir_all(&retained)?;
+    retain_file(&image, &retained, "doom_sbf.so")?;
+    retain_file(&manifest, &retained, "doom_ex2_source_manifest.json")?;
 
     let profile = run_root.join("profile-inputs");
     let capture = profile.join("capture");
@@ -238,6 +248,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("run.json meta")?
         .parse::<Pubkey>()?;
     let captured_meta = read(&live.join("end-meta.bin"))?;
+    let captured_state = read(&live.join("end-state.st1"))?;
+    let captured_mirror = read(&live.join("end-mirror.mp1"))?;
+    let captured_provenance: Value =
+        serde_json::from_slice(&read(&live.join("end-provenance.json"))?)?;
+    let captured_meta_sha = sha(&captured_meta);
+    let captured_state_sha = sha(&captured_state);
+    let captured_mirror_sha = sha(&captured_mirror);
+    if captured_provenance["meta_sha256"].as_str() != Some(captured_meta_sha.as_str())
+        || captured_provenance["state_sha256"].as_str() != Some(captured_state_sha.as_str())
+        || captured_provenance["mirror_sha256"].as_str() != Some(captured_mirror_sha.as_str())
+    {
+        return Err("captured SIM2 account provenance hash mismatch".into());
+    }
     if captured_meta.len() != sim2::META_BYTES {
         return Err("captured SIM2 meta has wrong size".into());
     }
@@ -277,11 +300,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let mut wads = Vec::with_capacity(resource_sbf::WAD_ACCOUNT_COUNT);
     for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
-        wads.push(wad_account(
-            &capture.join(format!("account/wad-{ordinal:03}.bin")),
-            ordinal,
-        )?);
+        let wad_path = capture.join(format!("account/wad-{ordinal:03}.bin"));
+        retain_file(&wad_path, &retained, &format!("wad-{ordinal:03}.bin"))?;
+        wads.push(wad_account(&wad_path, ordinal)?);
     }
+    retain_file(
+        &profile.join("resource-image.ri2"),
+        &retained,
+        "resource-image.ri2",
+    )?;
+    retain_file(
+        &capture.join("account/manifest.json"),
+        &retained,
+        "wad-account-manifest.json",
+    )?;
+    retain_file(
+        &native.join("imported-state.st1"),
+        &retained,
+        "native-imported-state.st1",
+    )?;
+    retain_file(
+        &native.join("imported-mirror.mp1"),
+        &retained,
+        "native-imported-mirror.mp1",
+    )?;
+    retain_file(
+        &native.join("imported-frame.fb1"),
+        &retained,
+        "native-imported-frame.fb1",
+    )?;
+    retain_file(&native.join("report.json"), &retained, "native-report.json")?;
+    retain_file(&live.join("run.json"), &retained, "sim2-run.json")?;
+    retain_file(
+        &live.join("end-meta.bin"),
+        &retained,
+        "sim2-captured-meta.bin",
+    )?;
+    retain_file(
+        &live.join("end-state.st1"),
+        &retained,
+        "sim2-captured-state.st1",
+    )?;
+    retain_file(
+        &live.join("end-mirror.mp1"),
+        &retained,
+        "sim2-captured-mirror.mp1",
+    )?;
+    retain_file(
+        &live.join("end-provenance.json"),
+        &retained,
+        "sim2-captured-provenance.json",
+    )?;
     let wad_manifest: Value =
         serde_json::from_slice(&read(&capture.join("account/manifest.json"))?)?;
     let native_report: Value = serde_json::from_slice(&read(&native.join("report.json"))?)?;
@@ -478,6 +547,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "snapshot_init_measured": false,
         "sim2_meta_fixture": "captured meta identity with cursor, state length, and root recomputed over retained native ST1/MP1",
         "sim2_meta_fixture_is_chain_readback": false,
+        "sim2_original_meta_sha256": captured_meta_sha,
+        "sim2_original_state_sha256": captured_state_sha,
+        "sim2_original_mirror_sha256": captured_mirror_sha,
         "native_oracle_profile": native_report["profile"],
         "native_oracle_frame_sha256": sha(&native_frame),
         "native_state_sha256": sha(&native_state),
