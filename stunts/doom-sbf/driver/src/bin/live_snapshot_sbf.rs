@@ -364,7 +364,7 @@ fn render_instruction(
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let image = PathBuf::from(args.next().ok_or(
-        "usage: live_snapshot_sbf IMAGE MANIFEST CAPTURE RESOURCE CONTROLLER R3_RECEIPT RECEIPT (local SBF ProgramTest; pinned-base RSR/2 keeps the static account at ordinal zero; each BUILD transaction uses a 1,400,000-CU limit)",
+        "usage: live_snapshot_sbf IMAGE MANIFEST CAPTURE RESOURCE CONTROLLER R3_RECEIPT RECEIPT (local SBF ProgramTest; pinned-base RSR/2 keeps the static account at ordinal zero; runner rejects BUILD above 1,400,000 CU)",
     )?);
     let manifest = PathBuf::from(args.next().ok_or("missing SBF source manifest")?);
     let capture = PathBuf::from(args.next().ok_or("missing retained capture directory")?);

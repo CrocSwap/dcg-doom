@@ -145,32 +145,47 @@ snapshot hash, the RI2 account hash, and the reconstructed WAD digest against
 the snapshot pin, then applies the projection without
 decoding ST1. The first RSN/3 implementation reconstructs the engine for each
 snapshot. The later RSR/1 path stores the imported graph, WAD cache, and
-renderer tables in a static account so RENDER can reuse them. Its BUILD
-operation is currently one transaction; RSR/1's nested C pointers still depend
-on the fixed `DOOM_CTX` account data address. The original RENDER path hashes
-the complete RI2 account when checking the snapshot's resource pin.
+renderer tables in a static account so RENDER can reuse them. **Measured:**
+RSR/1 BUILD was one transaction and exceeded the 1,400,000-CU comparison.
+**Designed:** RSR/2 makes BUILD resumable over five authenticated WAD-slice
+transactions and six C initialization phases. Each transaction is checked
+against the configured CU comparison in local ProgramTest. Nested C pointers
+still require the pinned
+`DOOM_CTX` address; the static account must be ordinal zero. Relocation is
+unsupported: the attempted per-instruction context pointer introduces writable
+`.bss`, which the SBF loader rejects. The original RENDER path hashes the
+complete RI2 account when checking the snapshot's resource pin.
 
 ### SNAPSHOT-LIVE/3
 
 `SNAPSHOT-LIVE/3` is a separate RSN/3 operation (operation byte 3). The
 legacy `SNAPSHOT/3`, `ADVANCE/3`, and their wire layouts remain unchanged.
 Its accounts are, in order: read-only resident context, SIM2 meta, ST1, MP1,
-the built RSR/1 static account, and the writable RSN/3 output PDA. It validates
+the built RSR/2 static account, and the writable RSN/3 output PDA. It validates
 the published E2R checkpoint, SIM2 meta PDA and account bindings, committed
-cursor and root, state length and tic, snapshot PDA, and both RSR/1 hash
+cursor and root, state length and tic, snapshot PDA, and both RSR/2 hash
 bindings before reading the live renderer fields. The RSN/3 payload is encoded
 from the context that E2R/5 and `ADVANCE/3` already keep resident. This path
 does not reset the context, copy WAD bytes, re-import RI2, reconstruct the
 graph, or decode ST1. It still validates and hashes the bounded SIM2 state and
-mirror inputs, so its final CU remains an empirical question until a local SBF
-ProgramTest runs with a captured published context.
+mirror inputs. **Measured** in the R5 local SBF ProgramTest, the live projection
+used 142,220 CU and wrote the same 31,260-byte payload as the retained R3
+snapshot. Its state root did not match that R3 fixture: the preceding SIM2
+ADVANCE had a state mismatch beginning at byte 8,603, although the mirror
+matched. The cheap projection therefore demonstrates rendering mechanics, not
+SIM2 state fidelity.
 
 The context, meta, ST1, MP1, and static resource accounts are read-only for
 this instruction; only the snapshot PDA is writable. That lets snapshot
 serialization take a read lock against context updates under the account
-runtime. **Open:** transaction cost, parity from an ADVANCE-produced context,
-and behavior at a relocated context data base require ProgramTest evidence.
-Source presence alone establishes no affordability or testnet claim.
+runtime. **Measured:** R5's eight 40×200 static-account RENDER strips were
+below the configured 1,400,000-CU comparison and reconstructed the retained
+native frame byte for byte. The account remained at the pinned `DOOM_CTX` base.
+**Open:**
+binding the same account at another address, chain-readback ADVANCE parity, and
+testnet provisioning and rendering remain unverified. The local ProgramTest
+bank maximum was configured to 30,000,000 CU; 1,400,000 is a runner comparison,
+not an enforced Fogo or testnet limit.
 
 The current OP_INIT requests the full snapshot-account allocation in one
 system CPI. ProgramTest therefore preallocates the large snapshot account as a
