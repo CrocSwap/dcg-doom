@@ -11,7 +11,7 @@ DOOM-SIM/2 DEPOSIT, ADVANCE/3, ADVANCE/4, and SNAPSHOT/4 wires unchanged.
 SNAPSHOT/4 remains a read-side consistency check. A separately versioned
 `DOOM-RSN/2` instruction writes the render snapshot and handles
 `RENDER(strip_id)`. It supersedes the initial
-`DOOM-RSN/1` design recorded in M1338 because the implementation copies MP1
+`DOOM-RSN/1` design recorded in M1341 because the implementation copies MP1
 into the image so later render calls do not need live state accounts.
 
 The captured DEMO1 state has a measured ST1 length of 59,604 bytes. The maximum account allocation
