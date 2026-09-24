@@ -158,7 +158,8 @@ static int doom_engine_ex2_resource_sbf_ri2_run(
     uint8_t *frame_out, unsigned long frame_cap,
     uint8_t *state_out, unsigned long state_cap, unsigned long *state_out_len,
     uint8_t *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
-    unsigned long *frame_out_len, unsigned long *arena_high_water_out)
+    unsigned long *frame_out_len, unsigned long *arena_high_water_out,
+    uint32_t render_mode, uint32_t strip_id)
 {
     r2_section_t sections[5];
     r2_v2_plan_t *plan;
@@ -178,6 +179,8 @@ static int doom_engine_ex2_resource_sbf_ri2_run(
         state_cap < RI2_STATE_MAX || mirror_cap < RI2_MIRROR_BYTES ||
         frame_cap < RI2_FRAME_BYTES || !ri2_state_shape(state, (size_t)state_len) ||
         !ri2_mirror_shape(mirror, (size_t)mirror_len)) return RI2_REFUSE_RESOURCE;
+    if (render_mode > 2u || strip_id >= 8u ||
+        (render_mode == 0u && strip_id != 0u)) return RI2_REFUSE_RESOURCE;
     input_tic = ri2_u32(state + 20);
     if (!ri2_controller_shape(controller, (size_t)controller_len, input_tic))
         return RI2_REFUSE_CONTROLLER;
@@ -269,6 +272,9 @@ static int doom_engine_ex2_resource_sbf_ri2_run(
     if (run_tic) {
         G_Ticker();
         RI2_PHASE(580);
+        /* E2R/3 is enabled only in the diagnostic measurement image. */
+        doom_render_fuzz_columns = render_mode
+            ? ((render_mode << 30) | (strip_id << 27)) : 0u;
         clipangle = xtoviewangle[0]; fixedcolormap = 0;
         R_RenderPlayerView(&players[displayplayer]);
         RI2_PHASE(590);
@@ -308,14 +314,15 @@ int doom_engine_ex2_resource_sbf_ri2_tic_entry(
     uint8_t *frame_out, unsigned long frame_cap,
     uint8_t *state_out, unsigned long state_cap, unsigned long *state_out_len,
     uint8_t *mirror_out, unsigned long mirror_cap, unsigned long *mirror_out_len,
-    unsigned long *frame_out_len, unsigned long *arena_high_water_out)
+    unsigned long *frame_out_len, unsigned long *arena_high_water_out,
+    uint32_t render_mode, uint32_t strip_id)
 {
     return doom_engine_ex2_resource_sbf_ri2_run(
         1, context, resource, resource_bytes, wad_image, wad_bytes,
         bootstrap, bootstrap_bytes, state, state_len, mirror, mirror_len,
         controller, controller_len, frame_out, frame_cap, state_out,
         state_cap, state_out_len, mirror_out, mirror_cap, mirror_out_len,
-        frame_out_len, arena_high_water_out);
+        frame_out_len, arena_high_water_out, render_mode, strip_id);
 }
 
 int doom_engine_ex2_resource_sbf_ri2_reconstruct(
@@ -335,7 +342,7 @@ int doom_engine_ex2_resource_sbf_ri2_reconstruct(
         bootstrap, bootstrap_bytes, state, state_len, mirror, mirror_len,
         controller, controller_len, frame_out, frame_cap, state_out,
         state_cap, state_out_len, mirror_out, mirror_cap, mirror_out_len,
-        frame_out_len, arena_high_water_out);
+        frame_out_len, arena_high_water_out, 0u, 0u);
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,0 +1,149 @@
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -45,6 +45,16 @@
+ 
+ // State.
+ #include "doomstat.h"
++
++/* Diagnostic strip rendering keeps the normal profile unchanged.  The top
++ * five bits of doom_render_fuzz_columns carry mode/strip; low bits keep the
++ * fuzz-work counter.  mode 1 clips only pixel writes after full shared-state
++ * reconstruction; mode 2 also restricts the drawseg/visplane column range. */
++#define DOOM_RENDER_CLIP_MODE ((doom_render_fuzz_columns >> 30) & 3u)
++#define DOOM_RENDER_CLIP_LEFT (((doom_render_fuzz_columns >> 27) & 7u) * 40u)
++#define DOOM_RENDER_CLIP_RIGHT (DOOM_RENDER_CLIP_LEFT + 40u)
++#define DOOM_RENDER_FUZZ_COUNT_MASK 0x07ffffffu
++#define DOOM_RENDER_FUZZ_FLAGS_MASK 0xf8000000u
+ 
+ 
+ // ?
+@@ -96,6 +106,10 @@
+     fixed_t		frac;
+     fixed_t		fracstep;	 
+     int			source_index;
++
++    if (DOOM_RENDER_CLIP_MODE &&
++	(dc_x < (int)DOOM_RENDER_CLIP_LEFT || dc_x >= (int)DOOM_RENDER_CLIP_RIGHT))
++	return;
+  
+     count = dc_yh - dc_yl; 
+ 
+@@ -277,6 +291,7 @@
+ void R_DrawFuzzColumn (void) 
+ { 
+     int			count; 
++    int			advance;
+     byte*		dest; 
+     fixed_t		frac;
+     fixed_t		fracstep;	 
+@@ -294,6 +309,23 @@
+     // Zero length.
+     if (count < 0) 
+ 	return; 
++
++    if (DOOM_RENDER_CLIP_MODE &&
++	(dc_x < (int)DOOM_RENDER_CLIP_LEFT || dc_x >= (int)DOOM_RENDER_CLIP_RIGHT))
++    {
++	/* Preserve vanilla fuzzpos order for later in-strip columns without
++	 * writing pixels outside this strip. */
++	advance = count + 1;
++	while (advance-- > 0)
++	{
++	    doom_render_fuzz_columns =
++		(doom_render_fuzz_columns & DOOM_RENDER_FUZZ_FLAGS_MASK) |
++		((doom_render_fuzz_columns + 1u) & DOOM_RENDER_FUZZ_COUNT_MASK);
++	    if (++fuzzpos == FUZZTABLE)
++		fuzzpos = 0;
++	}
++	return;
++    }
+ 
+     
+ #ifdef RANGECHECK 
+@@ -350,7 +382,9 @@
+ 	*dest = colormaps[6*256+dest[fuzzoffset[fuzzpos]]]; 
+ 
+ 	// Clamp table lookup index.
+-	doom_render_fuzz_columns++;
++	doom_render_fuzz_columns =
++	    (doom_render_fuzz_columns & DOOM_RENDER_FUZZ_FLAGS_MASK) |
++	    ((doom_render_fuzz_columns + 1u) & DOOM_RENDER_FUZZ_COUNT_MASK);
+ 	if (++fuzzpos == FUZZTABLE) 
+ 	    fuzzpos = 0;
+ 	
+@@ -378,7 +412,11 @@
+     int			count; 
+     byte*		dest; 
+     fixed_t		frac;
+-    fixed_t		fracstep;	 
++    fixed_t		fracstep;
++
++    if (DOOM_RENDER_CLIP_MODE &&
++	(dc_x < (int)DOOM_RENDER_CLIP_LEFT || dc_x >= (int)DOOM_RENDER_CLIP_RIGHT))
++	return;
+  
+     count = dc_yh - dc_yl; 
+     if (count < 0) 
+@@ -506,6 +544,9 @@
+     byte*		dest; 
+     int			count;
+     int			spot; 
++	int			draw_x1;
++	int			draw_x2;
++	uint32_t		skipped;
+ 	 
+ #ifdef RANGECHECK 
+     if (ds_x2 < ds_x1
+@@ -522,11 +563,27 @@
+     
+     xfrac = ds_xfrac; 
+     yfrac = ds_yfrac; 
++	draw_x1 = ds_x1;
++	draw_x2 = ds_x2;
++	if (DOOM_RENDER_CLIP_MODE)
++	{
++	    if (draw_x1 < (int)DOOM_RENDER_CLIP_LEFT)
++	    {
++		skipped = (uint32_t)((int)DOOM_RENDER_CLIP_LEFT - draw_x1);
++		xfrac = (fixed_t)((uint32_t)xfrac + skipped * (uint32_t)ds_xstep);
++		yfrac = (fixed_t)((uint32_t)yfrac + skipped * (uint32_t)ds_ystep);
++		draw_x1 = (int)DOOM_RENDER_CLIP_LEFT;
++	    }
++	    if (draw_x2 >= (int)DOOM_RENDER_CLIP_RIGHT)
++		draw_x2 = (int)DOOM_RENDER_CLIP_RIGHT - 1;
++	    if (draw_x1 > draw_x2)
++		return;
++	}
+ 	 
+-    dest = ylookup[ds_y] + columnofs[ds_x1];
++    dest = ylookup[ds_y] + columnofs[draw_x1];
+ 
+     // We do not check for zero spans here?
+-    count = ds_x2 - ds_x1; 
++    count = draw_x2 - draw_x1; 
+ 
+     do 
+     {
+--- a/linuxdoom-1.10/r_bsp.c
++++ b/linuxdoom-1.10/r_bsp.c
+@@ -228,9 +228,13 @@
+ //
+ void R_ClearClipSegs (void)
+ {
++    unsigned mode = (doom_render_fuzz_columns >> 30) & 3u;
++    int clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
++    int clip_right = clip_left + 40;
++
+     solidsegs[0].first = -0x7fffffff;
+-    solidsegs[0].last = -1;
+-    solidsegs[1].first = viewwidth;
++    solidsegs[0].last = mode == 2 ? clip_left - 1 : -1;
++    solidsegs[1].first = mode == 2 ? clip_right : viewwidth;
+     solidsegs[1].last = 0x7fffffff;
+     newend = solidsegs+2;
+ }
+@@ -561,4 +565,3 @@
+ 	R_RenderBSPNode (bsp->children[side^1]);
+ }
+ 
+-

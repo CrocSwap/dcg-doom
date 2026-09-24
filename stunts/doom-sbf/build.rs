@@ -24,6 +24,7 @@ const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC
 const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
 const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
 const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
+const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/3|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView|render=diagnostic-strip40-modes1-full-scene2-solidseg-clipped";
 const NATIVE_PROVENANCE_PROFILE: &str =
     "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
@@ -1038,7 +1039,9 @@ fn source_manifest(
         json_string(&source_tree)
     )
     .unwrap();
-    let profile = if env::var("CARGO_FEATURE_SIM_TRANSPORT").is_ok() {
+    let profile = if env::var("CARGO_FEATURE_RENDER_CLIP_MEASUREMENT").is_ok() {
+        "render-clip-measurement"
+    } else if env::var("CARGO_FEATURE_SIM_TRANSPORT").is_ok() {
         "sim-transport"
     } else {
         "legacy"
@@ -1058,6 +1061,11 @@ fn source_manifest(
     writeln!(
         &mut manifest,
         "  \"resource_ri2_sbf_abi_descriptor\": \"{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}\","
+    )
+    .unwrap();
+    writeln!(
+        &mut manifest,
+        "  \"resource_ri3_sbf_abi_descriptor\": \"{RESOURCE_RI3_SBF_ABI_DESCRIPTOR}\","
     )
     .unwrap();
     writeln!(&mut manifest, "  \"build_metadata\": {metadata},").unwrap();
@@ -1118,6 +1126,8 @@ fn write_identity(
         digest(format!("DOOM-E2R-ABI-ID\0{RESOURCE_SBF_ABI_DESCRIPTOR}").as_bytes());
     let resource_ri2_sbf_abi_id =
         digest(format!("DOOM-E2R2-ABI-ID\0{RESOURCE_RI2_SBF_ABI_DESCRIPTOR}").as_bytes());
+    let resource_ri3_sbf_abi_id =
+        digest(format!("DOOM-E2R3-ABI-ID\0{RESOURCE_RI3_SBF_ABI_DESCRIPTOR}").as_bytes());
     let mut image_input = b"DOOM-EX2-IMAGE-ID\0".to_vec();
     image_input.extend_from_slice(manifest.as_bytes());
     let image_id = digest(&image_input);
@@ -1130,17 +1140,20 @@ fn write_identity(
          pub const SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const RESOURCE_SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const RESOURCE_RI2_SBF_ABI_ID: [u8; 32] = [{}];\n\
+         pub const RESOURCE_RI3_SBF_ABI_ID: [u8; 32] = [{}];\n\
          pub const SOURCE_MANIFEST_SHA256: &str = \"{manifest_id}\";\n\
          pub const ABI_DESCRIPTOR: &str = {ABI_DESCRIPTOR:?};\n\
          pub const SBF_ABI_DESCRIPTOR: &str = {SBF_ABI_DESCRIPTOR:?};\n\
          pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_SBF_ABI_DESCRIPTOR:?};\n\
          pub const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_RI2_SBF_ABI_DESCRIPTOR:?};\n\
+         pub const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = {RESOURCE_RI3_SBF_ABI_DESCRIPTOR:?};\n\
          pub const BUILD_SOURCE_MANIFEST: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/doom_ex2_source_manifest.json\"));\n",
         rust_array(&image_id),
         rust_array(&abi_id),
         rust_array(&sbf_abi_id),
         rust_array(&resource_sbf_abi_id),
         rust_array(&resource_ri2_sbf_abi_id),
+        rust_array(&resource_ri3_sbf_abi_id),
     );
     fs::write(out_dir.join("doom_ex2_build_identity.rs"), generated)
         .expect("write Doom EX2 build identity");
@@ -1259,6 +1272,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DIAGNOSTIC_PROFILE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SIM_TRANSPORT");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RENDER_CLIP_MEASUREMENT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LEGACY_5120_BUFFER");
     println!("cargo:rerun-if-env-changed=DOOM_SBF_SOURCE_TREE");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");

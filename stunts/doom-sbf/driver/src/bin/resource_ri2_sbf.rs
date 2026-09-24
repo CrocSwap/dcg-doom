@@ -89,7 +89,7 @@ fn padded_state(state: &[u8]) -> Vec<u8> {
     out
 }
 
-fn instruction(resource: Pubkey, controller: Pubkey, request: &resource_sbf::Ri2Request) -> Instruction {
+fn instruction(resource: Pubkey, controller: Pubkey, request_data: &[u8]) -> Instruction {
     let mut accounts = vec![meta(CONTEXT, true), meta(resource, false)];
     for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
         accounts.push(meta(Pubkey::new_from_array([0xe0 + ordinal as u8; 32]), false));
@@ -97,7 +97,7 @@ fn instruction(resource: Pubkey, controller: Pubkey, request: &resource_sbf::Ri2
     accounts.extend([
         meta(STATE, true), meta(MIRROR, true), meta(controller, false), meta(FRAME, true),
     ]);
-    Instruction { program_id: PROGRAM, accounts, data: request.encode().to_vec() }
+    Instruction { program_id: PROGRAM, accounts, data: request_data.to_vec() }
 }
 
 async fn execute(
@@ -105,14 +105,14 @@ async fn execute(
     payer: &solana_keypair::Keypair,
     resource: Pubkey,
     controller: Pubkey,
-    request: &resource_sbf::Ri2Request,
+    request_data: &[u8],
     limit: u32,
 ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
     let blockhash = client.get_latest_blockhash().await?;
     let tx = Transaction::new(
         &[payer],
         Message::new_with_blockhash(
-            &[ComputeBudgetInstruction::set_compute_unit_limit(limit), instruction(resource, controller, request)],
+            &[ComputeBudgetInstruction::set_compute_unit_limit(limit), instruction(resource, controller, request_data)],
             Some(&payer.pubkey()), &blockhash,
         ),
         blockhash,
@@ -163,26 +163,36 @@ fn write_report(
     status: &str,
     blocker: &str,
     normal_limit: u32,
+    compute_limit: u32,
     units: Option<u64>,
+    normal_limit_succeeded: Option<bool>,
     controller_control: &str,
     resource_control: &str,
+    render_control: &str,
     error: Option<&str>,
     state_equal: Option<bool>,
     mirror_equal: Option<bool>,
     frame_equal: Option<bool>,
+    render_mode: Option<u8>,
+    strip_id: Option<u8>,
+    frame_oracle_scope: &str,
     image_sha: &str,
     manifest_sha: &str,
     abi: &str,
 ) -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("report.json"), format!(
-        "{{\n  \"status\": {},\n  \"profile\": \"DOOM-E2R/2-SBF-ACTUAL\",\n  \"first_blocker\": {},\n  \"normal_limit\": {},\n  \"qualification_max_units\": {},\n  \"normal_units\": {},\n  \"malformed_controller_refusal\": {},\n  \"malformed_resource_refusal\": {},\n  \"normal_error\": {},\n  \"image_sha256\": {},\n  \"source_manifest_sha256\": {},\n  \"ri2_sbf_abi_id\": {},\n  \"resource_image_bytes\": {},\n  \"state_equal_native_oracle\": {},\n  \"mirror_equal_native_oracle\": {},\n  \"frame_equal_native_oracle\": {},\n  \"consumer_setup_calls\": 0,\n  \"public_send\": false\n}}\n",
-        json(status), json(blocker), normal_limit, QUALIFICATION_MAX_UNITS,
-        units.map_or("null".to_owned(), |x| x.to_string()), json(controller_control),
-        json(resource_control), error.map_or("null".to_owned(), json), json(image_sha),
+        "{{\n  \"status\": {},\n  \"profile\": {},\n  \"first_blocker\": {},\n  \"normal_limit\": {},\n  \"compute_limit\": {},\n  \"qualification_max_units\": {},\n  \"compute_units_consumed\": {},\n  \"normal_limit_succeeded\": {},\n  \"malformed_controller_refusal\": {},\n  \"malformed_resource_refusal\": {},\n  \"malformed_render_refusal\": {},\n  \"normal_error\": {},\n  \"image_sha256\": {},\n  \"source_manifest_sha256\": {},\n  \"resource_sbf_abi_id\": {},\n  \"resource_image_bytes\": {},\n  \"state_equal_native_oracle\": {},\n  \"mirror_equal_native_oracle\": {},\n  \"frame_equal_native_oracle\": {},\n  \"frame_oracle_scope\": {},\n  \"render_mode\": {},\n  \"strip_id\": {},\n  \"consumer_setup_calls\": 0,\n  \"public_send\": false\n}}\n",
+        json(status), json(if render_mode.is_some() { "DOOM-E2R/3-SBF-CLIPPED-DIAGNOSTIC" } else { "DOOM-E2R/2-SBF-ACTUAL" }), json(blocker), normal_limit, compute_limit, QUALIFICATION_MAX_UNITS,
+        units.map_or("null".to_owned(), |x| x.to_string()),
+        normal_limit_succeeded.map_or("null".to_owned(), |x| x.to_string()), json(controller_control),
+        json(resource_control), json(render_control), error.map_or("null".to_owned(), json), json(image_sha),
         json(manifest_sha), json(abi), resource_sbf::RI2_RESOURCE_IMAGE_BYTES,
         state_equal.map_or("null".to_owned(), |x| x.to_string()),
         mirror_equal.map_or("null".to_owned(), |x| x.to_string()),
         frame_equal.map_or("null".to_owned(), |x| x.to_string()),
+        json(frame_oracle_scope),
+        render_mode.map_or("null".to_owned(), |x| x.to_string()),
+        strip_id.map_or("null".to_owned(), |x| x.to_string()),
     ))?;
     Ok(())
 }
@@ -190,7 +200,7 @@ fn write_report(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
-    let capture = PathBuf::from(args.next().ok_or("usage: resource_ri2_sbf CAPTURE RECEIPT IMAGE EXPECTED_IMAGE_SHA MANIFEST EXPECTED_MANIFEST_SHA ABI DRIVER RESOURCE_IMAGE NATIVE_RECEIPT CONTROLLER [--diagnostic]")?).canonicalize()?;
+    let capture = PathBuf::from(args.next().ok_or("usage: resource_ri2_sbf CAPTURE RECEIPT IMAGE EXPECTED_IMAGE_SHA MANIFEST EXPECTED_MANIFEST_SHA ABI DRIVER RESOURCE_IMAGE NATIVE_RECEIPT CONTROLLER [--diagnostic | --clipped MODE STRIP]")?).canonicalize()?;
     let receipt = PathBuf::from(args.next().ok_or("missing receipt")?);
     let image = PathBuf::from(args.next().ok_or("missing image")?).canonicalize()?;
     let expected_image_sha = args.next().ok_or("missing expected image SHA")?.into_string().map_err(|_| "image SHA is not UTF-8")?;
@@ -201,9 +211,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resource_path = PathBuf::from(args.next().ok_or("missing RI2 resource image")?).canonicalize()?;
     let native = PathBuf::from(args.next().ok_or("missing native receipt")?).canonicalize()?;
     let controller_path = PathBuf::from(args.next().ok_or("missing controller")?).canonicalize()?;
-    let diagnostic = match args.next() {
-        None => false,
-        Some(flag) if flag == "--diagnostic" => true,
+    let (diagnostic, render_clip) = match args.next() {
+        None => (false, None),
+        Some(flag) if flag == "--diagnostic" => {
+            if args.next().is_some() { return Err("unexpected argument".into()); }
+            (true, None)
+        }
+        Some(flag) if flag == "--clipped" => {
+            let mode: u8 = args.next().ok_or("missing clipped render mode")?.into_string()
+                .map_err(|_| "render mode is not UTF-8")?.parse()?;
+            let strip: u8 = args.next().ok_or("missing strip id")?.into_string()
+                .map_err(|_| "strip id is not UTF-8")?.parse()?;
+            if !(1..=2).contains(&mode) || strip >= 8 || args.next().is_some() {
+                return Err("clipped mode must be 1 or 2 and strip must be 0..7".into());
+            }
+            (true, Some((mode, strip)))
+        }
         Some(_) => return Err("unexpected argument".into()),
     };
     if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
@@ -212,7 +235,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&receipt)?;
     let limit = if diagnostic { DIAGNOSTIC_LIMIT } else { NORMAL_LIMIT };
     fs::write(receipt.join("run-mode.json"), format!(
-        "{{\n  \"schema\": \"doom-e2r2-sbf-run-mode/1\",\n  \"diagnostic_only\": {},\n  \"compute_limit\": {},\n  \"qualification_limit\": {}\n}}\n", diagnostic, limit, NORMAL_LIMIT))?;
+        "{{\n  \"schema\": \"doom-e2r3-sbf-run-mode/1\",\n  \"diagnostic_only\": {},\n  \"compute_limit\": {},\n  \"qualification_limit\": {},\n  \"render_mode\": {},\n  \"strip_id\": {}\n}}\n", diagnostic, limit, NORMAL_LIMIT,
+        render_clip.map_or("null".to_owned(), |x| x.0.to_string()),
+        render_clip.map_or("null".to_owned(), |x| x.1.to_string())))?;
 
     if image.file_name().and_then(|s| s.to_str()) != Some("doom_sbf.so") { return Err("expected doom_sbf.so".into()); }
     let image_bytes = read(&image)?;
@@ -222,15 +247,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let manifest_text = std::str::from_utf8(&manifest_bytes)?;
     let manifest_actual_sha = sha(&manifest_bytes);
     let expected_abi = digest_hex_to_array(&abi)?;
-    if expected_abi != resource_sbf::RI2_ABI_ID { return Err("RI2 ABI identity mismatch".into()); }
+    let expected_descriptor = if render_clip.is_some() {
+        if expected_abi != resource_sbf::RI3_ABI_ID { return Err("RI3 ABI identity mismatch".into()); }
+        resource_sbf::RESOURCE_RI3_SBF_ABI_DESCRIPTOR
+    } else {
+        if expected_abi != resource_sbf::RI2_ABI_ID { return Err("RI2 ABI identity mismatch".into()); }
+        resource_sbf::RESOURCE_RI2_SBF_ABI_DESCRIPTOR
+    };
     if manifest_actual_sha != expected_manifest_sha || !manifest_text.contains("\"sbf\": true")
         || !manifest_text.contains("\"target\": \"sbpf-solana-solana\"")
-        || !manifest_text.contains(&format!("\"resource_ri2_sbf_abi_descriptor\": \"{}\"", resource_sbf::RESOURCE_RI2_SBF_ABI_DESCRIPTOR)) {
+        || !manifest_text.contains(&format!("\"resource_ri{}_sbf_abi_descriptor\": \"{}\"", if render_clip.is_some() { 3 } else { 2 }, expected_descriptor)) {
         return Err("source manifest identity mismatch".into());
     }
     if sha(DRIVER_SOURCE) != driver_sha { return Err("driver source SHA mismatch".into()); }
     fs::write(receipt.join("identity.json"), format!(
-        "{{\n  \"image_sha256\": \"{}\",\n  \"source_manifest_sha256\": \"{}\",\n  \"ri2_sbf_abi_id\": \"{}\",\n  \"driver_sha256\": \"{}\"\n}}\n", image_actual_sha, manifest_actual_sha, abi, driver_sha))?;
+        "{{\n  \"image_sha256\": \"{}\",\n  \"source_manifest_sha256\": \"{}\",\n  \"resource_sbf_abi_id\": \"{}\",\n  \"driver_sha256\": \"{}\"\n}}\n", image_actual_sha, manifest_actual_sha, abi, driver_sha))?;
 
     let resource_image = read(&resource_path)?;
     if resource_image.len() != resource_sbf::RI2_RESOURCE_IMAGE_BYTES || sha(&resource_image) != RESOURCE_IMAGE_SHA256 {
@@ -262,6 +293,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     if wad_payload.len() != resource_sbf::WAD_IMAGE_BYTES || sha(&wad_payload) != WAD_CONCAT_SHA256 { return Err("WAD concat identity mismatch".into()); }
     let request = resource_sbf::Ri2Request { resource_bytes: resource_image.len(), state_len: state.len(), wad_bytes: wad_payload.len(), frame_bytes: resource_sbf::RI2_FRAME_BYTES };
+    let request_data = if let Some((mode, strip)) = render_clip {
+        resource_sbf::Ri3Request {
+            resource_bytes: resource_image.len(), state_len: state.len(), wad_bytes: wad_payload.len(),
+            frame_bytes: resource_sbf::RI2_FRAME_BYTES, render_mode: mode, strip_id: strip,
+        }.encode().to_vec()
+    } else { request.encode().to_vec() };
     let mut bad_controller = controller.clone();
     bad_controller[28] = 1;
     let mut bad_resource = resource_image.clone();
@@ -269,7 +306,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bank = program_test(&image, &resource_image, &bad_resource, &wad_accounts, &state, &mirror, &controller, &bad_controller, limit);
     let (mut client, payer, _) = bank.start().await;
 
-    let malformed_controller = execute(&mut client, &payer, RESOURCE, BAD_CONTROLLER, &request, NORMAL_LIMIT).await?;
+    let malformed_controller = execute(&mut client, &payer, RESOURCE, BAD_CONTROLLER, &request.encode(), NORMAL_LIMIT).await?;
     let controller_text = format!("{malformed_controller:?}");
     if !controller_text.contains("InvalidAccountData") { return Err(format!("malformed CI2 control failed: {controller_text}").into()); }
     let before_state = account_data(&client, STATE).await?;
@@ -277,18 +314,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let before_frame = account_data(&client, FRAME).await?;
     if before_state != padded_state(&state) || before_mirror != mirror || before_frame.iter().any(|b| *b != 0) { return Err("malformed CI2 mutated outputs".into()); }
 
-    let malformed_resource = execute(&mut client, &payer, BAD_RESOURCE, CONTROLLER, &request, NORMAL_LIMIT).await?;
+    let malformed_resource = execute(&mut client, &payer, BAD_RESOURCE, CONTROLLER, &request.encode(), NORMAL_LIMIT).await?;
     let resource_text = format!("{malformed_resource:?}");
     if !resource_text.contains("Custom(240)") { return Err(format!("malformed RI2 control was not Custom(240): {resource_text}").into()); }
     if account_data(&client, STATE).await? != before_state || account_data(&client, MIRROR).await? != before_mirror || account_data(&client, FRAME).await? != before_frame { return Err("malformed RI2 mutated outputs".into()); }
+    let render_text = if let Some((_, _)) = render_clip {
+        let mut malformed_render = request_data.clone();
+        malformed_render[13] = 3;
+        let refusal = execute(&mut client, &payer, RESOURCE, CONTROLLER, &malformed_render, NORMAL_LIMIT).await?;
+        let text = format!("{refusal:?}");
+        if !text.contains("InvalidInstructionData") { return Err(format!("malformed RI3 render mode was not refused: {text}").into()); }
+        if account_data(&client, STATE).await? != before_state || account_data(&client, MIRROR).await? != before_mirror || account_data(&client, FRAME).await? != before_frame { return Err("malformed RI3 mutated outputs".into()); }
+        fs::write(receipt.join("malformed-render-refusal.txt"), &text)?;
+        text
+    } else { "not-applicable".to_owned() };
 
-    let normal = execute(&mut client, &payer, RESOURCE, CONTROLLER, &request, limit).await?;
+    let (normal, normal_limit_succeeded) = if render_clip.is_some() {
+        let first = execute(&mut client, &payer, RESOURCE, CONTROLLER, &request_data, NORMAL_LIMIT).await?;
+        if first.result.is_ok() {
+            (first, Some(true))
+        } else {
+            fs::write(receipt.join("normal-limit-attempt.txt"), format!("{first:?}"))?;
+            (execute(&mut client, &payer, RESOURCE, CONTROLLER, &request_data, DIAGNOSTIC_LIMIT).await?, Some(false))
+        }
+    } else {
+        let transaction = execute(&mut client, &payer, RESOURCE, CONTROLLER, &request_data, limit).await?;
+        let succeeded = if diagnostic { None } else { Some(transaction.result.is_ok()) };
+        (transaction, succeeded)
+    };
     let logs = normal.metadata.as_ref().map(|m| m.log_messages.join("\n")).unwrap_or_default();
     fs::write(receipt.join("tic-logs.txt"), logs)?;
     let units = normal.metadata.as_ref().map(|m| m.compute_units_consumed);
     if normal.result.is_err() {
         let text = format!("{normal:?}");
-        write_report(&receipt, if diagnostic { "failed-diagnostic-runtime" } else { "failed-normal-budget" }, "actual-sbf-resource-tic", limit, units, &controller_text, &resource_text, Some(&text), None, None, None, &image_actual_sha, &manifest_actual_sha, &abi)?;
+        write_report(&receipt, if diagnostic { "failed-diagnostic-runtime" } else { "failed-normal-budget" }, "actual-sbf-resource-tic", NORMAL_LIMIT, if normal_limit_succeeded == Some(false) { DIAGNOSTIC_LIMIT } else { limit }, units, normal_limit_succeeded, &controller_text, &resource_text, &render_text, Some(&text), None, None, None, render_clip.map(|x| x.0), render_clip.map(|x| x.1), if render_clip.is_some() { "40-column strip" } else { "full framebuffer" }, &image_actual_sha, &manifest_actual_sha, &abi)?;
         return Err(format!("actual RI2 SBF tic failed: {text}").into());
     }
     let output_state = account_data(&client, STATE).await?;
@@ -296,18 +355,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let output_frame = account_data(&client, FRAME).await?;
     let state_equal = &output_state[..expected_state.len()] == expected_state && output_state[expected_state.len()..].iter().all(|b| *b == 0);
     let mirror_equal = output_mirror == expected_mirror;
-    let frame_equal = output_frame == expected_frame;
+    let frame_equal = if let Some((_, strip)) = render_clip {
+        (0..200).all(|row| {
+            let start = row * 320 + usize::from(strip) * 40;
+            output_frame[start..start + 40] == expected_frame[start..start + 40]
+        })
+    } else { output_frame == expected_frame };
     fs::write(receipt.join("output-state.st1"), &output_state[..expected_state.len()])?;
     fs::write(receipt.join("output-mirror.mp1"), &output_mirror)?;
     fs::write(receipt.join("output-frame.fb1"), &output_frame)?;
+    if let Some((_, strip)) = render_clip {
+        let mut pixels = Vec::with_capacity(40 * 200);
+        for row in 0..200 {
+            let start = row * 320 + usize::from(strip) * 40;
+            pixels.extend_from_slice(&output_frame[start..start + 40]);
+        }
+        fs::write(receipt.join("output-strip.px8"), pixels)?;
+    }
     if !state_equal || !mirror_equal || !frame_equal {
-        write_report(&receipt, "failed-output-mismatch", "native-oracle-mismatch", limit, units, &controller_text, &resource_text, None, Some(state_equal), Some(mirror_equal), Some(frame_equal), &image_actual_sha, &manifest_actual_sha, &abi)?;
+        write_report(&receipt, "failed-output-mismatch", "native-oracle-mismatch", NORMAL_LIMIT, if normal_limit_succeeded == Some(false) { DIAGNOSTIC_LIMIT } else { limit }, units, normal_limit_succeeded, &controller_text, &resource_text, &render_text, None, Some(state_equal), Some(mirror_equal), Some(frame_equal), render_clip.map(|x| x.0), render_clip.map(|x| x.1), if render_clip.is_some() { "40-column strip" } else { "full framebuffer" }, &image_actual_sha, &manifest_actual_sha, &abi)?;
         return Err(format!("actual RI2 SBF mismatch state={state_equal} mirror={mirror_equal} frame={frame_equal}").into());
     }
     let Some(units) = units else { return Err("actual SBF run did not report compute units".into()); };
-    let status = if diagnostic { "measured-diagnostic-only-equality" } else if units > QUALIFICATION_MAX_UNITS { "failed-over-qualification-budget" } else { "measured-accepted-normal-budget" };
-    let blocker = if diagnostic { "diagnostic-not-qualification" } else if units > QUALIFICATION_MAX_UNITS { "compute-units-over-qualification-threshold" } else { "none" };
-    write_report(&receipt, status, blocker, limit, Some(units), &controller_text, &resource_text, None, Some(true), Some(true), Some(true), &image_actual_sha, &manifest_actual_sha, &abi)?;
+    let status = if render_clip.is_some() && normal_limit_succeeded == Some(true) { "measured-normal-limit-equality" } else if diagnostic { "measured-diagnostic-only-equality" } else if units > QUALIFICATION_MAX_UNITS { "failed-over-qualification-budget" } else { "measured-accepted-normal-budget" };
+    let blocker = if diagnostic && normal_limit_succeeded != Some(true) { "diagnostic-not-normal-limit" } else if units > QUALIFICATION_MAX_UNITS { "compute-units-over-qualification-threshold" } else { "none" };
+    write_report(&receipt, status, blocker, NORMAL_LIMIT, if normal_limit_succeeded == Some(false) { DIAGNOSTIC_LIMIT } else { limit }, Some(units), normal_limit_succeeded, &controller_text, &resource_text, &render_text, None, Some(true), Some(true), Some(frame_equal), render_clip.map(|x| x.0), render_clip.map(|x| x.1), if render_clip.is_some() { "40-column strip" } else { "full framebuffer" }, &image_actual_sha, &manifest_actual_sha, &abi)?;
     println!("RI2 SBF {status}: units={units} receipt={}", receipt.display());
     if !diagnostic && units > QUALIFICATION_MAX_UNITS { return Err(format!("RI2 SBF over qualification threshold: {units}").into()); }
     Ok(())

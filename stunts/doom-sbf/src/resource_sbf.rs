@@ -18,9 +18,15 @@ pub const INSTRUCTION_BYTES: usize = 32;
 pub const ABI_ID: [u8; 32] = super::ex2::RESOURCE_SBF_ABI_ID;
 pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = super::ex2::RESOURCE_SBF_ABI_DESCRIPTOR;
 pub const RI2_VERSION: u32 = 2;
+/// Diagnostic-only clipped-render measurement ABI. Deployable images leave
+/// `render-clip-measurement` disabled and reject this version.
+pub const RI3_VERSION: u32 = 3;
 pub const RI2_ABI_ID: [u8; 32] = super::ex2::RESOURCE_RI2_SBF_ABI_ID;
 pub const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str =
     super::ex2::RESOURCE_RI2_SBF_ABI_DESCRIPTOR;
+pub const RI3_ABI_ID: [u8; 32] = super::ex2::RESOURCE_RI3_SBF_ABI_ID;
+pub const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str =
+    super::ex2::RESOURCE_RI3_SBF_ABI_DESCRIPTOR;
 
 pub const RESOURCE_ACCOUNT: usize = 1;
 pub const RESOURCE_ACCOUNT_BYTES: usize = 197_664;
@@ -185,6 +191,63 @@ impl Ri2Request {
         out[..8].copy_from_slice(MAGIC);
         out[8..12].copy_from_slice(&RI2_VERSION.to_le_bytes());
         out[12] = TIC;
+        out[16..20].copy_from_slice(&(self.resource_bytes as u32).to_le_bytes());
+        out[20..24].copy_from_slice(&(self.state_len as u32).to_le_bytes());
+        out[24..28].copy_from_slice(&(self.wad_bytes as u32).to_le_bytes());
+        out
+    }
+}
+
+/// Version-3 request used only by the isolated clipped-render measurement
+/// image. `render_mode` 1 recomputes the full BSP/drawseg/plane state and
+/// clips raster writes; mode 2 also seeds solid-segment clipping at the strip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ri3Request {
+    pub resource_bytes: usize,
+    pub state_len: usize,
+    pub wad_bytes: usize,
+    pub frame_bytes: usize,
+    pub render_mode: u8,
+    pub strip_id: u8,
+}
+
+impl Ri3Request {
+    pub fn decode(data: &[u8]) -> Result<Self, ProgramError> {
+        if data.len() != INSTRUCTION_BYTES
+            || &data[..8] != MAGIC
+            || u32_at(data, 8) != RI3_VERSION
+            || data[12] != TIC
+            || !(1..=2).contains(&data[13])
+            || data[14] >= 8
+            || data[15] != 0
+            || data[28..32].iter().any(|&byte| byte != 0)
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let request = Self {
+            resource_bytes: u32_at(data, 16) as usize,
+            state_len: u32_at(data, 20) as usize,
+            wad_bytes: u32_at(data, 24) as usize,
+            frame_bytes: RI2_FRAME_BYTES,
+            render_mode: data[13],
+            strip_id: data[14],
+        };
+        if request.resource_bytes != RI2_RESOURCE_IMAGE_BYTES
+            || !(64..=STATE_MAX_BYTES).contains(&request.state_len)
+            || request.wad_bytes != WAD_IMAGE_BYTES
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Ok(request)
+    }
+
+    pub fn encode(self) -> [u8; INSTRUCTION_BYTES] {
+        let mut out = [0u8; INSTRUCTION_BYTES];
+        out[..8].copy_from_slice(MAGIC);
+        out[8..12].copy_from_slice(&RI3_VERSION.to_le_bytes());
+        out[12] = TIC;
+        out[13] = self.render_mode;
+        out[14] = self.strip_id;
         out[16..20].copy_from_slice(&(self.resource_bytes as u32).to_le_bytes());
         out[20..24].copy_from_slice(&(self.state_len as u32).to_le_bytes());
         out[24..28].copy_from_slice(&(self.wad_bytes as u32).to_le_bytes());
@@ -489,6 +552,8 @@ unsafe extern "C" {
         mirror_out_len: *mut usize,
         frame_out_len: *mut usize,
         arena_high_water: *mut usize,
+        render_mode: u32,
+        strip_id: u32,
     ) -> i32;
 }
 
@@ -498,7 +563,26 @@ fn process_ri2(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let request = Ri2Request::decode(instruction_data)?;
+    let (request, render_mode, strip_id) = if instruction_data.len() >= 12
+        && u32_at(instruction_data, 8) == RI3_VERSION
+    {
+        if !cfg!(feature = "render-clip-measurement") {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let clipped = Ri3Request::decode(instruction_data)?;
+        (
+            Ri2Request {
+                resource_bytes: clipped.resource_bytes,
+                state_len: clipped.state_len,
+                wad_bytes: clipped.wad_bytes,
+                frame_bytes: clipped.frame_bytes,
+            },
+            clipped.render_mode as u32,
+            clipped.strip_id as u32,
+        )
+    } else {
+        (Ri2Request::decode(instruction_data)?, 0, 0)
+    };
     validate_account_shape_ri2(program, accounts)?;
     super::diagnostic_phase(401);
 
@@ -576,6 +660,8 @@ fn process_ri2(
             &mut mirror_out_len,
             &mut frame_out_len,
             &mut arena_high_water,
+            render_mode,
+            strip_id,
         )
     };
     if rc != 0 {
@@ -606,7 +692,10 @@ pub fn process(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    if instruction_data.len() >= 12 && u32_at(instruction_data, 8) == RI2_VERSION {
+    if instruction_data.len() >= 12
+        && (u32_at(instruction_data, 8) == RI2_VERSION
+            || u32_at(instruction_data, 8) == RI3_VERSION)
+    {
         return process_ri2(program, accounts, instruction_data);
     }
     let request = Request::decode(instruction_data)?;

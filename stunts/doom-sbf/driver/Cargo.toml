@@ -24,6 +24,7 @@ ex2-sbf = ["doom-sbf/ctx-engine"]
 # DOOM-SIM/2 gates: the driver encodes E2R/5 requests, so it must see the
 # same transport-profile constants as the image under test.
 sim-transport = ["ctx-engine", "doom-sbf/sim-transport"]
+render-clip-measurement = ["ctx-engine", "doom-sbf/render-clip-measurement"]
 
 [[bin]]
 name = "static_probe"
