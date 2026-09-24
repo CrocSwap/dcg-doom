@@ -115,12 +115,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let program = Pubkey::from_str(run["program"].as_str().ok_or("run.json program")?)?;
     let context = Pubkey::from_str(run["context"].as_str().ok_or("run.json context")?)?;
     let meta_key = Pubkey::from_str(run["meta"].as_str().ok_or("run.json meta")?)?;
-    let state_key = Pubkey::from_str(run["state"].as_str().ok_or("run.json state")?)?;
-    let mirror_key = Pubkey::from_str(run["mirror"].as_str().ok_or("run.json mirror")?)?;
-
     let meta = read(&captures.join("end-meta.bin"))?;
     let state = read(&captures.join("end-state.st1"))?;
     let mirror = read(&captures.join("end-mirror.mp1"))?;
+    let state_key = Pubkey::new_from_array(meta[sim2::M_STATE..sim2::M_STATE + 32].try_into()?);
+    let mirror_key = Pubkey::new_from_array(meta[sim2::M_MIRROR..sim2::M_MIRROR + 32].try_into()?);
     require_hash(
         "captured SIM2 meta",
         &sha(&meta),
@@ -154,11 +153,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if meta[sim2::M_CONTEXT..sim2::M_CONTEXT + 32] != context.as_ref()[..]
-        || meta[sim2::M_STATE..sim2::M_STATE + 32] != state_key.as_ref()[..]
-        || meta[sim2::M_MIRROR..sim2::M_MIRROR + 32] != mirror_key.as_ref()[..]
-    {
-        return Err("run.json account keys do not match captured SIM2 meta".into());
+    if meta[sim2::M_CONTEXT..sim2::M_CONTEXT + 32] != context.as_ref()[..] {
+        return Err("run.json context does not match captured SIM2 meta".into());
     }
     let (expected_meta, _) = sim2::meta_address(&program, &context);
     if expected_meta != meta_key {
