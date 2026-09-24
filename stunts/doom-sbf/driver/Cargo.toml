@@ -51,6 +51,10 @@ name = "resource_ri2_sbf"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "render_snapshot_v3_sbf"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "continuation_sbf"
 required-features = ["ctx-engine"]
 
