@@ -688,15 +688,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .get_account(mirror.pubkey())
         .await?
         .ok_or("MP1 missing after ADVANCE")?;
-    if meta_view.cursor != 1
-        || meta_view.state_root != expected_root
-        || final_state.data[..r3_native_state.len()] != r3_native_state
-        || final_state.data[r3_native_state.len()..]
+    fs::write(
+        receipt.join("advance-readback-state.st1"),
+        &final_state.data,
+    )?;
+    fs::write(
+        receipt.join("advance-readback-mirror.mp1"),
+        &final_mirror.data,
+    )?;
+    let state_prefix = final_state.data.get(..r3_native_state.len());
+    let state_tail_zero = final_state
+        .data
+        .get(r3_native_state.len()..)
+        .is_some_and(|tail| tail.iter().all(|byte| *byte == 0));
+    let state_first_diff = state_prefix.and_then(|actual| {
+        r3_native_state
             .iter()
-            .any(|byte| *byte != 0)
-        || final_mirror.data != r3_native_mirror
+            .zip(actual)
+            .position(|(expected, actual)| expected != actual)
+    });
+    let actual_root = sim2::verified_state_root(&final_state.data, &final_mirror.data)
+        .ok()
+        .map(|(_, root)| root);
+    let state_prefix_matches = state_prefix == Some(r3_native_state.as_slice());
+    let mirror_matches = final_mirror.data == r3_native_mirror;
+    let root_matches = actual_root.as_ref() == Some(&expected_root);
+    let meta_root_matches = actual_root.as_ref() == Some(&meta_view.state_root);
+    fs::write(
+        receipt.join("advance-readback.json"),
+        serde_json::to_vec_pretty(&json!({
+            "cursor":meta_view.cursor,
+            "cursor_is_one":meta_view.cursor == 1,
+            "meta_root_matches_r3":meta_view.state_root == expected_root,
+            "actual_state_root":actual_root.as_ref().map(|root| hex(root)),
+            "actual_root_matches_r3":root_matches,
+            "meta_root_matches_actual":meta_root_matches,
+            "state_prefix_matches_r3":state_prefix_matches,
+            "state_tail_is_zero":state_tail_zero,
+            "state_prefix_first_diff_offset":state_first_diff,
+            "r3_state_sha256":sha(&r3_native_state),
+            "actual_state_prefix_sha256":state_prefix.map(sha),
+            "mirror_matches_r3":mirror_matches,
+            "r3_mirror_sha256":sha(&r3_native_mirror),
+            "actual_mirror_sha256":sha(&final_mirror.data)
+        }))?,
+    )?;
+    if meta_view.cursor != 1
+        || !root_matches
+        || !state_prefix_matches
+        || !state_tail_zero
+        || !mirror_matches
     {
-        return Err("ADVANCE state/root differs from the captured native one-tic oracle".into());
+        return Err(format!(
+            "ADVANCE parity mismatch: cursor={}, root={}, state={}, zero_tail={}, mirror={}",
+            meta_view.cursor, root_matches, state_prefix_matches, state_tail_zero, mirror_matches
+        )
+        .into());
     }
     fs::write(receipt.join("advance-state.st1"), &final_state.data)?;
     fs::write(receipt.join("advance-mirror.mp1"), &final_mirror.data)?;
