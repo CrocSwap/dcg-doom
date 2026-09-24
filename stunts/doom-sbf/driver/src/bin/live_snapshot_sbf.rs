@@ -296,11 +296,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let image_bytes = fs::read(&image)?;
     let manifest_bytes = fs::read(&manifest)?;
     let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
-    if manifest_json["profile"] != "sim-transport"
+    let profile = manifest_json["profile"].as_str().unwrap_or("");
+    let render_abi = manifest_json["render_snapshot_v3_abi_descriptor"]
+        .as_str()
+        .unwrap_or("");
+    if !matches!(profile, "sim-transport" | "render-clip-measurement")
         || manifest_json["sbf"] != true
-        || !manifest_json
-            .get("render_snapshot_v3_abi_descriptor")
-            .is_some()
+        || !render_abi.contains("SNAPSHOT-LIVE/3")
     {
         return Err("image manifest is not the DOOM-SIM/2 RSN/3 SBF profile".into());
     }
