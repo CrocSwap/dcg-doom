@@ -137,7 +137,9 @@ Doom profile has no pitch field, so pitch is encoded as zero. Counts and the
 derived exact payload length are bounded before rendering. ST1 and MP1 bytes
 are not copied into RSN/3.
 
-`SNAPSHOT/3` validates the SIM2 root and cursor, reconstructs the captured
+`SNAPSHOT/3` takes the scratch account first so the C engine sees its pinned
+context address, followed by meta, ST1, MP1, RI2, five WAD accounts and the
+snapshot output. It validates the SIM2 root and cursor, reconstructs the captured
 engine state once, and writes this projection. `RENDER/3` validates the
 snapshot hash, the RI2 account hash, and the reconstructed WAD digest against
 the snapshot pin, then applies the projection without

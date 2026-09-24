@@ -147,6 +147,7 @@ fn snapshot_instruction(
     request: &[u8],
 ) -> Instruction {
     let mut accounts = vec![
+        meta(scratch, true),
         meta(meta_key, false),
         meta(state_key, false),
         meta(mirror_key, false),
@@ -158,7 +159,7 @@ fn snapshot_instruction(
             false,
         ));
     }
-    accounts.extend([meta(scratch, true), meta(snapshot, true)]);
+    accounts.push(meta(snapshot, true));
     Instruction {
         program_id: program,
         accounts,

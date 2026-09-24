@@ -472,12 +472,12 @@ unsafe extern "C" {
 
 fn process_snapshot(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let request = SnapshotRequest::decode(data)?;
-    const META: usize = 0;
-    const STATE: usize = 1;
-    const MIRROR: usize = 2;
-    const RESOURCE: usize = 3;
-    const WAD_FIRST: usize = 4;
-    const SCRATCH: usize = 9;
+    const SCRATCH: usize = 0;
+    const META: usize = 1;
+    const STATE: usize = 2;
+    const MIRROR: usize = 3;
+    const RESOURCE: usize = 4;
+    const WAD_FIRST: usize = 5;
     const SNAPSHOT: usize = 10;
     if accounts.len() != 11 || !distinct(accounts) {
         return Err(refuse(REFUSE_ACCOUNTS));
