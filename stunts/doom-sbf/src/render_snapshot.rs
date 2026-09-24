@@ -14,6 +14,7 @@ use solana_program::{
     pubkey::Pubkey,
     rent::Rent,
     system_instruction, system_program,
+    sysvar::Sysvar,
 };
 
 use crate::{ex2, resource_sbf, sim2};
