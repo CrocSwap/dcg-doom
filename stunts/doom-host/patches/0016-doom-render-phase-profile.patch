@@ -1,0 +1,149 @@
+--- a/linuxdoom-1.10/r_draw.h
++++ b/linuxdoom-1.10/r_draw.h
+@@ -31,6 +31,23 @@
+ 
+ 
+ // first pixel in a column
++
++
++/* Diagnostic-only render phase markers and drawer ablation.  A host build and
++ * a qualifying SBF image never define DOOM_SBF_PHASE_PROFILE, so the marker
++ * calls below compile out and the preprocessed output is unchanged.
++ * DOOM_SBF_RENDER_COUNT_ONLY keeps every BSP traversal, every column and span
++ * setup and every per-pixel texture computation but drops the framebuffer
++ * store, so the CU difference between a phase-profile image and a count-only
++ * image is the pixel-write cost of the drawers.  Both defines are
++ * diagnostic-only and must never appear in a deployable image. */
++#ifdef DOOM_SBF_PHASE_PROFILE
++extern void doom_sbf_phase_marker(unsigned long phase);
++#define R_DRAW_PHASE(phase) doom_sbf_phase_marker((unsigned long)(phase))
++#else
++#define R_DRAW_PHASE(phase) ((void)0)
++#endif
++
+ 
+ 
+ // The span blitting interface.
+--- a/linuxdoom-1.10/r_main.c
++++ b/linuxdoom-1.10/r_main.c
+@@ -833,29 +833,35 @@
+ void R_RenderPlayerView (player_t* player)
+ {	
+     R_SetupFrame (player);
++    R_DRAW_PHASE(1201);
+ 
+     // Clear buffers.
+     R_ClearClipSegs ();
+     R_ClearDrawSegs ();
+     R_ClearPlanes ();
+     R_ClearSprites ();
++    R_DRAW_PHASE(1202);
+     
+     // check for new console commands.
+     NetUpdate ();
+ 
+     // The head node is the last node output.
+     R_RenderBSPNode ((DOOM_CTX->numnodes)-1);
++    R_DRAW_PHASE(1203);
+     
+     // Check for new console commands.
+     NetUpdate ();
+     
+     R_DrawPlanes ();
++    R_DRAW_PHASE(1204);
+     
+     // Check for new console commands.
+     NetUpdate ();
+     
+     R_DrawMasked ();
++    R_DRAW_PHASE(1205);
+ 
+     // Check for new console commands.
+-    NetUpdate ();				
+-}
++    NetUpdate ();
++    R_DRAW_PHASE(1206);
++}
+--- a/linuxdoom-1.10/r_things.c
++++ b/linuxdoom-1.10/r_things.c
+@@ -944,6 +944,7 @@
+     drawseg_t*		ds;
+ 	
+     R_SortVisSprites ();
++    R_DRAW_PHASE(1210);
+ 
+     if (vissprite_p > vissprites)
+     {
+@@ -958,12 +959,15 @@
+     }
+     
+     // render any remaining masked mid textures
++    R_DRAW_PHASE(1212);
+     for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
+ 	if (ds->maskedtexturecol_m)
+ 	    R_RenderMaskedSegRange (ds, ds->x1, ds->x2);
+     
+     // draw the psprites on top of everything
++    R_DRAW_PHASE(1213);
+     //  but does not draw on side views
+     if (!viewangleoffset)		
+ 	R_DrawPlayerSprites ();
+-}
++    R_DRAW_PHASE(1214);
++}
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -143,12 +143,14 @@
+ 	// using a lighting/special effects LUT. A masked post can end between
+ 	// pixel centers; sampling past it is transparent, not a WAD over-read.
+ 	source_index = (frac>>FRACBITS)&127;
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
+ 	if (dc_source_length && source_index >= dc_source_length)
+ 	    *dest = dc_colormap[0];
+ 	else
+ 	    *dest = dc_colormap[dc_source[source_index]];
+ 	
+ 	dest += SCREENWIDTH; 
++#endif
+ 	frac += fracstep;
+ 	
+     } while (count--); 
+@@ -379,6 +381,7 @@
+ 	//  a pixel that is either one column
+ 	//  left or right of the current one.
+ 	// Add index from colormap to index.
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
+ 	*dest = colormaps[6*256+dest[fuzzoffset[fuzzpos]]]; 
+ 
+ 	// Clamp table lookup index.
+@@ -389,6 +392,7 @@
+ 	    fuzzpos = 0;
+ 	
+ 	dest += SCREENWIDTH;
++#endif
+ 
+ 	frac += fracstep; 
+     } while (count--); 
+@@ -592,7 +596,9 @@
+ 
+ 	// Lookup pixel from flat texture tile,
+ 	//  re-index using light/colormap.
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
+ 	*dest++ = ds_colormap[ds_source[spot]];
++#endif
+ 
+ 	// Next step in u,v.
+ 	xfrac += ds_xstep; 
+@@ -715,8 +721,12 @@
+ 	spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+ 	// Lowres/blocky mode does it twice,
+ 	//  while scale is adjusted appropriately.
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
+ 	*dest++ = ds_colormap[ds_source[spot]]; 
++#endif
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
+ 	*dest++ = ds_colormap[ds_source[spot]];
++#endif
+ 	
+ 	xfrac += ds_xstep; 
+ 	yfrac += ds_ystep; 
