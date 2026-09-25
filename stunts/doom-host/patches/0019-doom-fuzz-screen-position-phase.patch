@@ -1,0 +1,97 @@
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -279,9 +279,31 @@
+     FUZZOFF,-FUZZOFF,-FUZZOFF,-FUZZOFF,-FUZZOFF,FUZZOFF,FUZZOFF,
+     FUZZOFF,FUZZOFF,-FUZZOFF,FUZZOFF,FUZZOFF,-FUZZOFF,FUZZOFF 
+ };
++
++/* Pure screen-position fuzz phase.  Vanilla Doom advances the file-static
++ * fuzzpos once per fuzz pixel in draw order, so the phase of a pixel depends
++ * on how many fuzz pixels earlier columns of the same frame drew.  A strip
++ * render is a separate transaction that walks the scene again, so that count
++ * is not reproducible across strips and the in-strip columns come out with a
++ * shifted phase.  Deriving the table index from the pixel's own screen
++ * position removes the cross-strip dependency without carrying the phase in
++ * the snapshot: the native frame and every strip read the same index for the
++ * same (column, row).  The neighbourhood is still the pixel one row above or
++ * below in the same column, so the result is still Doom's vertical shimmer,
++ * and the index is decorrelated between neighbouring rows and columns.  This
++ * is a rendering-behaviour change: the frame a shadow sprite appears in
++ * differs from vanilla, so the native oracle and the strips are both built
++ * from this patched source. */
++static int doom_fuzz_index (int x, int y)
++{
++    unsigned h = (unsigned)x * 0x9e3779b1u + (unsigned)y * 0x85ebca6bu;
+ 
++    h ^= h >> 15;
++    return (int)(h % FUZZTABLE);
++}
+ 
+ 
++
+ //
+ // Framebuffer postprocessing.
+ // Creates a fuzzy image by copying pixels
+@@ -293,10 +315,10 @@
+ void R_DrawFuzzColumn (void) 
+ { 
+     int			count; 
+-    int			advance;
+     byte*		dest; 
+     fixed_t		frac;
+     fixed_t		fracstep;	 
++    int			fuzzrow;
+ 
+     // Adjust borders. Low... 
+     if (!dc_yl) 
+@@ -314,20 +336,7 @@
+ 
+     if (DOOM_RENDER_CLIP_MODE &&
+ 	(dc_x < (int)DOOM_RENDER_CLIP_LEFT || dc_x >= (int)DOOM_RENDER_CLIP_RIGHT))
+-    {
+-	/* Preserve vanilla fuzzpos order for later in-strip columns without
+-	 * writing pixels outside this strip. */
+-	advance = count + 1;
+-	while (advance-- > 0)
+-	{
+-	    doom_render_fuzz_columns =
+-		(doom_render_fuzz_columns & DOOM_RENDER_FUZZ_FLAGS_MASK) |
+-		((doom_render_fuzz_columns + 1u) & DOOM_RENDER_FUZZ_COUNT_MASK);
+-	    if (++fuzzpos == FUZZTABLE)
+-		fuzzpos = 0;
+-	}
+ 	return;
+-    }
+ 
+     
+ #ifdef RANGECHECK 
+@@ -367,6 +376,7 @@
+     
+     // Does not work with blocky mode.
+     dest = ylookup[dc_yl] + columnofs[dc_x];
++    fuzzrow = dc_yl;
+ 
+     // Looks familiar.
+     fracstep = dc_iscale; 
+@@ -382,18 +392,17 @@
+ 	//  left or right of the current one.
+ 	// Add index from colormap to index.
+ #ifndef DOOM_SBF_RENDER_COUNT_ONLY
+-	*dest = colormaps[6*256+dest[fuzzoffset[fuzzpos]]]; 
++	*dest = colormaps[6*256+dest[fuzzoffset[doom_fuzz_index(dc_x, fuzzrow)]]]; 
+ 
+-	// Clamp table lookup index.
++	// Diagnostic only: count the fuzz pixels this strip actually drew.
+ 	doom_render_fuzz_columns =
+ 	    (doom_render_fuzz_columns & DOOM_RENDER_FUZZ_FLAGS_MASK) |
+ 	    ((doom_render_fuzz_columns + 1u) & DOOM_RENDER_FUZZ_COUNT_MASK);
+-	if (++fuzzpos == FUZZTABLE) 
+-	    fuzzpos = 0;
+ 	
+ 	dest += SCREENWIDTH;
+ #endif
+ 
++	fuzzrow++;
+ 	frac += fracstep; 
+     } while (count--); 
+ } 

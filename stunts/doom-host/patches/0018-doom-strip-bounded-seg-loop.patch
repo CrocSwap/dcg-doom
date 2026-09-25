@@ -1,0 +1,92 @@
+--- a/linuxdoom-1.10/r_bsp.c
++++ b/linuxdoom-1.10/r_bsp.c
+@@ -228,13 +228,9 @@
+ //
+ void R_ClearClipSegs (void)
+ {
+-    unsigned mode = (doom_render_fuzz_columns >> 30) & 3u;
+-    int clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
+-    int clip_right = clip_left + 40;
+-
+     solidsegs[0].first = -0x7fffffff;
+-    solidsegs[0].last = mode == 2 ? clip_left - 1 : -1;
+-    solidsegs[1].first = mode == 2 ? clip_right : viewwidth;
++    solidsegs[0].last = -1;
++    solidsegs[1].first = viewwidth;
+     solidsegs[1].last = 0x7fffffff;
+     newend = solidsegs+2;
+ }
+--- a/linuxdoom-1.10/r_local.h
++++ b/linuxdoom-1.10/r_local.h
+@@ -23,6 +23,20 @@
+ #ifndef __R_LOCAL__
+ #define __R_LOCAL__
+ 
++/* Strip-bounded scene walk.  Clip mode 2 renders one 40-column strip of the
++ * 320-wide view.  The bound belongs inside R_RenderSegLoop's per-column loop
++ * and not in the clip posts: solidsegs drives R_CheckBBox, and the
++ * subsectors R_CheckBBox rejects decide which sprites enter the vissprite
++ * list, so bounding the posts changes the sprite draw order.  The bound also
++ * may not skip a seg before the R_CheckPlane calls at the end of
++ * R_StoreWallRange: ceilingplane and floorplane are file-static and chain
++ * across segs there, so an out-of-strip seg that returns early leaves the
++ * next seg's markfloor/markceiling marks on the wrong plane.  Mode 1 and mode
++ * 0 never test these. */
++#define DOOM_CLIP_MODE_2 (((doom_render_fuzz_columns >> 30) & 3u) == 2u)
++#define DOOM_CLIP_LEFT_2 ((int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u))
++#define DOOM_CLIP_RIGHT_2 (DOOM_CLIP_LEFT_2 + 40)
++
+ // Binary Angles, sine/cosine/atan lookups.
+ #include "tables.h"
+ 
+--- a/linuxdoom-1.10/r_segs.c
++++ b/linuxdoom-1.10/r_segs.c
+@@ -180,11 +180,46 @@
+     fixed_t		texturecolumn;
+     int			top;
+     int			bottom;
++    int			skip;
++    int			stopx = rw_stopx;
+ 
+     //texturecolumn = 0;				// shut up compiler warning
+-	
+-    for ( ; rw_x < rw_stopx ; rw_x++)
++
++    if (DOOM_CLIP_MODE_2)
+     {
++	/* Clip mode 2 renders one 40-column strip of the 320-wide view.  The
++	 * bound belongs here, inside the per-column loop, and not in
++	 * R_StoreWallRange: ceilingplane and floorplane are file-static and
++	 * chain across segs through R_CheckPlane, so a seg skipped before
++	 * those two calls leaves the next seg's markfloor/markceiling marks
++	 * on the wrong plane.  R_CheckPlane still sees the unclipped
++	 * [rw_x, rw_stopx) range, so the chain is exactly the one the
++	 * unclipped walk would build.  A clip or visplane entry outside the
++	 * strip is only ever read back at its own column index, and the
++	 * drawseg keeps its unclipped x1/x2, so leaving the skipped columns
++	 * unwritten cannot reach an in-strip pixel.  Every per-column
++	 * accumulator is advanced by exactly the number of steps the
++	 * unclipped loop would have taken, so the in-strip columns see
++	 * identical rw_scale, topfrac, bottomfrac, pixhigh and pixlow. */
++	if (rw_x >= DOOM_CLIP_RIGHT_2)
++	    return;
++
++	skip = DOOM_CLIP_LEFT_2 - rw_x;
++	if (skip > 0)
++	{
++	    rw_x = DOOM_CLIP_LEFT_2;
++	    rw_scale += skip * rw_scalestep;
++	    topfrac += skip * topstep;
++	    bottomfrac += skip * bottomstep;
++	    pixhigh += skip * pixhighstep;
++	    pixlow += skip * pixlowstep;
++	}
++	if (stopx > DOOM_CLIP_RIGHT_2)
++	    stopx = DOOM_CLIP_RIGHT_2;
++    }
++
++    for ( ; rw_x < stopx ; rw_x++)
++    {
+ 	// mark floor / ceiling areas
+ 	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
+ 
