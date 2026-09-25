@@ -2486,7 +2486,12 @@ mod tests {
     }
 
     impl ResetEngine for MockReset {
-        fn reset(&mut self, _state: &[u8], _state_len: usize, mirror: &mut [u8]) -> Result<(), u32> {
+        fn reset(
+            &mut self,
+            _state: &[u8],
+            _state_len: usize,
+            mirror: &mut [u8],
+        ) -> Result<(), u32> {
             self.resets += 1;
             if let Some(code) = self.refuse {
                 return Err(code);
@@ -2533,7 +2538,11 @@ mod tests {
     }
 
     fn mock_reset(start_mirror: Vec<u8>) -> MockReset {
-        MockReset { start_mirror, resets: 0, refuse: None }
+        MockReset {
+            start_mirror,
+            resets: 0,
+            refuse: None,
+        }
     }
 
     #[test]
@@ -2654,7 +2663,12 @@ mod tests {
         // The rewritten meta is still a valid meta for this slot.
         validate_meta(&g.meta, &g.keys, &g.checkpoint).unwrap();
         // And a second reset lands on exactly the same bytes.
-        let after_first = (g.meta.clone(), g.buffer.clone(), g.state.clone(), g.mirror.clone());
+        let after_first = (
+            g.meta.clone(),
+            g.buffer.clone(),
+            g.state.clone(),
+            g.mirror.clone(),
+        );
         let mut again = mock_reset(start_mirror.clone());
         let second = reset(
             &mut g.meta,
@@ -2744,7 +2758,10 @@ mod tests {
             ),
             Err(refuse(REFUSE_STATE_ROOT))
         );
-        assert_eq!(engine.resets, 1, "the decode ran and the root did not match");
+        assert_eq!(
+            engine.resets, 1,
+            "the decode ran and the root did not match"
+        );
         assert_eq!(g.meta, meta_before);
         assert_eq!(g.buffer, buffer_before);
     }

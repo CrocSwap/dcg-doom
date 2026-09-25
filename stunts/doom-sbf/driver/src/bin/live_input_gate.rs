@@ -61,8 +61,8 @@ use std::{env, error::Error, fs, io::Write, path::PathBuf, time::Instant};
 
 use common::Capture;
 use doom_sbf::{
-    continuation_split_sbf, render_snapshot_v3 as rsn3, resource, resource_sbf, sim2,
-    static_resource as rsr, stage,
+    continuation_split_sbf, render_snapshot_v3 as rsn3, resource, resource_sbf, sim2, stage,
+    static_resource as rsr,
 };
 use serde_json::json;
 use solana_account::Account;
@@ -245,7 +245,13 @@ impl Session {
         Ok(())
     }
 
-    fn e2r_ix(&self, continuation: Pubkey, operation: u8, cursor: u32, state_len: usize) -> Instruction {
+    fn e2r_ix(
+        &self,
+        continuation: Pubkey,
+        operation: u8,
+        cursor: u32,
+        state_len: usize,
+    ) -> Instruction {
         let mut accounts = vec![
             meta(
                 self.keys.context.pubkey(),
@@ -445,7 +451,11 @@ impl Session {
             accounts: vec![
                 meta(static_key, true, false),
                 meta(snapshot, false, false),
-                meta(rsn3::strip_address(&base::PROGRAM, &snapshot, strip).0, true, false),
+                meta(
+                    rsn3::strip_address(&base::PROGRAM, &snapshot, strip).0,
+                    true,
+                    false,
+                ),
             ],
             data: request.encode().to_vec(),
         }
@@ -506,7 +516,9 @@ async fn grow_buffer(
     .await?;
     while len < total {
         let ix = session.grow_ix(capacity, len as u32);
-        let grown = session.send(vec![ix], &[buffer], base::NORMAL_LIMIT).await?;
+        let grown = session
+            .send(vec![ix], &[buffer], base::NORMAL_LIMIT)
+            .await?;
         if grown.result.is_err() {
             return Err(format!("SIM2 GROW-BUFFER at {len}: {:?}", grown.result).into());
         }
@@ -536,7 +548,9 @@ async fn reconstruct(
     let context_signer = session.keys.context.insecure_clone();
     session.stage_account(&state_signer, staged_state).await?;
     session.stage_account(&mirror_signer, mirror).await?;
-    session.stage_account(&controller_signer, controller).await?;
+    session
+        .stage_account(&controller_signer, controller)
+        .await?;
     let continuation = Keypair::new();
     create_owned(
         &mut session.ctx,
@@ -579,7 +593,9 @@ async fn reconstruct(
         solana_program::hash::hash(controller).to_bytes(),
         solana_program::hash::hash(&vec![0u8; resource_sbf::RI2_FRAME_BYTES]).to_bytes(),
     );
-    let init = session.send(vec![ix], &[&authority], base::NORMAL_LIMIT).await?;
+    let init = session
+        .send(vec![ix], &[&authority], base::NORMAL_LIMIT)
+        .await?;
     if init.result.is_err() {
         return Err(format!("SIM2 INIT {:?}", init.result).into());
     }
@@ -693,8 +709,7 @@ fn doctored_start_state(state: &[u8]) -> Vec<u8> {
 /// and the decode it goes through is the real one.
 fn dead_player_state(state: &[u8]) -> Vec<u8> {
     let mut out = state.to_vec();
-    out[common::ST1_PLAYER0_PLAYERSTATE_OFFSET
-        ..common::ST1_PLAYER0_PLAYERSTATE_OFFSET + 4]
+    out[common::ST1_PLAYER0_PLAYERSTATE_OFFSET..common::ST1_PLAYER0_PLAYERSTATE_OFFSET + 4]
         .copy_from_slice(&common::PST_DEAD.to_le_bytes());
     out
 }
@@ -713,7 +728,9 @@ async fn stage_start_account(
         Rent::default().minimum_balance(resource_sbf::STATE_MAX_BYTES),
     )
     .await?;
-    session.stage_account(&key, &base::padded_state(state)).await?;
+    session
+        .stage_account(&key, &base::padded_state(state))
+        .await?;
     Ok(key)
 }
 
@@ -843,7 +860,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut new_game_start = false;
     while let Some(flag) = args.next() {
         let mut value = || -> Result<String, Box<dyn Error>> {
-            args.next().ok_or_else(|| format!("{flag} needs a value").into())
+            args.next()
+                .ok_or_else(|| format!("{flag} needs a value").into())
         };
         match flag.as_str() {
             "--profile" => profile = value()?,
@@ -870,7 +888,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let image_bytes = base::read(&image)?;
     let manifest_bytes = base::read(&manifest)?;
-    if base::sha(&image_bytes) != expected_image || base::sha(&manifest_bytes) != expected_manifest {
+    if base::sha(&image_bytes) != expected_image || base::sha(&manifest_bytes) != expected_manifest
+    {
         return Err("image/manifest identity mismatch".into());
     }
     let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
@@ -897,7 +916,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("image manifest context size is not the driver's".into());
     }
     fs::write(inputs.join("doom_sbf.so"), &image_bytes)?;
-    fs::write(inputs.join("doom_ex2_source_manifest.json"), &manifest_bytes)?;
+    fs::write(
+        inputs.join("doom_ex2_source_manifest.json"),
+        &manifest_bytes,
+    )?;
     env::set_var("BPF_OUT_DIR", image.parent().ok_or("image has no parent")?);
     env::set_var("SBF_OUT_DIR", image.parent().ok_or("image has no parent")?);
 
@@ -1093,13 +1115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         equal_sweeps += 1;
-        first_run.push((
-            last,
-            base::sha(&state),
-            base::sha(&mirror),
-            root,
-            chain,
-        ));
+        first_run.push((last, base::sha(&state), base::sha(&mirror), root, chain));
         writeln!(
             sweeps,
             "{}",
@@ -1159,7 +1175,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let snapshot_bytes = session.data(snapshot_key).await?;
             let snapshot = rsn3::validate_snapshot(&snapshot_bytes)?;
             if snapshot.cursor != last || snapshot.state_root != root {
-                return Err(format!("SNAPSHOT-LIVE at {last} does not bind the committed cursor").into());
+                return Err(
+                    format!("SNAPSHOT-LIVE at {last} does not bind the committed cursor").into(),
+                );
             }
             let directory = receipt.join(format!("strips/cursor-{last:05}"));
             fs::create_dir_all(&directory)?;
@@ -1171,14 +1189,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let ix = session.render_ix(static_key, snapshot_key, strip_id, request);
                 let rendered = session.send(vec![ix], &[], RENDER_LIMIT).await?;
                 if rendered.result.is_err() {
-                    return Err(format!("RENDER strip {strip_id} at {last}: {:?}", rendered.result).into());
+                    return Err(format!(
+                        "RENDER strip {strip_id} at {last}: {:?}",
+                        rendered.result
+                    )
+                    .into());
                 }
                 strip_units.push(base::units(&rendered)?);
                 let key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, strip_id).0;
                 let strip_bytes = session.data(key).await?;
                 let strip = rsn3::validate_strip(&strip_bytes)?;
                 if strip.cursor != last || strip.state_root != root {
-                    return Err(format!("strip {strip_id} at {last} does not bind the cursor").into());
+                    return Err(
+                        format!("strip {strip_id} at {last} does not bind the cursor").into(),
+                    );
                 }
                 strip_equal += usize::from(strip.strip_id == u32::from(strip_id));
                 for row in 0..200 {
@@ -1186,7 +1210,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let to = row * 320 + usize::from(strip_id) * 40;
                     reconstructed[to..to + 40].copy_from_slice(&strip.pixels[from..from + 40]);
                 }
-                fs::write(directory.join(format!("strip-{strip_id}.px8")), &strip.pixels)?;
+                fs::write(
+                    directory.join(format!("strip-{strip_id}.px8")),
+                    &strip.pixels,
+                )?;
                 strips_written += 1;
             }
             fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
@@ -1233,7 +1260,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     sweeps.flush()?;
     let sweep_seconds = started.elapsed().as_secs_f64();
-    if position_rows.iter().all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0)) {
+    if position_rows
+        .iter()
+        .all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0))
+    {
         return Err(if new_game_start {
             "the ST1 image did not change from the start state".into()
         } else {
@@ -1256,8 +1286,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         fs::write(directory.join("host-frame.fb1"), &frame)?;
         let mut strip_equal = 0usize;
         for strip_id in 0..8u8 {
-            let bytes =
-                fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
+            let bytes = fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
             if bytes == slice_frame(&frame, usize::from(strip_id)) {
                 strip_equal += 1;
             }
@@ -1333,8 +1362,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("the starved control needs a GS_LEVEL state".into());
     }
     let console_player = i32_at(&source_state, common::ST1_CONSOLEPLAYER_OFFSET);
-    let flags: [u8; 4] = source_state[common::ST1_PLAYERINGAME_OFFSET
-        ..common::ST1_PLAYERINGAME_OFFSET + 4]
+    let flags: [u8; 4] = source_state
+        [common::ST1_PLAYERINGAME_OFFSET..common::ST1_PLAYERINGAME_OFFSET + 4]
         .try_into()
         .unwrap();
     if flags != [1, 0, 0, 0] {
@@ -1351,7 +1380,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("starved.st1"), &starved_state)?;
     fs::write(receipt.join("starved-source.st1"), &source_state)?;
     if host_unmodified != 0 {
-        return Err(format!("the unmodified state did not run a consumed tic: {host_unmodified}").into());
+        return Err(
+            format!("the unmodified state did not run a consumed tic: {host_unmodified}").into(),
+        );
     }
     if host_starved >= 0 {
         return Err(format!(
@@ -1387,8 +1418,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let starve_mirror_signer_kp = starve.keys.mirror.insecure_clone();
     let starve_controller_signer_kp = starve.keys.controller.insecure_clone();
     let staged_starved = base::padded_state(&starved_state);
-    starve.stage_account(&starve_state_signer_kp, &staged_starved).await?;
-    starve.stage_account(&starve_mirror_signer_kp, &source_mirror).await?;
+    starve
+        .stage_account(&starve_state_signer_kp, &staged_starved)
+        .await?;
+    starve
+        .stage_account(&starve_mirror_signer_kp, &source_mirror)
+        .await?;
     starve
         .stage_account(&starve_controller_signer_kp, &starve_controller)
         .await?;
@@ -1412,7 +1447,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } else {
             continuation_split_sbf::STEP
         };
-        let ix = starve.e2r_ix(starve_continuation.pubkey(), operation, cursor, starved_state_len);
+        let ix = starve.e2r_ix(
+            starve_continuation.pubkey(),
+            operation,
+            cursor,
+            starved_state_len,
+        );
         let signers: Vec<&Keypair> = if cursor == 0 {
             vec![&starve_authority, &starve_context_signer]
         } else {
@@ -1425,9 +1465,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
     }
-    let prepare_code = starve_refusal.as_ref().and_then(|(cursor, text)| {
-        custom_code_text(cursor, text)
-    });
+    let prepare_code = starve_refusal
+        .as_ref()
+        .and_then(|(cursor, text)| custom_code_text(cursor, text));
     if starve_refusal.is_none() {
         return Err("E2R/5 reconstructed a state with no console player in the game".into());
     }
@@ -1532,12 +1572,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // root and input chain at every cursor the first run committed.  The
     // refusals come first, on the played slot, so each one is measured against
     // a state that really has something to lose.
-    let (final_cursor, _, _, final_root, _) =
-        *first_run.last().ok_or("the run committed no batch to replay over")?;
+    let (final_cursor, _, _, final_root, _) = *first_run
+        .last()
+        .ok_or("the run committed no batch to replay over")?;
     let staged_start = capture_data.state_account();
     let start_key = stage_start_account(&mut session, &capture_data.state).await?;
-    let wrong_key = stage_start_account(&mut session, &doctored_start_state(&capture_data.state))
-        .await?;
+    let wrong_key =
+        stage_start_account(&mut session, &doctored_start_state(&capture_data.state)).await?;
     let stranger = Keypair::new();
     let before_reset = (
         session.data(session.keys.state.pubkey()).await?,
@@ -1583,7 +1624,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let reset_ix = session.reset_ix(start_key.pubkey(), sim2::RESET_START_STATE, false);
-    let reset = session.send(vec![reset_ix], &[&authority], base::NORMAL_LIMIT).await?;
+    let reset = session
+        .send(vec![reset_ix], &[&authority], base::NORMAL_LIMIT)
+        .await?;
     if reset.result.is_err() {
         return Err(format!("RESET/9 {:?}", reset.result).into());
     }
@@ -1665,7 +1708,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let first = cursor;
         let last = (cursor + advance_tics).min(tics);
         let deposit = session.deposit_ix(first, &commands[first as usize * 4..last as usize * 4]);
-        let deposited = session.send(vec![deposit], &[&authority], base::NORMAL_LIMIT).await?;
+        let deposited = session
+            .send(vec![deposit], &[&authority], base::NORMAL_LIMIT)
+            .await?;
         if deposited.result.is_err() {
             return Err(format!("replay deposit {first}: {:?}", deposited.result).into());
         }
@@ -1749,11 +1794,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .send(vec![use_advance], &[&authority], base::NORMAL_LIMIT)
         .await?;
     if used.result.is_err() {
-        return Err(format!(
-            "a live player's use command was refused: {:?}",
-            used.result
-        )
-        .into());
+        return Err(format!("a live player's use command was refused: {:?}", used.result).into());
     }
     let use_view = session.view().await?;
     let live_use = json!({
@@ -1807,13 +1848,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // (a) four non-use tics from a dead player commit.
     let move_batch = vec![[16u8, 0, 0, 0]; 4].concat();
     let deposit = dead.deposit_ix(0, &move_batch);
-    let deposited = dead.send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     if deposited.result.is_err() {
         return Err(format!("dead-slot deposit: {:?}", deposited.result).into());
     }
     dead.cursor_before = 0;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 4);
-    let moved = dead.send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let moved = dead
+        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     if moved.result.is_err() {
         return Err(format!("a dead player could not tic: {:?}", moved.result).into());
     }
@@ -1827,13 +1872,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // (b) the use press is refused 295 and commits nothing.
     let press = [0u8, 0, 0, 0x01];
     let deposit = dead.deposit_ix(4, &press);
-    let deposited = dead.send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     if deposited.result.is_err() {
         return Err(format!("dead-slot use deposit: {:?}", deposited.result).into());
     }
     dead.cursor_before = 4;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
-    let refused = dead.send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let refused = dead
+        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     let restart_code = custom_code(&refused);
     if refused.result.is_err() {
         if restart_code != Some(sim2::REFUSE_RESTART_REQUEST) {
@@ -1855,7 +1904,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // (c) the answer: RESET/9 returns the dead slot to its committed start
     // state, and the slot runs again.
     let reset_ix = dead.reset_ix(dead_start_key.pubkey(), sim2::RESET_START_STATE, false);
-    let reset = dead.send(vec![reset_ix], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let reset = dead
+        .send(vec![reset_ix], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     if reset.result.is_err() {
         return Err(format!("dead-slot RESET/9: {:?}", reset.result).into());
     }
@@ -1876,13 +1927,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // -- the rule is about the committed state, not about the reset -- and a
     // non-use command is what has to commit here.
     let deposit = dead.deposit_ix(0, &[16u8, 0, 0, 0]);
-    let deposited = dead.send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     if deposited.result.is_err() {
         return Err(format!("restarted-slot deposit: {:?}", deposited.result).into());
     }
     dead.cursor_before = 0;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
-    let restarted = dead.send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT).await?;
+    let restarted = dead
+        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
     if restarted.result.is_err() {
         return Err(format!(
             "the restarted slot refused its first tic: {:?}",
@@ -2029,7 +2084,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let final_view = session.view().await?;
     fs::write(receipt.join("final-state.st1"), &final_state)?;
     fs::write(receipt.join("final-mirror.mp1"), &final_mirror)?;
-    fs::write(receipt.join("final-meta.bin"), &session.data(meta_key).await?)?;
+    fs::write(
+        receipt.join("final-meta.bin"),
+        &session.data(meta_key).await?,
+    )?;
     let mut sorted = advance_units.clone();
     sorted.sort_unstable();
     let report = json!({
