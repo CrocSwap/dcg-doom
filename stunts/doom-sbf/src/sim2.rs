@@ -255,7 +255,8 @@ pub const HALT_PAUSED: u8 = 4;
 pub const HALT_DEMO_END: u8 = 5;
 
 const META_MAGIC: &[u8; 8] = b"SIM2META";
-const BUFFER_MAGIC: &[u8; 8] = b"SIM2INPT";
+/// Published so a gate can prove a reset kept the input buffer's header.
+pub const BUFFER_MAGIC: &[u8; 8] = b"SIM2INPT";
 const BUFFER_GROW_MAGIC: &[u8; 8] = b"SIM2GROW";
 const DOMAIN_STATE: &[u8] = b"DOOM-SIM/2-STATE\0";
 const DOMAIN_CHAIN: &[u8] = b"DOOM-SIM/2-INPUT-CHAIN\0";
