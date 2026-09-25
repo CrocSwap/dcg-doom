@@ -203,7 +203,12 @@ impl Session {
                 )
                 .await?;
             if result.result.is_err() {
-                return Err(format!("stage body {offset}: {:?}", result.result).into());
+                return Err(format!(
+                    "stage body {offset} of {} bytes: {:?}",
+                    bytes.len(),
+                    result.result
+                )
+                .into());
             }
         }
         let (offset, chunk) = chunks[0];
@@ -590,6 +595,33 @@ fn session_keys(context: Keypair) -> SessionKeys {
     }
 }
 
+/// The `Custom(n)` an instruction error carries, if it carries one.
+fn custom_code_text(_phase: &u32, text: &str) -> Option<u32> {
+    let start = text.find("Custom(")? + "Custom(".len();
+    let end = text[start..].find(')')? + start;
+    text[start..end].parse().ok()
+}
+
+/// A DOOM-CI2 controller account bound to `gametic`.  `ri2_controller_shape`
+/// requires the recorded tic to equal the ST1 image's `gametic` and bytes
+/// 28..64 to be zero, so a context reconstructed from a later tic needs its
+/// own controller account.  The four command bytes are the armed ticcmd and
+/// are not compared with the demo stream on this path.
+fn controller_for_gametic(controller: &[u8], gametic: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+    if controller.len() != resource_sbf::CONTROLLER_BYTES
+        || &controller[..8] != b"DOOM-CI2"
+        || base::u32_at(controller, 8) != 1
+        || base::u32_at(controller, 12) != 28
+        || base::u32_at(controller, 16) != resource_sbf::CONTROLLER_BYTES as u32
+    {
+        return Err("retained CI2 controller has the wrong shape".into());
+    }
+    let mut out = controller.to_vec();
+    out[20..24].copy_from_slice(&gametic.to_le_bytes());
+    out[28..].fill(0);
+    Ok(out)
+}
+
 /// What the host ingress does with an ST1 image: `Err(rc)` from the import, a
 /// tic that ran with a consumed command (0), or a tic that ran with an
 /// unconsumed one (238, the DOOM-CI3 receipt reading zero).
@@ -775,6 +807,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_data = Capture::load(&capture_dir, &resource_path)?;
     let controller = base::read(&controller_path)?;
     let (commands, _) = common::input_commands(&profile, tics as usize)?;
+    let (neutral, _) = common::input_commands("neutral", tics as usize)?;
     fs::write(receipt.join("commands.bin"), &commands)?;
     let first_tic = base::u32_at(&capture_data.state, 20);
     let capture_cursor = base::u32_at(&capture_data.state, 24);
@@ -1083,6 +1116,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // for the chain at a later one.  The perturbation is measured, not hidden.
     let mut previous_frame: Option<(u32, Vec<u8>)> = None;
     for (index, (at, chain_frame)) in chain_frames.iter().enumerate() {
+        let chain_state = &chain_states[index].1;
         let (frame, moved_st1) = host_frame_at(&capture_data, &commands, *at)?;
         let directory = receipt.join(format!("strips/cursor-{at:05}"));
         fs::write(directory.join("host-frame.fb1"), &frame)?;
@@ -1104,6 +1138,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })
             })
             .unwrap_or(serde_json::Value::Null);
+        // The null control: the same capture and cursors with every staged
+        // command zeroed, so whatever the live-input run changed in committed
+        // state and in the view is attributable to the input and not to the
+        // level clock.
+        let (neutral_frame, _) = host_frame_at(&capture_data, &neutral, *at)?;
+        fs::write(directory.join("neutral-frame.fb1"), &neutral_frame)?;
+        let (neutral_state, _) = host_state_at(&capture_data, &neutral, *at)?;
+        let neutral_fields = changed_fields(&neutral_state, chain_state);
+        let mut movers: Vec<(usize, i32, i32)> = neutral_fields.clone();
+        movers.sort_by_key(|(_, before, after)| -i64::from(after.wrapping_sub(*before)).abs());
+        render_rows[index]["neutral_control"] = json!({
+            "frame_differing_pixels": differing_pixels(&neutral_frame, &frame),
+            "committed_st1_differing_bytes": neutral_state
+                .iter()
+                .zip(&chain_states[index].1[..neutral_state.len()])
+                .filter(|(a, b)| a != b)
+                .count(),
+            "committed_st1_differing_fields": neutral_fields.len(),
+            "largest_field_moves": movers.iter().take(6).map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after})).collect::<Vec<_>>(),
+        });
         render_rows[index]["strips_equal_to_host_pixels"] = json!(strip_equal);
         render_rows[index]["host_frame_sha256"] = json!(base::sha(&frame));
         render_rows[index]["reassembled_equals_host"] = json!(equal);
@@ -1193,15 +1247,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let starve_authority = starve.keys.authority.insecure_clone();
     let starve_context_signer = starve.keys.context.insecure_clone();
+    let starve_gametic = base::u32_at(&source_state, 20);
+    let starve_controller = controller_for_gametic(&controller, starve_gametic)?;
+    let starve_state_signer_kp = starve.keys.state.insecure_clone();
+    let starve_mirror_signer_kp = starve.keys.mirror.insecure_clone();
+    let starve_controller_signer_kp = starve.keys.controller.insecure_clone();
     let staged_starved = base::padded_state(&starved_state);
+    starve.stage_account(&starve_state_signer_kp, &staged_starved).await?;
+    starve.stage_account(&starve_mirror_signer_kp, &source_mirror).await?;
     starve
-        .stage_account(&starve.keys.state.clone(), &staged_starved)
-        .await?;
-    starve
-        .stage_account(&starve.keys.mirror.clone(), &source_mirror)
-        .await?;
-    starve
-        .stage_account(&starve.keys.controller.clone(), &controller)
+        .stage_account(&starve_controller_signer_kp, &starve_controller)
         .await?;
     let starve_continuation = Keypair::new();
     create_owned(
@@ -1211,26 +1266,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Rent::default().minimum_balance(continuation_split_sbf::CONTINUATION_BYTES),
     )
     .await?;
-    let ix = starve.e2r_ix(
-        starve_continuation.pubkey(),
-        continuation_split_sbf::PREPARE,
-        0,
-        starved_state.len(),
-    );
-    let prepare = starve
-        .send(
-            vec![ix],
-            &[&starve_authority, &starve_context_signer],
-            base::NORMAL_LIMIT,
-        )
-        .await?;
-    let prepare_code = custom_code(&prepare);
-    if prepare.result.is_ok() {
+    // The reconstruction is eight phases; the decode lives in one of them, so
+    // the refusal is wherever it lands.  Every phase is sent and the first
+    // refusal is recorded.
+    let starved_state_len = starved_state.len();
+    let mut starve_refusal = None;
+    let mut starve_phase_cu = Vec::new();
+    for cursor in 0..E2R_PHASES {
+        let operation = if cursor == 0 {
+            continuation_split_sbf::PREPARE
+        } else {
+            continuation_split_sbf::STEP
+        };
+        let ix = starve.e2r_ix(starve_continuation.pubkey(), operation, cursor, starved_state_len);
+        let signers: Vec<&Keypair> = if cursor == 0 {
+            vec![&starve_authority, &starve_context_signer]
+        } else {
+            vec![&starve_authority]
+        };
+        let result = starve.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        starve_phase_cu.push(base::units(&result)?);
+        if result.result.is_err() {
+            starve_refusal = Some((cursor, format!("{:?}", result.result)));
+            break;
+        }
+    }
+    let prepare_code = starve_refusal.as_ref().and_then(|(cursor, text)| {
+        custom_code_text(cursor, text)
+    });
+    if starve_refusal.is_none() {
         return Err("E2R/5 reconstructed a state with no console player in the game".into());
     }
     if starve.data(starve_state_signer).await? != staged_starved {
         return Err("the refused reconstruction changed the staged ST1".into());
     }
+
     // The same PREPARE from the unmodified state is accepted, so the refusal
     // is the state and not the packet.
     let good_keys = session_keys(Keypair::new());
@@ -1253,22 +1323,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let good_authority = good.keys.authority.insecure_clone();
     let good_context_signer = good.keys.context.insecure_clone();
-    good.stage_account(&good.keys.state.clone(), &base::padded_state(&source_state)).await?;
-    good.stage_account(&good.keys.mirror.clone(), &source_mirror).await?;
-    good.stage_account(&good.keys.controller.clone(), &controller).await?;
-    let good_continuation = Keypair::new();
-    create_owned(
-        &mut good.ctx,
-        &good_continuation,
-        continuation_split_sbf::CONTINUATION_BYTES,
-        Rent::default().minimum_balance(continuation_split_sbf::CONTINUATION_BYTES),
-    )
-    .await?;
+    let good_state_signer = good.keys.state.pubkey();
     let (good_phases, good_init_cu) = reconstruct(
         &mut good,
         &base::padded_state(&source_state),
         &source_mirror,
-        &controller,
+        &controller_for_gametic(&controller, starve_gametic)?,
         &capture_data,
         capacity,
     )
@@ -1305,7 +1365,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if good_view.cursor != advance_tics {
         return Err("the control context did not commit its first batch".into());
     }
-    let _ = (good_state_signer, good_init_cu);
+    let _ = (good_state_signer, good_init_cu, good_context_signer);
     let controls = json!({
         "starved_tic_is_unreachable_from_a_reconstructable_state": {
             "why": "G_Ticker consumes the armed command for every player in the game; the pre-tic guard refuses a pending gameaction, a non-level gamestate, paused and a reborn player, and ArmV2 always arms.  ds_scan_state then requires playeringame[consoleplayer], so no importable ST1 starves either.",
@@ -1412,11 +1472,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = buffer_signer;
     println!(
         "DOOM-SIM/2 gate (d) measured: {tics} tics in {sent} ADVANCE/5 sweeps of {advance_tics}, \
-         all {equal_sweeps} equal to the host ingress; first cursor past the {demo_tics}-tic demo \
-         end {first_past_demo:?}; {} frames byte exact; starved tic refused \
-         Custom({}); receipt={}",
+         all {equal_sweeps} equal to the host ingress, 0 refusals; first cursor past the \
+         {demo_tics}-tic demo end {first_past_demo:?}; {} frames 8/8 strips byte exact; a state \
+         with no console player in the game is refused at E2R/5 (Custom {prepare_code:?}) and by \
+         the host import, so a 288 cannot be staged; receipt={}",
         strips_written / 8,
-        sim2::REFUSE_UNCONSUMED_INPUT,
         receipt.display()
     );
     Ok(())
