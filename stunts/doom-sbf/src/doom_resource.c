@@ -48,10 +48,17 @@ extern int doom_engine_ex2_fill_mirror(
 #define RI_LEVEL_MAP 1
 #define RI_LEVEL_SKILL 3
 #define RI_LEVEL_NAME "E1M1\0\0\0\0"
-typedef char ri_level_name_check[
-    (RI_LEVEL_NAME[0] == 'E' && RI_LEVEL_NAME[1] == '0' + RI_LEVEL_EPISODE &&
-     RI_LEVEL_NAME[2] == 'M' && RI_LEVEL_NAME[3] == '0' + RI_LEVEL_MAP &&
-     RI_LEVEL_NAME[4] == 0 && sizeof(RI_LEVEL_NAME) == 9) ? 1 : -1];
+/* The two halves are separate so the front end folds both to plain constants:
+   a typedef whose size expression indexes a string literal is diagnosed as a
+   folded variable-length array, which is a warning in a build that has to stay
+   clean. */
+typedef char ri_level_name_check_bytes[sizeof(RI_LEVEL_NAME) == 9 ? 1 : -1];
+enum {
+    RI_LEVEL_NAME_SPELLS_THE_LEVEL = (RI_LEVEL_NAME[0] == 'E' &&
+        RI_LEVEL_NAME[1] == '0' + RI_LEVEL_EPISODE && RI_LEVEL_NAME[2] == 'M' &&
+        RI_LEVEL_NAME[3] == '0' + RI_LEVEL_MAP && RI_LEVEL_NAME[4] == 0),
+};
+typedef char ri_level_name_check_spelling[RI_LEVEL_NAME_SPELLS_THE_LEVEL ? 1 : -1];
 
 #define RI_MAGIC "DOOM-RI1"
 #define RI_VERSION 1u

@@ -57,10 +57,17 @@ extern int doom_resource_ri1_validate_graph(const uint8_t *image, size_t image_b
 #define RI2_LEVEL_EPISODE 1
 #define RI2_LEVEL_MAP 1
 #define RI2_LEVEL_NAME "E1M1\0\0\0\0"
-typedef char r2_level_name_check[
-    (RI2_LEVEL_NAME[0] == 'E' && RI2_LEVEL_NAME[1] == '0' + RI2_LEVEL_EPISODE &&
-     RI2_LEVEL_NAME[2] == 'M' && RI2_LEVEL_NAME[3] == '0' + RI2_LEVEL_MAP &&
-     RI2_LEVEL_NAME[4] == 0 && sizeof(RI2_LEVEL_NAME) == 9) ? 1 : -1];
+/* The two halves are separate so the front end folds both to plain constants:
+   a typedef whose size expression indexes a string literal is diagnosed as a
+   folded variable-length array, which is a warning in a build that has to stay
+   clean. */
+typedef char r2_level_name_check_bytes[sizeof(RI2_LEVEL_NAME) == 9 ? 1 : -1];
+enum {
+    RI2_LEVEL_NAME_SPELLS_THE_LEVEL = (RI2_LEVEL_NAME[0] == 'E' &&
+        RI2_LEVEL_NAME[1] == '0' + RI2_LEVEL_EPISODE && RI2_LEVEL_NAME[2] == 'M' &&
+        RI2_LEVEL_NAME[3] == '0' + RI2_LEVEL_MAP && RI2_LEVEL_NAME[4] == 0),
+};
+typedef char r2_level_name_check_spelling[RI2_LEVEL_NAME_SPELLS_THE_LEVEL ? 1 : -1];
 
 #define RI2_MAGIC "DOOM-RI2"
 #define RI2_VERSION_V1 1u
