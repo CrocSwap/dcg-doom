@@ -670,7 +670,8 @@ fn controller_for_gametic(controller: &[u8], gametic: u32) -> Result<Vec<u8>, Bo
 /// the shape checks must pass and only the root check can refuse it.
 fn doctored_start_state(state: &[u8]) -> Vec<u8> {
     let mut out = state.to_vec();
-    out[24..28].copy_from_slice(&(i32_at(&out, 24) as u32 + 1).to_le_bytes());
+    let moved = (i32_at(state, 24) as u32).wrapping_add(1);
+    out[24..28].copy_from_slice(&moved.to_le_bytes());
     out
 }
 
@@ -914,9 +915,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // frame cursors only have to be inside the run and on a batch boundary.
         let inside = *cursor > 0 && *cursor % advance_tics == 0 && *cursor <= tics;
         if !inside || (!new_game_start && *cursor <= demo_tics) {
+            let past = if new_game_start {
+                String::new()
+            } else {
+                format!(" and past the {demo_tics}-tic demo end")
+            };
             return Err(format!(
-                "frame cursor {cursor} must be inside the {tics}-tic run on a {advance_tics}-tic boundary{}",
-                if new_game_start { "" } else { &format!(" and past the {demo_tics}-tic demo end") }
+                "frame cursor {cursor} must be inside the {tics}-tic run on a {advance_tics}-tic boundary{past}"
             )
             .into());
         }
