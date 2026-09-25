@@ -756,3 +756,146 @@ test("concurrent requests on one slot are serialised, not interleaved", async ()
     assert.equal(relayer.stats.inputsAccepted, 4, "the loser was not deposited");
   });
 });
+
+// A background sender whose chain moves while nobody is holding a key, which is
+// what the R8l6 session did: the engine consumes tics whether or not anyone
+// writes them, so a page that counts only what it has sent falls behind the
+// cursor and every batch it offers names a slot the game has already read.
+function movingSender({advancePerRead = 4, lead = 36, width = 4, jumps = []} = {}) {
+  const inner = backgroundSender({frontier: 0});
+  const state = {cursor: 1000, reads: 0, deposits: [], width};
+  const read = () => {
+    state.reads += 1;
+    // `jumps` models the chain running on while the page was idle; after that
+    // it advances a tic at a time, as a live pipeline does.
+    state.cursor += jumps.length ? jumps.shift() : advancePerRead;
+    return {
+      cursor: state.cursor,
+      gametic: state.cursor,
+      capacity: 6016,
+      halted: false,
+      ticsPerSecond: 35,
+      stagingFrontier: state.cursor + lead,
+    };
+  };
+  return {
+    ...inner,
+    get cursor() {
+      return state.cursor;
+    },
+    state,
+    async provisionSlot() {
+      const slot = await inner.provisionSlot();
+      return {...slot, cursor: state.cursor, nextSeq: state.cursor};
+    },
+    async readProgress() {
+      return read();
+    },
+    async stagingFrontier() {
+      read();
+      return state.cursor + lead;
+    },
+    async advance() {
+      return {cursor: state.cursor, gametic: state.cursor, tics: 0, signature: null, background: true};
+    },
+    async deposit({firstSeq, commands}) {
+      // A batch is only readable by the engine if the producer had not already
+      // deposited it, which it has not done for the last `width` tics.
+      const live = state.cursor + lead - width;
+      await inner.deposit({firstSeq, commands});
+      state.deposits.push({firstSeq, tics: commands.length / 4, readable: firstSeq >= live});
+      return {accepted: commands.length / 4, signature: null};
+    },
+  };
+}
+
+test("the status poll tracks a moving chain, with no keystroke involved", async () => {
+  const sender = movingSender();
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const first = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    const second = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    // A cursor that only moved on a keystroke is what made the panel look hung
+    // while the engine ran on.
+    assert.ok(second.cursor > first.cursor, `cursor moved on a status poll: ${first.cursor} -> ${second.cursor}`);
+    assert.equal(second.tics_per_second, 35, "the sender's measured rate is reported, not a hardcoded null");
+    assert.equal(second.staging_frontier, second.cursor + 36, "the frontier travels with the cursor");
+    // The producer has deposited everything below the last advance packet, so
+    // the writable window is one packet wide however wide the frontier is.
+    assert.equal(second.input_window, 4, "input_window is the live window, not the staging frontier");
+    assert.ok(second.next_seq >= second.cursor, "next_seq never offers a tic the chain has consumed");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a batch behind the cursor is refused with a resume point, not deposited", async () => {
+  const sender = movingSender({advancePerRead: 4, jumps: [100, 4]});
+  // The chain runs on between the stale batch and the aimed one, which is the
+  // whole point: the page re-reads the window before it signs.
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    // A page that had been idle: it is offering the sequence it last knew, and
+    // the chain has run a hundred tics past it since.
+    const stale = await batch(wallet, relayer, created, {firstSeq: created.next_seq ?? 0, count: 4, clientSeq: 1});
+    const {status, body} = await call("POST", `/v1/sessions/${created.id}/input`, stale);
+    assert.equal(status, 409, "input for a consumed tic is not accepted");
+    assert.match(body.error, /behind/);
+    assert.equal(sender.deposits.length, 0, "nothing was staged into a dead slot");
+    assert.ok(body.detail.cursor > (created.next_seq ?? 0), "the refusal names the cursor to resume from");
+    assert.equal(body.detail.next_seq, body.detail.cursor, "next_seq is anchored to the chain");
+    assert.equal(body.detail.input_window, undefined);
+    // And a batch aimed at the live window, off a window read taken as freshly
+    // as the page takes it, is accepted whole and lands where the engine can
+    // still read it.
+    const window = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    const aimed = await batch(wallet, relayer, created, {
+      firstSeq: window.staging_frontier - window.input_window,
+      count: window.input_window,
+      clientSeq: 2,
+    });
+    const ok = await call("POST", `/v1/sessions/${created.id}/input`, aimed);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.accepted, window.input_window);
+    assert.equal(sender.deposits.length, 1);
+    // Ahead of the cursor, so not in a slot the engine has already read. Whether
+    // the producer had also deposited it is not knowable from out here: the
+    // producer's own generated cursor lives inside fire_blind and is not in the
+    // status it reports. Until it is, the top of the window is the best aim
+    // available and this is the guarantee it buys.
+    assert.ok(
+      sender.state.deposits[0].firstSeq >= sender.cursor,
+      `the batch is ahead of the cursor ${sender.cursor}: ${sender.state.deposits[0].firstSeq}`,
+    );
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
