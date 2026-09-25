@@ -199,6 +199,57 @@ fn check_wad_account(bytes: &[u8], ordinal: usize) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+struct SnapshotFields {
+    cursor: u32,
+    gametic: u32,
+    payload_bytes: usize,
+    snapshot_hash: [u8; 32],
+    state_root: [u8; 32],
+    wad_hash: [u8; 32],
+}
+
+fn snapshot_fields(data: &[u8]) -> Result<SnapshotFields, Box<dyn Error>> {
+    let legacy_abi: [u8; 32] = [
+        0xac, 0xca, 0x87, 0x87, 0x5d, 0x1e, 0xaf, 0xb6, 0xc0, 0x0e, 0x53, 0xb8, 0x6b, 0xf1, 0x2a, 0xa5,
+        0xf8, 0x2e, 0xb2, 0xfa, 0x90, 0xb3, 0x8f, 0x08, 0x2e, 0x97, 0x87, 0x39, 0x3e, 0xb8, 0x23, 0x4a,
+    ];
+    if data.len() != rsn3::SNAPSHOT_BYTES
+        || &data[..8] != b"DOOM-RSN"
+        || u32_at(data, 8) != rsn3::VERSION
+        || u32_at(data, 12) as usize != rsn3::HEADER_BYTES
+        || u32_at(data, 16) as usize != rsn3::SNAPSHOT_BYTES
+        || (data[160..192] != rsn3::ABI_ID && data[160..192] != legacy_abi)
+    {
+        return Err("snapshot header is not a supported RSN/3 image".into());
+    }
+    let payload_bytes = u32_at(data, 28) as usize;
+    if payload_bytes > rsn3::MAX_PAYLOAD_BYTES
+        || data[rsn3::HEADER_BYTES + payload_bytes..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err("snapshot payload bounds are invalid".into());
+    }
+    let mut preimage = Vec::with_capacity(7 + 128 + 32 + 32 + payload_bytes);
+    preimage.extend_from_slice(b"DOOM-RENDER-SNAPSHOT/3\0");
+    preimage.extend_from_slice(&data[..128]);
+    preimage.extend_from_slice(&[0; 32]);
+    preimage.extend_from_slice(&data[160..192]);
+    preimage.extend_from_slice(&data[rsn3::HEADER_BYTES..rsn3::HEADER_BYTES + payload_bytes]);
+    let snapshot_hash: [u8; 32] = Sha256::digest(&preimage).into();
+    if data[128..160] != snapshot_hash {
+        return Err("snapshot digest is invalid".into());
+    }
+    Ok(SnapshotFields {
+        cursor: u32_at(data, 20),
+        gametic: u32_at(data, 24),
+        payload_bytes,
+        snapshot_hash,
+        state_root: data[32..64].try_into().unwrap(),
+        wad_hash: data[64..96].try_into().unwrap(),
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
@@ -249,8 +300,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("retained RI2 image or native framebuffer has the wrong size".into());
     }
-    let snapshot_view = rsn3::validate_snapshot(&snapshot_image)?;
-    if baseline_report["snapshot_hash"].as_str() != Some(hex(&snapshot_view.snapshot_hash).as_str())
+    let snapshot = snapshot_fields(&snapshot_image)?;
+    if baseline_report["snapshot_hash"].as_str() != Some(hex(&snapshot.snapshot_hash).as_str())
         || baseline_report["native_oracle_frame_sha256"].as_str()
             != Some(sha(&native_frame).as_str())
         || baseline_report["all_eight_strips_match_native"] != true
@@ -383,7 +434,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } else if buffered {
             rsr::Request::render_buffered(0, strip_id).encode()
         } else {
-            rsr::Request::render(strip_id, snapshot_view.cursor, snapshot_view.snapshot_hash)
+            rsr::Request::render(strip_id, snapshot.cursor, snapshot.snapshot_hash)
                 .encode()
         };
         let instruction = if buffered {
@@ -418,10 +469,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let view = rsn3::validate_strip(&strip_account.data)?;
         let expected = slice_frame(&native_frame, usize::from(strip_id));
         let equal = view.strip_id == u32::from(strip_id)
-            && view.cursor == snapshot_view.cursor
-            && view.gametic == snapshot_view.gametic
-            && view.snapshot_hash == snapshot_view.snapshot_hash
-            && view.state_root == snapshot_view.state_root
+            && view.cursor == snapshot.cursor
+            && view.gametic == snapshot.gametic
+            && view.snapshot_hash == snapshot.snapshot_hash
+            && view.state_root == snapshot.state_root
             && view.pixels == expected;
         for row in 0..200 {
             let source = row * 40;
@@ -491,10 +542,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "source_manifest_sha256": manifest_sha,
         "driver_source_sha256": driver_sha,
         "resource_image_sha256": sha(&resource_image),
-        "snapshot_hash": hex(&snapshot_view.snapshot_hash),
-        "snapshot_payload_bytes": snapshot_view.payload.len(),
+        "snapshot_hash": hex(&snapshot.snapshot_hash),
+        "snapshot_payload_bytes": snapshot.payload_bytes,
         "native_oracle_frame_sha256": sha(&native_frame),
-        "wad_hash": hex(&snapshot_view.wad_hash),
+        "wad_hash": hex(&snapshot.wad_hash),
         "static_resource_pda": static_key.to_string(),
         "static_resource_account_bytes": rsr::ACCOUNT_BYTES,
         "static_resource_header_bytes": rsr::HEADER_BYTES,
@@ -544,7 +595,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "source_manifest_sha256": manifest_sha,
             "driver_source_sha256": driver_sha,
             "resource_image_sha256": sha(&resource_image),
-            "snapshot_hash": hex(&snapshot_view.snapshot_hash),
+            "snapshot_hash": hex(&snapshot.snapshot_hash),
             "static_resource_account_sha256_after_build": static_account_sha_after_build,
             "static_resource_account_sha256_after_render": static_account_sha_after_render
         }))?,
