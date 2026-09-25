@@ -12,8 +12,8 @@ ones, so the render split -- the thing the profile exists to measure -- is
 exactly what gets dropped.  Here each site accumulates its own interval into a
 context cell and the strip driver emits fifteen cells in five sol_log_64 lines.
 
-The cells are the last two members of doom_ctx_t (fifteen accumulators and
-four mark registers, 152 bytes), so every field offset above them, the zone
+The cells are the last two members of doom_ctx_t (eighteen accumulators and
+four mark registers, 176 bytes), so every field offset above them, the zone
 arena and the account layout are unchanged and only sizeof(doom_ctx_t) grows.
 They live in the context account rather than in C or Rust statics because the
 image must carry zero writable static data (M1006 measured the loader refusal
@@ -40,14 +40,16 @@ Slots, in emission order, three per line:
     beside them can be priced apart (0 minus 14 is the state import and the
     framebuffer allocation)
  15 R_RenderPlayerView as a whole, as a cross-check on 1,2,3,6,8
+ 16 rsn3_apply_dynamic, the dynamic state import
+ 17 the framebuffer allocation, the screen pointers, ylookup and the view bases
 
 Applies on top of 0001-0017.
 
 diff --git a/linuxdoom-1.10/headless/doom_ctx.h b/linuxdoom-1.10/headless/doom_ctx.h
-index cbb3f82..5746237 100644
+index cbb3f82..e4c546f 100644
 --- a/linuxdoom-1.10/headless/doom_ctx.h
 +++ b/linuxdoom-1.10/headless/doom_ctx.h
-@@ -50,6 +50,51 @@
+@@ -50,6 +50,57 @@
   * decoder failure threshold. */
  #define DOOM_SBF_PRIVATE_BYTES 32
  
@@ -57,11 +59,11 @@ index cbb3f82..5746237 100644
 + * unchanged, so only sizeof(doom_ctx_t) grows.  They are always present, host
 + * and SBF alike, so the host oracle and the chain agree on the layout; they
 + * are written only under DOOM_SBF_PHASE_PROFILE, which no qualifying image
-+ * defines.  Fifteen slots fit in five sol_log_64 lines, which is what makes a
++ * defines.  Eighteen slots fit in six sol_log_64 lines, which is what makes a
 + * nested phase split reportable at all: a flat marker list overruns Solana's
 + * ten-line per-transaction program log and the late markers are the ones that
 + * get dropped. */
-+#define DOOM_SBF_PROF_SLOTS 16
++#define DOOM_SBF_PROF_SLOTS 18
 +
 +/* Four mark registers, so a nested split (R_RenderBSPNode with R_RenderSegLoop
 + * and R_AddSprites inside it) does not overwrite its own start reading.  The
@@ -95,11 +97,17 @@ index cbb3f82..5746237 100644
 + * P_SetThingPosition for each. */
 +#define DOOM_SBF_PROF_REBIND 14
 +#define DOOM_SBF_PROF_RENDER_TOTAL 15
++/* The two halves of FIXED_PRE apart.  Slot 0 minus slot 14 was the only thing
++ * separating the dynamic state import from the framebuffer set-up, and which of
++ * them the fixed setup mostly is decides whether the fixed setup is worth
++ * attacking before a scene-once pass exists at all. */
++#define DOOM_SBF_PROF_RSN3_APPLY 16
++#define DOOM_SBF_PROF_FRAME_SETUP 17
 +
  typedef struct doom_ctx_s {
      unsigned long doom_ctx_probe_cell;
      int	easy;
-@@ -475,6 +520,10 @@ typedef struct doom_ctx_s {
+@@ -475,6 +526,10 @@ typedef struct doom_ctx_s {
      /* Last member on purpose: the zone arena and every field offset above are
       * unchanged, so only sizeof(doom_ctx_t) grows. */
      unsigned char doom_sbf_private[DOOM_SBF_PRIVATE_BYTES];
@@ -110,7 +118,7 @@ index cbb3f82..5746237 100644
  } doom_ctx_t;
  
  void doom_ctx_init(void);
-@@ -902,6 +951,29 @@ extern doom_ctx_t doom_ctx_host_backing;
+@@ -902,6 +957,29 @@ extern doom_ctx_t doom_ctx_host_backing;
  #define doom_sbf_controller_applied ((int *)&DOOM_CTX->doom_sbf_private[8])
  #define doom_sbf_private_alloc_fail ((long *)&DOOM_CTX->doom_sbf_private[16])
  #define doom_sbf_private_alloc_calls ((long *)&DOOM_CTX->doom_sbf_private[24])
