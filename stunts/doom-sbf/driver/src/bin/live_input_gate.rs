@@ -29,6 +29,23 @@
 //!    ADVANCE/3 on the same state commits, so the refusal is the receipt
 //!    rule and not the input.
 //!
+//! `--new-game-start` runs the same gate from the pinned E1M1 new-game start
+//! state instead of the retained E1M5 demo capture: the frame cursors need not
+//! be past the captured DEMO1 end (which belongs to a different level and says
+//! nothing about this run), and the position baseline is the start state
+//! itself.  The host lockstep oracle, the strip comparison and the controls
+//! are unchanged, so the two runs are the same measurement over a different
+//! committed start state.
+//!
+//! The reset half at the end is the reusable-slot claim: a staged start
+//! account, RESET/9, and the same staged commands replayed from cursor 0,
+//! landing on the same ST1, MP1, state root and input chain at every cursor
+//! the first run committed.  It also carries the refusals: a stranger's
+//! authority, a start account holding a different image, and a halted slot
+//! without the force flag.  The restart-request half stages a canonical dead
+//! player, presses use, and measures the guard's 295, with a live player's use
+//! on the same state as the control.
+//!
 //! The loaded image must advertise `ADVANCE/5` and the receipt rule in its own
 //! ABI descriptor before any work starts: a transport image without the rule
 //! is refused here rather than silently measured as "no refusals".
@@ -337,6 +354,32 @@ impl Session {
         }
     }
 
+    /// SIM/2 RESET/9.  Seven accounts: ADVANCE's six with the authority marked
+    /// writable (it is the fee payer), plus the sealed start account holding
+    /// the image to re-seed from.
+    fn reset_ix(&self, start: Pubkey, selector: u32, force: bool) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.context.pubkey(), true, false),
+                meta(self.keys.state.pubkey(), true, false),
+                meta(self.keys.mirror.pubkey(), true, false),
+                meta(self.keys.meta, true, false),
+                meta(self.keys.buffer.pubkey(), true, false),
+                meta(start, false, false),
+                meta(self.keys.authority.pubkey(), true, true),
+            ],
+            data: sim2::encode_reset(selector, force),
+        }
+    }
+
+    /// The same packet signed by a key that is not the meta's authority.
+    fn reset_ix_as(&self, start: Pubkey, stranger: &Keypair) -> Instruction {
+        let mut ix = self.reset_ix(start, sim2::RESET_START_STATE, false);
+        *ix.accounts.last_mut().unwrap() = meta(stranger.pubkey(), true, true);
+        ix
+    }
+
     fn grow_ix(&self, capacity: u32, expected_len: u32) -> Instruction {
         Instruction {
             program_id: base::PROGRAM,
@@ -622,6 +665,44 @@ fn controller_for_gametic(controller: &[u8], gametic: u32) -> Result<Vec<u8>, Bo
     Ok(out)
 }
 
+/// One committed field changed, nothing else: a canonical ST1 that is not this
+/// slot's committed start state.  Used as the wrong-start-image control, where
+/// the shape checks must pass and only the root check can refuse it.
+fn doctored_start_state(state: &[u8]) -> Vec<u8> {
+    let mut out = state.to_vec();
+    out[24..28].copy_from_slice(&(i32_at(&out, 24) as u32 + 1).to_le_bytes());
+    out
+}
+
+/// The same image with the console player marked dead.  `PST_DEAD` is inside
+/// the range the state codec's strict scan accepts, so this is a canonical ST1
+/// and the decode it goes through is the real one.
+fn dead_player_state(state: &[u8]) -> Vec<u8> {
+    let mut out = state.to_vec();
+    out[common::ST1_PLAYER0_PLAYERSTATE_OFFSET
+        ..common::ST1_PLAYER0_PLAYERSTATE_OFFSET + 4]
+        .copy_from_slice(&common::PST_DEAD.to_le_bytes());
+    out
+}
+
+/// One sealed start account holding `state`, freshly created and program-owned
+/// exactly as a relayer would provision it.
+async fn stage_start_account(
+    session: &mut Session,
+    state: &[u8],
+) -> Result<Keypair, Box<dyn Error>> {
+    let key = Keypair::new();
+    create_owned(
+        &mut session.ctx,
+        &key,
+        resource_sbf::STATE_MAX_BYTES,
+        Rent::default().minimum_balance(resource_sbf::STATE_MAX_BYTES),
+    )
+    .await?;
+    session.stage_account(&key, &base::padded_state(state)).await?;
+    Ok(key)
+}
+
 /// What the host ingress does with an ST1 image: `Err(rc)` from the import, a
 /// tic that ran with a consumed command (0), or a tic that ran with an
 /// unconsumed one (238, the DOOM-CI3 receipt reading zero).
@@ -745,6 +826,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut advance_tics = 4u32;
     let mut frames_at: Vec<u32> = vec![5_040, 5_076, 5_112];
     let mut starve_cursor = 2_048u32;
+    let mut new_game_start = false;
     while let Some(flag) = args.next() {
         let mut value = || -> Result<String, Box<dyn Error>> {
             args.next().ok_or_else(|| format!("{flag} needs a value").into())
@@ -761,6 +843,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .collect::<Result<Vec<u32>, _>>()?
             }
             "--starve-state-cursor" => starve_cursor = value()?.parse()?,
+            "--new-game-start" => new_game_start = true,
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
@@ -813,8 +896,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_cursor = base::u32_at(&capture_data.state, 24);
     // The captured lump is the bound: past it there is no recorded ticcmd, so
     // the controller ingress is the only thing that can drive a tic.
-    let demo_tics = capture_data.looped_demo_commands(tics as usize)?.1 as u32;
-    if demo_tics < 5_000 || demo_tics >= tics {
+    let demo_tics = capture_data.looped_demo_commands(tics.max(1) as usize)?.1 as u32;
+    if !new_game_start && (demo_tics < 5_000 || demo_tics >= tics) {
         return Err(format!(
             "captured DEMO1 carries {demo_tics} tics, which does not leave room in a {tics}-tic run"
         )
@@ -824,15 +907,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("--advance-tics is out of range".into());
     }
     for cursor in &frames_at {
-        if *cursor <= demo_tics || *cursor % advance_tics != 0 || *cursor > tics {
+        // A new-game start state carries a demo cursor into the shareware lump
+        // (13, the first DEMO1 ticcmd) purely so the SIM/2 cursor validation has
+        // real bounds; under SIM2INPT/3 the lump is not the source of player
+        // input, and its length is a property of E1M5, not of this run.  So the
+        // frame cursors only have to be inside the run and on a batch boundary.
+        let inside = *cursor > 0 && *cursor % advance_tics == 0 && *cursor <= tics;
+        if !inside || (!new_game_start && *cursor <= demo_tics) {
             return Err(format!(
-                "frame cursor {cursor} must be past the {demo_tics}-tic demo end, on a {advance_tics}-tic boundary and inside the run"
+                "frame cursor {cursor} must be inside the {tics}-tic run on a {advance_tics}-tic boundary{}",
+                if new_game_start { "" } else { &format!(" and past the {demo_tics}-tic demo end") }
             )
             .into());
         }
     }
-    if starve_cursor == 0 || starve_cursor >= demo_tics {
-        return Err("--starve-state-cursor must be inside the demo portion".into());
+    if starve_cursor == 0 || (!new_game_start && starve_cursor >= demo_tics) {
+        return Err("--starve-state-cursor must be inside the run".into());
     }
 
     // --- host lockstep oracle ------------------------------------------------
@@ -898,6 +988,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut render_rows: Vec<serde_json::Value> = Vec::new();
     let mut position_rows: Vec<serde_json::Value> = Vec::new();
     let mut st1_at_demo_end: Option<(u32, Vec<u8>)> = None;
+    // With a new-game start state the demo end is not in this run, so the
+    // "what did the live input move" comparison is against the start state
+    // itself, which is the state every other claim is relative to.
+    let baseline_state = if new_game_start {
+        capture_data.state.clone()
+    } else {
+        Vec::new()
+    };
     let mut chain_states: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut chain_frames: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut strips_written = 0usize;
@@ -1065,9 +1163,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
             let (segment, forward, strafe) = common::r8l_segment(last - 1);
-            let (demo_end_cursor, base_state) = st1_at_demo_end
-                .clone()
-                .ok_or("the run never committed a cursor at or before the demo end")?;
+            let (demo_end_cursor, base_state) = if new_game_start {
+                (0u32, baseline_state.clone())
+            } else {
+                st1_at_demo_end
+                    .clone()
+                    .ok_or("the run never committed a cursor at or before the demo end")?
+            };
             let changed = changed_fields(&base_state, &state);
             let chain_frame_sha = base::sha(&reconstructed);
             chain_frames.push((last, reconstructed));
@@ -1079,7 +1181,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .count();
             position_rows.push(json!({
                 "cursor": last,
-                "tics_past_demo_end": last - demo_tics,
+                "tics_past_demo_end": if new_game_start { json!(null) } else { json!(last - demo_tics) },
                 "compared_against_cursor": demo_end_cursor,
                 "input_segment": segment,
                 "segment_moves_forward": forward,
@@ -1091,7 +1193,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }));
             render_rows.push(json!({
                 "cursor": last,
-                "tics_past_demo_end": last - demo_tics,
+                "tics_past_demo_end": if new_game_start { json!(null) } else { json!(last - demo_tics) },
                 "snapshot_live_cu": snapshot_units,
                 "strip_cu": strip_units.clone(),
                 "strip_cu_max": strip_units.iter().max(),
@@ -1104,7 +1206,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     sweeps.flush()?;
     let sweep_seconds = started.elapsed().as_secs_f64();
     if position_rows.iter().all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0)) {
-        return Err("the ST1 image did not change past the demo end".into());
+        return Err(if new_game_start {
+            "the ST1 image did not change from the start state".into()
+        } else {
+            "the ST1 image did not change past the demo end".into()
+        });
     }
     if chain_frames.len() < 2 {
         return Err("fewer than two rendered cursors past the demo end".into());

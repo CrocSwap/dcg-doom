@@ -166,6 +166,15 @@ pub const ST1_GAMESTATE_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 3) as usize;
 pub const ST1_GAMETIC_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 5) as usize;
 pub const ST1_CONSOLEPLAYER_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 11) as usize;
 pub const ST1_DEMO_CURSOR_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 6) as usize;
+/// `players[0].playerstate`: `playeringame[4]` ends at
+/// `ST1_PLAYERINGAME_OFFSET + 4`, then the player record starts with
+/// `mobj_t *mo` (4 bytes) and `playerstate_t playerstate` (4 bytes).
+pub const ST1_PLAYER0_PLAYERSTATE_OFFSET: usize = ST1_PLAYERINGAME_OFFSET + 8;
+/// `PST_LIVE`, `PST_DEAD`, `PST_REBORN` (doomdef.h).  The state codec accepts
+/// all three, so a canonical ST1 can carry a dead player.
+pub const PST_LIVE: i32 = 0;
+pub const PST_DEAD: i32 = 1;
+pub const PST_REBORN: i32 = 2;
 pub const ST1_MAX_PLAYERS: u32 = 4;
 pub const GAMESTATE_LEVEL: i32 = 0;
 
