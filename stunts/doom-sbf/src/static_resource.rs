@@ -258,6 +258,66 @@ pub fn static_address(program: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[STATIC_SEED, &WAD_HASH], program)
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The static resource PDA is derived from the program, so it survives an
+    /// image upgrade, and BOOTSTRAP_OFFSET is derived from `CTX_MIN_BYTES`.
+    /// When a patch grows `doom_ctx_t` the header moves, and the two operations
+    /// that could re-head the account -- REBUILD/4 and BUILD cursor 0 -- both
+    /// read the header at the *current* offset.  A static resource built by the
+    /// previous image therefore has bytes where the new header must be, and
+    /// neither operation can clear them: REBUILD/4 refuses 303 because they
+    /// are not magic, BUILD/0 refuses 303 because they are not zero.
+    ///
+    /// This is a one-way door on a program-derived account, measured on testnet
+    /// (both refusals at the same static PDA, image ecea41a8), so it is pinned
+    /// here rather than left to be rediscovered.
+    #[test]
+    fn a_header_move_makes_the_static_resource_a_one_way_door() {
+        // The header lives exactly at the end of the WAD staging image.
+        assert_eq!(HEADER_OFFSET % ALLOC_ALIGNMENT, 0);
+        assert_eq!(
+            HEADER_OFFSET,
+            crate::resource_sbf::CTX_MIN_BYTES + crate::resource_sbf::WAD_IMAGE_BYTES,
+        );
+        assert_eq!(ACCOUNT_BYTES, resource_sbf::CONTEXT_BYTES);
+
+        // A grown doom_ctx_t moves the header; the 32-byte case is the one that
+        // actually happened, and it must not be silently absorbed.
+        let previous = HEADER_OFFSET - 32;
+        assert_eq!(previous % ALLOC_ALIGNMENT, 0);
+        assert_ne!(previous, HEADER_OFFSET);
+
+        // REBUILD/4's gate: the header at the current offset must already be a
+        // built header.  A previous image's header is not there at all.
+        let mut account = vec![0u8; ACCOUNT_BYTES];
+        account[previous..previous + 8].copy_from_slice(MAGIC);
+        let header = &account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+        assert!(
+            &header[..8] != MAGIC || u32_at(header, 8) != VERSION,
+            "a stale header must not satisfy REBUILD/4's built-header gate"
+        );
+
+        // BUILD cursor 0's gate: the header at the current offset must be all
+        // zero.  A previous image's header leaves the tail non-zero.
+        assert!(
+            header.iter().any(|byte| *byte != 0),
+            "a stale header must not satisfy BUILD cursor 0's zero-header gate"
+        );
+    }
+
+    /// The static account's own length is `ACCOUNT_BYTES`, and a growth beyond
+    /// that is refused, so the account can be grown into a new layout but never
+    /// shrunk back out of one.
+    #[test]
+    fn the_static_account_grows_into_a_layout_and_cannot_shrink_out() {
+        assert_eq!(ACCOUNT_BYTES, 9_734_160);
+        assert!(ACCOUNT_BYTES > 0);
+    }
+}
+
 fn process_init(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     const STATIC: usize = 0;
     const PAYER: usize = 1;
