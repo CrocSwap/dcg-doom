@@ -401,7 +401,13 @@ mod layout_tests {
         let account = stale_header_account();
         let old_header = &account[previous..previous + HEADER_BYTES];
         let header = &account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
-        assert_eq!(header, &old_header[32..]);
+        // The 480 bytes the two regions share, then the 32 bytes of whatever
+        // follows the old header (here the zero tail of the account).
+        assert_eq!(&header[..HEADER_BYTES - 32], &old_header[32..]);
+        assert_eq!(
+            &header[HEADER_BYTES - 32..],
+            &account[previous + HEADER_BYTES..HEADER_OFFSET + HEADER_BYTES]
+        );
         assert_ne!(&header[..8], MAGIC, "a stale tail is not a header magic");
         assert!(
             &header[..8] != MAGIC || u32_at(header, 8) != VERSION,
@@ -502,7 +508,9 @@ mod clear_tests {
         // half of the gate: the operation refuses a *good* resource, not any
         // resource that starts with the magic.
         let mut partial = account;
-        put_u32(&mut partial, H_BUILD_NEXT, 3);
+        // Header field offsets are relative to the header, so the account write
+        // has to land at HEADER_OFFSET + H_BUILD_NEXT, not at H_BUILD_NEXT.
+        put_u32(&mut partial, HEADER_OFFSET + H_BUILD_NEXT, 3);
         assert!(validate_header(&partial).is_err());
         assert_eq!(
             clear_static_header(&key, &program, &program, &mut partial),
