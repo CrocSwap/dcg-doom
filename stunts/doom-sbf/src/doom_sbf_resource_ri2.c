@@ -1576,18 +1576,7 @@ int doom_engine_rsn3_render_static(
     pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true;
-    /* Clip mode 2 (patch 0015): R_ClearClipSegs seeds solidsegs with
-     * [-inf, strip_left-1] and [strip_right, +inf], so R_CheckBBox rejects
-     * subtrees outside the strip and R_ClipSolidWallSegment absorbs out-of-strip
-     * segs without storing a wall range.  Straddling segs still store their
-     * in-strip fragment, so the strip's pixels are unchanged.  Mode 1 rendered
-     * the whole 320x200 view per strip and discarded seven eighths. */
-    /* Clip mode 2 (patches 0015 and 0017): the wall ranges the BSP walk
-     * stores are bounded to this strip, so a seg that never reaches it costs
-     * no drawseg, no wall column and no R_RenderSegLoop.  The clip posts, the
-     * subsectors R_CheckBBox keeps and the vissprite list are the unclipped
-     * walk's, which is what keeps the strip's pixels identical. */
-    doom_render_fuzz_columns = (2u << 30) | (strip_id << 27);
+    doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
     RI2_PHASE(1103);
     R_RenderPlayerView(&players[displayplayer]);
     RI2_PHASE(1104);
