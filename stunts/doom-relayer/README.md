@@ -30,10 +30,36 @@ Flags: `--mode mock|chain`, `--port`, `--slots`, `--network`, `--cors-origin`.
 
 ## Chain mode
 
-`--mode chain` is declared and deliberately not wired. It needs a long-lived
-sender on the Python side that does not exist yet; `createPipelineSender`
-throws with the requirements rather than guessing at an interface another
-worker is changing. See `PIPELINE_REQUIREMENTS` in `sender.mjs`.
+`--mode chain` binds to [`scripts/doom_relayer_server.py`](../../scripts/doom_relayer_server.py),
+which holds the measured R8m sender (`doom_r7_render_loop.fire_blind`) and the
+R8b frame pipeline open for the life of a session and takes the player's input
+as a stream over JSON lines on stdin and stdout. The relayer never sees a key:
+the keys stay in the child process, next to it on the host.
+
+The advance and the frame loop belong to the child, not to a request, so
+`PipelineSender.background` is true and the relayer's per-batch `advance` and
+`renderFrame` report where the chain is instead of driving it. What the relayer
+does own is backpressure: it asks the child for its staging frontier and accepts
+a batch only as far as the chain will consume within about a second, because
+the page offers eight tics per animation frame and the engine eats about 35 a
+second. Accepting all of it works and builds a backlog whose key-to-frame delay
+grows through the session, which is the R8l5 failure.
+
+```sh
+node stunts/doom-relayer/server.mjs --mode chain --port 8787 --host 127.0.0.1 \
+  --keys-dir /home/ec2-user/doom-keys/r8l4-fresh \
+  --payer-key /home/ec2-user/doom-keys/tokyo-testnet-payer.json \
+  --python /home/ec2-user/basanos-main/.venv/bin/python \
+  --image-sha256 67038f62... --image-bytes 983384 \
+  --seconds 900 --strip-rate 16 --render-buffers 2 \
+  --advance-tics 4 --advance-pipeline-depth 4 --sweep-rate 8 \
+  --spend-cap-fogo 2
+```
+
+`--host` defaults to `127.0.0.1`, so the relayer is not on every interface by
+accident. It is the one long-running thing here and its stop is SIGINT or
+SIGTERM, which asks the child to write its receipt and exit; a `kill -9` loses
+the receipt. To play: [`docs/runbooks/doom-play-local.md`](../../docs/runbooks/doom-play-local.md).
 
 ## Files
 
@@ -41,8 +67,8 @@ worker is changing. See `PIPELINE_REQUIREMENTS` in `sender.mjs`.
 |---|---|
 | `server.mjs` | The HTTP API and the relayer itself. No dependencies. |
 | `pool.mjs` | The in-memory slot pool. |
-| `sender.mjs` | The chain contract, the mock implementation, and the unwired pipeline binding. |
-| `test/test_relayer.mjs` | 25 tests, all in mock mode. |
+| `sender.mjs` | The chain contract, the mock implementation, and the pipeline binding. |
+| `test/test_relayer.mjs` | 27 tests: 25 in mock mode, plus the chain binding and its backpressure. |
 
 ## Tests
 
@@ -50,7 +76,8 @@ worker is changing. See `PIPELINE_REQUIREMENTS` in `sender.mjs`.
 node --test stunts/doom-relayer/test/test_relayer.mjs
 ```
 
-Nothing in the suite touches the network or a key file.
+Nothing in the suite touches the network or a key file. The chain-mode test
+constructs a `PipelineSender` and reads its argv; it never starts the process.
 
 ## The input contract
 

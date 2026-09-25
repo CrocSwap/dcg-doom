@@ -24,7 +24,7 @@ import {
   slotBinding,
 } from "../../web/doom-play/input.js";
 import {DEFAULT_NETWORK, NETWORKS, requireNetwork, explorerTransaction} from "../../web/doom-play/network.js";
-import {SlotPool, PoolError, SLOT_STATE} from "./pool.mjs";
+import {SlotPool, PoolError, SLOT_STATE, makeSlot} from "./pool.mjs";
 import {createSender, SenderError} from "./sender.mjs";
 
 export const API_VERSION = "doom-relayer/1";
@@ -148,7 +148,39 @@ export class Relayer {
     this.startedAt = Date.now();
     this.stats = {sessionsCreated: 0, sessionsEnded: 0, inputsAccepted: 0, inputsRejected: 0, ticsLanded: 0, framesRendered: 0};
     this.promise = Promise.resolve();
-    if (!this.pool.size) this.seedSlots(slotCount);
+    // Mock mode is synchronous and self-contained: the synthetic slots are what
+    // the page is developed against. Chain mode has to ask a process what
+    // context it is driving, so that waits for init().
+    if (!this.pool.size && !this.sender.background) this.seedSlots(slotCount);
+  }
+
+  // A background sender is already driving a provisioned context, so the pool
+  // is seeded from what it reports rather than from synthetic mock addresses.
+  // In mock mode the constructor has already done it and this is a no-op.
+  async init() {
+    if (this.pool.size || !this.sender.background) return this;
+    const slot = await this.sender.provisionSlot({network: this.networkName, label: null});
+    this.pool.slots.push(makeSlot({
+      slot: 0,
+      label: slot.label,
+      context: slot.context,
+      meta: slot.meta,
+      inputBuffer: slot.inputBuffer,
+      state: slot.state,
+      mirror: slot.mirror,
+      authority: slot.authority,
+      snapshot: slot.snapshot,
+      strips: slot.strips,
+      inputCapacity: slot.inputCapacity,
+    }));
+    const record = this.pool.slots[0];
+    record.cursor = slot.cursor ?? 0;
+    record.gametic = slot.gametic ?? 0;
+    // A context resumes where it stopped, so the player's first batch is
+    // staged at the chain's cursor, not at zero.
+    record.nextSeq = slot.nextSeq ?? 0;
+    this.log(`slot 0 is context ${record.accounts.context} at cursor ${record.cursor} of ${record.inputCapacity}`);
+    return this;
   }
 
   log(...parts) {
@@ -392,21 +424,67 @@ export class Relayer {
       throw error;
     }
 
-    const commands = decoded.commands;
-    const result = await this.sender.deposit({slot: slot.label, firstSeq: decoded.firstSeq, commands});
-    const advanced = await this.sender.advance({slot: slot.label, maxTics: 0, expectedCursor: slot.cursor});
+    // Backpressure. A player holding a key offers 8 tics per animation frame,
+    // which is 480 tics/s against an engine that consumes about 35. Staging all
+    // of it would work and would be a trap: the queue drains at the engine's
+    // rate, so the keystroke that started it would be seconds behind the one
+    // that ended it, and that gap grows through a session. So a batch is
+    // accepted only as far as the sender says it can stage soon, and the page
+    // re-offers the rest with whatever the keys are by then. Each sequence is
+    // written exactly once, by the batch that was accepted for it.
+    let commands = decoded.commands;
+    let accepted = decoded.count;
+    if (this.sender.background) {
+      const frontier = await this.sender.stagingFrontier();
+      const room = frontier - decoded.firstSeq;
+      if (room <= 0) {
+        this.stats.inputsRejected += 1;
+        const error = new Error(
+          `input window is full: ${decoded.firstSeq} is ${decoded.firstSeq - frontier} tics past the ` +
+            `staging frontier ${frontier}`,
+        );
+        error.status = 409;
+        error.code = "input_window_full";
+        throw error;
+      }
+      if (room < accepted) {
+        accepted = room;
+        commands = decoded.commands.subarray(0, accepted * COMMAND_BYTES);
+        this.log(`slot ${slot.slot} accepted ${accepted} of ${decoded.count} tics; the rest waits for the frontier`);
+      }
+    }
 
-    slot.nextSeq = Math.max(slot.nextSeq, decoded.firstSeq + decoded.count);
+    const result = await this.sender.deposit({slot: slot.label, firstSeq: decoded.firstSeq, commands});
+    // A background sender is already advancing and rendering on its own
+    // schedule, so a batch does not drive either. It reports where the chain
+    // has got to, which is what the page's status line wants.
+    const advanced = this.sender.background
+      ? await this.sender.advance({slot: slot.label, maxTics: 0, expectedCursor: null})
+      : await this.sender.advance({slot: slot.label, maxTics: 0, expectedCursor: slot.cursor});
+
+    slot.nextSeq = Math.max(slot.nextSeq, decoded.firstSeq + accepted);
     slot.cursor = advanced.cursor;
     slot.gametic = advanced.gametic;
     slot.ticsLanded += advanced.tics;
-    this.stats.inputsAccepted += decoded.count;
+    this.stats.inputsAccepted += accepted;
     this.stats.ticsLanded += advanced.tics;
 
     // The first batch always renders, so a joining player sees a frame
-    // immediately rather than waiting out the cadence.
-    const shouldRender = slot.framesLanded === 0 || advanced.tics >= this.ticsPerFrame;
-    if (shouldRender) {
+    // immediately rather than waiting out the cadence. With a background
+    // sender the render loop is already running, so there is nothing to force:
+    // the newest frame it knows about is recorded instead, which is what the
+    // page's frame line shows.
+    if (this.sender.background) {
+      try {
+        const frame = await this.sender.renderFrame({slot: slot.label, bufferId: 0});
+        if (frame.signature && frame.signature !== slot.lastFrameSignature) {
+          slot.lastFrameSignature = frame.signature;
+          slot.framesLanded += 1;
+        }
+      } catch {
+        // No frame has landed yet. The tics are on chain either way.
+      }
+    } else if (slot.framesLanded === 0 || advanced.tics >= this.ticsPerFrame) {
       try {
         const frame = await this.sender.renderFrame({slot: slot.label, bufferId: 0});
         slot.lastFrameSignature = frame.signature;
@@ -420,7 +498,8 @@ export class Relayer {
 
     return {
       ok: true,
-      accepted: decoded.count,
+      accepted,
+      offered: decoded.count,
       first_seq: decoded.firstSeq,
       next_seq: slot.nextSeq,
       cursor: slot.cursor,
@@ -444,6 +523,15 @@ export class Relayer {
   async frameBytes(sessionId) {
     const session = this.getSession(sessionId);
     const slot = session.slot;
+    if (this.sender.background) {
+      const error = new Error(
+        "in chain mode the frame pipeline writes the strip accounts and the viewer reads them " +
+          "from the network; the relayer holds no copy of the bytes",
+      );
+      error.status = 501;
+      error.code = "no_frame_bytes_in_chain_mode";
+      throw error;
+    }
     const frame = await this.sender.renderFrame({slot: slot.label, bufferId: 0});
     slot.lastFrameSignature = frame.signature;
     slot.framesLanded += 1;
@@ -462,15 +550,26 @@ export class Relayer {
   }
 
   // Render on demand, so a client that just joined can be caught up without
-  // waiting for the next batch.
+  // waiting for the next batch. A background sender renders on its own
+  // schedule, so this reports the newest frame rather than asking for a new
+  // one: forcing a render here would spend a frame's compute on a client that
+  // is about to be sent the newest one anyway.
   async renderNow(sessionId) {
     const session = this.getSession(sessionId);
     const slot = session.slot;
     const frame = await this.sender.renderFrame({slot: slot.label, bufferId: 0});
-    slot.lastFrameSignature = frame.signature;
-    slot.framesLanded += 1;
-    this.stats.framesRendered += 1;
-    return {ok: true, cursor: frame.cursor, gametic: frame.gametic, signature: frame.signature};
+    if (frame.signature && frame.signature !== slot.lastFrameSignature) {
+      slot.lastFrameSignature = frame.signature;
+      slot.framesLanded += 1;
+    }
+    if (!this.sender.background) {
+      // Only a forced render is this relayer's own work; a background sender's
+      // frames are its render loop's, and counting them here would say the
+      // relayer painted them.
+      slot.framesLanded += 1;
+      this.stats.framesRendered += 1;
+    }
+    return {ok: true, cursor: frame.cursor, gametic: frame.gametic, signature: frame.signature, forced: !this.sender.background};
   }
 
   async endSession(sessionId) {
@@ -596,32 +695,125 @@ export function createServer(relayer, {onLog = null, corsOrigin = "*"} = {}) {
 }
 
 // node stunts/doom-relayer/server.mjs --mode mock --port 8787 --slots 4
+//
+// node stunts/doom-relayer/server.mjs --mode chain --port 8787 \
+//   --keys-dir /home/ec2-user/doom-keys/r8l4-fresh \
+//   --payer-key /home/ec2-user/doom-keys/tokyo-testnet-payer.json \
+//   --python /home/ec2-user/basanos-main/.venv/bin/python \
+//   --image-sha256 67038f62... --seconds 900 --strip-rate 16
+//
+// Chain mode holds one long-lived pipeline process, which is what keeps the
+// cursor binding between player batches. It is the one thing in this file that
+// is allowed to be long-running, and it is stopped with SIGINT/SIGTERM, which
+// asks the pipeline to write its receipt and exit.
 function isMain() {
   return process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 }
 
-if (isMain()) {
+// Chain-mode flags, named here so a mistyped one is a startup error rather
+// than a silently default pipeline: every one of these changes what the sender
+// does on chain, and a default that looks like a choice is worse than a refusal.
+const CHAIN_FLAGS = new Set([
+  "keys-dir", "payer-key", "python", "script", "run-dir", "rpc-a", "rpc-b",
+  "image-sha256", "image-bytes", "seconds", "strip-rate", "render-buffers",
+  "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
+  "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
+  "render",
+]);
+
+function parseArgs(argv) {
   const args = new Map();
-  for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replace(/^--/, ""), process.argv[i + 1]);
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (!token.startsWith("--")) continue;
+    const name = token.slice(2);
+    if (CHAIN_FLAGS.has(name)) {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error(`--${name} needs a value`);
+      }
+      args.set(name, value);
+      i += 1;
+    } else {
+      args.set(name, argv[i + 1]);
+      i += 1;
+    }
+  }
+  return args;
+}
+
+if (isMain()) {
+  const args = parseArgs(process.argv);
   const mode = args.get("mode") ?? "mock";
   const port = Number(args.get("port") ?? 8787);
   const network = args.get("network") ?? DEFAULT_NETWORK;
   requireNetwork(network, ["doom.program"]);
+  const logger = (...parts) => console.error(new Date().toISOString(), ...parts);
+  const sender = createSender({
+    mode,
+    logger,
+    keysDir: args.get("keys-dir") ?? null,
+    payerKey: args.get("payer-key") ?? null,
+    python: args.get("python") ?? undefined,
+    script: args.get("script") ?? undefined,
+    runDir: args.get("run-dir") ?? undefined,
+    rpcA: args.get("rpc-a") ?? undefined,
+    rpcB: args.get("rpc-b") ?? undefined,
+    imageSha256: args.get("image-sha256") ?? undefined,
+    imageBytes: args.get("image-bytes") ? Number(args.get("image-bytes")) : undefined,
+    seconds: args.get("seconds") ? Number(args.get("seconds")) : undefined,
+    stripRate: args.get("strip-rate") ? Number(args.get("strip-rate")) : undefined,
+    renderBuffers: args.get("render-buffers") ? Number(args.get("render-buffers")) : undefined,
+    advanceTics: args.get("advance-tics") ? Number(args.get("advance-tics")) : undefined,
+    advancePipelineDepth: args.get("advance-pipeline-depth") ? Number(args.get("advance-pipeline-depth")) : undefined,
+    sweepRate: args.get("sweep-rate") ? Number(args.get("sweep-rate")) : undefined,
+    inputTicsPerSecond: args.get("input-tics-per-second") ? Number(args.get("input-tics-per-second")) : undefined,
+    inputStageLeadTics: args.get("input-stage-lead-tics") ? Number(args.get("input-stage-lead-tics")) : undefined,
+    startCursor: args.get("start-cursor") ? Number(args.get("start-cursor")) : undefined,
+    spendCapFogo: args.get("spend-cap-fogo") ? Number(args.get("spend-cap-fogo")) : undefined,
+    payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
+  });
   const relayer = createRelayer({
     network,
     mode,
     slotCount: Number(args.get("slots") ?? 2),
-    logger: (...parts) => console.error(new Date().toISOString(), ...parts),
+    logger,
+    sender,
   });
   const corsOrigin = args.get("cors-origin") ?? "*";
-  const server = createServer(relayer, {onLog: (line) => console.error(new Date().toISOString(), line), corsOrigin});
-  server.listen(port, () => {
-    console.error(`doom relayer ${API_VERSION} on http://127.0.0.1:${port} mode=${mode} network=${network} cors=${corsOrigin}`);
-    console.error(`pool: ${JSON.stringify(relayer.pool.summary())}`);
-  });
+  const server = createServer(relayer, {onLog: (line) => logger(line), corsOrigin});
+  // The listen address is named rather than left to node, because the relayer
+  // is reached through an SSH tunnel and must not be on every interface by
+  // accident.
+  const host = args.get("host") ?? "127.0.0.1";
+  let stopping = false;
+  const shutdown = async (signal) => {
+    if (stopping) return;
+    stopping = true;
+    logger(`${signal}: stopping; the pipeline writes its receipt before it exits`);
+    server.close();
+    try {
+      await relayer.sender.close();
+    } catch (error) {
+      logger(`sender close failed: ${error.message}`);
+    }
+    process.exit(0);
+  };
   for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => {
-      server.close(() => process.exit(0));
-    });
+    process.on(signal, () => void shutdown(signal));
   }
+  try {
+    await relayer.init();
+  } catch (error) {
+    logger(`could not start the ${mode} sender: ${error.message}`);
+    process.exit(1);
+  }
+  server.listen(port, host, () => {
+    logger(`doom relayer ${API_VERSION} on http://${host}:${port} mode=${mode} network=${network} cors=${corsOrigin}`);
+    logger(`pool: ${JSON.stringify(relayer.pool.summary())}`);
+    if (mode === "chain") {
+      logger(`strip rate ${args.get("strip-rate") ?? 16}/s, depth ${args.get("advance-pipeline-depth") ?? 4}, ` +
+        `stop with SIGINT or SIGTERM, or kill this process and the pipeline with it`);
+    }
+  });
 }

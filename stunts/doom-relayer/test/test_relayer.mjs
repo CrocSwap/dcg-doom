@@ -180,17 +180,62 @@ test("a halted mock slot refuses everything, standing in for a latched M_HALT", 
   assert.equal((await sender.readProgress({slot: "s0"})).halted, true);
 });
 
-test("the chain sender is declared but refuses to start", () => {
+test("chain mode is wired, and refuses to start without keys or a script", async () => {
+  // The chain sender is a binding to scripts/doom_relayer_server.py, which
+  // holds the R8m sender and the R8b frame pipeline open for the life of a
+  // session. Constructing one does not touch the network or a key file: it is
+  // the process that does both, and it is not started until init() asks.
   assert.throws(() => createSender({mode: "chain"}), (error) => {
     assert.ok(error instanceof SenderError);
-    assert.equal(error.code, "not_wired");
-    assert.match(error.message, /doom_r8b_tokyo_pipeline/);
+    assert.equal(error.code, "no_keys");
+    assert.match(error.message, /keys stay on the host/);
+    return true;
+  });
+  assert.throws(() => createSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", script: "/nope/relay.py"}), (error) => {
+    assert.ok(error instanceof SenderError);
+    assert.equal(error.code, "no_pipeline_script");
+    assert.match(error.message, /not at \/nope\/relay.py/);
     return true;
   });
   assert.throws(() => createSender({mode: "nonsense"}), /unknown sender mode/);
-  // The requirements are written down so the binding can be reviewed.
+
+  const sender = createSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    stripRate: 16,
+    advancePipelineDepth: 4,
+    seconds: 600,
+    imageSha256: "67038f62",
+  });
+  assert.equal(sender.mode, "chain");
+  // A background sender runs its own advance and render loops, which is what
+  // the relayer's per-batch calls must not duplicate.
+  assert.equal(sender.background, true);
+  assert.equal(sender.child, null);
+  // Every chain-mode flag reaches the child, and the flags that change what the
+  // sender does on chain are all present rather than defaulted away.
+  const argv = sender.argv().join(" ");
+  assert.match(argv, /--strip-rate 16/);
+  assert.match(argv, /--advance-pipeline-depth 4/);
+  assert.match(argv, /--seconds 600/);
+  assert.match(argv, /--image-sha256 67038f62/);
+  assert.match(argv, /--spend-cap-fogo/);
+  assert.match(argv, /--render-buffers 1/);
+  // Nothing in this test reaches a chain, and a dead child has to refuse rather
+  // than resolve to a zero cursor, which would read as a chain that is not
+  // moving when it is a process that is not running.
+  await assert.rejects(() => sender.readProgress(), (error) => {
+    assert.ok(error instanceof SenderError);
+    assert.equal(error.code, "pipeline_exited");
+    return true;
+  });
+  // The requirements are written down so the binding can be reviewed, and the
+  // one that used to be missing now points at the file that provides it.
   assert.equal(PIPELINE_REQUIREMENTS.operations.length, 5);
-  assert.ok(PIPELINE_REQUIREMENTS.missing.longLived);
+  assert.equal(PIPELINE_REQUIREMENTS.missing.longLived, undefined);
+  assert.match(PIPELINE_REQUIREMENTS.existing.longLived, /doom_relayer_server\.py/);
   assert.match(PIPELINE_REQUIREMENTS.transport, /JSON lines/);
 });
 
@@ -297,6 +342,143 @@ test("a signed batch is accepted, deposited and advanced", async () => {
     assert.ok(body.frame.explorer);
     assert.equal(relayer.stats.inputsAccepted, 8);
   });
+});
+
+// A background sender, as the chain binding is, with the frontier under the
+// test's control. The point of the frontier is backpressure: a player holding a
+// key offers 8 tics per animation frame and the engine eats about 35 a second,
+// so a relayer that accepted everything would build a backlog whose latency
+// grows through the session. That was R8l5's measured failure.
+function backgroundSender({frontier, cursor = 0}) {
+  const deposits = [];
+  return {
+    mode: "chain",
+    background: true,
+    deposits,
+    cursor,
+    async provisionSlot() {
+      return {
+        slot: 0,
+        label: "chain-test",
+        context: "CTX",
+        meta: "MET",
+        inputBuffer: "BUF",
+        state: "STA",
+        mirror: "MIR",
+        authority: "AUT",
+        snapshot: "SNP",
+        strips: Array.from({length: 8}, (_, i) => `STRIP-${i}`),
+        inputCapacity: 6016,
+        cursor,
+        gametic: cursor,
+        nextSeq: cursor,
+      };
+    },
+    async stagingFrontier() {
+      return frontier;
+    },
+    async deposit({firstSeq, commands}) {
+      deposits.push({firstSeq, tics: commands.length / 4});
+      return {accepted: commands.length / 4, signature: null};
+    },
+    async advance() {
+      return {cursor, gametic: cursor, tics: 0, signature: null};
+    },
+    async renderFrame() {
+      return {cursor, gametic: cursor, signature: "chain-frame-1", strips: null};
+    },
+    async readProgress() {
+      return {cursor, gametic: cursor, capacity: 6016, halted: false};
+    },
+    async close() {},
+  };
+}
+
+test("chain mode stages a signed batch, and refuses input past the staging frontier", async () => {
+  const sender = backgroundSender({frontier: 20});
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    // The slot is the real context the sender is driving, so the player's first
+    // batch is staged where the chain is, not at tic zero.
+    assert.equal(created.context, "CTX");
+    assert.equal(created.next_seq, 0);
+    assert.equal(created.strip_accounts.length, 8);
+    assert.equal(created.mode, "chain");
+
+    // A whole batch inside the frontier: all of it is staged.
+    const first = await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 0, count: 8, clientSeq: 1}),
+    );
+    assert.equal(first.status, 200);
+    assert.equal(first.body.accepted, 8);
+    assert.equal(first.body.offered, 8);
+    assert.equal(first.body.next_seq, 8);
+    assert.deepEqual(sender.deposits, [{firstSeq: 0, tics: 8}]);
+    // A background sender renders on its own schedule, so a batch does not
+    // force a frame; the newest one it knows about is reported instead.
+    assert.equal(first.body.frame.signature, "chain-frame-1");
+
+    // A batch that runs past the frontier is accepted as far as it goes, and
+    // the page re-offers the rest. Each sequence is written exactly once. The
+    // frontier is 20 and the cursor is not moving, so the third batch is the
+    // first one with nowhere left to put its tics.
+    const second = await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 8, count: 8, clientSeq: 2}),
+    );
+    assert.equal(second.status, 200);
+    assert.equal(second.body.offered, 8);
+    assert.equal(second.body.accepted, 8);
+    assert.equal(second.body.next_seq, 16);
+    assert.deepEqual(sender.deposits[1], {firstSeq: 8, tics: 8});
+
+    const third = await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 16, count: 8, clientSeq: 3}),
+    );
+    assert.equal(third.status, 200);
+    assert.equal(third.body.accepted, 4);
+    assert.equal(third.body.next_seq, 20);
+    assert.deepEqual(sender.deposits[2], {firstSeq: 16, tics: 4});
+
+    const fourth = await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 20, count: 8, clientSeq: 4}),
+    );
+    assert.equal(fourth.status, 409);
+    assert.equal(fourth.body.code, "input_window_full");
+    assert.equal(relayer.stats.inputsRejected, 1);
+    // Nothing was staged, so the page's next_seq has not moved and the same
+    // batch is still valid to re-offer.
+    assert.equal(sender.deposits.length, 3);
+
+    // And the frame-bytes endpoint says why it has none, rather than handing
+    // back eight empty strip accounts.
+    const bytes = await call("GET", `/v1/sessions/${created.id}/frame`);
+    assert.equal(bytes.status, 501);
+    assert.equal(bytes.body.code, "no_frame_bytes_in_chain_mode");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("a batch with a bad signature is refused", async () => {
