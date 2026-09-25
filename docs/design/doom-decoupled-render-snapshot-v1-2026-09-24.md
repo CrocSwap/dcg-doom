@@ -199,21 +199,17 @@ account provisioning or on-chain affordability.
 **Designed and source-implemented; live rendering remains unverified.** The
 buffered profile keeps the existing RSN/3 and RSR/2 operations and identifiers
 unchanged. It adds RSN `INIT-BUFFERED/7`, `SNAPSHOT-LIVE-BUFFERED/8`, and
-`GROW-BUFFERED/9`, plus RSR `RENDER-BUFFERED/5` and the compact
-`RENDER-BUFFERED-COMPACT/6` form.
+`GROW-BUFFERED/9`, plus RSR `RENDER-BUFFERED/5`.
 
 Buffer 0 reuses the paid legacy snapshot and strip accounts. Buffer 1 uses
-`DOOM-RENDER-SNAPSHOT-BUFFER/1` with the context and buffer byte. The legacy
-buffered strip request contains only buffer and strip identifiers and keeps its
-context account in the four-account list. The compact form carries the context
-pubkey in the request's reserved 32-byte field and uses only the static,
-snapshot, and strip accounts; the program derives and checks the same snapshot
-PDA without loading the 9.7 MB context account. Both forms obtain cursor, root,
-and snapshot hash from the snapshot account rather than trusting client state.
-The sender may submit the snapshot and all eight strips without waiting for a
-status or snapshot readback, alternates the two buffer sets, retries failed
-strips once with a fresh blockhash, and uses a background blockhash cache. The
-static account remains the serialization point for the engine renderer, so
-buffer overlap removes snapshot-account aliasing but does not imply parallel
-strip execution. Image SHA-256 for the source-built candidate is
+`DOOM-RENDER-SNAPSHOT-BUFFER/1` with the context and buffer byte. The buffered
+strip request contains only buffer and strip identifiers and keeps its context
+account in the four-account list. Cursor, root, and snapshot hash come from the
+snapshot account rather than trusting client state. The sender may submit the
+snapshot and all eight strips without waiting for a status or snapshot
+readback, alternates the two buffer sets, retries failed strips once with a
+fresh blockhash, and uses a background blockhash cache. The static account
+remains the serialization point for the engine renderer, so buffer overlap
+removes snapshot-account aliasing but does not imply parallel strip execution.
+Image SHA-256 for the source-built candidate is
 `5205fc58be61874db7a6d8e7e566b9bd55f2e363d43096dd63880adf8c2e88e5`.
