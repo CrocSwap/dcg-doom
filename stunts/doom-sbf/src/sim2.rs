@@ -1819,7 +1819,7 @@ mod tests {
         let mut buffer = vec![0u8; buffer_bytes(capacity).unwrap()];
         buffer[..8].copy_from_slice(BUFFER_MAGIC);
         put_u32(&mut buffer, 8, BUFFER_FORMAT_VERSION);
-        put_u32(&mut buffer, 12, BUFFER_HEADER_BYTES);
+        put_u32(&mut buffer, 12, BUFFER_HEADER_BYTES as u32);
         put_u32(&mut buffer, 16, buffer.len() as u32);
         put_u32(&mut buffer, B_CAPACITY, capacity as u32);
         put_u32(&mut buffer, B_FIRST_TIC, 0);
@@ -1854,7 +1854,7 @@ mod tests {
         meta[M_AUTHORITY..M_AUTHORITY + 32].copy_from_slice(signer.as_ref());
         meta[M_STATE_ROOT..M_STATE_ROOT + 32].copy_from_slice(&root);
         meta[M_INPUT_CHAIN..M_INPUT_CHAIN + 32]
-            .copy_from_slice(&chain_init(context.as_ref(), 0));
+            .copy_from_slice(&chain_init(&context, 0));
         meta[M_CHECKPOINT..M_CHECKPOINT + 32]
             .copy_from_slice(&checkpoint_hash(&context, &checkpoint));
 
@@ -1879,7 +1879,7 @@ mod tests {
     /// index and the staged bytes, so it is a golden vector that survives any
     /// engine change: ADVANCE/5 must commit exactly this after four tics.
     fn golden_chain_after_four() -> [u8; 32] {
-        let mut chain = chain_init(Pubkey::new_from_array([0xc0; 32]).as_ref(), 0);
+        let mut chain = chain_init(&Pubkey::new_from_array([0xc0; 32]), 0);
         for (seq, command) in GOLDEN_COMMANDS.iter().enumerate() {
             chain = chain_step(&chain, seq as u32, command);
         }
