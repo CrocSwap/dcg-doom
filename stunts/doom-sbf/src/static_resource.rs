@@ -6,12 +6,12 @@
 //! unsupported by the SBF loader because writable .bss is not accepted.
 
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program::invoke_signed,
-    program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, system_program,
-    sysvar::Sysvar,
+    account_info::AccountInfo, bpf_loader_upgradeable, entrypoint::ProgramResult, hash::hashv,
+    program::invoke_signed, program_error::ProgramError, pubkey::Pubkey, rent::Rent,
+    system_instruction, system_program, sysvar::Sysvar,
 };
 
-use crate::{render_snapshot_v3 as rsn3, resource_sbf};
+use crate::{continuation_split_sbf, render_snapshot_v3 as rsn3, resource_sbf};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-RSR";
 pub const VERSION: u32 = 2;
@@ -19,6 +19,7 @@ pub const OP_BUILD: u8 = 0;
 pub const OP_RENDER: u8 = 1;
 pub const OP_INIT: u8 = 2;
 pub const OP_GROW: u8 = 3;
+pub const OP_REBUILD: u8 = 4;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
 pub const ROOTS_OFFSET: usize = 160;
@@ -32,6 +33,7 @@ pub const REFUSE_ACCOUNT: u32 = 302;
 pub const REFUSE_BUILT: u32 = 303;
 pub const REFUSE_BINDING: u32 = 304;
 pub const REFUSE_STATIC: u32 = 305;
+pub const REFUSE_AUTHORITY: u32 = 306;
 
 pub const WAD_HASH: [u8; 32] = [
     0x1d, 0x7d, 0x43, 0xbe, 0x50, 0x1e, 0x67, 0xd9, 0x27, 0xe4, 0x15, 0xe0, 0xb8, 0xf3, 0xe2, 0x9c,
@@ -88,7 +90,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +138,15 @@ impl Request {
         }
     }
 
+    pub const fn rebuild() -> Self {
+        Self {
+            operation: OP_REBUILD,
+            strip_id: 0,
+            cursor: 0,
+            snapshot_hash: [0; 32],
+        }
+    }
+
     pub const fn render(strip_id: u8, cursor: u32, snapshot_hash: [u8; 32]) -> Self {
         Self {
             operation: OP_RENDER,
@@ -161,7 +172,7 @@ impl Request {
             || &data[..8] != MAGIC
             || u32_at(data, 8) != VERSION
             || data[14..16] != [0, 0]
-            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_INIT | OP_GROW)
+            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_INIT | OP_GROW | OP_REBUILD)
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -181,7 +192,7 @@ impl Request {
         if request.operation == OP_RENDER && request.strip_id >= 8 {
             return Err(refuse(REFUSE_MALFORMED));
         }
-        if matches!(request.operation, OP_INIT | OP_GROW)
+        if matches!(request.operation, OP_INIT | OP_GROW | OP_REBUILD)
             && (request.strip_id != 0 || request.cursor != 0 || request.snapshot_hash != [0; 32])
         {
             return Err(refuse(REFUSE_MALFORMED));
@@ -196,7 +207,7 @@ mod request_tests {
 
     #[test]
     fn account_provision_requests_round_trip() {
-        for request in [Request::init(), Request::grow()] {
+        for request in [Request::init(), Request::grow(), Request::rebuild()] {
             assert_eq!(Request::decode(&request.encode()), Ok(request));
         }
     }
@@ -310,6 +321,74 @@ fn validate_static_account(
     if account.key != &expected || !owned(program, account, ACCOUNT_BYTES, writable) {
         return Err(refuse(REFUSE_ACCOUNT));
     }
+    Ok(())
+}
+
+fn require_upgrade_authority(
+    program: &Pubkey,
+    authority: &AccountInfo,
+    program_data: &AccountInfo,
+) -> ProgramResult {
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let expected = bpf_loader_upgradeable::get_program_data_address(program);
+    if program_data.key != &expected || program_data.owner != &bpf_loader_upgradeable::ID {
+        return Err(refuse(REFUSE_AUTHORITY));
+    }
+    let body = program_data.try_borrow_data()?;
+    if body.len() < 45
+        || body[..4] != [3, 0, 0, 0]
+        || body[12] != 1
+        || body[13..45] != authority.key.to_bytes()
+    {
+        return Err(refuse(REFUSE_AUTHORITY));
+    }
+    Ok(())
+}
+
+fn process_rebuild(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    const PROGRAM: usize = 0;
+    const STATIC: usize = 1;
+    const PROGRAM_DATA: usize = 2;
+    const AUTHORITY: usize = 3;
+    const CONTEXT: usize = 4;
+    const CONTINUATION: usize = 5;
+    if accounts.len() != 6 || !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    if accounts[PROGRAM].key != program
+        || accounts[PROGRAM].owner != &bpf_loader_upgradeable::ID
+        || !accounts[PROGRAM].executable
+        || accounts[PROGRAM].is_writable
+        || accounts[PROGRAM].is_signer
+        || accounts[PROGRAM_DATA].is_writable
+        || accounts[PROGRAM_DATA].is_signer
+        || accounts[CONTEXT].owner != program
+        || accounts[CONTEXT].data_len() != resource_sbf::CONTEXT_BYTES
+        || !accounts[CONTEXT].is_writable
+        || !accounts[CONTEXT].is_signer
+        || accounts[CONTINUATION].owner != program
+        || accounts[CONTINUATION].data_len() != continuation_split_sbf::CONTINUATION_BYTES
+        || !accounts[CONTINUATION].is_writable
+        || accounts[CONTINUATION].is_signer
+    {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    validate_static_account(program, &accounts[STATIC], true)?;
+    if accounts[STATIC].is_signer {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    require_upgrade_authority(program, &accounts[AUTHORITY], &accounts[PROGRAM_DATA])?;
+    let mut data = accounts[STATIC].try_borrow_mut_data()?;
+    let header = &mut data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+    if &header[..8] != MAGIC || u32_at(header, 8) != VERSION {
+        return Err(refuse(REFUSE_BUILT));
+    }
+    header.fill(0);
+    drop(data);
+    accounts[CONTEXT].try_borrow_mut_data()?.fill(0);
+    accounts[CONTINUATION].try_borrow_mut_data()?.fill(0);
     Ok(())
 }
 
@@ -680,6 +759,7 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         OP_RENDER => process_render(program, accounts, request),
         OP_INIT => process_init(program, accounts),
         OP_GROW => process_grow(program, accounts),
+        OP_REBUILD => process_rebuild(program, accounts),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
