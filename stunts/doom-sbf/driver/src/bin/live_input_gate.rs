@@ -1832,9 +1832,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("the dead slot was not returned to its start state".into());
     }
-    // And the restarted slot takes input again, including a use press, because
-    // its start state is whatever this slot was provisioned with.
-    let deposit = dead.deposit_ix(0, &press);
+    // And the restarted slot takes input again.  Its committed start state is
+    // the one with the dead player, so a *use* press is still a restart request
+    // -- the rule is about the committed state, not about the reset -- and a
+    // non-use command is what has to commit here.
+    let deposit = dead.deposit_ix(0, &[16u8, 0, 0, 0]);
     let deposited = dead.send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT).await?;
     if deposited.result.is_err() {
         return Err(format!("restarted-slot deposit: {:?}", deposited.result).into());
@@ -1859,6 +1861,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "use_press_committed_nothing": true,
         "use_press_cu": base::units(&refused).ok(),
         "reset_cu": dead_reset_cu,
+        "restarted_first_command": "forward 16, no buttons",
         "restarted_cursor": dead.view().await?.cursor,
         "restarted_first_tic_cu": base::units(&restarted)?,
         "live_use_control": live_use,
