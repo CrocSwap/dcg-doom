@@ -75,6 +75,84 @@ static const uint8_t ri2_wad_hash[32] = {
     0x3b,0xf3,0x30,0x75,0xe8,0x59,0x72,0x18,0x16,0xf6,0x52,0xa5,0x26,0xca,0xc7,0x71
 };
 
+/* A render must not inherit the frame identity the committed state happens to
+ * carry, and must not leave one behind.
+ *
+ * `validcount` is a frame counter the renderer bumps once per R_SetupFrame,
+ * and R_RenderBSPNode skips a subsector whose mark already equals it while
+ * R_ProjectSprite skips any sector whose sector->validcount_m already equals
+ * it -- those are the BSP's "this is already drawn and already lit" marks.
+ * Both the counter and the per-sector marks are committed fields: ST1 encodes
+ * `validcount` and every sector's `validcount_m`.  So a render that runs on the
+ * decoded state inherits a counter that can equal the marks the last render
+ * left in the state, and the subsector's walls, flats and sprites are then
+ * dropped or lit from the previous draw.  The host strip harness has always
+ * primed a fresh identity per strip (0x40000000 + id*2) for exactly this
+ * reason, which is why the host is byte-exact where the chain is not from
+ * identical C.
+ *
+ * `fuzzpos` (R_DrawFuzzColumn), `validcount` and `framecount` are restored
+ * afterwards, so a render cannot move the committed state it renders from.
+ *
+ * Ported from fadeno/doom-lowdetail-3 (commit 99b031726) with the spellings
+ * that branch's follow-up commits settled on: the engine headers turn
+ * `fuzzpos`, `validcount`, `framecount`, `numlines` and `numsectors` into
+ * `DOOM_CTX` macros, so a field declared with one of those names would be
+ * rewritten by the preprocessor. */
+typedef struct { int saved_fuzzpos, saved_validcount, saved_framecount; } ri2_render_saved_t;
+
+static void ri2_render_begin(uint32_t strip_id, ri2_render_saved_t *saved)
+{
+    saved->saved_fuzzpos = fuzzpos;
+    saved->saved_validcount = validcount;
+    saved->saved_framecount = framecount;
+    validcount = (int)(0x40000000u + strip_id * 2u);
+}
+
+static void ri2_render_end(const ri2_render_saved_t *saved)
+{
+    fuzzpos = saved->saved_fuzzpos;
+    validcount = saved->saved_validcount;
+    framecount = saved->saved_framecount;
+}
+
+/* The same rule for the two committed arrays a render writes besides the
+ * counters: R_StoreWallRange sets ML_MAPPED (0x100) on every linedef whose
+ * wall it draws, and R_ProjectSprite stamps sector->validcount_m.  ST1
+ * encodes line->flags and sector->validcount_m, so a render that runs before
+ * the encode would publish them.  The dynamic entry, which encodes after it
+ * renders, snapshots both arrays and puts them back; the strip entries
+ * publish no state and need no snapshot. */
+typedef struct { short *line_flags; int *sector_marks; } ri2_render_arrays_t;
+
+static int ri2_render_arrays_save(ri2_render_arrays_t *arrays, int line_count, int sector_count)
+{
+    int i;
+    arrays->line_flags = 0;
+    arrays->sector_marks = 0;
+    if (line_count > 0) {
+        arrays->line_flags = (short *)malloc((size_t)line_count * sizeof(short));
+        if (!arrays->line_flags) return -1;
+        for (i = 0; i < line_count; i++) arrays->line_flags[i] = lines[i].flags;
+    }
+    if (sector_count > 0) {
+        arrays->sector_marks = (int *)malloc((size_t)sector_count * sizeof(int));
+        if (!arrays->sector_marks) { free(arrays->line_flags); arrays->line_flags = 0; return -1; }
+        for (i = 0; i < sector_count; i++) arrays->sector_marks[i] = sectors[i].validcount_m;
+    }
+    return 0;
+}
+
+static void ri2_render_arrays_restore(const ri2_render_arrays_t *arrays, int line_count, int sector_count)
+{
+    int i;
+    for (i = 0; arrays->line_flags && i < line_count; i++) lines[i].flags = arrays->line_flags[i];
+    for (i = 0; arrays->sector_marks && i < sector_count; i++)
+        sectors[i].validcount_m = arrays->sector_marks[i];
+    free(arrays->line_flags);
+    free(arrays->sector_marks);
+}
+
 static uint32_t ri2_u32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -274,13 +352,25 @@ static int doom_engine_ex2_resource_sbf_ri2_run(
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0;
     setsizeneeded = false;
     if (run_tic) {
+        ri2_render_saved_t saved;
+        ri2_render_arrays_t arrays;
         G_Ticker();
         RI2_PHASE(580);
         /* E2R/3 is enabled only in the diagnostic measurement image. */
         doom_render_fuzz_columns = render_mode
             ? ((render_mode << 30) | (strip_id << 27)) : 0u;
         clipangle = xtoviewangle[0]; fixedcolormap = 0;
+        /* This entry encodes ST1 after it renders, so the render's writes to
+         * the committed counters and to the two committed arrays have to be
+         * put back before the encode runs: a tic that rendered and a tic that
+         * did not must publish the same state. */
+        if (ri2_render_arrays_save(&arrays, DOOM_CTX->numlines, numsectors)) {
+            free(frame); return RI2_REFUSE_OUTPUT;
+        }
+        ri2_render_begin(strip_id, &saved);
         R_RenderPlayerView(&players[displayplayer]);
+        ri2_render_end(&saved);
+        ri2_render_arrays_restore(&arrays, DOOM_CTX->numlines, numsectors);
         RI2_PHASE(590);
         gametic++;
     } else {
@@ -366,6 +456,7 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
     uint8_t *frame = 0, *demo;
     size_t strip_bytes = 40u * 200u;
     int rc, y, x, lump, demo_len;
+    ri2_render_saved_t ri2_saved;
 
     if (doom_ctx_guard(context)) return 199;
     if (!resource || resource_bytes < RI2_HEADER_BYTES ||
@@ -459,7 +550,9 @@ int doom_engine_ex2_resource_sbf_ri2_render_strip(
     setsizeneeded = false;
     RI2_PHASE(770); /* per-frame view bases rebuilt from decoded state */
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
+    ri2_render_begin(strip_id, &ri2_saved);
     R_RenderPlayerView(&players[displayplayer]);
+    ri2_render_end(&ri2_saved);
     RI2_PHASE(780); /* draw completed */
     if (doom_sbf_arena_exhausted()) {
         free(frame); return RI2_REFUSE_ARENA;
@@ -817,6 +910,7 @@ int doom_engine_ex2_resource_sbf_ri2_render_rsn3(
     uint8_t *frame = 0, *demo;
     size_t strip_bytes = 40u * 200u;
     int rc, y, x, lump, demo_len;
+    ri2_render_saved_t ri2_saved;
     if (doom_ctx_guard(context)) return 199;
     if (!resource || resource_bytes < RI2_HEADER_BYTES || !wad_image ||
         wad_bytes != RI2_WAD_BYTES || !bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
@@ -859,7 +953,9 @@ int doom_engine_ex2_resource_sbf_ri2_render_rsn3(
     pspritescale = FRACUNIT * viewwidth / SCREENWIDTH; pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true;
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
+    ri2_render_begin(strip_id, &ri2_saved);
     R_RenderPlayerView(&players[displayplayer]);
+    ri2_render_end(&ri2_saved);
     if (doom_sbf_arena_exhausted()) { free(frame); return RI2_REFUSE_ARENA; }
     for (y = 0; y < 200; y++) for (x = 0; x < 40; x++)
         strip_out[(size_t)y * 40u + (size_t)x] = frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
@@ -1582,6 +1678,7 @@ int doom_engine_rsn3_render_static(
     size_t strip_bytes = 40u * 200u;
     unsigned long transient_mark;
     int rc, y, x;
+    ri2_render_saved_t ri2_saved;
     RI2_PHASE(1100);
     if (doom_ctx_guard(context)) return 199;
     if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !payload ||
@@ -1616,7 +1713,15 @@ int doom_engine_rsn3_render_static(
     clipangle = xtoviewangle[0]; viewactive = true;
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
     RI2_PHASE(1103);
+    /* The static entry publishes no state, so it needs no array snapshot, but
+     * the frame identity it inherits is the static image's own: the counters
+     * and the per-sector marks are constant for the whole session, so a
+     * collision there would drop the same subsector's walls and sprites in
+     * every frame.  Priming removes the class the same way the host harness
+     * does; the restores keep the entry from moving the image's counters. */
+    ri2_render_begin(strip_id, &ri2_saved);
     R_RenderPlayerView(&players[displayplayer]);
+    ri2_render_end(&ri2_saved);
     RI2_PHASE(1104);
     if (doom_sbf_arena_exhausted()) {
         free(frame);
