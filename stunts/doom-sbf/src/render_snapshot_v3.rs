@@ -664,7 +664,7 @@ fn initialize_buffered_account<'a>(
     invoke_signed(
         &system_instruction::create_account(payer.key, snapshot.key, rent_lamports, 0, program),
         &[payer.clone(), snapshot.clone(), system.clone()],
-        signer_seeds.as_slice(),
+        &[signer_seeds.as_slice()],
     )
 }
 
