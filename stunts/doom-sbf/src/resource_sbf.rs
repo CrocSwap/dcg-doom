@@ -60,7 +60,12 @@ pub const MIRROR_ACCOUNT: usize = 8;
 pub const CONTROLLER_ACCOUNT: usize = 9;
 pub const ACCOUNT_COUNT: usize = 10;
 
-pub const RI2_RESOURCE_ACCOUNT_BYTES: usize = 334_384;
+/// The resource account is exactly the pinned image: the producer's section
+/// total, written into the image header and checked against the account length
+/// by the C preflight.  It is the E1M1 image's size, not the retired E1M5
+/// image's 334,384, so the account, the STG/1 kind table and every size check
+/// move together.
+pub const RI2_RESOURCE_ACCOUNT_BYTES: usize = 261_056;
 pub const RI2_RESOURCE_IMAGE_BYTES: usize = RI2_RESOURCE_ACCOUNT_BYTES;
 pub const RI2_FRAME_ACCOUNT: usize = 10;
 pub const RI2_ACCOUNT_COUNT: usize = 11;

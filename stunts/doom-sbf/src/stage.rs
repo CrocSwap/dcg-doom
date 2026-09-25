@@ -30,7 +30,7 @@ pub const MAGIC: &[u8; 8] = b"DOOM-STG";
 pub const VERSION: u32 = 1;
 pub const HEADER_BYTES: usize = 20;
 pub const MAX_CHUNK_BYTES: usize = 1_024;
-pub const ABI_DESCRIPTOR: &str = "DOOM-STG/1|header=20|accounts=target(signer,writable)|seal=offset0-magic-last|kinds=RI2:334384,WC1:1048576,ST1:126976,MP1:65536,CI2:64";
+pub const ABI_DESCRIPTOR: &str = "DOOM-STG/1|header=20|accounts=target(signer,writable)|seal=offset0-magic-last|kinds=RI2:261056,WC1:1048576,ST1:126976,MP1:65536,CI2:64";
 
 pub const REFUSE_ACCOUNT: u32 = 290;
 pub const REFUSE_SEALED: u32 = 291;

@@ -70,8 +70,12 @@ typedef char r2_level_name_check[
    and it is no longer accepted: `r2_sections` takes only the version the
    protocol pins, so an E1M5 image is refused on chain. */
 #define RI2_VERSION_E1M5 2u
-/* Version 3 is the pinned E1M1 new-game start image. */
-#define RI2_VERSION_E1M1 3u
+/* Version 4 is the pinned E1M1 new-game start image.  It is 4 and not 3
+   because 3 is the number the diagnostic-only clipped-render measurement
+   request (DOOM-RC3, resource_sbf::RI3_VERSION) already uses, and the Rust
+   entry point dispatches on the version field alone: an image version of 3
+   would make the two requests indistinguishable there. */
+#define RI2_VERSION_E1M1 4u
 #define RI2_VERSION RI2_VERSION_E1M1
 #define RI2_HEADER_BYTES 256u
 #define RI2_SCHEMA 2u
