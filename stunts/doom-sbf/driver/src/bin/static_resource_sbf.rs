@@ -214,12 +214,19 @@ fn snapshot_fields(data: &[u8]) -> Result<SnapshotFields, Box<dyn Error>> {
         0x58, 0x4e, 0x03, 0xef, 0xae, 0x83, 0xc0, 0xb8, 0x46, 0x27, 0x5b, 0xdb, 0xab, 0x97, 0xe4,
         0x57, 0x65,
     ];
+    let r5_abi: [u8; 32] = [
+        0x05, 0x03, 0xd2, 0x6a, 0x3b, 0xa6, 0x56, 0x89, 0x89, 0x10, 0xfb, 0xc5, 0xa4, 0xea, 0x4f,
+        0xf4, 0x90, 0xf6, 0x43, 0xa5, 0xbc, 0x78, 0xcf, 0xb8, 0x82, 0x37, 0x72, 0xe8, 0x53, 0x80,
+        0xdf, 0xeb,
+    ];
     if data.len() != rsn3::SNAPSHOT_BYTES
         || &data[..8] != b"DOOM-RSN"
         || u32_at(data, 8) != rsn3::VERSION
         || u32_at(data, 12) as usize != rsn3::HEADER_BYTES
         || u32_at(data, 16) as usize != rsn3::SNAPSHOT_BYTES
-        || (data[160..192] != rsn3::ABI_ID && data[160..192] != legacy_abi)
+        || (data[160..192] != rsn3::ABI_ID
+            && data[160..192] != legacy_abi
+            && data[160..192] != r5_abi)
     {
         return Err("snapshot header is not a supported RSN/3 image".into());
     }
