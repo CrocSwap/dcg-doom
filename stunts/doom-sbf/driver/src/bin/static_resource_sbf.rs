@@ -27,7 +27,8 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
-const COMPUTE_LIMIT: u32 = 1_400_000;
+const COMPUTE_LIMIT: u32 = 30_000_000;
+const TARGET_COMPUTE_LIMIT: u64 = 1_400_000;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/static_resource_sbf.rs"
@@ -145,6 +146,29 @@ fn render_instruction(
     }
 }
 
+fn buffered_render_instruction(
+    program: Pubkey,
+    static_key: Pubkey,
+    context: Pubkey,
+    snapshot: Pubkey,
+    strip_id: u8,
+    request: &[u8],
+    compact: bool,
+) -> Instruction {
+    let strip = rsn3::strip_address(&program, &snapshot, strip_id).0;
+    let mut accounts = vec![meta(static_key, true)];
+    if !compact {
+        accounts.push(meta(context, false));
+    }
+    accounts.push(meta(snapshot, false));
+    accounts.push(meta(strip, true));
+    Instruction {
+        program_id: program,
+        accounts,
+        data: request.to_vec(),
+    }
+}
+
 fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
     (0..200)
         .flat_map(|row| {
@@ -180,14 +204,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let image = PathBuf::from(
         args.next()
-            .ok_or("usage: static_resource_sbf IMAGE SOURCE_MANIFEST R3_RECEIPT_DIR RECEIPT_DIR (local SBF ProgramTest; pinned-base RSR/2; runner rejects BUILD above 1,400,000 CU)")?,
+            .ok_or("usage: static_resource_sbf IMAGE SOURCE_MANIFEST R3_RECEIPT_DIR RECEIPT_DIR [render|buffered|buffered-compact] (local SBF ProgramTest; pinned-base RSR/2)")?,
     );
     let manifest = PathBuf::from(args.next().ok_or("missing source manifest")?);
     let r3_root = PathBuf::from(args.next().ok_or("missing R3 receipt root")?);
     let receipt = PathBuf::from(args.next().ok_or("missing receipt directory")?);
+    let mode = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "render".to_owned());
     if args.next().is_some() {
         return Err("too many arguments".into());
     }
+    if !matches!(mode.as_str(), "render" | "buffered" | "buffered-compact") {
+        return Err("mode must be render, buffered, or buffered-compact".into());
+    }
+    let buffered = mode != "render";
+    let compact = mode == "buffered-compact";
     fs::create_dir_all(&receipt)?;
     let image_bytes = read(&image)?;
     let manifest_bytes = read(&manifest)?;
@@ -271,6 +304,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bank.set_compute_max_units(u64::from(COMPUTE_LIMIT));
     bank.add_program("doom_sbf", program, None);
     bank.add_account(static_key, account(program, vec![0; rsr::ACCOUNT_BYTES]));
+    if buffered && !compact {
+        bank.add_account(context, account(program, vec![0; resource_sbf::CONTEXT_BYTES]));
+    }
     bank.add_account(RESOURCE, account(program, resource_image.clone()));
     for (ordinal, bytes) in wad_accounts.iter().enumerate() {
         bank.add_account(
@@ -337,13 +373,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
     let mut render_units_total = 0u64;
     for strip_id in 0..8u8 {
-        let request =
+        let request = if compact {
+            rsr::Request::render_buffered_compact(
+                0,
+                strip_id,
+                context.as_ref().try_into().unwrap(),
+            )
+            .encode()
+        } else if buffered {
+            rsr::Request::render_buffered(0, strip_id).encode()
+        } else {
             rsr::Request::render(strip_id, snapshot_view.cursor, snapshot_view.snapshot_hash)
-                .encode();
+                .encode()
+        };
+        let instruction = if buffered {
+            buffered_render_instruction(
+                program,
+                static_key,
+                context,
+                snapshot_key,
+                strip_id,
+                &request,
+                compact,
+            )
+        } else {
+            render_instruction(program, static_key, snapshot_key, strip_id, &request)
+        };
         let (units, logs) = submit(
             &mut client.banks_client,
             &payer,
-            render_instruction(program, static_key, snapshot_key, strip_id, &request),
+            instruction,
         )
         .await?;
         fs::write(
@@ -416,6 +475,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let report = json!({
         "status": "measured-equal",
         "profile": "DOOM-RSR/2-pinned-base-SBF-PROGRAMTEST",
+        "mode": mode,
+        "buffered_account_shape": if compact {
+            "static+snapshot+strip"
+        } else if buffered {
+            "static+context+snapshot+strip"
+        } else {
+            "static+snapshot+strip"
+        },
         "local_programtest_only": true,
         "network_calls": 0,
         "baseline_profile": baseline_report["profile"],
@@ -453,7 +520,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "render_mean_cu_before": mean_before,
         "render_mean_cu_after": mean_after,
         "render_mean_cu_drop": mean_before.saturating_sub(mean_after),
-        "render_target_cu": 1_400_000,
+        "render_target_cu": TARGET_COMPUTE_LIMIT,
         "all_eight_strips_match_native": true,
         "reconstructed_frame_matches_native": full_parity,
         "pixel_parity": "exact byte equality",

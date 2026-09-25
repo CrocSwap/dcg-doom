@@ -21,6 +21,7 @@ pub const OP_INIT: u8 = 2;
 pub const OP_GROW: u8 = 3;
 pub const OP_REBUILD: u8 = 4;
 pub const OP_RENDER_BUFFERED: u8 = 5;
+pub const OP_RENDER_BUFFERED_COMPACT: u8 = 6;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
 pub const ROOTS_OFFSET: usize = 160;
@@ -91,7 +92,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+RENDER-BUFFERED-COMPACT/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +167,15 @@ impl Request {
         }
     }
 
+    pub const fn render_buffered_compact(buffer: u8, strip_id: u8, context: [u8; 32]) -> Self {
+        Self {
+            operation: OP_RENDER_BUFFERED_COMPACT,
+            strip_id,
+            cursor: buffer as u32,
+            snapshot_hash: context,
+        }
+    }
+
     pub fn encode(self) -> [u8; REQUEST_BYTES] {
         let mut out = [0; REQUEST_BYTES];
         out[..8].copy_from_slice(MAGIC);
@@ -182,7 +192,7 @@ impl Request {
             || &data[..8] != MAGIC
             || u32_at(data, 8) != VERSION
             || data[14..16] != [0, 0]
-            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_INIT | OP_GROW | OP_REBUILD | OP_RENDER_BUFFERED)
+            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_INIT | OP_GROW | OP_REBUILD | OP_RENDER_BUFFERED | OP_RENDER_BUFFERED_COMPACT)
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -206,6 +216,13 @@ impl Request {
             && (request.strip_id >= 8
                 || request.cursor >= rsn3::BUFFER_COUNT as u32
                 || request.snapshot_hash != [0; 32])
+        {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
+        if request.operation == OP_RENDER_BUFFERED_COMPACT
+            && (request.strip_id >= 8
+                || request.cursor >= rsn3::BUFFER_COUNT as u32
+                || request.snapshot_hash == [0; 32])
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -233,6 +250,20 @@ mod request_tests {
         assert_eq!(Request::decode(&encoded), Ok(request));
         let mut bad = encoded;
         bad[20] = 1;
+        assert!(Request::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn compact_buffered_render_request_binds_context_key() {
+        let request = Request::render_buffered_compact(1, 6, [7; 32]);
+        let encoded = request.encode();
+        assert_eq!(encoded[12], OP_RENDER_BUFFERED_COMPACT);
+        assert_eq!(encoded[13], 6);
+        assert_eq!(u32_at(&encoded, 16), 1);
+        assert_eq!(encoded[20..52], [7; 32]);
+        assert_eq!(Request::decode(&encoded), Ok(request));
+        let mut bad = encoded;
+        bad[20] = 0;
         assert!(Request::decode(&bad).is_err());
     }
 
@@ -720,6 +751,7 @@ fn render_snapshot_to_strip(
     let header_ptr = header.as_ptr();
     let header_len = header.len();
     let mut arena_high_water = 0usize;
+    crate::diagnostic_phase(1203);
     #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
     let rc = unsafe {
         doom_engine_rsn3_render_static(
@@ -742,6 +774,7 @@ fn render_snapshot_to_strip(
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
+    crate::diagnostic_phase(1204);
     strip_data[..rsn3::STRIP_HEADER_BYTES].fill(0);
     strip_data[..8].copy_from_slice(b"DOOM-RS1");
     put_u32(&mut strip_data, 8, 1);
@@ -823,6 +856,7 @@ fn process_render_buffered(
     {
         return Err(refuse(REFUSE_ACCOUNT));
     }
+    crate::diagnostic_phase(1201);
     let Some((expected_snapshot, _)) = rsn3::buffered_snapshot_address(
         program,
         accounts[CONTEXT].key,
@@ -840,6 +874,56 @@ fn process_render_buffered(
     }
     let snapshot_data = accounts[SNAPSHOT].try_borrow_data()?;
     let snapshot = rsn3::validate_buffered_snapshot_for(&snapshot_data, request.cursor as u8)?;
+    crate::diagnostic_phase(1202);
+    render_snapshot_to_strip(
+        program,
+        &accounts[STATIC],
+        &accounts[STRIP],
+        snapshot,
+        request.strip_id,
+    )
+}
+
+fn process_render_buffered_compact(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    request: Request,
+) -> ProgramResult {
+    const STATIC: usize = 0;
+    const SNAPSHOT: usize = 1;
+    const STRIP: usize = 2;
+    if request.strip_id >= 8
+        || request.cursor >= rsn3::BUFFER_COUNT as u32
+        || accounts.len() != 3
+        || !distinct(accounts)
+    {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    validate_static_account(program, &accounts[STATIC], true)?;
+    if accounts.iter().any(|account| account.is_signer)
+        || !owned(program, &accounts[SNAPSHOT], rsn3::SNAPSHOT_BYTES, false)
+        || !owned(program, &accounts[STRIP], rsn3::STRIP_ACCOUNT_BYTES, true)
+    {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    crate::diagnostic_phase(1201);
+    let context = Pubkey::new_from_array(request.snapshot_hash);
+    let Some((expected_snapshot, _)) =
+        rsn3::buffered_snapshot_address(program, &context, request.cursor as u8)
+    else {
+        return Err(refuse(REFUSE_MALFORMED));
+    };
+    if accounts[SNAPSHOT].key != &expected_snapshot {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    let (expected_strip, _) =
+        rsn3::strip_address(program, accounts[SNAPSHOT].key, request.strip_id);
+    if accounts[STRIP].key != &expected_strip {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    let snapshot_data = accounts[SNAPSHOT].try_borrow_data()?;
+    let snapshot = rsn3::validate_buffered_snapshot_for(&snapshot_data, request.cursor as u8)?;
+    crate::diagnostic_phase(1202);
     render_snapshot_to_strip(
         program,
         &accounts[STATIC],
@@ -850,11 +934,15 @@ fn process_render_buffered(
 }
 
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    crate::diagnostic_phase(1200);
     let request = Request::decode(data)?;
     match request.operation {
         OP_BUILD => process_build(program, accounts, request),
         OP_RENDER => process_render(program, accounts, request),
         OP_RENDER_BUFFERED => process_render_buffered(program, accounts, request),
+        OP_RENDER_BUFFERED_COMPACT => {
+            process_render_buffered_compact(program, accounts, request)
+        }
         OP_INIT => process_init(program, accounts),
         OP_GROW => process_grow(program, accounts),
         OP_REBUILD => process_rebuild(program, accounts),

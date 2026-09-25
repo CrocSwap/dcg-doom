@@ -199,17 +199,17 @@ account provisioning or on-chain affordability.
 **Designed and source-implemented; live rendering remains unverified.** The
 buffered profile keeps the existing RSN/3 and RSR/2 operations and identifiers
 unchanged. It adds RSN `INIT-BUFFERED/7`, `SNAPSHOT-LIVE-BUFFERED/8`, and
-`GROW-BUFFERED/9`, plus RSR `RENDER-BUFFERED/5`.
+`GROW-BUFFERED/9`, plus RSR `RENDER-BUFFERED/5` and the compact
+`RENDER-BUFFERED-COMPACT/6` form.
 
 Buffer 0 reuses the paid legacy snapshot and strip accounts. Buffer 1 uses
-`DOOM-RENDER-SNAPSHOT-BUFFER/1` with the context and buffer byte. The buffered
-snapshot header uses the existing RSN/3 ABI ID for buffer 0 and the distinct
-`DOOM-RENDER-SNAPSHOT-BUFFER/1` ABI ID for buffer 1. A buffered strip request
-contains only the buffer and strip identifiers; its account list is static,
-context, snapshot, strip. The program derives the snapshot PDA from the context
-and buffer, validates the snapshot account and ABI, and obtains cursor, root,
-and snapshot hash from that account rather than trusting client fields.
-
+`DOOM-RENDER-SNAPSHOT-BUFFER/1` with the context and buffer byte. The legacy
+buffered strip request contains only buffer and strip identifiers and keeps its
+context account in the four-account list. The compact form carries the context
+pubkey in the request's reserved 32-byte field and uses only the static,
+snapshot, and strip accounts; the program derives and checks the same snapshot
+PDA without loading the 9.7 MB context account. Both forms obtain cursor, root,
+and snapshot hash from the snapshot account rather than trusting client state.
 The sender may submit the snapshot and all eight strips without waiting for a
 status or snapshot readback, alternates the two buffer sets, retries failed
 strips once with a fresh blockhash, and uses a background blockhash cache. The
