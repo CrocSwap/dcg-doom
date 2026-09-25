@@ -380,6 +380,19 @@ impl Session {
         ix
     }
 
+    /// SIM/2 SNAPSHOT, the read-side check a renderer must pass.
+    fn snapshot_ix(&self, cursor: u32, root: &[u8; 32]) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.meta, false, false),
+                meta(self.keys.state.pubkey(), false, false),
+                meta(self.keys.mirror.pubkey(), false, false),
+            ],
+            data: sim2::encode_snapshot(cursor, root),
+        }
+    }
+
     fn grow_ix(&self, capacity: u32, expected_len: u32) -> Instruction {
         Instruction {
             program_id: base::PROGRAM,
@@ -1519,6 +1532,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // root and input chain at every cursor the first run committed.  The
     // refusals come first, on the played slot, so each one is measured against
     // a state that really has something to lose.
+    let (final_cursor, _, _, final_root, _) =
+        *first_run.last().ok_or("the run committed no batch to replay over")?;
     let staged_start = capture_data.state_account();
     let start_key = stage_start_account(&mut session, &capture_data.state).await?;
     let wrong_key = stage_start_account(&mut session, &doctored_start_state(&capture_data.state))
@@ -1606,6 +1621,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             state_after_reset == staged_start,
             mirror_after_reset == capture_data.mirror,
             buffer_after_reset[sim2::BUFFER_HEADER_BYTES..].iter().all(|byte| *byte == 0),
+        )
+        .into());
+    }
+
+    // A renderer holding a frame from before the reset is refused: its cursor
+    // and root no longer equal the meta.  The same packet with the reset's own
+    // cursor and root is accepted, so the refusal is the binding and not the
+    // packet.
+    let stale = session.snapshot_ix(final_cursor, &final_root);
+    let stale_result = session.send(vec![stale], &[], base::NORMAL_LIMIT).await?;
+    let stale_code = custom_code(&stale_result);
+    if stale_result.result.is_err() {
+        if stale_code != Some(sim2::REFUSE_SNAPSHOT) {
+            return Err(format!("a stale snapshot refused with {stale_code:?}").into());
+        }
+    } else {
+        return Err("a frame from before the reset still passed the snapshot check".into());
+    }
+    let fresh = session.snapshot_ix(0, &start_root);
+    let fresh_result = session.send(vec![fresh], &[], base::NORMAL_LIMIT).await?;
+    if fresh_result.result.is_err() {
+        return Err(format!(
+            "the reset slot refused its own snapshot: {:?}",
+            fresh_result.result
         )
         .into());
     }
@@ -1867,6 +1906,123 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "live_use_control": live_use,
     });
 
+    // --- 3d. a halted slot, and the force flag --------------------------------
+    // A halt is latched and terminal, and the only way to reach one from a
+    // committed start state is a start state the guard refuses.  This slot's
+    // committed start state is a canonical ST1 whose gamestate is not
+    // GS_LEVEL, so its first sweep latches halt reason 1.  RESET/9 then refuses
+    // 289 without the force flag and lands on the slot's own start state with
+    // it: the force flag is the operator saying "discard this session", not a
+    // way to install a different start state.
+    let halt_state = {
+        let mut out = capture_data.state.clone();
+        let at = common::ST1_GAMESTATE_OFFSET;
+        out[at..at + 4].copy_from_slice(&2i32.to_le_bytes());
+        out
+    };
+    let halt_keys = session_keys(Keypair::new());
+    let halt_bank = bank_with(
+        &capture_data,
+        halt_keys.context.pubkey(),
+        halt_keys.state.pubkey(),
+        halt_keys.mirror.pubkey(),
+        halt_keys.controller.pubkey(),
+        halt_keys.authority.pubkey(),
+        None,
+    );
+    let halt_ctx = halt_bank.start_with_context().await;
+    let mut halt = Session {
+        ctx: halt_ctx,
+        keys: halt_keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let halt_authority = halt.keys.authority.insecure_clone();
+    let halt_state_signer = halt.keys.state.insecure_clone();
+    let halt_mirror_signer = halt.keys.mirror.insecure_clone();
+    let halt_controller = controller_for_gametic(&controller, base::u32_at(&halt_state, 20))?;
+    let (halt_phases, halt_init_cu) = reconstruct(
+        &mut halt,
+        &base::padded_state(&halt_state),
+        &capture_data.mirror,
+        &halt_controller,
+        &capture_data,
+        capacity,
+    )
+    .await?;
+    let halt_start_key = stage_start_account(&mut halt, &halt_state).await?;
+    let deposit = halt.deposit_ix(0, &[0u8, 0, 0, 0]);
+    let deposited = halt
+        .send(vec![deposit], &[&halt_authority], base::NORMAL_LIMIT)
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("halt-slot deposit: {:?}", deposited.result).into());
+    }
+    halt.cursor_before = 0;
+    let advance = halt.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let halted = halt
+        .send(vec![advance], &[&halt_authority], base::NORMAL_LIMIT)
+        .await?;
+    if halted.result.is_err() {
+        return Err(format!("the halt control did not latch: {:?}", halted.result).into());
+    }
+    let halt_view = halt.view().await?;
+    if halt_view.halt != sim2::HALT_GAMESTATE || halt_view.cursor != 0 {
+        return Err(format!(
+            "the halt control did not latch reason 1: halt={} cursor={}",
+            halt_view.halt, halt_view.cursor
+        )
+        .into());
+    }
+    let halted_meta = halt.data(halt.keys.meta).await?;
+    let refused = halt
+        .send(
+            vec![halt.reset_ix(halt_start_key.pubkey(), sim2::RESET_START_STATE, false)],
+            &[&halt_authority],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    let halted_code = custom_code(&refused);
+    if refused.result.is_err() {
+        if halted_code != Some(sim2::REFUSE_HALTED) {
+            return Err(format!("a halted slot refused with {halted_code:?}, wanted 289").into());
+        }
+    } else {
+        return Err("a halted slot accepted a reset with no force flag".into());
+    }
+    if halt.data(halt.keys.meta).await? != halted_meta {
+        return Err("the refused reset changed a halted slot's meta".into());
+    }
+    let forced = halt
+        .send(
+            vec![halt.reset_ix(halt_start_key.pubkey(), sim2::RESET_START_STATE, true)],
+            &[&halt_authority],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    if forced.result.is_err() {
+        return Err(format!("the forced reset of a halted slot: {:?}", forced.result).into());
+    }
+    let forced_cu = base::units(&forced)?;
+    let forced_view = halt.view().await?;
+    if forced_view.halt != 0 || forced_view.cursor != 0 || forced_view.resets != 1 {
+        return Err("the forced reset did not clear the halt".into());
+    }
+    let halted = json!({
+        "why": "gamestate != GS_LEVEL, so the shared pre-tic guard halts reason 1 before G_Ticker; the halt is latched in the meta and every later sweep is a no-op",
+        "committed_start_gamestate": 2,
+        "e2r5_phase_cu": halt_phases,
+        "init_cu": halt_init_cu,
+        "halt_reason": halt_view.halt,
+        "cursor_after_halt": halt_view.cursor,
+        "reset_without_force_refused_with": halted_code,
+        "refused_reset_changed_nothing": true,
+        "reset_with_force_cu": forced_cu,
+        "halt_after_forced_reset": forced_view.halt,
+        "cursor_after_forced_reset": forced_view.cursor,
+        "resets": forced_view.resets,
+    });
+
     // --- 4. receipts -----------------------------------------------------------
     let final_state = session.data(state_signer.pubkey()).await?;
     let final_mirror = session.data(mirror_signer.pubkey()).await?;
@@ -1928,6 +2084,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "state_after_reset_equals_start": true,
             "mirror_after_reset_equals_derived": true,
             "staged_slots_cleared": true,
+            "stale_snapshot_refused_with": stale_code,
+            "post_reset_snapshot_accepted": true,
             "replay_batches": replay_equal,
             "replay_equal_to_first_run": true,
             "replay_cu_min": replay_units.iter().min(),
@@ -1935,6 +2093,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "replay_note": "same staged commands from cursor 0: same ST1, MP1, state root and input chain at every cursor the first run committed, and equal to a fresh host session locked to those commands",
         },
         "restart_request": restart,
+        "halted_slot": halted,
         "position": position_rows,
         "controls": controls,
         "host_ingress": "resource::NativeSimSession::step, the chain per-tic contract verbatim (pre-tic guard, DoomControllerArmV2, G_Ticker, gametic++, DOOM-CI3 receipt), locked to the same staged commands",
