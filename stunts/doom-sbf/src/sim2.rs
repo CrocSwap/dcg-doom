@@ -2027,13 +2027,13 @@ mod tests {
             assert_eq!(g.meta, meta_before, "starve_from={starve_from:?}");
             assert_eq!(u32_at(&g.meta, M_CURSOR), 0, "starve_from={starve_from:?}");
             // The engine published a gametic that is short of the cursor the
-            // sweep counted, which is the whole cause of the 284.
-            assert_eq!(
-                u32_at(&g.state, 20),
-                ran_tics,
-                "starve_from={starve_from:?}"
-            );
-            assert_ne!(g.state, state_before, "starve_from={starve_from:?}");
+            // sweep counted, which is the whole cause of the 284.  When the
+            // very first tic starved there was no tic to advance, so the
+            // published image is the pre-sweep one.
+            assert_eq!(u32_at(&g.state, 20), ran_tics, "starve_from={starve_from:?}");
+            if ran_tics > 0 {
+                assert_ne!(g.state, state_before, "starve_from={starve_from:?}");
+            }
         }
     }
 
