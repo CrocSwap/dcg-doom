@@ -1881,7 +1881,7 @@ mod tests {
     /// engine change: ADVANCE/5 must commit exactly this after four tics.
     fn golden_chain_after_four() -> [u8; 32] {
         let mut chain = chain_init(&Pubkey::new_from_array([0xc0; 32]), 0);
-        for (seq, command) in GOLDEN_COMMANDS.iter().enumerate() {
+        for (seq, command) in GOLDEN_COMMANDS[..4].iter().enumerate() {
             chain = chain_step(&chain, seq as u32, command);
         }
         chain
