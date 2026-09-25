@@ -261,6 +261,8 @@ pub fn static_address(program: &Pubkey) -> (Pubkey, u8) {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::CTX_MIN_BYTES;
+    use resource_sbf::ALLOC_ALIGNMENT;
 
     /// The static resource PDA is derived from the program, so it survives an
     /// image upgrade, and BOOTSTRAP_OFFSET is derived from `CTX_MIN_BYTES`.
@@ -280,7 +282,7 @@ mod layout_tests {
         assert_eq!(HEADER_OFFSET % ALLOC_ALIGNMENT, 0);
         assert_eq!(
             HEADER_OFFSET,
-            crate::resource_sbf::CTX_MIN_BYTES + crate::resource_sbf::WAD_IMAGE_BYTES,
+            CTX_MIN_BYTES + resource_sbf::WAD_IMAGE_BYTES,
         );
         assert_eq!(ACCOUNT_BYTES, resource_sbf::CONTEXT_BYTES);
 
