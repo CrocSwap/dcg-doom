@@ -21,6 +21,7 @@ pub const OP_INIT: u8 = 2;
 pub const OP_GROW: u8 = 3;
 pub const OP_REBUILD: u8 = 4;
 pub const OP_RENDER_BUFFERED: u8 = 5;
+pub const OP_CLEAR: u8 = 6;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
 pub const ROOTS_OFFSET: usize = 160;
@@ -35,6 +36,10 @@ pub const REFUSE_BUILT: u32 = 303;
 pub const REFUSE_BINDING: u32 = 304;
 pub const REFUSE_STATIC: u32 = 305;
 pub const REFUSE_AUTHORITY: u32 = 306;
+/// The header at the current offset is a valid built header, so the clear
+/// refused it: the operation exists to remove a *stale* header, never a good
+/// one.
+pub const REFUSE_HEADER_VALID: u32 = 307;
 
 pub const WAD_HASH: [u8; 32] = [
     0x1d, 0x7d, 0x43, 0xbe, 0x50, 0x1e, 0x67, 0xd9, 0x27, 0xe4, 0x15, 0xe0, 0xb8, 0xf3, 0xe2, 0x9c,
@@ -91,7 +96,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-valid|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +153,15 @@ impl Request {
         }
     }
 
+    pub const fn clear() -> Self {
+        Self {
+            operation: OP_CLEAR,
+            strip_id: 0,
+            cursor: 0,
+            snapshot_hash: [0; 32],
+        }
+    }
+
     pub const fn render(strip_id: u8, cursor: u32, snapshot_hash: [u8; 32]) -> Self {
         Self {
             operation: OP_RENDER,
@@ -184,7 +198,13 @@ impl Request {
             || data[14..16] != [0, 0]
             || !matches!(
                 data[12],
-                OP_BUILD | OP_RENDER | OP_INIT | OP_GROW | OP_REBUILD | OP_RENDER_BUFFERED
+                OP_BUILD
+                    | OP_RENDER
+                    | OP_INIT
+                    | OP_GROW
+                    | OP_REBUILD
+                    | OP_RENDER_BUFFERED
+                    | OP_CLEAR
             )
         {
             return Err(refuse(REFUSE_MALFORMED));
@@ -212,7 +232,7 @@ impl Request {
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
-        if matches!(request.operation, OP_INIT | OP_GROW | OP_REBUILD)
+        if matches!(request.operation, OP_INIT | OP_GROW | OP_REBUILD | OP_CLEAR)
             && (request.strip_id != 0 || request.cursor != 0 || request.snapshot_hash != [0; 32])
         {
             return Err(refuse(REFUSE_MALFORMED));
@@ -241,7 +261,12 @@ mod request_tests {
 
     #[test]
     fn account_provision_requests_round_trip() {
-        for request in [Request::init(), Request::grow(), Request::rebuild()] {
+        for request in [
+            Request::init(),
+            Request::grow(),
+            Request::rebuild(),
+            Request::clear(),
+        ] {
             assert_eq!(Request::decode(&request.encode()), Ok(request));
         }
     }
@@ -251,11 +276,81 @@ mod request_tests {
         let mut bytes = Request::grow().encode();
         bytes[16] = 1;
         assert_eq!(Request::decode(&bytes), Err(refuse(REFUSE_MALFORMED)));
+        let mut clear = Request::clear().encode();
+        clear[13] = 1;
+        assert_eq!(Request::decode(&clear), Err(refuse(REFUSE_MALFORMED)));
     }
 }
 
 pub fn static_address(program: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[STATIC_SEED, &WAD_HASH], program)
+}
+
+/// A static-resource account as the *previous* image left it: a full built
+/// header at `HEADER_OFFSET - 32`, so the new offset reads that header's tail
+/// followed by the head of the bootstrap.  Shared by the one-way-door test and
+/// by the clear tests, because CLEAR/6 exists for exactly this state.
+#[cfg(test)]
+fn stale_header_account() -> Vec<u8> {
+    let previous = HEADER_OFFSET - 32;
+    let mut old_header = vec![0u8; HEADER_BYTES];
+    old_header[..8].copy_from_slice(MAGIC);
+    put_u32(&mut old_header, 8, VERSION);
+    put_u32(&mut old_header, 12, HEADER_BYTES as u32);
+    put_u32(&mut old_header, H_BOOTSTRAP_OFFSET, previous as u32);
+    put_u32(&mut old_header, H_BUILD_NEXT, BUILD_FINAL_CURSOR);
+    let mut account = vec![0u8; ACCOUNT_BYTES];
+    account[previous..previous + HEADER_BYTES].copy_from_slice(&old_header);
+    account
+}
+
+/// A header that satisfies every field `validate_header` checks, i.e. the one a
+/// completed BUILD leaves.  Written out rather than taken from a run so the
+/// refusal test states the gate, not a captured artifact.
+#[cfg(test)]
+fn built_header(base: u64) -> Vec<u8> {
+    let resource_hash = [7u8; 32];
+    let mut header = vec![0u8; HEADER_BYTES];
+    header[..8].copy_from_slice(MAGIC);
+    put_u32(&mut header, 8, VERSION);
+    put_u32(&mut header, 12, HEADER_BYTES as u32);
+    put_u32(&mut header, H_ACCOUNT_BYTES, ACCOUNT_BYTES as u32);
+    put_u32(
+        &mut header,
+        H_CONTEXT_BYTES,
+        resource_sbf::CTX_STRUCT_BYTES as u32,
+    );
+    put_u32(
+        &mut header,
+        H_WAD_OFFSET,
+        resource_sbf::WAD_IMAGE_OFFSET as u32,
+    );
+    put_u32(
+        &mut header,
+        H_WAD_BYTES,
+        resource_sbf::WAD_IMAGE_BYTES as u32,
+    );
+    put_u32(&mut header, H_BOOTSTRAP_OFFSET, HEADER_OFFSET as u32);
+    put_u32(
+        &mut header,
+        H_BOOTSTRAP_BYTES,
+        resource_sbf::BOOTSTRAP_BYTES as u32,
+    );
+    put_u32(&mut header, H_ROOT_COUNT, ROOT_COUNT as u32);
+    put_u32(&mut header, H_FLAGS, 1);
+    header[H_WAD_HASH..H_WAD_HASH + 32].copy_from_slice(&WAD_HASH);
+    header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32].copy_from_slice(&resource_hash);
+    header[H_BUILD_RESOURCE_HASH..H_BUILD_RESOURCE_HASH + 32].copy_from_slice(&resource_hash);
+    header[H_ABI_ID..H_ABI_ID + 32].copy_from_slice(&abi_id());
+    put_u32(&mut header, H_BUILD_NEXT, BUILD_FINAL_CURSOR + 1);
+    put_u32(
+        &mut header,
+        H_BUILD_WAD_USED,
+        resource_sbf::WAD_IMAGE_BYTES as u32,
+    );
+    put_u64(&mut header, H_BASE_ADDRESS, base);
+    put_u64(&mut header, H_BUILD_BASE, base);
+    header
 }
 
 #[cfg(test)]
@@ -285,7 +380,10 @@ mod layout_tests {
         assert_eq!(CTX_MIN_BYTES % ALLOC_ALIGNMENT, 0);
         assert_ne!(WAD_IMAGE_BYTES_LEN % ALLOC_ALIGNMENT, 0);
         let unaligned = CTX_MIN_BYTES + WAD_IMAGE_BYTES_LEN;
-        assert_eq!(HEADER_OFFSET, (unaligned + ALLOC_ALIGNMENT - 1) / ALLOC_ALIGNMENT * ALLOC_ALIGNMENT);
+        assert_eq!(
+            HEADER_OFFSET,
+            (unaligned + ALLOC_ALIGNMENT - 1) / ALLOC_ALIGNMENT * ALLOC_ALIGNMENT
+        );
         assert_eq!(ACCOUNT_BYTES, resource_sbf::CONTEXT_BYTES);
 
         // A grown doom_ctx_t moves the header; the 32-byte case is the one that
@@ -300,15 +398,16 @@ mod layout_tests {
         // bootstrap -- neither of which is a header, and neither of which is
         // zero.  The old header is built in its own buffer because the two
         // regions overlap.
-        let mut old_header = vec![0u8; HEADER_BYTES];
-        old_header[..8].copy_from_slice(MAGIC);
-        put_u32(&mut old_header, 8, VERSION);
-        put_u32(&mut old_header, H_BOOTSTRAP_OFFSET, previous as u32);
-        put_u32(&mut old_header, H_BUILD_NEXT, BUILD_FINAL_CURSOR);
-        let mut account = vec![0u8; ACCOUNT_BYTES];
-        account[previous..previous + HEADER_BYTES].copy_from_slice(&old_header);
+        let account = stale_header_account();
+        let old_header = &account[previous..previous + HEADER_BYTES];
         let header = &account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
-        assert_eq!(&header[..8], &old_header[32..40]);
+        // The 480 bytes the two regions share, then the 32 bytes of whatever
+        // follows the old header (here the zero tail of the account).
+        assert_eq!(&header[..HEADER_BYTES - 32], &old_header[32..]);
+        assert_eq!(
+            &header[HEADER_BYTES - 32..],
+            &account[previous + HEADER_BYTES..HEADER_OFFSET + HEADER_BYTES]
+        );
         assert_ne!(&header[..8], MAGIC, "a stale tail is not a header magic");
         assert!(
             &header[..8] != MAGIC || u32_at(header, 8) != VERSION,
@@ -330,6 +429,134 @@ mod layout_tests {
     fn the_static_account_grows_into_a_layout_and_cannot_shrink_out() {
         assert_eq!(ACCOUNT_BYTES, 9_734_160);
         assert!(ACCOUNT_BYTES > 0);
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+
+    const PROGRAM: [u8; 32] = [0x57; 32];
+
+    fn program() -> Pubkey {
+        Pubkey::new_from_array(PROGRAM)
+    }
+
+    /// The state the clear exists to remove: the previous image's header sits
+    /// across the new offset, so `BUILD` cursor 0 refuses.  After the clear the
+    /// header region is zero and that gate is open again.
+    #[test]
+    fn clears_a_stale_header_and_opens_the_build_cursor_zero_gate() {
+        let program = program();
+        let key = static_address(&program).0;
+        let mut account = stale_header_account();
+        let header = HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES;
+        assert!(
+            account[header.clone()].iter().any(|byte| *byte != 0),
+            "precondition: a stale header is not the all-zero region BUILD cursor 0 needs"
+        );
+        assert!(validate_header(&account).is_err());
+
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut account),
+            Ok(())
+        );
+
+        assert!(
+            account[header.clone()].iter().all(|byte| *byte == 0),
+            "the clear must leave the whole header region zero"
+        );
+
+        // The old image's header lives entirely below the new offset, so this
+        // clear does not touch it and does not have to: BUILD rewrites the WAD
+        // staging image from cursor 0.
+        assert_eq!(
+            &account[HEADER_OFFSET - 32..HEADER_OFFSET],
+            &stale_header_account()[HEADER_OFFSET - 32..HEADER_OFFSET]
+        );
+
+        // The property the session needs: idempotent, so a retry after a lost
+        // confirmation is free and still leaves BUILD cursor 0 open.
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut account),
+            Ok(())
+        );
+        assert!(account[header.clone()].iter().all(|byte| *byte == 0));
+    }
+
+    /// The gate is the whole safety argument: a resource that passes
+    /// `validate_header` is the good one, and it is never cleared.
+    #[test]
+    fn refuses_on_a_valid_built_header_and_leaves_it_untouched() {
+        let program = program();
+        let key = static_address(&program).0;
+        let mut account = vec![0u8; ACCOUNT_BYTES];
+        account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES]
+            .copy_from_slice(&built_header(0x4_0000_0060));
+        assert!(
+            validate_header(&account).is_ok(),
+            "precondition: the fixture is a header this image would accept"
+        );
+        let before = account.clone();
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut account),
+            Err(refuse(REFUSE_HEADER_VALID))
+        );
+        assert_eq!(account, before, "a refused clear must not write a byte");
+
+        // A header one field short of valid is clearable, which is the other
+        // half of the gate: the operation refuses a *good* resource, not any
+        // resource that starts with the magic.
+        let mut partial = account;
+        // Header field offsets are relative to the header, so the account write
+        // has to land at HEADER_OFFSET + H_BUILD_NEXT, not at H_BUILD_NEXT.
+        put_u32(&mut partial, HEADER_OFFSET + H_BUILD_NEXT, 3);
+        assert!(validate_header(&partial).is_err());
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut partial),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn refuses_on_the_wrong_account_owner_or_length() {
+        let program = program();
+        let key = static_address(&program).0;
+        let other = static_address(&Pubkey::new_from_array([0x58; 32])).0;
+        assert_ne!(
+            key, other,
+            "precondition: another program's PDA is a different account"
+        );
+        let mut account = stale_header_account();
+        let before = account.clone();
+
+        assert_eq!(
+            clear_static_header(&other, &program, &program, &mut account),
+            Err(refuse(REFUSE_ACCOUNT))
+        );
+        assert_eq!(
+            clear_static_header(&key, &program, &bpf_loader_upgradeable::ID, &mut account),
+            Err(refuse(REFUSE_ACCOUNT))
+        );
+        assert_eq!(
+            clear_static_header(&key, &program, &system_program::id(), &mut account),
+            Err(refuse(REFUSE_ACCOUNT))
+        );
+        // The previous layout's length, and an over-long account: both are
+        // lengths this image never writes.
+        let mut short = before.clone();
+        short.truncate(ACCOUNT_BYTES - 32);
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut short),
+            Err(refuse(REFUSE_ACCOUNT))
+        );
+        let mut long = before.clone();
+        long.push(0);
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut long),
+            Err(refuse(REFUSE_ACCOUNT))
+        );
+        assert_eq!(account, before, "a refused clear must not write a byte");
     }
 }
 
@@ -499,6 +726,65 @@ fn process_rebuild(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     accounts[CONTEXT].try_borrow_mut_data()?.fill(0);
     accounts[CONTINUATION].try_borrow_mut_data()?.fill(0);
     Ok(())
+}
+
+/// Zero the static resource's header region, and nothing else.
+///
+/// A patch that grows `doom_ctx_t` moves `HEADER_OFFSET`, so a resource built
+/// by the previous image keeps a 512-byte header where the new one must go.
+/// Both operations that could re-head the account refuse that state:
+/// `REBUILD/4` wants a *built* header at the new offset and `BUILD` cursor 0
+/// wants an all-zero one, so the account is a one-way door
+/// (`a_header_move_makes_the_static_resource_a_one_way_door`). This is the
+/// way back out, and it is deliberately narrow:
+///
+/// * the only bytes written are the 512 of the header region, which is
+///   exactly what `BUILD` cursor 0 requires to be zero -- the WAD staging
+///   image, the context and the bootstrap carrier ahead of it are rewritten
+///   by the rebuild itself (phase 0 memsets the context and rebinds the arena
+///   cursor to zero), so none of them is part of the contract;
+/// * a *valid* built header is refused, so a good resource can never be
+///   wiped by this or by a caller who reaches the account first;
+/// * the account must still be this program's static PDA, program-owned, and
+///   exactly `ACCOUNT_BYTES` long, so it cannot be pointed at another
+///   account, at a shorter one, or at a layout this image does not write.
+///
+/// The price of that narrowness is that a *partially* built header (cursor 1
+/// through 10, which is not a valid header) is clearable by anyone who can
+/// name the PDA. That is a restart of work that is reproducible from the
+/// pinned WAD and resource accounts, not a loss of state: unlike
+/// `REBUILD/4`, this writes nothing that cannot be rebuilt from public input.
+fn clear_static_header(
+    key: &Pubkey,
+    program: &Pubkey,
+    owner: &Pubkey,
+    data: &mut [u8],
+) -> ProgramResult {
+    let (expected, _) = static_address(program);
+    if key != &expected || owner != program || data.len() != ACCOUNT_BYTES {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    if validate_header(data).is_ok() {
+        return Err(refuse(REFUSE_HEADER_VALID));
+    }
+    data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES].fill(0);
+    Ok(())
+}
+
+fn process_clear(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    const STATIC: usize = 0;
+    if accounts.len() != 1 {
+        return Err(refuse(REFUSE_ACCOUNT));
+    }
+    let static_account = &accounts[STATIC];
+    validate_static_account(program, static_account, true)?;
+    let mut data = static_account.try_borrow_mut_data()?;
+    clear_static_header(
+        &static_account.key,
+        program,
+        &static_account.owner,
+        &mut data,
+    )
 }
 
 fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
@@ -944,6 +1230,7 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         OP_INIT => process_init(program, accounts),
         OP_GROW => process_grow(program, accounts),
         OP_REBUILD => process_rebuild(program, accounts),
+        OP_CLEAR => process_clear(program, accounts),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
