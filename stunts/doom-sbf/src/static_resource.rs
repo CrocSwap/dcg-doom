@@ -91,7 +91,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,7 +182,10 @@ impl Request {
             || &data[..8] != MAGIC
             || u32_at(data, 8) != VERSION
             || data[14..16] != [0, 0]
-            || !matches!(data[12], OP_BUILD | OP_RENDER | OP_INIT | OP_GROW | OP_REBUILD | OP_RENDER_BUFFERED)
+            || !matches!(
+                data[12],
+                OP_BUILD | OP_RENDER | OP_INIT | OP_GROW | OP_REBUILD | OP_RENDER_BUFFERED
+            )
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -720,6 +723,7 @@ fn render_snapshot_to_strip(
     let header_ptr = header.as_ptr();
     let header_len = header.len();
     let mut arena_high_water = 0usize;
+    crate::diagnostic_phase(1203);
     #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
     let rc = unsafe {
         doom_engine_rsn3_render_static(
@@ -742,6 +746,7 @@ fn render_snapshot_to_strip(
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
+    crate::diagnostic_phase(1204);
     strip_data[..rsn3::STRIP_HEADER_BYTES].fill(0);
     strip_data[..8].copy_from_slice(b"DOOM-RS1");
     put_u32(&mut strip_data, 8, 1);
@@ -817,17 +822,21 @@ fn process_render_buffered(
     }
     validate_static_account(program, &accounts[STATIC], true)?;
     if accounts.iter().any(|account| account.is_signer)
-        || !owned(program, &accounts[CONTEXT], resource_sbf::CONTEXT_BYTES, false)
+        || !owned(
+            program,
+            &accounts[CONTEXT],
+            resource_sbf::CONTEXT_BYTES,
+            false,
+        )
         || !owned(program, &accounts[SNAPSHOT], rsn3::SNAPSHOT_BYTES, false)
         || !owned(program, &accounts[STRIP], rsn3::STRIP_ACCOUNT_BYTES, true)
     {
         return Err(refuse(REFUSE_ACCOUNT));
     }
-    let Some((expected_snapshot, _)) = rsn3::buffered_snapshot_address(
-        program,
-        accounts[CONTEXT].key,
-        request.cursor as u8,
-    ) else {
+    crate::diagnostic_phase(1201);
+    let Some((expected_snapshot, _)) =
+        rsn3::buffered_snapshot_address(program, accounts[CONTEXT].key, request.cursor as u8)
+    else {
         return Err(refuse(REFUSE_MALFORMED));
     };
     if accounts[SNAPSHOT].key != &expected_snapshot {
@@ -840,6 +849,7 @@ fn process_render_buffered(
     }
     let snapshot_data = accounts[SNAPSHOT].try_borrow_data()?;
     let snapshot = rsn3::validate_buffered_snapshot_for(&snapshot_data, request.cursor as u8)?;
+    crate::diagnostic_phase(1202);
     render_snapshot_to_strip(
         program,
         &accounts[STATIC],
@@ -850,6 +860,7 @@ fn process_render_buffered(
 }
 
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    crate::diagnostic_phase(1200);
     let request = Request::decode(data)?;
     match request.operation {
         OP_BUILD => process_build(program, accounts, request),

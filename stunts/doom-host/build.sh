@@ -32,6 +32,10 @@ for patch in "$root"/stunts/doom-host/patches/*.patch; do
       ;;
   esac
 done
+if ! grep -Fq '#define DOOM_RENDER_CLIP_MODE' "$src/linuxdoom-1.10/r_draw.c"; then
+  echo "missing 0015 clipped-strip renderer in $src/linuxdoom-1.10/r_draw.c" >&2
+  exit 1
+fi
 
 mkdir -p "$wad_dir"
 if [ ! -f "$wad" ]; then

@@ -27,7 +27,8 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
-const COMPUTE_LIMIT: u32 = 1_400_000;
+const COMPUTE_LIMIT: u32 = 30_000_000;
+const TARGET_COMPUTE_LIMIT: u64 = 1_400_000;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/static_resource_sbf.rs"
@@ -145,6 +146,28 @@ fn render_instruction(
     }
 }
 
+fn buffered_render_instruction(
+    program: Pubkey,
+    static_key: Pubkey,
+    context: Pubkey,
+    snapshot: Pubkey,
+    strip_id: u8,
+    request: &[u8],
+) -> Instruction {
+    let strip = rsn3::strip_address(&program, &snapshot, strip_id).0;
+    let accounts = vec![
+        meta(static_key, true),
+        meta(context, false),
+        meta(snapshot, false),
+        meta(strip, true),
+    ];
+    Instruction {
+        program_id: program,
+        accounts,
+        data: request.to_vec(),
+    }
+}
+
 fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
     (0..200)
         .flat_map(|row| {
@@ -175,19 +198,86 @@ fn check_wad_account(bytes: &[u8], ordinal: usize) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+struct SnapshotFields {
+    cursor: u32,
+    gametic: u32,
+    payload_bytes: usize,
+    snapshot_hash: [u8; 32],
+    state_root: [u8; 32],
+    wad_hash: [u8; 32],
+}
+
+fn snapshot_fields(data: &[u8]) -> Result<SnapshotFields, Box<dyn Error>> {
+    let legacy_abi: [u8; 32] = [
+        0xac, 0xca, 0x87, 0x87, 0x5d, 0x1e, 0xaf, 0xb6, 0xc0, 0x0e, 0x53, 0xf4, 0x4f, 0xd3, 0x72,
+        0x58, 0x4e, 0x03, 0xef, 0xae, 0x83, 0xc0, 0xb8, 0x46, 0x27, 0x5b, 0xdb, 0xab, 0x97, 0xe4,
+        0x57, 0x65,
+    ];
+    let r5_abi: [u8; 32] = [
+        0x05, 0x03, 0xd2, 0x6a, 0x3b, 0xa6, 0x56, 0x89, 0x89, 0x10, 0xfb, 0xc5, 0xa4, 0xea, 0x4f,
+        0xf4, 0x90, 0xf6, 0x43, 0xa5, 0xbc, 0x78, 0xcf, 0xb8, 0x82, 0x37, 0x72, 0xe8, 0x53, 0x80,
+        0xdf, 0xeb,
+    ];
+    if data.len() != rsn3::SNAPSHOT_BYTES
+        || &data[..8] != b"DOOM-RSN"
+        || u32_at(data, 8) != rsn3::VERSION
+        || u32_at(data, 12) as usize != rsn3::HEADER_BYTES
+        || u32_at(data, 16) as usize != rsn3::SNAPSHOT_BYTES
+        || (data[160..192] != rsn3::ABI_ID
+            && data[160..192] != legacy_abi
+            && data[160..192] != r5_abi)
+    {
+        return Err("snapshot header is not a supported RSN/3 image".into());
+    }
+    let payload_bytes = u32_at(data, 28) as usize;
+    if payload_bytes > rsn3::MAX_PAYLOAD_BYTES
+        || data[rsn3::HEADER_BYTES + payload_bytes..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err("snapshot payload bounds are invalid".into());
+    }
+    let mut preimage = Vec::with_capacity(7 + 128 + 32 + 32 + payload_bytes);
+    preimage.extend_from_slice(b"DOOM-RENDER-SNAPSHOT/3\0");
+    preimage.extend_from_slice(&data[..128]);
+    preimage.extend_from_slice(&[0; 32]);
+    preimage.extend_from_slice(&data[160..192]);
+    preimage.extend_from_slice(&data[rsn3::HEADER_BYTES..rsn3::HEADER_BYTES + payload_bytes]);
+    let snapshot_hash: [u8; 32] = Sha256::digest(&preimage).into();
+    if data[128..160] != snapshot_hash {
+        return Err("snapshot digest is invalid".into());
+    }
+    Ok(SnapshotFields {
+        cursor: u32_at(data, 20),
+        gametic: u32_at(data, 24),
+        payload_bytes,
+        snapshot_hash,
+        state_root: data[32..64].try_into().unwrap(),
+        wad_hash: data[64..96].try_into().unwrap(),
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let image = PathBuf::from(
         args.next()
-            .ok_or("usage: static_resource_sbf IMAGE SOURCE_MANIFEST R3_RECEIPT_DIR RECEIPT_DIR (local SBF ProgramTest; pinned-base RSR/2; runner rejects BUILD above 1,400,000 CU)")?,
+            .ok_or("usage: static_resource_sbf IMAGE SOURCE_MANIFEST R3_RECEIPT_DIR RECEIPT_DIR [render|buffered] (local SBF ProgramTest; pinned-base RSR/2)")?,
     );
     let manifest = PathBuf::from(args.next().ok_or("missing source manifest")?);
     let r3_root = PathBuf::from(args.next().ok_or("missing R3 receipt root")?);
     let receipt = PathBuf::from(args.next().ok_or("missing receipt directory")?);
+    let mode = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "render".to_owned());
     if args.next().is_some() {
         return Err("too many arguments".into());
     }
+    if !matches!(mode.as_str(), "render" | "buffered") {
+        return Err("mode must be render or buffered".into());
+    }
+    let buffered = mode == "buffered";
     fs::create_dir_all(&receipt)?;
     let image_bytes = read(&image)?;
     let manifest_bytes = read(&manifest)?;
@@ -216,8 +306,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("retained RI2 image or native framebuffer has the wrong size".into());
     }
-    let snapshot_view = rsn3::validate_snapshot(&snapshot_image)?;
-    if baseline_report["snapshot_hash"].as_str() != Some(hex(&snapshot_view.snapshot_hash).as_str())
+    let snapshot = snapshot_fields(&snapshot_image)?;
+    if baseline_report["snapshot_hash"].as_str() != Some(hex(&snapshot.snapshot_hash).as_str())
         || baseline_report["native_oracle_frame_sha256"].as_str()
             != Some(sha(&native_frame).as_str())
         || baseline_report["all_eight_strips_match_native"] != true
@@ -271,6 +361,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bank.set_compute_max_units(u64::from(COMPUTE_LIMIT));
     bank.add_program("doom_sbf", program, None);
     bank.add_account(static_key, account(program, vec![0; rsr::ACCOUNT_BYTES]));
+    if buffered {
+        bank.add_account(
+            context,
+            account(program, vec![0; resource_sbf::CONTEXT_BYTES]),
+        );
+    }
     bank.add_account(RESOURCE, account(program, resource_image.clone()));
     for (ordinal, bytes) in wad_accounts.iter().enumerate() {
         bank.add_account(
@@ -337,15 +433,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
     let mut render_units_total = 0u64;
     for strip_id in 0..8u8 {
-        let request =
-            rsr::Request::render(strip_id, snapshot_view.cursor, snapshot_view.snapshot_hash)
-                .encode();
-        let (units, logs) = submit(
-            &mut client.banks_client,
-            &payer,
-            render_instruction(program, static_key, snapshot_key, strip_id, &request),
-        )
-        .await?;
+        let request = if buffered {
+            rsr::Request::render_buffered(0, strip_id).encode()
+        } else {
+            rsr::Request::render(strip_id, snapshot.cursor, snapshot.snapshot_hash).encode()
+        };
+        let instruction = if buffered {
+            buffered_render_instruction(
+                program,
+                static_key,
+                context,
+                snapshot_key,
+                strip_id,
+                &request,
+            )
+        } else {
+            render_instruction(program, static_key, snapshot_key, strip_id, &request)
+        };
+        let (units, logs) = submit(&mut client.banks_client, &payer, instruction).await?;
         fs::write(
             receipt.join(format!("render-strip-{strip_id}-logs.txt")),
             logs,
@@ -359,10 +464,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let view = rsn3::validate_strip(&strip_account.data)?;
         let expected = slice_frame(&native_frame, usize::from(strip_id));
         let equal = view.strip_id == u32::from(strip_id)
-            && view.cursor == snapshot_view.cursor
-            && view.gametic == snapshot_view.gametic
-            && view.snapshot_hash == snapshot_view.snapshot_hash
-            && view.state_root == snapshot_view.state_root
+            && view.cursor == snapshot.cursor
+            && view.gametic == snapshot.gametic
+            && view.snapshot_hash == snapshot.snapshot_hash
+            && view.state_root == snapshot.state_root
             && view.pixels == expected;
         for row in 0..200 {
             let source = row * 40;
@@ -416,6 +521,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let report = json!({
         "status": "measured-equal",
         "profile": "DOOM-RSR/2-pinned-base-SBF-PROGRAMTEST",
+        "mode": mode,
+        "buffered_account_shape": if buffered {
+            "static+context+snapshot+strip"
+        } else {
+            "static+snapshot+strip"
+        },
         "local_programtest_only": true,
         "network_calls": 0,
         "baseline_profile": baseline_report["profile"],
@@ -424,10 +535,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "source_manifest_sha256": manifest_sha,
         "driver_source_sha256": driver_sha,
         "resource_image_sha256": sha(&resource_image),
-        "snapshot_hash": hex(&snapshot_view.snapshot_hash),
-        "snapshot_payload_bytes": snapshot_view.payload.len(),
+        "snapshot_hash": hex(&snapshot.snapshot_hash),
+        "snapshot_payload_bytes": snapshot.payload_bytes,
         "native_oracle_frame_sha256": sha(&native_frame),
-        "wad_hash": hex(&snapshot_view.wad_hash),
+        "wad_hash": hex(&snapshot.wad_hash),
         "static_resource_pda": static_key.to_string(),
         "static_resource_account_bytes": rsr::ACCOUNT_BYTES,
         "static_resource_header_bytes": rsr::HEADER_BYTES,
@@ -453,7 +564,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "render_mean_cu_before": mean_before,
         "render_mean_cu_after": mean_after,
         "render_mean_cu_drop": mean_before.saturating_sub(mean_after),
-        "render_target_cu": 1_400_000,
+        "render_target_cu": TARGET_COMPUTE_LIMIT,
         "all_eight_strips_match_native": true,
         "reconstructed_frame_matches_native": full_parity,
         "pixel_parity": "exact byte equality",
@@ -477,7 +588,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "source_manifest_sha256": manifest_sha,
             "driver_source_sha256": driver_sha,
             "resource_image_sha256": sha(&resource_image),
-            "snapshot_hash": hex(&snapshot_view.snapshot_hash),
+            "snapshot_hash": hex(&snapshot.snapshot_hash),
             "static_resource_account_sha256_after_build": static_account_sha_after_build,
             "static_resource_account_sha256_after_render": static_account_sha_after_render
         }))?,

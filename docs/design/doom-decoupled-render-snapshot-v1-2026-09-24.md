@@ -203,17 +203,13 @@ unchanged. It adds RSN `INIT-BUFFERED/7`, `SNAPSHOT-LIVE-BUFFERED/8`, and
 
 Buffer 0 reuses the paid legacy snapshot and strip accounts. Buffer 1 uses
 `DOOM-RENDER-SNAPSHOT-BUFFER/1` with the context and buffer byte. The buffered
-snapshot header uses the existing RSN/3 ABI ID for buffer 0 and the distinct
-`DOOM-RENDER-SNAPSHOT-BUFFER/1` ABI ID for buffer 1. A buffered strip request
-contains only the buffer and strip identifiers; its account list is static,
-context, snapshot, strip. The program derives the snapshot PDA from the context
-and buffer, validates the snapshot account and ABI, and obtains cursor, root,
-and snapshot hash from that account rather than trusting client fields.
-
-The sender may submit the snapshot and all eight strips without waiting for a
-status or snapshot readback, alternates the two buffer sets, retries failed
-strips once with a fresh blockhash, and uses a background blockhash cache. The
-static account remains the serialization point for the engine renderer, so
-buffer overlap removes snapshot-account aliasing but does not imply parallel
-strip execution. Image SHA-256 for the source-built candidate is
+strip request contains only buffer and strip identifiers and keeps its context
+account in the four-account list. Cursor, root, and snapshot hash come from the
+snapshot account rather than trusting client state. The sender may submit the
+snapshot and all eight strips without waiting for a status or snapshot
+readback, alternates the two buffer sets, retries failed strips once with a
+fresh blockhash, and uses a background blockhash cache. The static account
+remains the serialization point for the engine renderer, so buffer overlap
+removes snapshot-account aliasing but does not imply parallel strip execution.
+Image SHA-256 for the source-built candidate is
 `5205fc58be61874db7a6d8e7e566b9bd55f2e363d43096dd63880adf8c2e88e5`.
