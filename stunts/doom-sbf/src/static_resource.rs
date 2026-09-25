@@ -457,7 +457,7 @@ mod clear_tests {
         );
 
         assert!(
-            account[header].iter().all(|byte| *byte == 0),
+            account[header.clone()].iter().all(|byte| *byte == 0),
             "the clear must leave the whole header region zero"
         );
 
