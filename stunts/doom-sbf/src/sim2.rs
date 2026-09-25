@@ -2533,17 +2533,21 @@ mod tests {
     }
 
     #[test]
-    fn reset_wire_is_24_bytes_and_only_names_the_meta_start_state() {
+    fn reset_wire_is_24_bytes_and_names_one_of_two_start_states() {
         let data = encode_reset(RESET_START_META, false);
         assert_eq!(data.len(), RESET_BYTES);
         assert_eq!(data[12], RESET);
         assert_eq!(decode_reset(&data), Ok((RESET_START_META, false)));
         let forced = encode_reset(RESET_START_META, true);
         assert_eq!(decode_reset(&forced), Ok((RESET_START_META, true)));
+        assert_eq!(
+            decode_reset(&encode_reset(RESET_START_STATE, false)),
+            Ok((RESET_START_STATE, false))
+        );
         // A selector this version does not serve, an unknown flag bit, a
         // trailing byte and the wrong operation number are all malformed.
         assert_eq!(
-            decode_reset(&encode_reset(1, false)),
+            decode_reset(&encode_reset(2, false)),
             Err(refuse(REFUSE_MALFORMED))
         );
         let mut bad_flag = encode_reset(RESET_START_META, true);
@@ -2794,27 +2798,49 @@ mod tests {
         assert_eq!(u32_at(&g.meta, M_RESETS), 0);
     }
 
-    /// A malformed ST1 account is refused by the shape check (281) before the
-    /// engine sees it.
+    /// A malformed start image is refused by the shape check (281) before the
+    /// engine sees it, and before the state account is written: the magic is
+    /// wrong in the supplied account, and separately in the state account when
+    /// that is the start image (selector 0).
     #[test]
-    fn reset_refuses_a_malformed_state_account() {
-        let (mut g, start_state, start_mirror) = played(true);
+    fn reset_refuses_a_malformed_start_image() {
+        let (mut g, mut start_state, start_mirror) = played(true);
+        start_state[0] = b'X';
         let start_image = start_state.clone();
-        let mut engine = mock_reset(start_mirror);
-        let mut state = g.state.clone();
-        state[0] = b'X';
-        let result = reset(
-            &mut g.meta,
-            &mut g.buffer,
-            &mut state,
-            Some(&start_image),
-            &mut g.mirror,
-            &g.keys,
-            &g.checkpoint,
-            false,
-            &mut engine,
+        let mut engine = mock_reset(start_mirror.clone());
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                Some(&start_image),
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_STATE_SHAPE))
         );
-        assert_eq!(result, Err(refuse(REFUSE_STATE_SHAPE)));
+        assert_eq!(engine.resets, 0);
+        // Selector 0 reads the state account, so the same refusal has to hold
+        // when the state account itself is malformed.
+        stage_start(&mut g, &start_state);
+        let mut engine = mock_reset(start_mirror);
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                None,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_STATE_SHAPE))
+        );
         assert_eq!(engine.resets, 0);
     }
 
