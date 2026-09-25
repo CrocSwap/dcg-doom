@@ -1757,27 +1757,41 @@ mod tests {
     }
 
     struct MockEngine {
-        ran: u32,
-        /// When set, every step returns `Unconsumed` instead of `Ran`.
-        starve: bool,
+        /// Steps taken so far, `Ran` and `Unconsumed` alike.
+        steps: u32,
+        /// Steps the engine reported as `Ran`.  Only these advance the ST1
+        /// gametic, exactly as the real engine does: `doom_sbf_sim2_step`
+        /// returns 238 *before* `gametic++` (doom_sbf_resource_ri2.c), so a
+        /// tic that did not consume its command leaves the tic counter alone.
+        advanced: u32,
+        /// `Some(seq)`: from that step index on, every step reports
+        /// `Unconsumed` (the DOOM-CI3 starved tic).  `None` runs every tic.
+        starve_from: Option<u32>,
         published: u32,
+    }
+
+    impl MockEngine {
+        fn new(starve_from: Option<u32>) -> Self {
+            Self { steps: 0, advanced: 0, starve_from, published: 0 }
+        }
     }
 
     impl Engine for MockEngine {
         fn step(&mut self, _command: &[u8; 4]) -> Result<StepResult, u32> {
-            self.ran += 1;
-            Ok(if self.starve {
-                StepResult::Unconsumed
-            } else {
-                StepResult::Ran
-            })
+            let seq = self.steps;
+            self.steps += 1;
+            if self.starve_from.is_some_and(|from| seq >= from) {
+                return Ok(StepResult::Unconsumed);
+            }
+            self.advanced += 1;
+            Ok(StepResult::Ran)
         }
         fn publish(&mut self, state: &mut [u8], _mirror: &mut [u8]) -> Result<usize, u32> {
             self.published += 1;
-            // A publish must leave a shape-valid ST1 whose gametic advanced.
+            // A publish must leave a shape-valid ST1 whose gametic advanced by
+            // exactly the tics the engine actually ran.
             let len = u32_at(state, 16) as usize;
-            let gametic = u32_at(state, 20);
-            put_u32(state, 20, gametic + self.ran);
+            put_u32(state, 20, u32_at(state, 20) + self.advanced);
             Ok(len)
         }
     }
@@ -1879,18 +1893,29 @@ mod tests {
     /// The input chain is a pure function of the committed chain, the slot
     /// index and the staged bytes, so it is a golden vector that survives any
     /// engine change: ADVANCE/5 must commit exactly this after four tics.
-    fn golden_chain_after_four() -> [u8; 32] {
+    /// Pinned as literal hex, not recomputed from `chain_step`, so a change to
+    /// the domain, the context binding, or the step encoding fails here instead
+    /// of quietly redefining what "the same chain" means.
+    const GOLDEN_CHAIN_AFTER_FOUR: [u8; 32] = [
+        0x1d, 0xed, 0x37, 0xcb, 0x9b, 0x5a, 0xda, 0x0f, 0x2c, 0x1a, 0x70, 0xb2, 0x27, 0xe5, 0xd1, 0x0a,
+        0x60, 0xfa, 0x14, 0xd3, 0x24, 0x01, 0x6d, 0x95, 0xf6, 0xd4, 0x3b, 0xbf, 0xc0, 0x93, 0x57, 0x5e,
+    ];
+
+    /// The pinned vector has to be the one the function actually produces, and
+    /// this is the only place the two are tied together.
+    #[test]
+    fn golden_chain_vector_is_the_committed_function() {
         let mut chain = chain_init(&Pubkey::new_from_array([0xc0; 32]), 0);
         for (seq, command) in GOLDEN_COMMANDS[..4].iter().enumerate() {
             chain = chain_step(&chain, seq as u32, command);
         }
-        chain
+        assert_eq!(chain, GOLDEN_CHAIN_AFTER_FOUR);
     }
 
     #[test]
     fn advance5_commits_the_golden_chain_and_cursor() {
         let mut g = golden();
-        let mut engine = MockEngine { ran: 0, starve: false, published: 0 };
+        let mut engine = MockEngine::new(None);
         let report = sweep(
             &mut g.meta,
             &g.buffer,
@@ -1904,64 +1929,134 @@ mod tests {
             &NoBudget,
         )
         .unwrap();
-        assert_eq!(engine.ran, 4);
+        assert_eq!(engine.steps, 4);
+        assert_eq!(engine.advanced, 4);
         assert_eq!(engine.published, 1);
         assert_eq!(report.ran, 4);
         assert_eq!(report.stop, Stop::Gap);
         assert_eq!(report.cursor_after, 4);
-        assert_eq!(report.input_chain, golden_chain_after_four());
+        assert_eq!(report.input_chain, GOLDEN_CHAIN_AFTER_FOUR);
         assert_eq!(u32_at(&g.meta, M_CURSOR), 4);
         assert_eq!(u32_at(&g.meta, M_LAST_SWEEP_TICS), 4);
     }
 
     /// The malformed-input control: a sweep whose staged command the engine
-    /// never consumed is refused, and nothing is committed.  The meta cursor
-    /// must still read 0 and the state root must still be the pre-sweep one.
+    /// never consumed is refused, and nothing is committed.  `starve_from` is 0
+    /// (the very first staged tic starves) and 3 (three tics run, the fourth
+    /// starves).  The second shape is the one that matters: by then the engine
+    /// has already run three tics, so if the refusal ever committed a byte of
+    /// ST1/MP1 it would show -- and the check is on the bytes, not on the meta.
     #[test]
     fn advance5_refuses_a_tic_with_no_consumed_command() {
-        let mut g = golden();
-        let before = g.meta.clone();
-        let mut engine = MockEngine { ran: 0, starve: true, published: 0 };
-        let result = sweep(
-            &mut g.meta,
-            &g.buffer,
-            &mut g.state,
-            &mut g.mirror,
-            &g.keys,
-            &g.checkpoint,
-            8,
-            true,
-            &mut engine,
-            &NoBudget,
-        );
-        assert_eq!(result, Err(refuse(REFUSE_UNCONSUMED_INPUT)));
-        assert_eq!(engine.ran, 1);
-        assert_eq!(engine.published, 0);
-        assert_eq!(g.meta, before);
+        for (starve_from, steps) in [(Some(0), 1), (Some(3), 4)] {
+            let mut g = golden();
+            let meta_before = g.meta.clone();
+            let state_before = g.state.clone();
+            let mirror_before = g.mirror.clone();
+            let mut engine = MockEngine::new(starve_from);
+            let result = sweep(
+                &mut g.meta,
+                &g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                8,
+                true,
+                &mut engine,
+                &NoBudget,
+            );
+            assert_eq!(
+                result,
+                Err(refuse(REFUSE_UNCONSUMED_INPUT)),
+                "starve_from={starve_from:?}"
+            );
+            assert_eq!(engine.steps, steps, "starve_from={starve_from:?}");
+            assert_eq!(engine.advanced, steps - 1, "starve_from={starve_from:?}");
+            assert_eq!(engine.published, 0, "starve_from={starve_from:?}");
+            assert_eq!(g.meta, meta_before, "starve_from={starve_from:?}");
+            // A refused sweep commits nothing: not the cursor, not the chain,
+            // and not one byte of the engine state or of its mirror.
+            assert_eq!(g.state, state_before, "starve_from={starve_from:?}");
+            assert_eq!(g.mirror, mirror_before, "starve_from={starve_from:?}");
+        }
     }
 
-    /// ADVANCE/3 and ADVANCE/4 keep their old meaning: an unconsumed tic still
-    /// counts, so a historical client's cursor stays reproducible.
+    /// ADVANCE/3 and ADVANCE/4 do NOT keep a permissive meaning on the real
+    /// engine.  DOOM-CI3 lives in `doom_sbf_sim2_step`, not in the ADVANCE
+    /// opcode: an unconsumed tic returns 238 *before* `gametic++`
+    /// (doom_sbf_resource_ri2.c), so the engine's tic counter does not move
+    /// even though the sweep loop would have counted the step.  The
+    /// post-publish tic check then sees a cursor that has run ahead of gametic
+    /// and refuses 284.  A starved tic is uncommittable under every opcode;
+    /// ADVANCE/5 only names the refusal earlier, with 288 instead of 284.
     #[test]
-    fn advance3_still_counts_an_unconsumed_tic() {
-        let mut g = golden();
-        let mut engine = MockEngine { ran: 0, starve: true, published: 0 };
-        let report = sweep(
-            &mut g.meta,
-            &g.buffer,
-            &mut g.state,
-            &mut g.mirror,
-            &g.keys,
-            &g.checkpoint,
+    fn advance3_also_refuses_a_tic_with_no_consumed_command() {
+        for starve_from in [Some(0), Some(3)] {
+            let mut g = golden();
+            let meta_before = g.meta.clone();
+            let state_before = g.state.clone();
+            let mirror_before = g.mirror.clone();
+            let mut engine = MockEngine::new(starve_from);
+            let result = sweep(
+                &mut g.meta,
+                &g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                8,
+                false,
+                &mut engine,
+                &NoBudget,
+            );
+            assert_eq!(result, Err(refuse(REFUSE_TIC)), "starve_from={starve_from:?}");
+            assert!(engine.published >= 1, "starve_from={starve_from:?}");
+            assert_eq!(g.meta, meta_before, "starve_from={starve_from:?}");
+            assert_eq!(g.state, state_before, "starve_from={starve_from:?}");
+            assert_eq!(g.mirror, mirror_before, "starve_from={starve_from:?}");
+        }
+    }
+
+    /// The engine-driven control for the tic check itself: with every staged
+    /// tic consumed, /3 and /5 agree, which is the only shape in which the
+    /// permissive branch is still reachable.
+    #[test]
+    fn advance3_and_advance5_agree_when_every_tic_is_consumed() {
+        let mut five = golden();
+        let mut three = golden();
+        let mut engine_five = MockEngine::new(None);
+        let mut engine_three = MockEngine::new(None);
+        let report_five = sweep(
+            &mut five.meta,
+            &five.buffer,
+            &mut five.state,
+            &mut five.mirror,
+            &five.keys,
+            &five.checkpoint,
             8,
-            false,
-            &mut engine,
+            true,
+            &mut engine_five,
             &NoBudget,
         )
         .unwrap();
-        assert_eq!(report.ran, 4);
-        assert_eq!(report.input_chain, golden_chain_after_four());
-        assert_eq!(u32_at(&g.meta, M_CURSOR), 4);
+        let report_three = sweep(
+            &mut three.meta,
+            &three.buffer,
+            &mut three.state,
+            &mut three.mirror,
+            &three.keys,
+            &three.checkpoint,
+            8,
+            false,
+            &mut engine_three,
+            &NoBudget,
+        )
+        .unwrap();
+        assert_eq!(report_five.input_chain, report_three.input_chain);
+        assert_eq!(report_five.cursor_after, report_three.cursor_after);
+        assert_eq!(report_five.input_chain, GOLDEN_CHAIN_AFTER_FOUR);
+        assert_eq!(five.meta, three.meta);
     }
 
     #[test]

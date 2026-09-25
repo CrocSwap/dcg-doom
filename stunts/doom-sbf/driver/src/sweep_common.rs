@@ -171,13 +171,38 @@ pub const GAMESTATE_LEVEL: i32 = 0;
 
 /// A staged-input profile, independent of the DEMO1 lump.  Every profile
 /// returns `count` ticcmd bytes and the length of the cycle it repeats (0 when
-/// it does not repeat).  `r8l-move` is the profile the R8b sender's
-/// KEY_SCRIPTS produces: every 200-tic segment either moves or turns, so a
-/// receiver cannot mistake "input arrived" for "the player moved".
+/// it does not repeat).  `r8l-move` is a synthetic stand-in for the R8b
+/// sender's KEY_SCRIPTS: every 200-tic segment either moves or turns, so a
+/// receiver cannot mistake "input arrived" for "the player moved".  It is NOT
+/// the sender's stream, and a gate that compares against the chain has to use
+/// `command-file:<path>` instead.
 pub fn input_commands(profile: &str, count: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
     let mut commands = Vec::with_capacity(count.checked_mul(4).ok_or("command size overflow")?);
     match profile {
         "neutral" => commands.resize(count * 4, 0),
+        // The bytes the chain actually committed, read back from the sender's
+        // own `command-stream.bin`.  A prefix of at least `count` tics is
+        // required: a short file would silently run a different input stream
+        // than the one the chain advanced over.
+        profile if profile.starts_with("command-file:") => {
+            let path = Path::new(&profile["command-file:".len()..]);
+            let raw = fs::read(path)
+                .map_err(|error| format!("cannot read command file {}: {error}", path.display()))?;
+            if raw.len() < count * 4 {
+                return Err(format!(
+                    "command file {} holds {} bytes, {} tics need {}",
+                    path.display(),
+                    raw.len(),
+                    count,
+                    count * 4
+                )
+                .into());
+            }
+            if raw.len() % 4 != 0 {
+                return Err(format!("command file {} is not a whole number of tics", path.display()).into());
+            }
+            commands.extend_from_slice(&raw[..count * 4]);
+        }
         "orbit-fire" => {
             for seq in 0..count {
                 let turn = if (seq / 256) % 2 == 0 { 1u8 } else { 255u8 };
