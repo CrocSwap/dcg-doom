@@ -1102,7 +1102,7 @@ pub fn reset(
         // A supplied start account: install the image and its zero tail into
         // the bound state account, which is the account every later read, the
         // render path included, is bound to.
-        sol_memcpy(state, start, state_len, state_len);
+        sol_memcpy(state, start, state_len);
         sol_memset(&mut state[state_len..], 0, state.len() - state_len);
     }
     crate::diagnostic_phase(926);
@@ -2507,7 +2507,6 @@ mod tests {
             &mut g.meta,
             &g.buffer,
             &mut g.state,
-            &start_image,
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2941,7 +2940,6 @@ mod tests {
                 &mut g.meta,
                 &g.buffer,
                 &mut g.state,
-                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
