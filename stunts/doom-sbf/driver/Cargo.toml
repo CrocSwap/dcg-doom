@@ -62,6 +62,12 @@ required-features = ["ctx-engine"]
 name = "live_snapshot_sbf"
 required-features = ["ctx-engine"]
 
+# Live-input gate: ADVANCE/5 batches past the captured DEMO1 end, compared to
+# the host ingress, with the chain's own strips against the host frame.
+[[bin]]
+name = "live_input_gate"
+required-features = ["ctx-engine"]
+
 [[bin]]
 name = "continuation_sbf"
 required-features = ["ctx-engine"]

@@ -98,6 +98,18 @@ impl Harness {
         budget: u64,
         checkpoint: Option<&[u8]>,
     ) -> Result<sim2::SweepReport, ProgramError> {
+        self.sweep_starved(signer, max_tics, budget, checkpoint, false)
+    }
+
+    /// ADVANCE/5: `require_consumed` refuses a tic the engine did not consume.
+    fn sweep_starved(
+        &mut self,
+        signer: &Pubkey,
+        max_tics: u32,
+        budget: u64,
+        checkpoint: Option<&[u8]>,
+        require_consumed: bool,
+    ) -> Result<sim2::SweepReport, ProgramError> {
         self.budget.set(budget);
         let checkpoint = checkpoint
             .map(<[u8]>::to_vec)
@@ -117,6 +129,7 @@ impl Harness {
             },
             &checkpoint,
             max_tics,
+            require_consumed,
             &mut self.engine,
             &CellBudget(self.budget.clone()),
         );

@@ -1522,7 +1522,8 @@ int doom_resource_sim_session_open(
 }
 
 /* Same contract as doom_sbf_sim2_step: 0 ran, 1..5 halted before G_Ticker,
- * 232 refused command, 237 arm failure. */
+ * 232 refused command, 237 arm failure, 238 the tic ran without consuming the
+ * armed command. */
 int doom_resource_sim_session_step(const unsigned char *command)
 {
     int halt;
@@ -1530,7 +1531,20 @@ int doom_resource_sim_session_step(const unsigned char *command)
     halt = doom_sim2_pretic_guard(command);
     if (halt) return halt;
     if (DoomControllerArmV2(command)) return 237;
-    G_Ticker(); gametic++;
+    G_Ticker();
+    if (!DoomControllerConsumed()) return 238;
+    gametic++;
+    return 0;
+}
+
+/* The whole player view at the resident gametic, row-major 320x200, the same
+ * bytes the eight chain strips reassemble.  Host-only; the render cost path
+ * is untouched, this calls the same R_RenderPlayerView the strips call. */
+int doom_resource_sim_session_frame(unsigned char *out, unsigned long cap)
+{
+    if (!sim2_native_open || !out || cap < RI2_FRAME_BYTES) return 232;
+    R_RenderPlayerView(&players[displayplayer]);
+    memcpy(out, screens[0], RI2_FRAME_BYTES);
     return 0;
 }
 

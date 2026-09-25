@@ -69,13 +69,13 @@ pub const CTX_MAGIC: &[u8; 8] = b"DOOM-CX1";
 #[cfg(feature = "ctx-engine")]
 pub const CTX_GUARD_REFUSED: u32 = 199;
 /// Exact context-account length the instruction accepts: the generated
-/// sizeof(doom_ctx_t) (host-measured, 3_440_920) plus one scratch triple
+/// sizeof(doom_ctx_t) (host-measured, 3_440_952) plus one scratch triple
 /// (observed base, SBF-side sizeof, readback) past the end of the struct.
 /// The driver asserts the SBF-side sizeof the probe writes back against its
 /// own copy, so layout drift between the host-measured constant and the SBF
 /// struct fails loudly instead of aliasing engine state.
 #[cfg(feature = "ctx-engine")]
-pub const CTX_MIN_BYTES: usize = 3_440_920 + 24;
+pub const CTX_MIN_BYTES: usize = 3_440_952 + 24;
 
 /// Numeric phase-log magic used only by the bounded diagnostic SBF image.
 /// The feature changes the image identity; no normal or positive qualification

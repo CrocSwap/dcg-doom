@@ -1,0 +1,1483 @@
+#![recursion_limit = "512"]
+
+//! DOOM-SIM/2 gate (d): live input past the DEMO1 end, on SBF under
+//! ProgramTest with `prefer_bpf(true)`.
+//!
+//! The captured DEMO1 stream is 5,026 tics long, so a gate that sources its
+//! commands from `capture.demo_commands()` cannot run past tic 5026 at all.
+//! This gate instead stages a live-input profile (`--profile`, default
+//! `r8l-move`: every 200-tic segment either moves or turns) and sweeps it in
+//! `--advance-tics` sized ADVANCE/5 batches, so the load-bearing claim of
+//! DOOM-CI3 is measured on the image rather than argued:
+//!
+//! 1. The SBF commits ST1, MP1, the state root and the input chain equal to
+//!    the host session at every committed cursor.  The host session is the
+//!    chain's own ingress contract, source matched: the same pre-tic guard,
+//!    `DoomControllerArmV2`, `G_Ticker`, `gametic++` and the DOOM-CI3
+//!    receipt, driven in lockstep one batch at a time so a 5,400-tic run
+//!    keeps one ST1/MP1 pair resident instead of gigabytes.
+//! 2. Past the demo end the player moves: the ST1 image changes at every
+//!    cursor, and the chain's own eight RENDER strips at the chosen cursors
+//!    reassemble byte for byte into the host's `R_RenderPlayerView` frame.
+//! 3. A deliberately starved tic is refused.  `DoomControllerConsumed()`
+//!    returns zero exactly when `G_Ticker` ran with no console player in the
+//!    game, and the retained capture cannot reach that state, so the control
+//!    builds one: a canonical ST1 whose `playeringame[0]` byte is zero
+//!    (proved canonical by a host encode/decode round trip, proved to be that
+//!    byte by the receipt it produces and by the unmodified state not
+//!    starving).  ADVANCE/5 refuses it with Custom 288 and commits nothing;
+//!    ADVANCE/3 on the same state commits, so the refusal is the receipt
+//!    rule and not the input.
+//!
+//! The loaded image must advertise `ADVANCE/5` and the receipt rule in its own
+//! ABI descriptor before any work starts: a transport image without the rule
+//! is refused here rather than silently measured as "no refusals".
+
+#[path = "continuation_split_sbf.rs"]
+#[allow(dead_code)]
+mod base;
+#[path = "../sweep_common.rs"]
+#[allow(dead_code)]
+mod common;
+
+use std::{env, error::Error, fs, io::Write, path::PathBuf, time::Instant};
+
+use common::Capture;
+use doom_sbf::{
+    continuation_split_sbf, render_snapshot_v3 as rsn3, resource, resource_sbf, sim2,
+    static_resource as rsr, stage,
+};
+use serde_json::json;
+use solana_account::Account;
+use solana_banks_interface::BanksTransactionResultWithMetadata;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_instruction::{error::InstructionError, AccountMeta, Instruction};
+use solana_keypair::Keypair;
+use solana_message::Message;
+use solana_program::rent::Rent;
+use solana_program_test::{ProgramTest, ProgramTestContext};
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_system_interface::{instruction as system_instruction, program as system_program};
+use solana_transaction::Transaction;
+use solana_transaction_error::TransactionError;
+
+const RESOURCE: Pubkey = Pubkey::new_from_array([0xe1; 32]);
+const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
+const STAGE_CHUNK: usize = 900;
+const RENDER_LIMIT: u32 = 1_400_000;
+const E2R_PHASES: u32 = 8;
+const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/bin/live_input_gate.rs"
+));
+const SWEEP_COMMON_SOURCE: &[u8] = include_bytes!("../sweep_common.rs");
+
+fn wad_key(ordinal: usize) -> Pubkey {
+    Pubkey::new_from_array([0xf0 + ordinal as u8; 32])
+}
+
+fn meta(key: Pubkey, writable: bool, signer: bool) -> AccountMeta {
+    AccountMeta {
+        pubkey: key,
+        is_signer: signer,
+        is_writable: writable,
+    }
+}
+
+fn i32_at(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn custom_code(result: &BanksTransactionResultWithMetadata) -> Option<u32> {
+    match &result.result {
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => Some(*code),
+        _ => None,
+    }
+}
+
+struct Session {
+    ctx: ProgramTestContext,
+    keys: SessionKeys,
+    nonce: u64,
+    /// The committed cursor the next ADVANCE packet binds, so the packet a
+    /// gate signs is the one the sender would sign.
+    cursor_before: u32,
+}
+
+struct SessionKeys {
+    authority: Keypair,
+    context: Keypair,
+    state: Keypair,
+    mirror: Keypair,
+    controller: Keypair,
+    buffer: Keypair,
+    meta: Pubkey,
+    bump: u8,
+}
+
+impl Session {
+    async fn send(
+        &mut self,
+        instructions: Vec<Instruction>,
+        signers: &[&Keypair],
+        limit: u32,
+    ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
+        // A unique compute-unit price per transaction keeps otherwise
+        // identical packets distinct; it does not change the compute limit.
+        self.nonce += 1;
+        let mut all = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(limit),
+            ComputeBudgetInstruction::set_compute_unit_price(self.nonce),
+        ];
+        all.extend(instructions);
+        let blockhash = self.ctx.banks_client.get_latest_blockhash().await?;
+        let mut keypairs: Vec<&Keypair> = vec![&self.ctx.payer];
+        keypairs.extend_from_slice(signers);
+        let tx = Transaction::new(
+            &keypairs,
+            Message::new_with_blockhash(&all, Some(&self.ctx.payer.pubkey()), &blockhash),
+            blockhash,
+        );
+        Ok(self
+            .ctx
+            .banks_client
+            .process_transaction_with_metadata(tx)
+            .await?)
+    }
+
+    async fn data(&mut self, key: Pubkey) -> Result<Vec<u8>, Box<dyn Error>> {
+        base::account_data(&self.ctx.banks_client, key).await
+    }
+
+    async fn view(&mut self) -> Result<sim2::MetaView, Box<dyn Error>> {
+        sim2::MetaView::parse(&self.data(self.keys.meta).await?).ok_or_else(|| "meta parse".into())
+    }
+
+    async fn durable(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
+        let mut out = Vec::new();
+        for key in [
+            self.keys.context.pubkey(),
+            self.keys.state.pubkey(),
+            self.keys.mirror.pubkey(),
+            self.keys.meta,
+            self.keys.buffer.pubkey(),
+        ] {
+            match self.ctx.banks_client.get_account(key).await? {
+                Some(account) => out.push(base::sha(&account.data)),
+                None => out.push("absent".into()),
+            }
+        }
+        Ok(out)
+    }
+
+    fn stage_ix(target: Pubkey, offset: usize, bytes: &[u8]) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![meta(target, true, true)],
+            data: stage::encode(offset as u32, bytes),
+        }
+    }
+
+    async fn stage_account(
+        &mut self,
+        target: &Keypair,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        let chunks: Vec<(usize, &[u8])> = bytes
+            .chunks(STAGE_CHUNK)
+            .enumerate()
+            .map(|(i, c)| (i * STAGE_CHUNK, c))
+            .collect();
+        // Body first (all-zero chunks are already right in a zeroed
+        // account), then the sealing header chunk.
+        for &(offset, chunk) in chunks.iter().skip(1) {
+            if chunk.iter().all(|&b| b == 0) {
+                continue;
+            }
+            let result = self
+                .send(
+                    vec![Self::stage_ix(target.pubkey(), offset, chunk)],
+                    &[target],
+                    base::NORMAL_LIMIT,
+                )
+                .await?;
+            if result.result.is_err() {
+                return Err(format!(
+                    "stage body {offset} of {} bytes: {:?}",
+                    bytes.len(),
+                    result.result
+                )
+                .into());
+            }
+        }
+        let (offset, chunk) = chunks[0];
+        let result = self
+            .send(
+                vec![Self::stage_ix(target.pubkey(), offset, chunk)],
+                &[target],
+                base::NORMAL_LIMIT,
+            )
+            .await?;
+        if result.result.is_err() {
+            return Err(format!("stage header: {:?}", result.result).into());
+        }
+        if self.data(target.pubkey()).await? != bytes {
+            return Err(format!("staged account readback mismatch: {}", target.pubkey()).into());
+        }
+        Ok(())
+    }
+
+    fn e2r_ix(&self, continuation: Pubkey, operation: u8, cursor: u32, state_len: usize) -> Instruction {
+        let mut accounts = vec![
+            meta(
+                self.keys.context.pubkey(),
+                true,
+                operation == continuation_split_sbf::PREPARE,
+            ),
+            meta(RESOURCE, false, false),
+        ];
+        for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+            accounts.push(meta(wad_key(ordinal), false, false));
+        }
+        accounts.extend([
+            meta(self.keys.state.pubkey(), true, false),
+            meta(self.keys.mirror.pubkey(), true, false),
+            meta(self.keys.controller.pubkey(), false, false),
+            meta(FRAME, true, false),
+            meta(continuation, true, false),
+            meta(self.keys.authority.pubkey(), false, true),
+        ]);
+        let mut data = continuation_split_sbf::Request {
+            operation,
+            state_len,
+            cursor,
+            fault: 0,
+        }
+        .encode()
+        .to_vec();
+        // The host harness is built with the provenance-pinned `ctx-engine`
+        // feature only; the loaded SBF image is DOOM-SIM/2 transport and takes
+        // E2R/5.  Same 32-byte field layout, the version is the header only.
+        data[8..12].copy_from_slice(&5u32.to_le_bytes());
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts,
+            data,
+        }
+    }
+
+    fn init_ix(
+        &self,
+        continuation: Pubkey,
+        resource_hash: [u8; 32],
+        controller_hash: [u8; 32],
+        frame_hash: [u8; 32],
+    ) -> Instruction {
+        let mut e2r_keys = [Pubkey::default(); sim2::INIT_KEY_COUNT];
+        e2r_keys[0] = RESOURCE;
+        for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+            e2r_keys[1 + ordinal] = wad_key(ordinal);
+        }
+        e2r_keys[6] = self.keys.controller.pubkey();
+        e2r_keys[7] = FRAME;
+        e2r_keys[8] = continuation;
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.context.pubkey(), false, false),
+                meta(self.keys.state.pubkey(), false, false),
+                meta(self.keys.mirror.pubkey(), false, false),
+                meta(self.keys.meta, true, false),
+                meta(self.keys.buffer.pubkey(), true, false),
+                meta(self.keys.authority.pubkey(), true, true),
+                meta(system_program::id(), false, false),
+            ],
+            data: sim2::InitRequest {
+                bump: self.keys.bump,
+                capacity: sim2::DEFAULT_BUFFER_CAPACITY as u32,
+                e2r_keys,
+                resource_hash,
+                controller_hash,
+                frame_hash,
+            }
+            .encode(),
+        }
+    }
+
+    fn deposit_ix(&self, first: u32, commands: &[u8]) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.buffer.pubkey(), true, false),
+                meta(self.keys.authority.pubkey(), false, true),
+            ],
+            data: sim2::encode_deposit(first, commands),
+        }
+    }
+
+    fn advance_ix(&self, operation: u8, max_tics: u32) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.context.pubkey(), true, false),
+                meta(self.keys.state.pubkey(), true, false),
+                meta(self.keys.mirror.pubkey(), true, false),
+                meta(self.keys.meta, true, false),
+                meta(self.keys.buffer.pubkey(), false, false),
+                meta(self.keys.authority.pubkey(), false, true),
+            ],
+            data: if operation == sim2::ADVANCE_STARVED {
+                sim2::encode_advance_starved(self.cursor_before, max_tics)
+            } else {
+                // ADVANCE/3 is the historical cursor-free packet; the gate
+                // uses it only as the differential for the receipt rule.
+                sim2::encode_advance(max_tics)
+            },
+        }
+    }
+
+    fn grow_ix(&self, capacity: u32, expected_len: u32) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![meta(self.keys.buffer.pubkey(), true, true)],
+            data: sim2::encode_grow_buffer(capacity, expected_len),
+        }
+    }
+
+    fn static_ix(&self, static_key: Pubkey, cursor: u32) -> Instruction {
+        let mut accounts = vec![meta(static_key, true, false), meta(RESOURCE, false, false)];
+        if (cursor as usize) < rsr::BUILD_WAD_CHUNKS as usize {
+            accounts.push(meta(wad_key(cursor as usize), false, false));
+        }
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts,
+            data: rsr::Request::build_chunk(cursor).encode().to_vec(),
+        }
+    }
+
+    fn snapshot_live_ix(
+        &self,
+        static_key: Pubkey,
+        snapshot: Pubkey,
+        request: rsn3::SnapshotRequest,
+    ) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.context.pubkey(), false, false),
+                meta(self.keys.meta, false, false),
+                meta(self.keys.state.pubkey(), false, false),
+                meta(self.keys.mirror.pubkey(), false, false),
+                meta(static_key, false, false),
+                meta(snapshot, true, false),
+            ],
+            data: request.encode_live().to_vec(),
+        }
+    }
+
+    fn render_ix(
+        &self,
+        static_key: Pubkey,
+        snapshot: Pubkey,
+        strip: u8,
+        request: rsr::Request,
+    ) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(static_key, true, false),
+                meta(snapshot, false, false),
+                meta(rsn3::strip_address(&base::PROGRAM, &snapshot, strip).0, true, false),
+            ],
+            data: request.encode().to_vec(),
+        }
+    }
+}
+
+fn system_account(lamports: u64) -> Account {
+    Account {
+        lamports,
+        data: Vec::new(),
+        owner: system_program::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+async fn create_owned(
+    ctx: &mut ProgramTestContext,
+    key: &Keypair,
+    bytes: usize,
+    lamports: u64,
+) -> Result<(), Box<dyn Error>> {
+    let blockhash = ctx.banks_client.get_latest_blockhash().await?;
+    let tx = Transaction::new(
+        &[&ctx.payer, key],
+        Message::new_with_blockhash(
+            &[system_instruction::create_account(
+                &ctx.payer.pubkey(),
+                &key.pubkey(),
+                lamports,
+                bytes as u64,
+                &base::PROGRAM,
+            )],
+            Some(&ctx.payer.pubkey()),
+            &blockhash,
+        ),
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await?;
+    Ok(())
+}
+
+/// Grow a fresh input buffer to its declared length.
+async fn grow_buffer(
+    session: &mut Session,
+    buffer: &Keypair,
+    capacity: u32,
+    units: &mut Vec<u64>,
+) -> Result<(), Box<dyn Error>> {
+    let total = sim2::buffer_bytes(capacity as usize).ok_or("buffer capacity")?;
+    let mut len = sim2::initial_buffer_bytes(capacity as usize).ok_or("initial buffer length")?;
+    create_owned(
+        &mut session.ctx,
+        buffer,
+        len,
+        Rent::default().minimum_balance(total),
+    )
+    .await?;
+    while len < total {
+        let ix = session.grow_ix(capacity, len as u32);
+        let grown = session.send(vec![ix], &[buffer], base::NORMAL_LIMIT).await?;
+        if grown.result.is_err() {
+            return Err(format!("SIM2 GROW-BUFFER at {len}: {:?}", grown.result).into());
+        }
+        units.push(base::units(&grown)?);
+        len = sim2::next_buffer_len(len, capacity as usize).ok_or("buffer growth stalled")?;
+    }
+    if session.data(buffer.pubkey()).await?.len() != total {
+        return Err("SIM2 input buffer did not reach its declared length".into());
+    }
+    Ok(())
+}
+
+/// STG/1 + E2R/5 + SIM/2 INIT for one context, from one staged ST1/MP1 pair.
+#[allow(clippy::too_many_arguments)]
+async fn reconstruct(
+    session: &mut Session,
+    staged_state: &[u8],
+    mirror: &[u8],
+    controller: &[u8],
+    capture: &Capture,
+    capacity: u32,
+) -> Result<(Vec<u64>, u64), Box<dyn Error>> {
+    let state_signer = session.keys.state.insecure_clone();
+    let mirror_signer = session.keys.mirror.insecure_clone();
+    let controller_signer = session.keys.controller.insecure_clone();
+    let authority = session.keys.authority.insecure_clone();
+    let context_signer = session.keys.context.insecure_clone();
+    session.stage_account(&state_signer, staged_state).await?;
+    session.stage_account(&mirror_signer, mirror).await?;
+    session.stage_account(&controller_signer, controller).await?;
+    let continuation = Keypair::new();
+    create_owned(
+        &mut session.ctx,
+        &continuation,
+        continuation_split_sbf::CONTINUATION_BYTES,
+        Rent::default().minimum_balance(continuation_split_sbf::CONTINUATION_BYTES),
+    )
+    .await?;
+    let state_len = base::u32_at(staged_state, 16) as usize;
+    let mut phases = Vec::new();
+    for cursor in 0..E2R_PHASES {
+        let operation = if cursor == 0 {
+            continuation_split_sbf::PREPARE
+        } else {
+            continuation_split_sbf::STEP
+        };
+        let ix = session.e2r_ix(continuation.pubkey(), operation, cursor, state_len);
+        let signers: Vec<&Keypair> = if cursor == 0 {
+            vec![&authority, &context_signer]
+        } else {
+            vec![&authority]
+        };
+        let result = session.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        if result.result.is_err() {
+            return Err(format!("E2R/5 phase {cursor}: {:?}", result.result).into());
+        }
+        phases.push(base::units(&result)?);
+    }
+    if session.data(state_signer.pubkey()).await? != staged_state
+        || session.data(mirror_signer.pubkey()).await? != mirror
+    {
+        return Err("E2R/5 publication changed the staged ST1/MP1".into());
+    }
+    let buffer = session.keys.buffer.insecure_clone();
+    let mut grow_units = Vec::new();
+    grow_buffer(session, &buffer, capacity, &mut grow_units).await?;
+    let ix = session.init_ix(
+        continuation.pubkey(),
+        solana_program::hash::hash(&capture.resource).to_bytes(),
+        solana_program::hash::hash(controller).to_bytes(),
+        solana_program::hash::hash(&vec![0u8; resource_sbf::RI2_FRAME_BYTES]).to_bytes(),
+    );
+    let init = session.send(vec![ix], &[&authority], base::NORMAL_LIMIT).await?;
+    if init.result.is_err() {
+        return Err(format!("SIM2 INIT {:?}", init.result).into());
+    }
+    let init_cu = base::units(&init)?;
+    let staged_len = base::u32_at(staged_state, 16) as usize;
+    let view = session.view().await?;
+    if view.cursor != 0 {
+        return Err("INIT meta does not start at cursor 0".into());
+    }
+    let (checked, root) = sim2::verified_state_root(staged_state, mirror)
+        .map_err(|e| format!("staged state root: {e:?}"))?;
+    if checked != staged_len || view.state_root != root {
+        return Err("INIT meta does not commit the published state".into());
+    }
+    Ok((phases, init_cu))
+}
+
+fn bank_with(
+    capture: &Capture,
+    context: Pubkey,
+    state: Pubkey,
+    mirror: Pubkey,
+    controller: Pubkey,
+    authority: Pubkey,
+    render_accounts: Option<(Pubkey, Pubkey)>,
+) -> ProgramTest {
+    let mut bank = ProgramTest::default();
+    bank.prefer_bpf(true);
+    bank.set_compute_max_units(u64::from(base::NORMAL_LIMIT));
+    bank.add_program("doom_sbf", base::PROGRAM, None);
+    bank.add_account(context, base::account(vec![0; resource_sbf::CONTEXT_BYTES]));
+    bank.add_account(RESOURCE, base::account(capture.resource.clone()));
+    for (ordinal, bytes) in capture.wad.iter().enumerate() {
+        bank.add_account(wad_key(ordinal), base::account(bytes.clone()));
+    }
+    for (key, len) in [
+        (state, resource_sbf::STATE_MAX_BYTES),
+        (mirror, resource_sbf::MIRROR_BYTES),
+        (controller, resource_sbf::CONTROLLER_BYTES),
+    ] {
+        bank.add_account(key, base::account(vec![0; len]));
+    }
+    bank.add_account(FRAME, base::account(vec![0; resource_sbf::RI2_FRAME_BYTES]));
+    bank.add_account(authority, system_account(100_000_000_000));
+    if let Some((static_key, snapshot)) = render_accounts {
+        bank.add_account(static_key, base::account(vec![0; rsr::ACCOUNT_BYTES]));
+        bank.add_account(snapshot, base::account(vec![0; rsn3::SNAPSHOT_BYTES]));
+        for strip_id in 0..8u8 {
+            bank.add_account(
+                rsn3::strip_address(&base::PROGRAM, &snapshot, strip_id).0,
+                base::account(vec![0; rsn3::STRIP_ACCOUNT_BYTES]),
+            );
+        }
+    }
+    bank
+}
+
+fn session_keys(context: Keypair) -> SessionKeys {
+    let (meta, bump) = sim2::meta_address(&base::PROGRAM, &context.pubkey());
+    SessionKeys {
+        authority: Keypair::new(),
+        context,
+        state: Keypair::new(),
+        mirror: Keypair::new(),
+        controller: Keypair::new(),
+        buffer: Keypair::new(),
+        meta,
+        bump,
+    }
+}
+
+/// The `Custom(n)` an instruction error carries, if it carries one.
+fn custom_code_text(_phase: &u32, text: &str) -> Option<u32> {
+    let start = text.find("Custom(")? + "Custom(".len();
+    let end = text[start..].find(')')? + start;
+    text[start..end].parse().ok()
+}
+
+/// A DOOM-CI2 controller account bound to `gametic`.  `ri2_controller_shape`
+/// requires the recorded tic to equal the ST1 image's `gametic` and bytes
+/// 28..64 to be zero, so a context reconstructed from a later tic needs its
+/// own controller account.  The four command bytes are the armed ticcmd and
+/// are not compared with the demo stream on this path.
+fn controller_for_gametic(controller: &[u8], gametic: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+    if controller.len() != resource_sbf::CONTROLLER_BYTES
+        || &controller[..8] != b"DOOM-CI2"
+        || base::u32_at(controller, 8) != 1
+        || base::u32_at(controller, 12) != 28
+        || base::u32_at(controller, 16) != resource_sbf::CONTROLLER_BYTES as u32
+    {
+        return Err("retained CI2 controller has the wrong shape".into());
+    }
+    let mut out = controller.to_vec();
+    out[20..24].copy_from_slice(&gametic.to_le_bytes());
+    out[28..].fill(0);
+    Ok(out)
+}
+
+/// What the host ingress does with an ST1 image: `Err(rc)` from the import, a
+/// tic that ran with a consumed command (0), or a tic that ran with an
+/// unconsumed one (238, the DOOM-CI3 receipt reading zero).
+fn host_import_and_step(capture: &Capture, state: &[u8]) -> Result<i32, Box<dyn Error>> {
+    let mut session =
+        match resource::NativeSimSession::open(capture.wad_refs(), &capture.resource, state) {
+            Ok(session) => session,
+            Err(rc) => return Ok(-rc),
+        };
+    Ok(session.step(&[0u8, 0u8, 0u8, 0u8]))
+}
+
+/// The host ingress stepped to `cursor` and published: the ST1/MP1 pair a
+/// chain context at that cursor would hold.
+fn host_state_at(
+    capture: &Capture,
+    commands: &[u8],
+    cursor: u32,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    let mut session =
+        resource::NativeSimSession::open(capture.wad_refs(), &capture.resource, &capture.state)
+            .map_err(|rc| format!("host session open rc={rc}"))?;
+    for (seq, command) in commands.chunks_exact(4).take(cursor as usize).enumerate() {
+        let command: [u8; 4] = command.try_into().unwrap();
+        let rc = session.step(&command);
+        if rc != 0 {
+            return Err(format!("host step {seq} rc={rc}").into());
+        }
+    }
+    let mut state = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+    let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
+    let length = session
+        .publish(&mut state, &mut mirror)
+        .map_err(|rc| format!("host publish rc={rc}"))?;
+    state.truncate(length);
+    Ok((state, mirror))
+}
+
+/// The host player view at `cursor`, rendered in a session replayed over the
+/// same staged commands, with the number of committed ST1 bytes the render
+/// itself moved.  `R_RenderPlayerView` is not a pure read of the committed
+/// state, so the perturbation is reported rather than assumed away.
+fn host_frame_at(
+    capture: &Capture,
+    commands: &[u8],
+    cursor: u32,
+) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+    let mut session =
+        resource::NativeSimSession::open(capture.wad_refs(), &capture.resource, &capture.state)
+            .map_err(|rc| format!("frame session open rc={rc}"))?;
+    for (seq, command) in commands.chunks_exact(4).take(cursor as usize).enumerate() {
+        let rc = session.step(&command.try_into().unwrap());
+        if rc != 0 {
+            return Err(format!("frame session step {seq} rc={rc}").into());
+        }
+    }
+    let mut before = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+    let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
+    let length = session
+        .publish(&mut before, &mut mirror)
+        .map_err(|rc| format!("frame session publish rc={rc}"))?;
+    before.truncate(length);
+    let frame = session
+        .frame()
+        .map_err(|rc| format!("frame at {cursor} rc={rc}"))?;
+    let mut after = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+    let mut again = vec![0u8; resource_sbf::MIRROR_BYTES];
+    let length = session
+        .publish(&mut after, &mut again)
+        .map_err(|rc| format!("frame session publish after render rc={rc}"))?;
+    after.truncate(length);
+    let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+    Ok((frame, moved))
+}
+
+fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
+    (0..200)
+        .flat_map(|row| {
+            let start = row * 320 + strip * 40;
+            frame[start..start + 40].iter().copied()
+        })
+        .collect()
+}
+
+fn differing_pixels(left: &[u8], right: &[u8]) -> usize {
+    left.iter().zip(right).filter(|(a, b)| a != b).count()
+}
+
+/// 4-byte little-endian fields of two ST1 images that differ, as
+/// `(offset, before, after)`.  This says which committed fields the live input
+/// moved without asserting a layout the gate has not read.
+fn changed_fields(before: &[u8], after: &[u8]) -> Vec<(usize, i32, i32)> {
+    let end = before.len().min(after.len());
+    (0..end.saturating_sub(3))
+        .step_by(4)
+        .filter_map(|offset| {
+            let a = i32_at(before, offset);
+            let b = i32_at(after, offset);
+            (a != b).then_some((offset, a, b))
+        })
+        .collect()
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let argv: Vec<String> = env::args().collect();
+    let mut args = argv.iter().skip(1).cloned();
+    let image = PathBuf::from(args.next().ok_or(
+        "usage: live_input_gate IMAGE IMAGE_SHA MANIFEST MANIFEST_SHA CAPTURE RESOURCE CONTROLLER RECEIPT [--profile NAME] [--tics N] [--advance-tics N] [--frames-at a,b,c] [--starve-state-cursor N]",
+    )?)
+    .canonicalize()?;
+    let expected_image = args.next().ok_or("missing image SHA")?;
+    let manifest = PathBuf::from(args.next().ok_or("missing manifest")?).canonicalize()?;
+    let expected_manifest = args.next().ok_or("missing manifest SHA")?;
+    let capture_dir = PathBuf::from(args.next().ok_or("missing capture")?).canonicalize()?;
+    let resource_path = PathBuf::from(args.next().ok_or("missing resource")?).canonicalize()?;
+    let controller_path = PathBuf::from(args.next().ok_or("missing controller")?).canonicalize()?;
+    let receipt = PathBuf::from(args.next().ok_or("missing receipt")?);
+    let mut profile = "r8l-move".to_owned();
+    let mut tics = 5_400u32;
+    let mut advance_tics = 4u32;
+    let mut frames_at: Vec<u32> = vec![5_040, 5_076, 5_112];
+    let mut starve_cursor = 2_048u32;
+    while let Some(flag) = args.next() {
+        let mut value = || -> Result<String, Box<dyn Error>> {
+            args.next().ok_or_else(|| format!("{flag} needs a value").into())
+        };
+        match flag.as_str() {
+            "--profile" => profile = value()?,
+            "--tics" => tics = value()?.parse()?,
+            "--advance-tics" => advance_tics = value()?.parse()?,
+            "--frames-at" => {
+                frames_at = value()?
+                    .split(',')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| part.parse::<u32>())
+                    .collect::<Result<Vec<u32>, _>>()?
+            }
+            "--starve-state-cursor" => starve_cursor = value()?.parse()?,
+            other => return Err(format!("unknown flag {other}").into()),
+        }
+    }
+    if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
+        return Err("receipt directory is not empty".into());
+    }
+    fs::create_dir_all(&receipt)?;
+    let inputs = receipt.join("inputs");
+    fs::create_dir_all(&inputs)?;
+
+    let image_bytes = base::read(&image)?;
+    let manifest_bytes = base::read(&manifest)?;
+    if base::sha(&image_bytes) != expected_image || base::sha(&manifest_bytes) != expected_manifest {
+        return Err("image/manifest identity mismatch".into());
+    }
+    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+    if manifest_json["profile"] != "sim-transport" || manifest_json["sbf"] != true {
+        return Err("image manifest is not the sim-transport SBF profile".into());
+    }
+    if !sim2::ABI_DESCRIPTOR.contains("ADVANCE/5")
+        || !sim2::ABI_DESCRIPTOR.contains("unconsumed-tic-refused")
+    {
+        return Err("the driver does not carry the ADVANCE/5 receipt rule".into());
+    }
+    if !manifest_json["render_snapshot_v3_abi_descriptor"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("SNAPSHOT-LIVE/3")
+    {
+        return Err("image manifest does not carry the live render path".into());
+    }
+    if !manifest_json["resource_ri2_sbf_abi_descriptor"]
+        .as_str()
+        .unwrap_or_default()
+        .contains(&format!("context={}", resource_sbf::CONTEXT_BYTES))
+    {
+        return Err("image manifest context size is not the driver's".into());
+    }
+    fs::write(inputs.join("doom_sbf.so"), &image_bytes)?;
+    fs::write(inputs.join("doom_ex2_source_manifest.json"), &manifest_bytes)?;
+    env::set_var("BPF_OUT_DIR", image.parent().ok_or("image has no parent")?);
+    env::set_var("SBF_OUT_DIR", image.parent().ok_or("image has no parent")?);
+
+    let capture_data = Capture::load(&capture_dir, &resource_path)?;
+    let controller = base::read(&controller_path)?;
+    let (commands, _) = common::input_commands(&profile, tics as usize)?;
+    let (neutral, _) = common::input_commands("neutral", tics as usize)?;
+    fs::write(receipt.join("commands.bin"), &commands)?;
+    let first_tic = base::u32_at(&capture_data.state, 20);
+    let capture_cursor = base::u32_at(&capture_data.state, 24);
+    // The captured lump is the bound: past it there is no recorded ticcmd, so
+    // the controller ingress is the only thing that can drive a tic.
+    let demo_tics = capture_data.looped_demo_commands(tics as usize)?.1 as u32;
+    if demo_tics < 5_000 || demo_tics >= tics {
+        return Err(format!(
+            "captured DEMO1 carries {demo_tics} tics, which does not leave room in a {tics}-tic run"
+        )
+        .into());
+    }
+    if advance_tics == 0 || advance_tics > sim2::MAX_SWEEP_TICS {
+        return Err("--advance-tics is out of range".into());
+    }
+    for cursor in &frames_at {
+        if *cursor <= demo_tics || *cursor % advance_tics != 0 || *cursor > tics {
+            return Err(format!(
+                "frame cursor {cursor} must be past the {demo_tics}-tic demo end, on a {advance_tics}-tic boundary and inside the run"
+            )
+            .into());
+        }
+    }
+    if starve_cursor == 0 || starve_cursor >= demo_tics {
+        return Err("--starve-state-cursor must be inside the demo portion".into());
+    }
+
+    // --- host lockstep oracle ------------------------------------------------
+    // One resident session, stepped in lockstep with the chain: the chain's own
+    // per-tic contract, one ST1/MP1 pair resident instead of gigabytes.
+    let mut host = resource::NativeSimSession::open(
+        capture_data.wad_refs(),
+        &capture_data.resource,
+        &capture_data.state,
+    )
+    .map_err(|rc| format!("oracle session open rc={rc}"))?;
+    let initial_state = capture_data.state_account();
+    let (_, initial_root) = sim2::verified_state_root(&initial_state, &capture_data.mirror)
+        .map_err(|e| format!("initial state root: {e:?}"))?;
+    let mut host_state = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+    let mut host_mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
+
+    // --- 1. main context: STG/1, E2R/5, SIM/2 INIT ----------------------------
+    let keys = session_keys(Keypair::new());
+    let static_key = rsr::static_address(&base::PROGRAM).0;
+    let snapshot_key = rsn3::snapshot_address(&base::PROGRAM, &keys.context.pubkey()).0;
+    let bank = bank_with(
+        &capture_data,
+        keys.context.pubkey(),
+        keys.state.pubkey(),
+        keys.mirror.pubkey(),
+        keys.controller.pubkey(),
+        keys.authority.pubkey(),
+        Some((static_key, snapshot_key)),
+    );
+    let ctx = bank.start_with_context().await;
+    let mut session = Session {
+        ctx,
+        keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let capacity = sim2::DEFAULT_BUFFER_CAPACITY as u32;
+    let staged_state = capture_data.state_account();
+    let (phases, init_cu) = reconstruct(
+        &mut session,
+        &staged_state,
+        &capture_data.mirror,
+        &controller,
+        &capture_data,
+        capacity,
+    )
+    .await?;
+    // The input chain is seeded with the context key SIM/2 INIT binds, so the
+    // gate compares the chain the program actually commits.
+    let mut chain = sim2::chain_init(&session.keys.context.pubkey(), first_tic);
+    let authority = session.keys.authority.insecure_clone();
+    let state_signer = session.keys.state.insecure_clone();
+    let mirror_signer = session.keys.mirror.insecure_clone();
+    let buffer_signer = session.keys.buffer.insecure_clone();
+    let meta_key = session.keys.meta;
+
+    // --- 2. live-input sweeps, with the chain's own render at chosen cursors ---
+    let mut sweeps = fs::File::create(receipt.join("sweeps.jsonl"))?;
+    let mut advance_units: Vec<u64> = Vec::new();
+    let mut deposit_units: Vec<u64> = Vec::new();
+    let mut build_units: Vec<u64> = Vec::new();
+    let mut render_rows: Vec<serde_json::Value> = Vec::new();
+    let mut position_rows: Vec<serde_json::Value> = Vec::new();
+    let mut st1_at_demo_end: Option<(u32, Vec<u8>)> = None;
+    let mut chain_states: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut chain_frames: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut strips_written = 0usize;
+    let mut equal_sweeps = 0usize;
+    let mut first_past_demo = None;
+    let mut cursor = 0u32;
+    let mut sent = 0usize;
+    let started = Instant::now();
+    let mut static_built = false;
+    while cursor < tics {
+        let first = cursor;
+        let last = (cursor + advance_tics).min(tics);
+        let count = (last - first) as usize;
+        let deposit = session.deposit_ix(first, &commands[first as usize * 4..last as usize * 4]);
+        let deposited = session
+            .send(vec![deposit], &[&authority], base::NORMAL_LIMIT)
+            .await?;
+        if deposited.result.is_err() {
+            return Err(format!("deposit {first}+{count}: {:?}", deposited.result).into());
+        }
+        deposit_units.push(base::units(&deposited)?);
+        session.cursor_before = first;
+        let advance = session.advance_ix(sim2::ADVANCE_STARVED, count as u32);
+        let result = session
+            .send(vec![advance], &[&authority], base::NORMAL_LIMIT)
+            .await?;
+        if result.result.is_err() {
+            return Err(format!(
+                "ADVANCE/5 refused live input at cursor {first} after {sent} sweeps: {:?}",
+                result.result
+            )
+            .into());
+        }
+        sent += 1;
+        let units = base::units(&result)?;
+        advance_units.push(units);
+        let view = session.view().await?;
+        if view.cursor != last {
+            return Err(format!(
+                "ADVANCE/5 committed cursor {} for the batch {first}..{last}",
+                view.cursor
+            )
+            .into());
+        }
+        for seq in first..last {
+            let command: [u8; 4] = commands[seq as usize * 4..seq as usize * 4 + 4]
+                .try_into()
+                .unwrap();
+            let rc = host.step(&command);
+            if rc != 0 {
+                return Err(format!("host ingress starved at tic {seq} rc={rc}").into());
+            }
+            chain = sim2::chain_step(&chain, seq, &command);
+        }
+        host.publish(&mut host_state, &mut host_mirror)
+            .map_err(|rc| format!("host publish at {last}: rc={rc}"))?;
+        let state = session.data(state_signer.pubkey()).await?;
+        let mirror = session.data(mirror_signer.pubkey()).await?;
+        let (checked, root) = sim2::verified_state_root(&state, &mirror)
+            .map_err(|e| format!("chain state root at {last}: {e:?}"))?;
+        if state != host_state
+            || mirror != host_mirror
+            || checked != base::u32_at(&state, 16) as usize
+            || root != view.state_root
+            || view.input_chain != chain
+        {
+            return Err(format!(
+                "SBF state at {last} differs from the host ingress: st1={} mp1={} root={} chain={}",
+                state == host_state,
+                mirror == host_mirror,
+                root == view.state_root,
+                view.input_chain == chain
+            )
+            .into());
+        }
+        equal_sweeps += 1;
+        writeln!(
+            sweeps,
+            "{}",
+            json!({
+                "before": first,
+                "after": last,
+                "advance_tics": count,
+                "cu": units,
+                "st1_sha256": base::sha(&state),
+                "mp1_sha256": base::sha(&mirror),
+                "state_root": common::hex(&root),
+                "input_chain": common::hex(&chain),
+                "gametic": base::u32_at(&state, 20),
+                "demo_cursor": base::u32_at(&state, 24),
+                "equal_to_host_ingress": true,
+            })
+        )?;
+        // The demo end is 5,026 tics and the batches are 4 tics, so the
+        // boundary at or just before it is what the past-the-end rows compare
+        // against: the state the player held when the recorded stream ran out.
+        if last <= demo_tics {
+            st1_at_demo_end = Some((last, state.clone()));
+        }
+        if first_past_demo.is_none() && last > demo_tics {
+            first_past_demo = Some(last);
+        }
+        if frames_at.contains(&last) {
+            if !static_built {
+                for chunk in 0..=rsr::BUILD_FINAL_CURSOR {
+                    let ix = session.static_ix(static_key, chunk);
+                    let built = session.send(vec![ix], &[], RENDER_LIMIT).await?;
+                    if built.result.is_err() {
+                        return Err(format!("RSR/2 BUILD {chunk}: {:?}", built.result).into());
+                    }
+                    build_units.push(base::units(&built)?);
+                }
+                let header = session.data(static_key).await?;
+                if header[rsr::HEADER_OFFSET..rsr::HEADER_OFFSET + 8] != *rsr::MAGIC {
+                    return Err("static BUILD did not write a valid RSR/2 header".into());
+                }
+                static_built = true;
+            }
+            // The chain's own render.  SNAPSHOT-LIVE takes the context
+            // read-only, so nothing here can move the committed cursor; the
+            // host frame is taken after the sweep, in its own session, because
+            // `R_RenderPlayerView` is not a pure read of the committed ST1.
+            let request = rsn3::SnapshotRequest {
+                cursor: last,
+                state_root: root,
+            };
+            let ix = session.snapshot_live_ix(static_key, snapshot_key, request);
+            let snap = session.send(vec![ix], &[], RENDER_LIMIT).await?;
+            if snap.result.is_err() {
+                return Err(format!("SNAPSHOT-LIVE at {last}: {:?}", snap.result).into());
+            }
+            let snapshot_units = base::units(&snap)?;
+            let snapshot_bytes = session.data(snapshot_key).await?;
+            let snapshot = rsn3::validate_snapshot(&snapshot_bytes)?;
+            if snapshot.cursor != last || snapshot.state_root != root {
+                return Err(format!("SNAPSHOT-LIVE at {last} does not bind the committed cursor").into());
+            }
+            let directory = receipt.join(format!("strips/cursor-{last:05}"));
+            fs::create_dir_all(&directory)?;
+            let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
+            let mut strip_units = Vec::new();
+            let mut strip_equal = 0usize;
+            for strip_id in 0..8u8 {
+                let request = rsr::Request::render(strip_id, last, snapshot.snapshot_hash);
+                let ix = session.render_ix(static_key, snapshot_key, strip_id, request);
+                let rendered = session.send(vec![ix], &[], RENDER_LIMIT).await?;
+                if rendered.result.is_err() {
+                    return Err(format!("RENDER strip {strip_id} at {last}: {:?}", rendered.result).into());
+                }
+                strip_units.push(base::units(&rendered)?);
+                let key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, strip_id).0;
+                let strip_bytes = session.data(key).await?;
+                let strip = rsn3::validate_strip(&strip_bytes)?;
+                if strip.cursor != last || strip.state_root != root {
+                    return Err(format!("strip {strip_id} at {last} does not bind the cursor").into());
+                }
+                strip_equal += usize::from(strip.strip_id == u32::from(strip_id));
+                for row in 0..200 {
+                    let from = row * 40;
+                    let to = row * 320 + usize::from(strip_id) * 40;
+                    reconstructed[to..to + 40].copy_from_slice(&strip.pixels[from..from + 40]);
+                }
+                fs::write(directory.join(format!("strip-{strip_id}.px8")), &strip.pixels)?;
+                strips_written += 1;
+            }
+            fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
+            let (segment, forward, strafe) = common::r8l_segment(last - 1);
+            let (demo_end_cursor, base_state) = st1_at_demo_end
+                .clone()
+                .ok_or("the run never committed a cursor at or before the demo end")?;
+            let changed = changed_fields(&base_state, &state);
+            let chain_frame_sha = base::sha(&reconstructed);
+            chain_frames.push((last, reconstructed));
+            chain_states.push((last, state.clone()));
+            let bytes_changed = base_state
+                .iter()
+                .zip(&state)
+                .filter(|(a, b)| a != b)
+                .count();
+            position_rows.push(json!({
+                "cursor": last,
+                "tics_past_demo_end": last - demo_tics,
+                "compared_against_cursor": demo_end_cursor,
+                "input_segment": segment,
+                "segment_moves_forward": forward,
+                "segment_strafes": strafe,
+                "st1_changed_fields_vs_demo_end": changed.len(),
+                "st1_changed_bytes_vs_demo_end": bytes_changed,
+                "first_changed_fields": changed.iter().take(8).map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after})).collect::<Vec<_>>(),
+                "chain_frame_sha256": chain_frame_sha,
+            }));
+            render_rows.push(json!({
+                "cursor": last,
+                "tics_past_demo_end": last - demo_tics,
+                "snapshot_live_cu": snapshot_units,
+                "strip_cu": strip_units.clone(),
+                "strip_cu_max": strip_units.iter().max(),
+                "strips_well_formed": strip_equal,
+                "chain_frame_sha256": chain_frame_sha,
+            }));
+        }
+        cursor = last;
+    }
+    sweeps.flush()?;
+    let sweep_seconds = started.elapsed().as_secs_f64();
+    if position_rows.iter().all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0)) {
+        return Err("the ST1 image did not change past the demo end".into());
+    }
+    if chain_frames.len() < 2 {
+        return Err("fewer than two rendered cursors past the demo end".into());
+    }
+
+    // --- 2b. the host frame at each rendered cursor ---------------------------
+    // One fresh session per cursor: `R_RenderPlayerView` moves committed ST1
+    // bytes, so a replay that rendered at an earlier cursor could not stand in
+    // for the chain at a later one.  The perturbation is measured, not hidden.
+    let mut previous_frame: Option<(u32, Vec<u8>)> = None;
+    for (index, (at, chain_frame)) in chain_frames.iter().enumerate() {
+        let chain_state = &chain_states[index].1;
+        let (frame, moved_st1) = host_frame_at(&capture_data, &commands, *at)?;
+        let directory = receipt.join(format!("strips/cursor-{at:05}"));
+        fs::write(directory.join("host-frame.fb1"), &frame)?;
+        let mut strip_equal = 0usize;
+        for strip_id in 0..8u8 {
+            let bytes =
+                fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
+            if bytes == slice_frame(&frame, usize::from(strip_id)) {
+                strip_equal += 1;
+            }
+        }
+        let equal = chain_frame == &frame;
+        let differing = previous_frame
+            .as_ref()
+            .map(|(cursor, previous)| {
+                json!({
+                    "from_cursor": cursor,
+                    "differing_pixels": differing_pixels(previous, &frame),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        // The null control: the same capture and cursors with every staged
+        // command zeroed, so whatever the live-input run changed in committed
+        // state and in the view is attributable to the input and not to the
+        // level clock.
+        let (neutral_frame, _) = host_frame_at(&capture_data, &neutral, *at)?;
+        fs::write(directory.join("neutral-frame.fb1"), &neutral_frame)?;
+        let (neutral_state, _) = host_state_at(&capture_data, &neutral, *at)?;
+        let neutral_fields = changed_fields(&neutral_state, chain_state);
+        let mut movers: Vec<(usize, i32, i32)> = neutral_fields.clone();
+        movers.sort_by_key(|(_, before, after)| -i64::from(after.wrapping_sub(*before)).abs());
+        render_rows[index]["neutral_control"] = json!({
+            "frame_differing_pixels": differing_pixels(&neutral_frame, &frame),
+            "committed_st1_differing_bytes": neutral_state
+                .iter()
+                .zip(&chain_states[index].1[..neutral_state.len()])
+                .filter(|(a, b)| a != b)
+                .count(),
+            "committed_st1_differing_fields": neutral_fields.len(),
+            "largest_field_moves": movers.iter().take(6).map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after})).collect::<Vec<_>>(),
+        });
+        render_rows[index]["strips_equal_to_host_pixels"] = json!(strip_equal);
+        render_rows[index]["host_frame_sha256"] = json!(base::sha(&frame));
+        render_rows[index]["reassembled_equals_host"] = json!(equal);
+        render_rows[index]["host_render_moved_committed_st1_bytes"] = json!(moved_st1);
+        render_rows[index]["differing_pixels_from_previous_cursor"] = differing;
+        if index > 0 {
+            let (previous_cursor, previous_state) = &chain_states[index - 1];
+            render_rows[index]["st1_changed_fields_from_previous_cursor"] = json!({
+                "from_cursor": previous_cursor,
+                "fields": changed_fields(previous_state, &chain_states[index].1)
+                    .iter()
+                    .take(8)
+                    .map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after}))
+                    .collect::<Vec<_>>(),
+                "field_count": changed_fields(previous_state, &chain_states[index].1).len(),
+            });
+        }
+        if strip_equal != 8 || !equal {
+            return Err(format!(
+                "the chain frame at {at} is not the host frame: strips {strip_equal}/8, frame equal {equal}"
+            )
+            .into());
+        }
+        previous_frame = Some((*at, frame));
+    }
+
+    // --- 3. the deliberately starved tic, and why it cannot be staged -------
+    // `DoomControllerConsumed()` reads zero exactly when G_Ticker ran with no
+    // console player in the game, and that is the only way a tic runs without
+    // consuming the command it was armed with: the pre-tic guard already
+    // refuses a pending gameaction, a non-level gamestate, a paused tic and a
+    // reborn player, and ArmV2 always arms.  The state codec then closes the
+    // last door: `ds_scan_state` requires playeringame[consoleplayer], so no
+    // ST1 image a context can be reconstructed from is starved either.  The
+    // gate measures both halves of that instead of asserting it: the host
+    // import refuses the doctored image, and so does E2R/5 on the image.
+    let (source_state, source_mirror) = host_state_at(&capture_data, &commands, starve_cursor)?;
+    if i32_at(&source_state, common::ST1_GAMESTATE_OFFSET) != common::GAMESTATE_LEVEL {
+        return Err("the starved control needs a GS_LEVEL state".into());
+    }
+    let console_player = i32_at(&source_state, common::ST1_CONSOLEPLAYER_OFFSET);
+    let flags: [u8; 4] = source_state[common::ST1_PLAYERINGAME_OFFSET
+        ..common::ST1_PLAYERINGAME_OFFSET + 4]
+        .try_into()
+        .unwrap();
+    if flags != [1, 0, 0, 0] {
+        return Err(format!(
+            "unexpected playeringame bytes {flags:?} at offset {}",
+            common::ST1_PLAYERINGAME_OFFSET
+        )
+        .into());
+    }
+    let mut starved_state = source_state.clone();
+    starved_state[common::ST1_PLAYERINGAME_OFFSET + console_player as usize] = 0;
+    let host_unmodified = host_import_and_step(&capture_data, &source_state)?;
+    let host_starved = host_import_and_step(&capture_data, &starved_state)?;
+    fs::write(receipt.join("starved.st1"), &starved_state)?;
+    fs::write(receipt.join("starved-source.st1"), &source_state)?;
+    if host_unmodified != 0 {
+        return Err(format!("the unmodified state did not run a consumed tic: {host_unmodified}").into());
+    }
+    if host_starved >= 0 {
+        return Err(format!(
+            "the host import accepted a state with no console player in the game (step rc={host_starved})"
+        )
+        .into());
+    }
+
+    // The same doctored image, reconstructed by the image under test.
+    let starve_keys = session_keys(Keypair::new());
+    let starve_bank = bank_with(
+        &capture_data,
+        starve_keys.context.pubkey(),
+        starve_keys.state.pubkey(),
+        starve_keys.mirror.pubkey(),
+        starve_keys.controller.pubkey(),
+        starve_keys.authority.pubkey(),
+        None,
+    );
+    let starve_state_signer = starve_keys.state.pubkey();
+    let starve_ctx = starve_bank.start_with_context().await;
+    let mut starve = Session {
+        ctx: starve_ctx,
+        keys: starve_keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let starve_authority = starve.keys.authority.insecure_clone();
+    let starve_context_signer = starve.keys.context.insecure_clone();
+    let starve_gametic = base::u32_at(&source_state, 20);
+    let starve_controller = controller_for_gametic(&controller, starve_gametic)?;
+    let starve_state_signer_kp = starve.keys.state.insecure_clone();
+    let starve_mirror_signer_kp = starve.keys.mirror.insecure_clone();
+    let starve_controller_signer_kp = starve.keys.controller.insecure_clone();
+    let staged_starved = base::padded_state(&starved_state);
+    starve.stage_account(&starve_state_signer_kp, &staged_starved).await?;
+    starve.stage_account(&starve_mirror_signer_kp, &source_mirror).await?;
+    starve
+        .stage_account(&starve_controller_signer_kp, &starve_controller)
+        .await?;
+    let starve_continuation = Keypair::new();
+    create_owned(
+        &mut starve.ctx,
+        &starve_continuation,
+        continuation_split_sbf::CONTINUATION_BYTES,
+        Rent::default().minimum_balance(continuation_split_sbf::CONTINUATION_BYTES),
+    )
+    .await?;
+    // The reconstruction is eight phases; the decode lives in one of them, so
+    // the refusal is wherever it lands.  Every phase is sent and the first
+    // refusal is recorded.
+    let starved_state_len = starved_state.len();
+    let mut starve_refusal = None;
+    let mut starve_phase_cu = Vec::new();
+    for cursor in 0..E2R_PHASES {
+        let operation = if cursor == 0 {
+            continuation_split_sbf::PREPARE
+        } else {
+            continuation_split_sbf::STEP
+        };
+        let ix = starve.e2r_ix(starve_continuation.pubkey(), operation, cursor, starved_state_len);
+        let signers: Vec<&Keypair> = if cursor == 0 {
+            vec![&starve_authority, &starve_context_signer]
+        } else {
+            vec![&starve_authority]
+        };
+        let result = starve.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        starve_phase_cu.push(base::units(&result)?);
+        if result.result.is_err() {
+            starve_refusal = Some((cursor, format!("{:?}", result.result)));
+            break;
+        }
+    }
+    let prepare_code = starve_refusal.as_ref().and_then(|(cursor, text)| {
+        custom_code_text(cursor, text)
+    });
+    if starve_refusal.is_none() {
+        return Err("E2R/5 reconstructed a state with no console player in the game".into());
+    }
+    if starve.data(starve_state_signer).await? != staged_starved {
+        return Err("the refused reconstruction changed the staged ST1".into());
+    }
+
+    // The same PREPARE from the unmodified state is accepted, so the refusal
+    // is the state and not the packet.
+    let good_keys = session_keys(Keypair::new());
+    let good_bank = bank_with(
+        &capture_data,
+        good_keys.context.pubkey(),
+        good_keys.state.pubkey(),
+        good_keys.mirror.pubkey(),
+        good_keys.controller.pubkey(),
+        good_keys.authority.pubkey(),
+        None,
+    );
+    let good_state_signer = good_keys.state.pubkey();
+    let good_ctx = good_bank.start_with_context().await;
+    let mut good = Session {
+        ctx: good_ctx,
+        keys: good_keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let good_authority = good.keys.authority.insecure_clone();
+    let good_context_signer = good.keys.context.insecure_clone();
+    let good_state_signer = good.keys.state.pubkey();
+    let (good_phases, good_init_cu) = reconstruct(
+        &mut good,
+        &base::padded_state(&source_state),
+        &source_mirror,
+        &controller_for_gametic(&controller, starve_gametic)?,
+        &capture_data,
+        capacity,
+    )
+    .await?;
+    // The good context really does run live-input tics, with the receipt
+    // checked on every one of them.
+    let good_batch = &commands[..advance_tics as usize * 4];
+    let good_deposit = good
+        .send(
+            vec![good.deposit_ix(0, good_batch)],
+            &[&good_authority],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    if good_deposit.result.is_err() {
+        return Err(format!("control DEPOSIT {:?}", good_deposit.result).into());
+    }
+    good.cursor_before = 0;
+    let good_advance = good
+        .send(
+            vec![good.advance_ix(sim2::ADVANCE_STARVED, advance_tics)],
+            &[&good_authority],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    if good_advance.result.is_err() {
+        return Err(format!(
+            "ADVANCE/5 refused a good first batch: {:?}",
+            good_advance.result
+        )
+        .into());
+    }
+    let good_view = good.view().await?;
+    if good_view.cursor != advance_tics {
+        return Err("the control context did not commit its first batch".into());
+    }
+    let _ = (good_state_signer, good_init_cu, good_context_signer);
+    let controls = json!({
+        "starved_tic_is_unreachable_from_a_reconstructable_state": {
+            "why": "G_Ticker consumes the armed command for every player in the game; the pre-tic guard refuses a pending gameaction, a non-level gamestate, paused and a reborn player, and ArmV2 always arms.  ds_scan_state then requires playeringame[consoleplayer], so no importable ST1 starves either.",
+            "playeringame_offset": common::ST1_PLAYERINGAME_OFFSET,
+            "console_player": console_player,
+            "playeringame_bytes": flags,
+            "host_import_and_step_unmodified": host_unmodified,
+            "host_import_and_step_starved": host_starved,
+            "host_starved_is_a_refused_import": host_starved < 0,
+            "e2r5_prepare_refusal_code": prepare_code,
+            "staged_state_unchanged_after_refusal": true,
+        },
+        "unmodified_state_reconstructs_and_runs_live_input": {
+            "e2r5_phase_cu": good_phases,
+            "advance5_first_batch_cursor": good_view.cursor,
+            "advance5_first_batch_cu": base::units(&good_advance)?,
+        },
+        "advance5_on_the_image": {
+            "operation_byte": sim2::ADVANCE_STARVED,
+            "sweeps": sent,
+            "tics": tics,
+            "refusals": 0,
+        },
+    });
+
+    // --- 4. receipts -----------------------------------------------------------
+    let final_state = session.data(state_signer.pubkey()).await?;
+    let final_mirror = session.data(mirror_signer.pubkey()).await?;
+    let final_view = session.view().await?;
+    fs::write(receipt.join("final-state.st1"), &final_state)?;
+    fs::write(receipt.join("final-mirror.mp1"), &final_mirror)?;
+    fs::write(receipt.join("final-meta.bin"), &session.data(meta_key).await?)?;
+    let mut sorted = advance_units.clone();
+    sorted.sort_unstable();
+    let report = json!({
+        "status": "measured",
+        "gate": "DOOM-SIM/2 (d) live input past the captured DEMO1 end, SBF ProgramTest prefer_bpf(true)",
+        "network_calls": 0,
+        "image_sha256": base::sha(&image_bytes),
+        "manifest_sha256": base::sha(&manifest_bytes),
+        "manifest_source_commit": manifest_json["compile_source_commit"],
+        "manifest_source_tree": manifest_json["compile_source_tree"],
+        "driver_source_sha256": base::sha(DRIVER_SOURCE),
+        "capture": capture_dir.display().to_string(),
+        "resource_sha256": base::sha(&capture_data.resource),
+        "controller_sha256": base::sha(&controller),
+        "input_profile": profile,
+        "tics": tics,
+        "advance_tics": advance_tics,
+        "sweeps_sent": sent,
+        "sweeps_equal_to_host_ingress": equal_sweeps,
+        "captured_demo_tics": demo_tics,
+        "captured_demo_cursor_at_capture": capture_cursor,
+        "first_cursor_past_demo_end": first_past_demo,
+        "tics_past_demo_end": tics - demo_tics,
+        "final_cursor": final_view.cursor,
+        "final_state_root": common::hex(&final_view.state_root),
+        "final_input_chain": common::hex(&final_view.input_chain),
+        "final_st1_sha256": base::sha(&final_state),
+        "final_mp1_sha256": base::sha(&final_mirror),
+        "initial_state_root": common::hex(&initial_root),
+        "e2r5_phase_cu": phases,
+        "sim2_init_cu": init_cu,
+        "deposit_transactions": deposit_units.len(),
+        "deposit_cu_max": deposit_units.iter().max(),
+        "advance_cu_min": sorted.first(),
+        "advance_cu_median": sorted.get(sorted.len() / 2),
+        "advance_cu_max": sorted.last(),
+        "sweep_wall_seconds": sweep_seconds,
+        "sweeps_per_second": sent as f64 / sweep_seconds,
+        "tics_per_second_including_renders": tics as f64 / sweep_seconds,
+        "rsr2_build_transactions": build_units.len(),
+        "rsr2_build_cu_max": build_units.iter().max(),
+        "render": render_rows,
+        "strips_written": strips_written,
+        "position": position_rows,
+        "controls": controls,
+        "host_ingress": "resource::NativeSimSession::step, the chain per-tic contract verbatim (pre-tic guard, DoomControllerArmV2, G_Ticker, gametic++, DOOM-CI3 receipt), locked to the same staged commands",
+        "frame_oracle": "host session.frame(): the same R_RenderPlayerView the chain strips call",
+        "abi": {
+            "sim2": sim2::ABI_DESCRIPTOR,
+            "advance_starved": sim2::ADVANCE_STARVED,
+            "refuse_unconsumed_input": sim2::REFUSE_UNCONSUMED_INPUT,
+        },
+        "command_line": argv,
+        "sources": common::driver_identity(&[
+            ("driver/src/bin/live_input_gate.rs", DRIVER_SOURCE),
+            ("driver/src/sweep_common.rs", SWEEP_COMMON_SOURCE),
+        ]),
+    });
+    common::write_json(&receipt.join("summary.json"), &report)?;
+    common::write_json(
+        &receipt.join("identity.json"),
+        &json!({
+            "image": image.display().to_string(),
+            "image_sha256": base::sha(&image_bytes),
+            "manifest": manifest.display().to_string(),
+            "manifest_sha256": base::sha(&manifest_bytes),
+            "commands_sha256": base::sha(&commands),
+            "starved_st1_sha256": base::sha(&starved_state),
+            "source_tree": manifest_json["compile_source_tree"],
+        }),
+    )?;
+    let _ = buffer_signer;
+    println!(
+        "DOOM-SIM/2 gate (d) measured: {tics} tics in {sent} ADVANCE/5 sweeps of {advance_tics}, \
+         all {equal_sweeps} equal to the host ingress, 0 refusals; first cursor past the \
+         {demo_tics}-tic demo end {first_past_demo:?}; {} frames 8/8 strips byte exact; a state \
+         with no console player in the game is refused at E2R/5 (Custom {prepare_code:?}) and by \
+         the host import, so a 288 cannot be staged; receipt={}",
+        strips_written / 8,
+        receipt.display()
+    );
+    Ok(())
+}

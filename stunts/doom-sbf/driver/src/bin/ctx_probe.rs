@@ -30,7 +30,7 @@ const PREFIX: Pubkey = Pubkey::new_from_array([0xac; 32]);
 /// M1021: first account data at a fixed layout.
 const PINNED_ADDR: u64 = 0x4000_0006_0;
 /// Host-measured sizeof(doom_ctx_t) (see CTX_MIN_BYTES).
-const CTX_STRUCT_BYTES: usize = 3_440_920;
+const CTX_STRUCT_BYTES: usize = 3_440_952;
 
 const V1: u64 = 0x0123_4567_89ab_cdef;
 const V2: u64 = 0xfedc_ba98_7654_3210;

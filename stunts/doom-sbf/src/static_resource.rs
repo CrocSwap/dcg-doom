@@ -258,6 +258,81 @@ pub fn static_address(program: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[STATIC_SEED, &WAD_HASH], program)
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::CTX_MIN_BYTES;
+    use resource_sbf::{ALLOC_ALIGNMENT, WAD_IMAGE_BYTES as WAD_IMAGE_BYTES_LEN};
+
+    /// The static resource PDA is derived from the program, so it survives an
+    /// image upgrade, and BOOTSTRAP_OFFSET is derived from `CTX_MIN_BYTES`.
+    /// When a patch grows `doom_ctx_t` the header moves, and the two operations
+    /// that could re-head the account -- REBUILD/4 and BUILD cursor 0 -- both
+    /// read the header at the *current* offset.  A static resource built by the
+    /// previous image therefore has bytes where the new header must be, and
+    /// neither operation can clear them: REBUILD/4 refuses 303 because they
+    /// are not magic, BUILD/0 refuses 303 because they are not zero.
+    ///
+    /// This is a one-way door on a program-derived account, measured on testnet
+    /// (both refusals at the same static PDA, image ecea41a8), so it is pinned
+    /// here rather than left to be rediscovered.
+    #[test]
+    fn a_header_move_makes_the_static_resource_a_one_way_door() {
+        // The header lives exactly at the end of the WAD staging image, rounded
+        // up to the allocator's alignment.  WAD_IMAGE_BYTES is 4 mod 16, so the
+        // rounding is a real 12-byte step and not a no-op that happens to hold.
+        assert_eq!(HEADER_OFFSET % ALLOC_ALIGNMENT, 0);
+        assert_eq!(CTX_MIN_BYTES % ALLOC_ALIGNMENT, 0);
+        assert_ne!(WAD_IMAGE_BYTES_LEN % ALLOC_ALIGNMENT, 0);
+        let unaligned = CTX_MIN_BYTES + WAD_IMAGE_BYTES_LEN;
+        assert_eq!(HEADER_OFFSET, (unaligned + ALLOC_ALIGNMENT - 1) / ALLOC_ALIGNMENT * ALLOC_ALIGNMENT);
+        assert_eq!(ACCOUNT_BYTES, resource_sbf::CONTEXT_BYTES);
+
+        // A grown doom_ctx_t moves the header; the 32-byte case is the one that
+        // actually happened, and it must not be silently absorbed.
+        let previous = HEADER_OFFSET - 32;
+        assert_eq!(previous % ALLOC_ALIGNMENT, 0);
+        assert_ne!(previous, HEADER_OFFSET);
+
+        // A previous image's resource: a full 512-byte built header at the old
+        // offset.  The new offset is 32 bytes *into* that header, so what it
+        // reads is the old header's tail followed by the first 32 bytes of the
+        // bootstrap -- neither of which is a header, and neither of which is
+        // zero.  The old header is built in its own buffer because the two
+        // regions overlap.
+        let mut old_header = vec![0u8; HEADER_BYTES];
+        old_header[..8].copy_from_slice(MAGIC);
+        put_u32(&mut old_header, 8, VERSION);
+        put_u32(&mut old_header, H_BOOTSTRAP_OFFSET, previous as u32);
+        put_u32(&mut old_header, H_BUILD_NEXT, BUILD_FINAL_CURSOR);
+        let mut account = vec![0u8; ACCOUNT_BYTES];
+        account[previous..previous + HEADER_BYTES].copy_from_slice(&old_header);
+        let header = &account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+        assert_eq!(&header[..8], &old_header[32..40]);
+        assert_ne!(&header[..8], MAGIC, "a stale tail is not a header magic");
+        assert!(
+            &header[..8] != MAGIC || u32_at(header, 8) != VERSION,
+            "a stale header must not satisfy REBUILD/4's built-header gate"
+        );
+
+        // BUILD cursor 0's gate: the header at the current offset must be all
+        // zero.  A previous image's header leaves the tail non-zero.
+        assert!(
+            header.iter().any(|byte| *byte != 0),
+            "a stale header must not satisfy BUILD cursor 0's zero-header gate"
+        );
+    }
+
+    /// The static account's own length is `ACCOUNT_BYTES`, and a growth beyond
+    /// that is refused, so the account can be grown into a new layout but never
+    /// shrunk back out of one.
+    #[test]
+    fn the_static_account_grows_into_a_layout_and_cannot_shrink_out() {
+        assert_eq!(ACCOUNT_BYTES, 9_734_160);
+        assert!(ACCOUNT_BYTES > 0);
+    }
+}
+
 fn process_init(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     const STATIC: usize = 0;
     const PAYER: usize = 1;
