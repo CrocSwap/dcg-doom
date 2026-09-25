@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Doom running on Fogo. Frames are rendered on chain in eight strip accounts; the browser only paints what it reads.">
+  <title>Doom on Fogo</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%2304090d'/%3E%3Crect x='3' y='5' width='4' height='4' fill='%234de6ff'/%3E%3Crect x='9' y='5' width='4' height='4' fill='%23ffb45e'/%3E%3Crect x='3' y='11' width='4' height='3' fill='%236ee7ac'/%3E%3Crect x='9' y='11' width='4' height='3' fill='%23a875ff'/%3E%3C/svg%3E">
+  <script>
+    // Blocking, before first paint, so a stored light theme does not flash dark.
+    (function () {
+      try {
+        var stored = localStorage.getItem("doom-play.theme");
+        var theme = stored === "light" || stored === "dark"
+          ? stored
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        document.documentElement.dataset.theme = theme;
+      } catch (error) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">BARANOS <span>//</span> DOOM ON FOGO</div>
+    <div class="run-stamp">
+      <span class="network-badge" id="network-badge">—</span>
+      <span id="commitment-stamp">—</span>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch between dark and light">◐</button>
+    </div>
+  </header>
+
+  <section class="panel session" aria-labelledby="session-title">
+    <header class="panel-heading">
+      <div><span>01</span><h2 id="session-title">SESSION</h2></div>
+      <strong id="session-state">NO RELAYER</strong>
+    </header>
+    <div class="session-body">
+      <div class="session-cell"><span>BURNER KEY</span><strong id="burner-key">—</strong></div>
+      <div class="session-cell"><span>SLOT</span><strong id="slot-cell">—</strong></div>
+      <div class="session-cell"><span>INPUTS SENT</span><strong id="inputs-sent">0</strong></div>
+      <div class="session-cell"><span>INPUT LATENCY</span><strong id="input-latency">—</strong></div>
+    </div>
+    <div class="session-controls">
+      <label for="relayer-url">RELAYER</label>
+      <input id="relayer-url" type="url" placeholder="http://localhost:8787" spellcheck="false" autocomplete="off">
+      <label for="buffer-select">BUFFER</label>
+      <select id="buffer-select">
+        <option value="0" selected>BUFFER 0</option>
+        <option value="1">BUFFER 1</option>
+      </select>
+      <button id="join" class="primary" type="button">JOIN</button>
+      <button id="leave" type="button" disabled>LEAVE</button>
+    </div>
+    <p class="burner-note">
+      <b>THROWAWAY TEST KEY.</b>
+      The page made the key above in this tab and kept it in localStorage. It signs input batches and nothing else. There is no wallet extension and no connect button. Anyone can read that key, so do not put anything of value behind it: the relayer pays every fee and the amounts are tiny.
+    </p>
+  </section>
+
+  <main class="play-grid">
+    <section class="panel stage" aria-labelledby="stage-title">
+      <header class="panel-heading">
+        <div><span>02</span><h2 id="stage-title">DOOM</h2></div>
+        <strong id="stage-state">READING TESTNET</strong>
+      </header>
+      <div class="screen">
+        <canvas id="doom-canvas" width="320" height="200" aria-label="Doom frame rendered on chain"></canvas>
+        <span class="stage-badge" id="stage-badge">RENDERED ON CHAIN</span>
+      </div>
+      <div class="statusbar" aria-label="Frame status">
+        <div class="status-cell"><span>TIC</span><strong id="stat-tic">—</strong></div>
+        <div class="status-cell"><span>FPS</span><strong id="stat-fps">—</strong></div>
+        <div class="status-cell"><span>CHAIN SLOT</span><strong id="stat-slot">—</strong></div>
+        <div class="status-cell"><span>COMMITMENT</span><strong id="stat-commitment">—</strong></div>
+        <div class="status-cell"><span>RENDERED ON CHAIN</span><a id="stat-explorer" href="#" target="_blank" rel="noopener">—</a></div>
+      </div>
+      <div class="status-foot">
+        <span id="foot-frame">no frame yet</span>
+        <span>320×200 · 8 strips of 40 columns · one palette index per pixel</span>
+      </div>
+      <div class="pad" aria-label="Touch controls">
+        <button class="up" type="button" data-key="forward" aria-label="Move forward">▲</button>
+        <button class="use" type="button" data-key="use" aria-label="Use">USE</button>
+        <button class="fire" type="button" data-key="attack" aria-label="Fire">FIRE</button>
+        <button class="left" type="button" data-key="left" aria-label="Turn left">◀</button>
+        <button class="right" type="button" data-key="right" aria-label="Turn right">▶</button>
+        <button class="back" type="button" data-key="back" aria-label="Move back">▼</button>
+        <button class="run" type="button" data-key="run" aria-label="Run">RUN</button>
+      </div>
+    </section>
+
+    <aside class="panel rail" aria-labelledby="rail-title">
+      <header class="panel-heading">
+        <div><span>03</span><h2 id="rail-title">ON CHAIN</h2></div>
+        <strong id="rail-state">—</strong>
+      </header>
+      <dl class="readout">
+        <div><dt>PROGRAM</dt><dd id="chain-program">—</dd></div>
+        <div><dt>CONTEXT</dt><dd id="chain-context">—</dd></div>
+        <div><dt>SNAPSHOT</dt><dd id="chain-snapshot">—</dd></div>
+        <div><dt>SNAPSHOT HASH</dt><dd id="chain-snapshot-hash">—</dd></div>
+        <div><dt>STATE ROOT</dt><dd id="chain-state-root">—</dd></div>
+        <div><dt>FRAME SHA-256</dt><dd id="chain-frame-sha">—</dd></div>
+        <div><dt>INPUT CAPACITY</dt><dd id="chain-capacity">—</dd></div>
+      </dl>
+      <div class="section-label"><span>STRIP ACCOUNTS</span><strong id="strip-summary">0 / 8</strong></div>
+      <div class="strip-grid" id="strip-grid" aria-label="Per-strip digest status"></div>
+      <p class="hint" id="spectator-hint">
+        <b>SPECTATING.</b> No relayer, so this page only reads. The R8i context spent all
+        <span id="hint-capacity">6016</span> of its input slots, and the deployed image refuses
+        extend-capacity, so it cannot host a new session. To play, point RELAYER at a relayer
+        holding a fresh context.
+      </p>
+    </aside>
+  </main>
+
+  <div id="error" class="error" role="alert" hidden></div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

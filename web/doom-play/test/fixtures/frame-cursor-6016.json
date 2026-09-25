@@ -1,0 +1,16 @@
+{
+  "note": "Real R8i strip accounts read from Fogo testnet on 2026-09-25, in strip order 0..7, concatenated. The .bin.gz holds all eight 8128-byte accounts back to back. The numbers below are what the decoder must reproduce; they also appear in the R8i receipts at out/runs/doom-r8i-20260925/s5-strip64/frames.jsonl.",
+  "source": "web/doom-play/network.js testnet doom.strips[0]",
+  "cursor": 6016,
+  "gametic": 6016,
+  "buffer": 0,
+  "context": "9kmADZit1MbcEJ2iej61QQBQnZZWM7w1gaPV4ZrtsTBd",
+  "snapshot": "HvsYLMSa9fpSu78zxf7WJHPXMLqPJBBPzwZL2A1musuX",
+  "snapshotSignature": "G8Tgbjg3sxKeM1UgpqdtmbhAWAsYiKrN3qDNoN85QrggzjJjE2W7mUwuB6cpJpwK2ic3CNqyXPk29B2HYDeTvgY",
+  "snapshotHash": "3d0f8c8d9769ca81af2af5a10685dcad782c50a24cece4ebee2c923db9d718c5",
+  "stateRoot": "c848d0b519955ea621433d34477f5f2eac2b9ade4bbec50a2c4406f2ec72febb",
+  "frameSha256": "79402398a69b03ca686ff608aa98dad476c970394845b09730fa2c02ce12dfeb",
+  "stripsSha256": "6e86e11960c28131197fde7ec415264047d1dd1bf062a11bf032a2b98ae8c2d1",
+  "distinctPaletteIndices": 92,
+  "frame": "frame-buffer-0-cursor-06016.fb1"
+}
