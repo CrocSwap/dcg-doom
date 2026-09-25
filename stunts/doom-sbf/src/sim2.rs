@@ -835,7 +835,9 @@ pub fn validate_meta(meta: &[u8], keys: &SweepKeys, checkpoint: &[u8]) -> Progra
 ///
 /// `require_consumed` is ADVANCE/5.  When it is set, a tic the engine did not
 /// consume is `REFUSE_UNCONSUMED_INPUT` rather than a committed tic; when it
-/// is clear (ADVANCE/3, ADVANCE/4) the tic counts, unchanged.
+/// is clear (ADVANCE/3, ADVANCE/4) the step is counted, and the tic check then
+/// refuses 284 instead, because DOOM-CI3 stops the real engine's `gametic++`
+/// before a consumed tic exists.  Either way a starved tic is not committed.
 #[allow(clippy::too_many_arguments)]
 pub fn sweep(
     meta: &mut [u8],
@@ -1897,8 +1899,8 @@ mod tests {
     /// the domain, the context binding, or the step encoding fails here instead
     /// of quietly redefining what "the same chain" means.
     const GOLDEN_CHAIN_AFTER_FOUR: [u8; 32] = [
-        0x1d, 0xed, 0x37, 0xcb, 0x9b, 0x5a, 0xda, 0x0f, 0x2c, 0x1a, 0x70, 0xb2, 0x27, 0xe5, 0xd1, 0x0a,
-        0x60, 0xfa, 0x14, 0xd3, 0x24, 0x01, 0x6d, 0x95, 0xf6, 0xd4, 0x3b, 0xbf, 0xc0, 0x93, 0x57, 0x5e,
+        0x1d, 0xed, 0x37, 0xcb, 0x9b, 0x5a, 0xda, 0x0f, 0x2c, 0x1a, 0x70, 0xb2, 0x27, 0x6e, 0x5d, 0x10,
+        0xa6, 0x0f, 0xa1, 0x4d, 0x32, 0x40, 0x16, 0xd9, 0x5f, 0x6d, 0x43, 0xbb, 0xfc, 0x09, 0x35, 0x75,
     ];
 
     /// The pinned vector has to be the one the function actually produces, and
@@ -1990,13 +1992,20 @@ mod tests {
     /// post-publish tic check then sees a cursor that has run ahead of gametic
     /// and refuses 284.  A starved tic is uncommittable under every opcode;
     /// ADVANCE/5 only names the refusal earlier, with 288 instead of 284.
+    ///
+    /// The 284 refusal lands *after* the publish, so in this harness the ST1
+    /// bytes are already changed.  That is exactly why the refusal has to be a
+    /// whole-instruction ProgramError: on chain Solana rolls those writes back
+    /// with the rest of the instruction, and a unit test has no such rollback.
+    /// What is assertable here is that nothing was *committed* -- meta cursor,
+    /// chain and state root are untouched -- and that the published gametic is
+    /// the one that proves the mismatch.
     #[test]
     fn advance3_also_refuses_a_tic_with_no_consumed_command() {
-        for starve_from in [Some(0), Some(3)] {
+        for (starve_from, ran_tics) in [(Some(0), 0), (Some(3), 3)] {
             let mut g = golden();
             let meta_before = g.meta.clone();
             let state_before = g.state.clone();
-            let mirror_before = g.mirror.clone();
             let mut engine = MockEngine::new(starve_from);
             let result = sweep(
                 &mut g.meta,
@@ -2011,10 +2020,20 @@ mod tests {
                 &NoBudget,
             );
             assert_eq!(result, Err(refuse(REFUSE_TIC)), "starve_from={starve_from:?}");
-            assert!(engine.published >= 1, "starve_from={starve_from:?}");
+            assert_eq!(engine.published, 1, "starve_from={starve_from:?}");
+            assert_eq!(engine.steps, 4, "starve_from={starve_from:?}");
+            assert_eq!(engine.advanced, ran_tics, "starve_from={starve_from:?}");
+            // Nothing was committed: no cursor, no chain, no state root.
             assert_eq!(g.meta, meta_before, "starve_from={starve_from:?}");
-            assert_eq!(g.state, state_before, "starve_from={starve_from:?}");
-            assert_eq!(g.mirror, mirror_before, "starve_from={starve_from:?}");
+            assert_eq!(u32_at(&g.meta, M_CURSOR), 0, "starve_from={starve_from:?}");
+            // The engine published a gametic that is short of the cursor the
+            // sweep counted, which is the whole cause of the 284.
+            assert_eq!(
+                u32_at(&g.state, 20),
+                ran_tics,
+                "starve_from={starve_from:?}"
+            );
+            assert_ne!(g.state, state_before, "starve_from={starve_from:?}");
         }
     }
 
