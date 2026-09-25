@@ -1594,8 +1594,11 @@ int doom_engine_rsn3_render_static(
         return RI2_REFUSE_ARENA;
     PROF_EXIT(DOOM_SBF_PROF_REBIND, 1);
     transient_mark = doom_sbf_arena_mark();
+    PROF_ENTER(DOOM_SBF_PROF_RSN3_APPLY, 1);
     rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
+    PROF_EXIT(DOOM_SBF_PROF_RSN3_APPLY, 1);
     if (rc) return rc;
+    PROF_ENTER(DOOM_SBF_PROF_FRAME_SETUP, 1);
     frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
     if (!frame) return RI2_REFUSE_OUTPUT;
     screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES;
@@ -1609,7 +1612,18 @@ int doom_engine_rsn3_render_static(
     pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true;
+#ifdef DOOM_SBF_RENDER_FULLWIDTH
+    /* Diagnostic-only: no clip at all, so this strip's CU is the whole frame's
+     * render cost.  The extraction below still takes this strip's 40 columns,
+     * and with nothing clipped the framebuffer holds the full native frame, so
+     * the 8-of-8 native pixel gate still holds.  That is the point: it turns
+     * the scene-once note's extrapolated full-width scene pass into a measured
+     * one without touching the render path. */
+    doom_render_fuzz_columns = 0u;
+#else
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
+#endif
+    PROF_EXIT(DOOM_SBF_PROF_FRAME_SETUP, 1);
     PROF_EXIT(DOOM_SBF_PROF_FIXED_PRE, 0);
     R_RenderPlayerView(&players[displayplayer]);
     PROF_ENTER(DOOM_SBF_PROF_FIXED_POST, 0);
