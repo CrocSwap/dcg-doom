@@ -829,7 +829,10 @@ pub trait Budget {
 /// so a reset cannot install a pool that disagrees with the state it claims to
 /// describe.
 pub trait ResetEngine {
-    fn reset(&mut self, state: &[u8], mirror: &mut [u8]) -> Result<(), u32>;
+    /// `state` is the whole state account and `state_len` its encoded length,
+    /// which is what the C entry shape-checks: the image is the encoded
+    /// prefix, and the account tail is zero.
+    fn reset(&mut self, state: &[u8], state_len: usize, mirror: &mut [u8]) -> Result<(), u32>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1115,7 +1118,7 @@ pub fn reset(
         sol_memset(&mut state[state_len..], 0, tail);
     }
     crate::diagnostic_phase(926);
-    engine.reset(state, mirror).map_err(refuse)?;
+    engine.reset(state, state_len, mirror).map_err(refuse)?;
     crate::diagnostic_phase(927);
     let (checked, root) = verified_state_root(state, mirror)?;
     if checked != state_len || meta[M_START_ROOT..M_START_ROOT + 32] != root[..] {
@@ -1347,12 +1350,12 @@ impl Engine for ResidentEngine {
 
 impl ResetEngine for ResidentEngine {
     #[cfg(target_os = "solana")]
-    fn reset(&mut self, state: &[u8], mirror: &mut [u8]) -> Result<(), u32> {
+    fn reset(&mut self, state: &[u8], state_len: usize, mirror: &mut [u8]) -> Result<(), u32> {
         match unsafe {
             doom_sbf_sim2_reset(
                 self.context,
                 state.as_ptr(),
-                state.len(),
+                state_len,
                 mirror.as_mut_ptr(),
                 mirror.len(),
             )
@@ -1363,7 +1366,7 @@ impl ResetEngine for ResidentEngine {
     }
 
     #[cfg(not(target_os = "solana"))]
-    fn reset(&mut self, _state: &[u8], _mirror: &mut [u8]) -> Result<(), u32> {
+    fn reset(&mut self, _state: &[u8], _state_len: usize, _mirror: &mut [u8]) -> Result<(), u32> {
         Err(244)
     }
 }
@@ -2483,7 +2486,7 @@ mod tests {
     }
 
     impl ResetEngine for MockReset {
-        fn reset(&mut self, _state: &[u8], mirror: &mut [u8]) -> Result<(), u32> {
+        fn reset(&mut self, _state: &[u8], _state_len: usize, mirror: &mut [u8]) -> Result<(), u32> {
             self.resets += 1;
             if let Some(code) = self.refuse {
                 return Err(code);
