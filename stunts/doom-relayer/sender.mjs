@@ -293,8 +293,8 @@ export class MockSender {
 //   advance        SIM2 ADVANCE, optionally expected-cursor bound.
 //                  doom_sweep_testnet.py:1454 (advance_ix).
 //   snapshot       RSN/3 SNAPSHOT-LIVE into the buffer's snapshot account.
-//                  doom_r8b_tokyo_pipeline.py:973 (snapshot_instruction).
-//   renderStrip    RENDER for one strip id.  doom_r8b_tokyo_pipeline.py:987
+//                  doom_r8b_tokyo_pipeline.py:1015 (snapshot_instruction).
+//   renderStrip    RENDER for one strip id.  doom_r8b_tokyo_pipeline.py:1029
 //                  (strip_instruction).
 //   longLived      NEW. A way to keep one context advancing from an external
 //                  source of commands. `run` today takes --seconds and a
@@ -311,8 +311,8 @@ export const PIPELINE_REQUIREMENTS = {
   existing: {
     deposit: "scripts/doom_sweep_testnet.py:1450 deposit_ix",
     advance: "scripts/doom_sweep_testnet.py:1454 advance_ix",
-    snapshot: "scripts/doom_r8b_tokyo_pipeline.py:973 FramePipeline.snapshot_instruction",
-    renderStrip: "scripts/doom_r8b_tokyo_pipeline.py:987 FramePipeline.strip_instruction",
+    snapshot: "scripts/doom_r8b_tokyo_pipeline.py:1015 FramePipeline.snapshot_instruction",
+    renderStrip: "scripts/doom_r8b_tokyo_pipeline.py:1029 FramePipeline.strip_instruction",
   },
   missing: {
     longLived: "a command source the relayer can push signed batches into, with a stable cursor binding",

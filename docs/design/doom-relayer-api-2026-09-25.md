@@ -165,10 +165,10 @@ the player wants.
 program as deployed:
 
 1. `process_init` refuses to initialise a meta it already owns
-   (`stunts/doom-sbf/src/sim2.rs:1243-1245`, refusal `275`). There is no
+   (`stunts/doom-sbf/src/sim2.rs:1243-1244`, refusal `REFUSE_ALREADY_INIT` = 275 at `sim2.rs:187`). There is no
    in-place SIM2 reset.
 2. `M_HALT` is latched into the meta and, once set, every later sweep returns
-   `Stop::Halted` without touching state (`sim2.rs:837-840`). A halted
+   `Stop::Halted` without touching state (`sim2.rs:837-838`, `report.stop = Stop::Halted`). A halted
    context is permanently dead, and a player will eventually pause or
    finish a level.
 3. `EXTEND-CAPACITY` is refused by the deployed image: the operation exists in
@@ -188,7 +188,7 @@ dance, not a recycle.
 1. **Ship the `capacity-extension` feature.** The code is written and the
    growth arithmetic is already bounded: one instruction grows the buffer by at
    most `MAX_BUFFER_GROWTH` = 10,240 bytes, which is 1,280 slots
-   (`sim2.rs:475-481`). The default and maximum buffer capacity is 65,536 slots
+   (`sim2.rs:477-481`). The default and maximum buffer capacity is 65,536 slots
    (`sim2.rs:91-99`). From 6,016 slots to 65,536 is about 47 growth
    instructions. At 35 tics/s, 65,536 slots is about 31 minutes. This is the
    smallest change that gets to the 30-minute target, and it is a feature
@@ -226,8 +226,8 @@ Four of the five operations already exist somewhere in the tree:
 |---|---|
 | `deposit` | `scripts/doom_sweep_testnet.py:1450` `deposit_ix` |
 | `advance` | `scripts/doom_sweep_testnet.py:1454` `advance_ix` |
-| `snapshot` | `scripts/doom_r8b_tokyo_pipeline.py:973` `snapshot_instruction` |
-| `renderStrip` | `scripts/doom_r8b_tokyo_pipeline.py:987` `strip_instruction` |
+| `snapshot` | `scripts/doom_r8b_tokyo_pipeline.py:1015` `snapshot_instruction` |
+| `renderStrip` | `scripts/doom_r8b_tokyo_pipeline.py:1029` `strip_instruction` |
 | `longLived` | **missing** |
 
 `longLived` is the blocker. `run` today takes `--seconds` and drives a scripted
