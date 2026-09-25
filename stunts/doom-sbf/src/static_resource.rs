@@ -262,7 +262,7 @@ pub fn static_address(program: &Pubkey) -> (Pubkey, u8) {
 mod layout_tests {
     use super::*;
     use crate::CTX_MIN_BYTES;
-    use resource_sbf::ALLOC_ALIGNMENT;
+    use resource_sbf::{ALLOC_ALIGNMENT, WAD_IMAGE_BYTES as WAD_IMAGE_BYTES_LEN};
 
     /// The static resource PDA is derived from the program, so it survives an
     /// image upgrade, and BOOTSTRAP_OFFSET is derived from `CTX_MIN_BYTES`.
@@ -278,12 +278,14 @@ mod layout_tests {
     /// here rather than left to be rediscovered.
     #[test]
     fn a_header_move_makes_the_static_resource_a_one_way_door() {
-        // The header lives exactly at the end of the WAD staging image.
+        // The header lives exactly at the end of the WAD staging image, rounded
+        // up to the allocator's alignment.  WAD_IMAGE_BYTES is 4 mod 16, so the
+        // rounding is a real 12-byte step and not a no-op that happens to hold.
         assert_eq!(HEADER_OFFSET % ALLOC_ALIGNMENT, 0);
-        assert_eq!(
-            HEADER_OFFSET,
-            CTX_MIN_BYTES + resource_sbf::WAD_IMAGE_BYTES,
-        );
+        assert_eq!(CTX_MIN_BYTES % ALLOC_ALIGNMENT, 0);
+        assert_ne!(WAD_IMAGE_BYTES_LEN % ALLOC_ALIGNMENT, 0);
+        let unaligned = CTX_MIN_BYTES + WAD_IMAGE_BYTES_LEN;
+        assert_eq!(HEADER_OFFSET, (unaligned + ALLOC_ALIGNMENT - 1) / ALLOC_ALIGNMENT * ALLOC_ALIGNMENT);
         assert_eq!(ACCOUNT_BYTES, resource_sbf::CONTEXT_BYTES);
 
         // A grown doom_ctx_t moves the header; the 32-byte case is the one that
