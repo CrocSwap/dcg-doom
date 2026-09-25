@@ -475,7 +475,7 @@ mod clear_tests {
             clear_static_header(&key, &program, &program, &mut account),
             Ok(())
         );
-        assert!(account[header].iter().all(|byte| *byte == 0));
+        assert!(account[header.clone()].iter().all(|byte| *byte == 0));
     }
 
     /// The gate is the whole safety argument: a resource that passes
