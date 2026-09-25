@@ -483,6 +483,7 @@ unsafe extern "C" {
         mirror_cap: usize,
     ) -> i32;
     fn doom_resource_sim_session_probe(out: *mut i64) -> i32;
+    fn doom_resource_sim_session_frame(out: *mut u8, cap: usize) -> i32;
     fn doom_resource_sim_session_close();
 }
 
@@ -536,7 +537,8 @@ impl NativeSimSession {
     }
 
     /// Returns the raw SIM/2 step code: 0 ran, 1..=5 halted before
-    /// `G_Ticker`, otherwise a refusal.
+    /// `G_Ticker`, 238 the tic ran without consuming the armed command,
+    /// otherwise a refusal.
     pub fn step(&mut self, command: &[u8; 4]) -> i32 {
         unsafe { doom_resource_sim_session_step(command.as_ptr()) }
     }
@@ -558,6 +560,19 @@ impl NativeSimSession {
             return Err(rc);
         }
         Ok(state_len)
+    }
+
+    /// The whole 320x200 player view at the resident gametic, row-major, the
+    /// same 64,000 bytes the eight chain strips reassemble.  The oracle
+    /// renders through the same `R_RenderPlayerView` the strips call, so this
+    /// is a pixel reference for the SBF renderer, not a second renderer.
+    pub fn frame(&mut self) -> Result<Vec<u8>, i32> {
+        let mut out = vec![0u8; FRAME_BYTES];
+        let rc = unsafe { doom_resource_sim_session_frame(out.as_mut_ptr(), out.len()) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        Ok(out)
     }
 
     pub fn probe(&self) -> SessionProbe {

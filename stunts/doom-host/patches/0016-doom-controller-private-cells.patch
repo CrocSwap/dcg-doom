@@ -1,0 +1,185 @@
+Subject: [PATCH 0016] Give the live controller its own context cells and a receipt
+
+The SBF image carried no writable static data, so the controller's host
+globals were relocated by build.rs onto three live Doom fields: the arm
+flags became D_AdvanceDemo's doom_sbf_demo_done and I_Error's
+doom_error_latched, and the staged command bytes became doom_ctx_probe_cell,
+which the state codec reads as ds_alloc_fail_after.  An engine terminal flag
+could therefore read as an armed command, and a staged neutral command
+(00 00 00 00) read as "fail the next decode allocation" once the cursor
+passed 0x00.  A consumer could not tell the two apart from the account.
+
+Patch 0007 is generated, so the fields are added by this patch instead:
+DOOM_SBF_PRIVATE_BYTES, a 32-byte doom_sbf_private region declared as the
+LAST member of doom_ctx_t.  The zone arena and every field offset above it
+are unchanged; only sizeof(doom_ctx_t) grows, 3440920 -> 3440952, which the
+program's account layout and ABI descriptors restate.  The region is five
+disjoint slices, each owned by exactly one translation unit:
+
+  [0..4)   int    controller state      doom_controller.c
+  [4..8)   byte   staged command        doom_controller.c
+  [8..12)  int    applied receipt       doom_controller.c
+  [16..24) long   decode alloc trigger  doom_state.c
+  [24..32) long   decode alloc counter  doom_state.c
+
+DOOM-CI3 v1 also merges the two arm flags into one state cell
+(IDLE/ARMED_V1/ARMED_V2), so a tic has one unambiguous ingress, and adds
+DoomControllerConsumed(): arming clears the receipt, applying sets it, and
+reading clears it.  A caller that arms every command can now require that
+G_Ticker consumed it and refuse the tic otherwise, instead of running a tic
+on whatever the engine already held.  g_game.c is unchanged: the receipt is
+set inside the controller, so the host DEMO1 replay and the chain share one
+G_Ticker.
+
+Applies on top of 0001-0015.
+
+--- a/linuxdoom-1.10/headless/doom_ctx.h
++++ b/linuxdoom-1.10/headless/doom_ctx.h
+@@ -39,6 +39,16 @@
+ /* Measured zone floor: 2 MiB fails the DEMO1 replay, 3 MiB
+  * completes all 5,026 tics with the golden stream (M1006). */
+ #define DOOM_ZONE_BYTES 3145728
++
++/* DOOM-SBF/1 private region, patch 0016.  Every mutable byte the SBF image
++ * needs that is not Doom engine state lives here, in disjoint slices, and
++ * nothing outside the platform layer reads or writes them.  Before 0016 the
++ * controller aliased three live globals instead (D_AdvanceDemo's
++ * doom_sbf_demo_done, I_Error's doom_error_latched, and the doom_ctx_probe_cell
++ * that the state codec reads as ds_alloc_fail_after), so an engine terminal
++ * flag could look like an armed command and a staged command could look like a
++ * decoder failure threshold. */
++#define DOOM_SBF_PRIVATE_BYTES 32
+ 
+ typedef struct doom_ctx_s {
+     unsigned long doom_ctx_probe_cell;
+@@ -462,6 +472,9 @@
+      * inherits only offset alignment from the struct layout, so
+      * the union pins 8-byte alignment on host and SBF alike. */
+     union { void *align_me; unsigned char bytes[DOOM_ZONE_BYTES]; } zone;
++    /* Last member on purpose: the zone arena and every field offset above are
++     * unchanged, so only sizeof(doom_ctx_t) grows. */
++    unsigned char doom_sbf_private[DOOM_SBF_PRIVATE_BYTES];
+ } doom_ctx_t;
+ 
+ void doom_ctx_init(void);
+@@ -884,6 +897,11 @@
+ #define save_p (DOOM_CTX->save_p)
+ #define netcmds (DOOM_CTX->netcmds)
+ #define player_names (DOOM_CTX->player_names)
++#define doom_sbf_controller_state ((int *)&DOOM_CTX->doom_sbf_private[0])
++#define doom_sbf_controller_command ((byte *)&DOOM_CTX->doom_sbf_private[4])
++#define doom_sbf_controller_applied ((int *)&DOOM_CTX->doom_sbf_private[8])
++#define doom_sbf_private_alloc_fail ((long *)&DOOM_CTX->doom_sbf_private[16])
++#define doom_sbf_private_alloc_calls ((long *)&DOOM_CTX->doom_sbf_private[24])
+ #define doom_error_latched (DOOM_CTX->doom_error_latched)
+ #define doom_sbf_demo_done (DOOM_CTX->doom_sbf_demo_done)
+ #define doom_render_fuzz_columns (DOOM_CTX->doom_render_fuzz_columns)
+--- a/linuxdoom-1.10/headless/doom_controller.c
++++ b/linuxdoom-1.10/headless/doom_controller.c
+@@ -45,9 +45,16 @@
+     return read_account(path, "DOOM-CI2", expected_gametic, out);
+ }
+ 
+-static int controller_armed;
+-static int controller_v2_armed;
++/* One armed command per tic, and a receipt the caller can read.  DOOM-CI3 v1
++ * replaces the two separate arm flags with one state cell so a single tic has
++ * a single, unambiguous ingress. */
++#define DOOM_CONTROLLER_IDLE 0
++#define DOOM_CONTROLLER_ARMED_V1 1
++#define DOOM_CONTROLLER_ARMED_V2 2
++
++static int controller_state;
+ static uint8_t controller_command[4];
++static int controller_applied;
+ static const uint8_t *captured_demo_begin;
+ static const uint8_t *captured_demo_end;
+ 
+@@ -66,7 +73,8 @@
+     if (!command)
+         return -1;
+     memcpy(controller_command, command, sizeof(controller_command));
+-    controller_armed = 1;
++    controller_state = DOOM_CONTROLLER_ARMED_V1;
++    controller_applied = 0;
+     return 0;
+ }
+ 
+@@ -90,26 +98,35 @@
+         || captured_demo_end < captured_demo_begin)
+         return -1;
+     memcpy(controller_command, command, sizeof(controller_command));
+-    controller_v2_armed = 1;
++    controller_state = DOOM_CONTROLLER_ARMED_V2;
++    controller_applied = 0;
+     return 0;
+ }
+ 
+ int DoomControllerApplyTiccmd(ticcmd_t *cmd)
+ {
+-    if (!controller_armed || !cmd)
++    if (controller_state != DOOM_CONTROLLER_ARMED_V1 || !cmd)
+         return 0;
+     apply_command(cmd);
+-    controller_armed = 0;
++    controller_state = DOOM_CONTROLLER_IDLE;
++    controller_applied = 1;
+     return 1;
+ }
+ 
++int DoomControllerConsumed(void)
++{
++    int applied = controller_applied;
++    controller_applied = 0;
++    return applied;
++}
++
+ int DoomControllerApplyTiccmdV2(ticcmd_t *cmd, uint8_t **cursor)
+ {
+-    if (!controller_v2_armed)
++    if (controller_state != DOOM_CONTROLLER_ARMED_V2)
+         return 0;
+ #ifdef DOOM_SIM2_UNBOUNDED_INPUT
+     if (!cmd || !cursor || !*cursor) {
+-        controller_v2_armed = 0;
++        controller_state = DOOM_CONTROLLER_IDLE;
+         return -1;
+     }
+     /* Continue accepting committed SIM/2 commands after DEMO1 ends. Keep
+@@ -117,17 +134,19 @@
+     if (!DoomControllerValidateCapturedDemoCursor(*cursor))
+         *cursor += 4;
+     apply_command(cmd);
+-    controller_v2_armed = 0;
++    controller_state = DOOM_CONTROLLER_IDLE;
++    controller_applied = 1;
+     return 1;
+ #else
+     if (!cmd || !cursor || !*cursor
+         || DoomControllerValidateCapturedDemoCursor(*cursor)) {
+-        controller_v2_armed = 0;
++        controller_state = DOOM_CONTROLLER_IDLE;
+         return -1;
+     }
+     *cursor += 4;
+     apply_command(cmd);
+-    controller_v2_armed = 0;
++    controller_state = DOOM_CONTROLLER_IDLE;
++    controller_applied = 1;
+     return 1;
+ #endif
+ }
+--- a/linuxdoom-1.10/headless/doom_controller.h
++++ b/linuxdoom-1.10/headless/doom_controller.h
+@@ -24,4 +24,11 @@
+ int DoomControllerArmV2(const uint8_t[4]);
+ int DoomControllerApplyTiccmdV2(ticcmd_t *, uint8_t **);
+ 
++/* DOOM-CI3 v1: arming a command clears the applied receipt, applying one sets
++ * it, and DoomControllerConsumed reads and clears it.  A caller that requires
++ * every G_Ticker to have consumed a command it armed reads the receipt after
++ * the ticker and refuses the tic when it is zero, instead of letting a tic run
++ * on whatever the engine already held. */
++int DoomControllerConsumed(void);
++
+ #endif

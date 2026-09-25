@@ -36,7 +36,7 @@ pub const SCRATCH_ACCOUNT: usize = 10;
 pub const FRAME_ACCOUNT: usize = 11;
 pub const ACCOUNT_COUNT: usize = 12;
 
-pub const CONTEXT_BYTES: usize = 3_440_920 + 24;
+pub const CONTEXT_BYTES: usize = 3_440_952 + 24;
 pub const CONFIG_BYTES: usize = 4_096;
 pub const WAD_ACCOUNT_BYTES: usize = 1_048_576;
 pub const LEVEL_BYTES: usize = 131_072;

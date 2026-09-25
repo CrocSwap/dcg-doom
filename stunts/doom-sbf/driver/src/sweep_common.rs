@@ -171,6 +171,7 @@ impl sim2::Engine for NativeEngine {
                 Ok(sim2::StepResult::Ran)
             }
             1..=5 => Ok(sim2::StepResult::Halt(rc as u8)),
+            238 => Ok(sim2::StepResult::Unconsumed),
             code => Err(code as u32),
         }
     }

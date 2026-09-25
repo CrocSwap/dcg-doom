@@ -1235,6 +1235,13 @@ int doom_sbf_sim2_step(uint8_t *context, const uint8_t *command,
     if (DoomControllerArmV2(command)) return 237;
     RI2_PHASE(901);
     G_Ticker();
+    /* DOOM-CI3: the tic only ran if G_Ticker consumed the command this step
+     * armed.  A tic that fell through to the demo stream, to a zeroed
+     * netcmds slot, or to no ingress at all is a refusal, not a silent tick:
+     * the caller turns 238 into a ProgramError, which fails the whole
+     * instruction and rolls the engine back, so a cursor is never committed
+     * over a tic the player did not receive. */
+    if (!DoomControllerConsumed()) return 238;
     gametic++;
     RI2_PHASE(902);
     if (doom_sbf_arena_exhausted()) return 239;

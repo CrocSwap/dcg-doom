@@ -21,12 +21,12 @@ const ENGINE_TUS: &[&str] = &[
 ];
 
 const ABI_DESCRIPTOR: &str = "DOOM-EX2/v2|header=256|little-endian|operation=TIC/2|schema=2|roles=12|state=ST1/v0|mirror=MP1/v1|controller=CI2/v1|frame=FB1/64000|role-map=00..0b";
-const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
-const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
-const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
-const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = "DOOM-RC3/1|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734128|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView|render=diagnostic-strip40-modes1-full-scene2-solidseg-clipped";
-const RENDER_SNAPSHOT_ABI_DESCRIPTOR: &str = "DOOM-RSN/2|operations=INIT/2+SNAPSHOT/2+RENDER/1|init=16:accounts=payer+meta+snapshot+system|snapshot=52:accounts=meta+ST1+MP1+snapshot|snapshot-PDA(DOOM-RENDER-SNAPSHOT/2,context):192704|render=52:accounts=scratch+RI2+WADx5+snapshot+strip|scratch=9734128|strip=8128|header=192|payload=ST1:126976+MP1:65536|wad=MP1[36..68]|resource-abi=RI2|root=SIM2(ST1,MP1-used)|hash=sha256|advance=unchanged";
-const RENDER_SNAPSHOT_V3_ABI_DESCRIPTOR: &str = "DOOM-RSN/3|operations=INIT/3+GROW/3+INIT-STRIP/3+SNAPSHOT/3+SNAPSHOT-LIVE/3+SNAPSHOT-LIVE-LATEST/6+RENDER/3|init=16:accounts=payer+meta+snapshot+system:zero-data|grow=16:accounts=snapshot+meta:commutative-10240|init-strip=16:accounts=strip+payer+snapshot+system|snapshot=52:accounts=scratch+meta+ST1+MP1+RI2+WADx5+snapshot|snapshot-live=52:accounts=context+meta+ST1+MP1+static+snapshot|snapshot-live-latest=52:accounts=context+meta+ST1+MP1+static+snapshot:cursor-root-read-at-execution|snapshot-PDA(DOOM-RENDER-SNAPSHOT/3,context):1048768|render=52:accounts=scratch+RI2+WADx5+snapshot+strip|render-static=52:accounts=static+snapshot+strip|scratch=9734128|strip=8128|header=192|payload=render-dynamic-v1(view+psprites+translations+sectors+sides+mobjs)|state=SIM2-root-pinned|wad=MP1[36..68]|resource-hash=RI2-image-sha256|render-no-ST1-decode|snapshot-live=resident-ADVANCE-context-no-reconstruction";
+const SBF_ABI_DESCRIPTOR: &str = "DOOM-E2S/1|instruction=24|operation=TIC/2|accounts=9|context=9734160|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=G_Ticker|frame=none";
+const RESOURCE_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/1|instruction=32|operation=TIC/2|accounts=10|resource=DOOM-RI1/1:197664|context=9734160|wad=5x1048576|state=126976|mirror=65536|controller=64|continuation=resource-import+G_Ticker|frame=none";
+const RESOURCE_RI2_SBF_ABI_DESCRIPTOR: &str = "DOOM-E2R/2|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734160|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView";
+const RESOURCE_RI3_SBF_ABI_DESCRIPTOR: &str = "DOOM-RC3/1|instruction=32|operation=TIC/2|accounts=11|resource=DOOM-RI2/2:334384|context=9734160|wad=5x1048576|state=126976|mirror=65536|controller=64|frame=64000|continuation=initialized-resource-import+G_Ticker+R_RenderPlayerView|render=diagnostic-strip40-modes1-full-scene2-solidseg-clipped";
+const RENDER_SNAPSHOT_ABI_DESCRIPTOR: &str = "DOOM-RSN/2|operations=INIT/2+SNAPSHOT/2+RENDER/1|init=16:accounts=payer+meta+snapshot+system|snapshot=52:accounts=meta+ST1+MP1+snapshot|snapshot-PDA(DOOM-RENDER-SNAPSHOT/2,context):192704|render=52:accounts=scratch+RI2+WADx5+snapshot+strip|scratch=9734160|strip=8128|header=192|payload=ST1:126976+MP1:65536|wad=MP1[36..68]|resource-abi=RI2|root=SIM2(ST1,MP1-used)|hash=sha256|advance=unchanged";
+const RENDER_SNAPSHOT_V3_ABI_DESCRIPTOR: &str = "DOOM-RSN/3|operations=INIT/3+GROW/3+INIT-STRIP/3+SNAPSHOT/3+SNAPSHOT-LIVE/3+SNAPSHOT-LIVE-LATEST/6+RENDER/3|init=16:accounts=payer+meta+snapshot+system:zero-data|grow=16:accounts=snapshot+meta:commutative-10240|init-strip=16:accounts=strip+payer+snapshot+system|snapshot=52:accounts=scratch+meta+ST1+MP1+RI2+WADx5+snapshot|snapshot-live=52:accounts=context+meta+ST1+MP1+static+snapshot|snapshot-live-latest=52:accounts=context+meta+ST1+MP1+static+snapshot:cursor-root-read-at-execution|snapshot-PDA(DOOM-RENDER-SNAPSHOT/3,context):1048768|render=52:accounts=scratch+RI2+WADx5+snapshot+strip|render-static=52:accounts=static+snapshot+strip|scratch=9734160|strip=8128|header=192|payload=render-dynamic-v1(view+psprites+translations+sectors+sides+mobjs)|state=SIM2-root-pinned|wad=MP1[36..68]|resource-hash=RI2-image-sha256|render-no-ST1-decode|snapshot-live=resident-ADVANCE-context-no-reconstruction";
 const NATIVE_PROVENANCE_PROFILE: &str =
     "DOOM-NATIVE-PROVENANCE/sweep_native+fresh_resume_probe/ctx-engine-host-release/2";
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
@@ -1565,7 +1565,11 @@ fn compile_ctx_engine(target: &str) {
             &tree,
             "headless/doom_state.c",
             "static long ds_alloc_fail_after = -1;\nstatic long ds_alloc_calls;",
-            "#ifdef DOOM_SBF_BUILD\n#undef doom_render_fuzz_columns\n#define ds_alloc_fail_after DOOM_CTX->doom_ctx_probe_cell\n#define ds_alloc_calls DOOM_CTX->doom_render_fuzz_columns\n#else\nstatic long ds_alloc_fail_after = -1;\nstatic long ds_alloc_calls;\n#endif",
+            // DOOM-SBF/1: the decoder's allocation-failure controls are host
+            // test controls.  On SBF they get two private cells of their own
+            // instead of sharing doom_render_fuzz_columns, which r_draw.c
+            // increments on the render path.
+            "#ifdef DOOM_SBF_BUILD\n#define ds_alloc_fail_after (*doom_sbf_private_alloc_fail)\n#define ds_alloc_calls (*doom_sbf_private_alloc_calls)\n#else\nstatic long ds_alloc_fail_after = -1;\nstatic long ds_alloc_calls;\n#endif",
             "doom_state_sbf.c",
         );
         // The retained decoder keeps a large fixed plan on the C stack. SBF
@@ -1848,8 +1852,16 @@ fn compile_ctx_engine(target: &str) {
             &out_dir,
             &tree,
             "headless/doom_controller.c",
-            "static int controller_armed;\nstatic int controller_v2_armed;\nstatic uint8_t controller_command[4];\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;",
-            "#endif\n#ifdef DOOM_SBF_BUILD\n#undef doom_sbf_demo_done\n#undef doom_error_latched\n#undef demobuffer\n#undef demoend\n#define controller_armed DOOM_CTX->doom_sbf_demo_done\n#define controller_v2_armed DOOM_CTX->doom_error_latched\n#define controller_command ((uint8_t *)&DOOM_CTX->doom_ctx_probe_cell)\n#define captured_demo_begin DOOM_CTX->demobuffer\n#define captured_demo_end DOOM_CTX->demoend\n#else\nstatic int controller_armed;\nstatic int controller_v2_armed;\nstatic uint8_t controller_command[4];\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;\n#endif",
+            "static int controller_state;\nstatic uint8_t controller_command[4];\nstatic int controller_applied;\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;",
+            // DOOM-CI3 v1: the controller's three cells are slices of the
+            // DOOM_SBF_PRIVATE_BYTES region patch 0016 adds to doom_ctx_t, so
+            // nothing else in the image writes them.  D_AdvanceDemo and
+            // I_Error keep their own latches and can no longer read as an
+            // armed command, and the state codec no longer reads a staged
+            // command as ds_alloc_fail_after.  captured_demo_begin/end stay
+            // aliased on demobuffer/demoend on purpose: those ARE the captured
+            // DEMO1 bounds, written only by the demo loader.
+            "#endif\n#ifdef DOOM_SBF_BUILD\n#undef demobuffer\n#undef demoend\n#define controller_state (*doom_sbf_controller_state)\n#define controller_command (doom_sbf_controller_command)\n#define controller_applied (*doom_sbf_controller_applied)\n#define captured_demo_begin DOOM_CTX->demobuffer\n#define captured_demo_end DOOM_CTX->demoend\n#else\nstatic int controller_state;\nstatic uint8_t controller_command[4];\nstatic int controller_applied;\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;\n#endif",
             "doom_controller_sbf.c",
         );
         // The retained controller source also contains the host filesystem

@@ -17,7 +17,11 @@
 //!   when the remaining compute would not cover another tic plus
 //!   publication), then derive ST1/MP1 once and commit the new cursor, state
 //!   root and input chain.  A future ADVANCE/4 that arrives out of order
-//!   refuses atomically.  A sweep that finds nothing staged is a cheap no-op.
+//!   refuses atomically.  ADVANCE/5 adds the DOOM-CI3 receipt rule: a staged
+//!   tic whose command the engine did not consume is refused (288) before any
+//!   cursor, chain or engine byte is committed, so a cursor is never advanced
+//!   over a tic the player did not receive.  A sweep that finds nothing staged
+//!   is a cheap no-op.
 //!   After INIT, ADVANCE is the only instruction that changes CONTEXT, STATE
 //!   or MIRROR bytes. EXTEND-CAPACITY may change only the bound input buffer's
 //!   capacity and the corresponding capacity field in META.
@@ -55,16 +59,21 @@ pub const GROW_BUFFER: u8 = 5;
 pub const ADVANCE_EXPECTED_CURSOR: u8 = 6;
 /// Extend a live input buffer and its bound meta by one bounded realloc.
 pub const EXTEND_CAPACITY: u8 = 7;
+/// ADVANCE/5: ADVANCE/4 plus the DOOM-CI3 receipt rule.  A staged tic whose
+/// command the engine did not consume is a refusal, not a tick, so a cursor is
+/// never committed over a tic the player did not receive.  ADVANCE/3 and /4
+/// keep their old meaning so a historical client stays reproducible.
+pub const ADVANCE_STARVED: u8 = 8;
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(feature = "legacy-5120-buffer")]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
@@ -196,6 +205,8 @@ pub const REFUSE_TIC: u32 = 284;
 pub const REFUSE_BUFFER_GROWTH: u32 = 285;
 pub const REFUSE_CURSOR_MISMATCH: u32 = 286;
 pub const REFUSE_CAPACITY_GROWTH: u32 = 287;
+/// ADVANCE/5: a staged tic ran without the engine consuming its command.
+pub const REFUSE_UNCONSUMED_INPUT: u32 = 288;
 
 pub const HALT_GAMESTATE: u8 = 1;
 pub const HALT_GAMEACTION: u8 = 2;
@@ -517,6 +528,22 @@ pub fn encode_advance_expected(expected_cursor: u32, max_tics: u32) -> Vec<u8> {
     out
 }
 
+/// Encode cursor-bound ADVANCE/5: ADVANCE/4 with the DOOM-CI3 receipt rule
+/// (a staged tic the engine did not consume is a refusal).
+pub fn encode_advance_starved(expected_cursor: u32, max_tics: u32) -> Vec<u8> {
+    let mut out = request_header(ADVANCE_STARVED).to_vec();
+    out.extend_from_slice(&expected_cursor.to_le_bytes());
+    out.extend_from_slice(&max_tics.to_le_bytes());
+    out
+}
+
+pub fn decode_advance_starved(data: &[u8]) -> Result<(u32, u32), ProgramError> {
+    if data.len() != ADVANCE_BYTES || !header_ok(data, ADVANCE_STARVED) {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    Ok((u32_at(data, 16), u32_at(data, 20)))
+}
+
 pub fn decode_advance_expected(data: &[u8]) -> Result<(u32, u32), ProgramError> {
     if data.len() != ADVANCE_BYTES || !header_ok(data, ADVANCE_EXPECTED_CURSOR) {
         return Err(refuse(REFUSE_MALFORMED));
@@ -705,6 +732,10 @@ pub fn deposit(
 pub enum StepResult {
     Ran,
     Halt(u8),
+    /// The tic ran, but the engine did not consume the command the caller
+    /// armed.  Only ADVANCE/5 refuses on this; ADVANCE/3 and /4 keep counting
+    /// it as a ran tic.
+    Unconsumed,
 }
 
 /// One resident engine: `step` runs one tic (or halts before it), `publish`
@@ -801,6 +832,10 @@ pub fn validate_meta(meta: &[u8], keys: &SweepKeys, checkpoint: &[u8]) -> Progra
 
 /// ADVANCE core.  Executes consecutive written slots from the committed
 /// cursor, then publishes ST1/MP1 once and commits the new cursor.
+///
+/// `require_consumed` is ADVANCE/5.  When it is set, a tic the engine did not
+/// consume is `REFUSE_UNCONSUMED_INPUT` rather than a committed tic; when it
+/// is clear (ADVANCE/3, ADVANCE/4) the tic counts, unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn sweep(
     meta: &mut [u8],
@@ -810,6 +845,7 @@ pub fn sweep(
     keys: &SweepKeys,
     checkpoint: &[u8],
     max_tics: u32,
+    require_consumed: bool,
     engine: &mut dyn Engine,
     budget: &dyn Budget,
 ) -> Result<SweepReport, ProgramError> {
@@ -880,6 +916,17 @@ pub fn sweep(
         }
         match engine.step(&command).map_err(refuse)? {
             StepResult::Ran => {
+                chain = chain_step(&chain, next, &command);
+                next += 1;
+                ran += 1;
+            }
+            // ADVANCE/5: refuse before the cursor, the chain, the state root
+            // or any engine byte is committed.  The instruction fails, so the
+            // tic the engine already ran is rolled back with it.
+            StepResult::Unconsumed if require_consumed => {
+                return Err(refuse(REFUSE_UNCONSUMED_INPUT));
+            }
+            StepResult::Unconsumed => {
                 chain = chain_step(&chain, next, &command);
                 next += 1;
                 ran += 1;
@@ -1088,6 +1135,7 @@ impl Engine for ResidentEngine {
         match unsafe { doom_sbf_sim2_step(self.context, command.as_ptr(), 4) } {
             0 => Ok(StepResult::Ran),
             code @ 1..=5 => Ok(StepResult::Halt(code as u8)),
+            238 => Ok(StepResult::Unconsumed),
             code => Err(code as u32),
         }
     }
@@ -1485,6 +1533,7 @@ fn process_advance(
     accounts: &[AccountInfo],
     data: &[u8],
     cursor_bound: bool,
+    require_consumed: bool,
 ) -> ProgramResult {
     let [context, state, mirror, meta, buffer, authority] = accounts else {
         return Err(refuse(REFUSE_ACCOUNTS));
@@ -1502,11 +1551,16 @@ fn process_advance(
     if !authority.is_signer {
         return Err(refuse(REFUSE_AUTHORITY));
     }
-    let (expected_cursor, requested_max_tics) = if cursor_bound {
-        let (expected, max_tics) = decode_advance_expected(data)?;
-        (Some(expected), max_tics)
-    } else {
-        (None, decode_advance(data)?)
+    let (expected_cursor, requested_max_tics) = match (cursor_bound, require_consumed) {
+        (true, true) => {
+            let (expected, max_tics) = decode_advance_starved(data)?;
+            (Some(expected), max_tics)
+        }
+        (true, false) => {
+            let (expected, max_tics) = decode_advance_expected(data)?;
+            (Some(expected), max_tics)
+        }
+        (false, _) => (None, decode_advance(data)?),
     };
     let max_tics = effective_max_tics(requested_max_tics);
     let checkpoint = read_checkpoint(context)?;
@@ -1542,6 +1596,7 @@ fn process_advance(
         },
         &checkpoint,
         max_tics,
+        require_consumed,
         &mut engine,
         &ComputeMeter,
     )?;
@@ -1587,8 +1642,9 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     match data[12] {
         INIT => process_init(program, accounts, data),
         DEPOSIT => process_deposit(program, accounts, data),
-        ADVANCE => process_advance(program, accounts, data, false),
-        ADVANCE_EXPECTED_CURSOR => process_advance(program, accounts, data, true),
+        ADVANCE => process_advance(program, accounts, data, false, false),
+        ADVANCE_EXPECTED_CURSOR => process_advance(program, accounts, data, true, false),
+        ADVANCE_STARVED => process_advance(program, accounts, data, true, true),
         SNAPSHOT => process_snapshot(program, accounts, data),
         #[cfg(not(feature = "legacy-5120-buffer"))]
         GROW_BUFFER => process_grow_buffer(program, accounts, data),
@@ -1678,6 +1734,252 @@ mod tests {
             decode_snapshot(&encode_snapshot(5, &[9; 32])),
             Ok((5, [9; 32]))
         );
+    }
+
+    // ---- ADVANCE/5 golden vectors and the unconsumed-tic control -------
+
+    const GOLDEN_COMMANDS: [[u8; 4]; 6] = [
+        [0x10, 0x00, 0x00, 0x00],
+        [0x00, 0x20, 0x00, 0x00],
+        [0x00, 0x00, 0x04, 0x01],
+        [0x00, 0x00, 0xfc, 0x00],
+        [0x08, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00],
+    ];
+
+    struct Golden {
+        meta: Vec<u8>,
+        buffer: Vec<u8>,
+        state: Vec<u8>,
+        mirror: Vec<u8>,
+        checkpoint: Vec<u8>,
+        keys: SweepKeys<'static>,
+    }
+
+    struct MockEngine {
+        ran: u32,
+        /// When set, every step returns `Unconsumed` instead of `Ran`.
+        starve: bool,
+        published: u32,
+    }
+
+    impl Engine for MockEngine {
+        fn step(&mut self, _command: &[u8; 4]) -> Result<StepResult, u32> {
+            self.ran += 1;
+            Ok(if self.starve {
+                StepResult::Unconsumed
+            } else {
+                StepResult::Ran
+            })
+        }
+        fn publish(&mut self, state: &mut [u8], _mirror: &mut [u8]) -> Result<usize, u32> {
+            self.published += 1;
+            // A publish must leave a shape-valid ST1 whose gametic advanced.
+            let len = u32_at(state, 16) as usize;
+            let gametic = u32_at(state, 20);
+            put_u32(state, 20, gametic + self.ran);
+            Ok(len)
+        }
+    }
+
+    struct NoBudget;
+    impl Budget for NoBudget {
+        fn remaining(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    fn golden() -> Golden {
+        let context = Pubkey::new_from_array([0xc0; 32]);
+        let state_key = Pubkey::new_from_array([0x51; 32]);
+        let mirror_key = Pubkey::new_from_array([0x52; 32]);
+        let buffer_key = Pubkey::new_from_array([0x53; 32]);
+        let meta_key = Pubkey::new_from_array([0x54; 32]);
+        let signer = Pubkey::new_from_array([0xa1; 32]);
+        let capacity = 64usize;
+
+        let mut state = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+        state[..8].copy_from_slice(b"DOOM-ST1");
+        put_u32(&mut state, 8, 0);
+        put_u32(&mut state, 12, 64);
+        put_u32(&mut state, 16, 64);
+        put_u32(&mut state, 20, 0);
+
+        let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
+        mirror[..8].copy_from_slice(b"DOOM-MP1");
+        put_u32(&mut mirror, 8, 1);
+        put_u32(&mut mirror, 12, MIRROR_HEADER_BYTES);
+        put_u32(&mut mirror, 16, resource_sbf::MIRROR_BYTES);
+        put_u32(&mut mirror, 20, MIRROR_SLOT_BYTES);
+        put_u32(&mut mirror, 24, MIRROR_SLOTS);
+        mirror[36..68].copy_from_slice(&WAD_HASH);
+        put_u32(&mut mirror, 28, 0);
+        put_u32(&mut mirror, 32, 0);
+
+        let mut buffer = vec![0u8; buffer_bytes(capacity).unwrap()];
+        buffer[..8].copy_from_slice(BUFFER_MAGIC);
+        put_u32(&mut buffer, 8, BUFFER_FORMAT_VERSION);
+        put_u32(&mut buffer, 12, BUFFER_HEADER_BYTES);
+        put_u32(&mut buffer, 16, buffer.len() as u32);
+        put_u32(&mut buffer, B_CAPACITY, capacity as u32);
+        put_u32(&mut buffer, B_FIRST_TIC, 0);
+        put_u32(&mut buffer, B_SLOT_BYTES, SLOT_BYTES as u32);
+        buffer[B_AUTHORITY..B_AUTHORITY + 32].copy_from_slice(signer.as_ref());
+        buffer[B_CONTEXT..B_CONTEXT + 32].copy_from_slice(context.as_ref());
+        buffer[B_META..B_META + 32].copy_from_slice(meta_key.as_ref());
+        deposit(&mut buffer, &signer, 0, &GOLDEN_COMMANDS[..4].concat()).unwrap();
+
+        let (state_len, root) = verified_state_root(&state, &mirror).unwrap();
+        let mut checkpoint = vec![0u8; CHECKPOINT_BYTES];
+        checkpoint[..8].copy_from_slice(continuation_split_sbf::CHECKPOINT_MAGIC);
+        put_u32(&mut checkpoint, 8, continuation_split_sbf::CHECKPOINT_VERSION);
+        put_u32(&mut checkpoint, 12, CHECKPOINT_PHASE_PUBLISHED);
+        put_u32(&mut checkpoint, 16, CHECKPOINT_CURSOR_PUBLISHED);
+        put_u32(&mut checkpoint, 84, 0);
+        put_u32(&mut checkpoint, 88, CHECKPOINT_OFFSET as u32);
+
+        let mut meta = vec![0u8; META_BYTES];
+        meta[..8].copy_from_slice(META_MAGIC);
+        put_u32(&mut meta, 8, VERSION);
+        put_u32(&mut meta, 12, META_BYTES as u32);
+        put_u32(&mut meta, 16, META_BYTES as u32);
+        put_u32(&mut meta, M_FIRST_TIC, 0);
+        put_u32(&mut meta, M_CURSOR, 0);
+        put_u32(&mut meta, M_STATE_LEN, state_len as u32);
+        put_u32(&mut meta, M_CAPACITY, capacity as u32);
+        meta[M_CONTEXT..M_CONTEXT + 32].copy_from_slice(context.as_ref());
+        meta[M_STATE..M_STATE + 32].copy_from_slice(state_key.as_ref());
+        meta[M_MIRROR..M_MIRROR + 32].copy_from_slice(mirror_key.as_ref());
+        meta[M_BUFFER..M_BUFFER + 32].copy_from_slice(buffer_key.as_ref());
+        meta[M_AUTHORITY..M_AUTHORITY + 32].copy_from_slice(signer.as_ref());
+        meta[M_STATE_ROOT..M_STATE_ROOT + 32].copy_from_slice(&root);
+        meta[M_INPUT_CHAIN..M_INPUT_CHAIN + 32]
+            .copy_from_slice(&chain_init(context.as_ref(), 0));
+        meta[M_CHECKPOINT..M_CHECKPOINT + 32]
+            .copy_from_slice(&checkpoint_hash(&context, &checkpoint));
+
+        Golden {
+            meta,
+            buffer,
+            state,
+            mirror,
+            checkpoint,
+            keys: SweepKeys {
+                context: Box::leak(Box::new(context)),
+                state: Box::leak(Box::new(state_key)),
+                mirror: Box::leak(Box::new(mirror_key)),
+                buffer: Box::leak(Box::new(buffer_key)),
+                meta: Box::leak(Box::new(meta_key)),
+                signer: Box::leak(Box::new(signer)),
+            },
+        }
+    }
+
+    /// The input chain is a pure function of the committed chain, the slot
+    /// index and the staged bytes, so it is a golden vector that survives any
+    /// engine change: ADVANCE/5 must commit exactly this after four tics.
+    fn golden_chain_after_four() -> [u8; 32] {
+        let mut chain = chain_init(Pubkey::new_from_array([0xc0; 32]).as_ref(), 0);
+        for (seq, command) in GOLDEN_COMMANDS.iter().enumerate() {
+            chain = chain_step(&chain, seq as u32, command);
+        }
+        chain
+    }
+
+    #[test]
+    fn advance5_commits_the_golden_chain_and_cursor() {
+        let mut g = golden();
+        let mut engine = MockEngine { ran: 0, starve: false, published: 0 };
+        let report = sweep(
+            &mut g.meta,
+            &g.buffer,
+            &mut g.state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            8,
+            true,
+            &mut engine,
+            &NoBudget,
+        )
+        .unwrap();
+        assert_eq!(engine.ran, 4);
+        assert_eq!(engine.published, 1);
+        assert_eq!(report.ran, 4);
+        assert_eq!(report.stop, Stop::Gap);
+        assert_eq!(report.cursor_after, 4);
+        assert_eq!(report.input_chain, golden_chain_after_four());
+        assert_eq!(u32_at(&g.meta, M_CURSOR), 4);
+        assert_eq!(u32_at(&g.meta, M_LAST_SWEEP_TICS), 4);
+    }
+
+    /// The malformed-input control: a sweep whose staged command the engine
+    /// never consumed is refused, and nothing is committed.  The meta cursor
+    /// must still read 0 and the state root must still be the pre-sweep one.
+    #[test]
+    fn advance5_refuses_a_tic_with_no_consumed_command() {
+        let mut g = golden();
+        let before = g.meta.clone();
+        let mut engine = MockEngine { ran: 0, starve: true, published: 0 };
+        let result = sweep(
+            &mut g.meta,
+            &g.buffer,
+            &mut g.state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            8,
+            true,
+            &mut engine,
+            &NoBudget,
+        );
+        assert_eq!(result, Err(refuse(REFUSE_UNCONSUMED_INPUT)));
+        assert_eq!(engine.ran, 1);
+        assert_eq!(engine.published, 0);
+        assert_eq!(g.meta, before);
+    }
+
+    /// ADVANCE/3 and ADVANCE/4 keep their old meaning: an unconsumed tic still
+    /// counts, so a historical client's cursor stays reproducible.
+    #[test]
+    fn advance3_still_counts_an_unconsumed_tic() {
+        let mut g = golden();
+        let mut engine = MockEngine { ran: 0, starve: true, published: 0 };
+        let report = sweep(
+            &mut g.meta,
+            &g.buffer,
+            &mut g.state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            8,
+            false,
+            &mut engine,
+            &NoBudget,
+        )
+        .unwrap();
+        assert_eq!(report.ran, 4);
+        assert_eq!(report.input_chain, golden_chain_after_four());
+        assert_eq!(u32_at(&g.meta, M_CURSOR), 4);
+    }
+
+    #[test]
+    fn advance5_wire_is_separate_from_advance4() {
+        let starved = encode_advance_starved(23, 7);
+        assert_eq!(starved[12], ADVANCE_STARVED);
+        assert_eq!(decode_advance_starved(&starved), Ok((23, 7)));
+        // ADVANCE/4 must not accept an ADVANCE/5 packet and the reverse.
+        assert_eq!(
+            decode_advance_expected(&starved),
+            Err(refuse(REFUSE_MALFORMED))
+        );
+        assert_eq!(
+            decode_advance_starved(&encode_advance_expected(23, 7)),
+            Err(refuse(REFUSE_MALFORMED))
+        );
+        let mut short = starved.clone();
+        short.pop();
+        assert_eq!(decode_advance_starved(&short), Err(refuse(REFUSE_MALFORMED)));
     }
 
     #[test]
