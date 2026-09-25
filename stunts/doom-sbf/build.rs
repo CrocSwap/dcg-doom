@@ -1864,7 +1864,7 @@ fn compile_ctx_engine(target: &str) {
             "headless/doom_controller.c",
             "static int controller_state;\nstatic uint8_t controller_command[4];\nstatic int controller_applied;\nstatic const uint8_t *captured_demo_begin;\nstatic const uint8_t *captured_demo_end;",
             // DOOM-CI3 v1: the controller's three cells are slices of the
-            // DOOM_SBF_PRIVATE_BYTES region patch 0016 adds to doom_ctx_t, so
+            // DOOM_SBF_PRIVATE_BYTES region patch 0017 adds to doom_ctx_t, so
             // nothing else in the image writes them.  D_AdvanceDemo and
             // I_Error keep their own latches and can no longer read as an
             // armed command, and the state codec no longer reads a staged

@@ -1,4 +1,4 @@
-Subject: [PATCH 0016] Give the live controller its own context cells and a receipt
+Subject: [PATCH 0017] Give the live controller its own context cells and a receipt
 
 The SBF image carried no writable static data, so the controller's host
 globals were relocated by build.rs onto three live Doom fields: the arm
@@ -31,7 +31,7 @@ on whatever the engine already held.  g_game.c is unchanged: the receipt is
 set inside the controller, so the host DEMO1 replay and the chain share one
 G_Ticker.
 
-Applies on top of 0001-0015.
+Applies on top of 0001-0016.
 
 --- a/linuxdoom-1.10/headless/doom_ctx.h
 +++ b/linuxdoom-1.10/headless/doom_ctx.h
@@ -76,26 +76,22 @@ Applies on top of 0001-0015.
  #define doom_render_fuzz_columns (DOOM_CTX->doom_render_fuzz_columns)
 --- a/linuxdoom-1.10/headless/doom_controller.c
 +++ b/linuxdoom-1.10/headless/doom_controller.c
-@@ -45,9 +45,16 @@
+@@ -45,9 +45,12 @@
      return read_account(path, "DOOM-CI2", expected_gametic, out);
  }
  
 -static int controller_armed;
 -static int controller_v2_armed;
-+/* One armed command per tic, and a receipt the caller can read.  DOOM-CI3 v1
-+ * replaces the two separate arm flags with one state cell so a single tic has
-+ * a single, unambiguous ingress. */
-+#define DOOM_CONTROLLER_IDLE 0
-+#define DOOM_CONTROLLER_ARMED_V1 1
-+#define DOOM_CONTROLLER_ARMED_V2 2
-+
++/* DOOM-CI3 v1: one armed command per tic, and a receipt the caller can read.
++ * The state values live in doom_controller.h so the SBF build, whose host
++ * reader block compiles this file's statics out, still sees them. */
 +static int controller_state;
  static uint8_t controller_command[4];
 +static int controller_applied;
  static const uint8_t *captured_demo_begin;
  static const uint8_t *captured_demo_end;
  
-@@ -66,7 +73,8 @@
+@@ -66,7 +69,8 @@
      if (!command)
          return -1;
      memcpy(controller_command, command, sizeof(controller_command));
@@ -105,7 +101,7 @@ Applies on top of 0001-0015.
      return 0;
  }
  
-@@ -90,26 +98,35 @@
+@@ -90,26 +94,35 @@
          || captured_demo_end < captured_demo_begin)
          return -1;
      memcpy(controller_command, command, sizeof(controller_command));
@@ -146,7 +142,7 @@ Applies on top of 0001-0015.
          return -1;
      }
      /* Continue accepting committed SIM/2 commands after DEMO1 ends. Keep
-@@ -117,17 +134,19 @@
+@@ -117,17 +130,19 @@
      if (!DoomControllerValidateCapturedDemoCursor(*cursor))
          *cursor += 4;
      apply_command(cmd);
@@ -171,7 +167,21 @@ Applies on top of 0001-0015.
  }
 --- a/linuxdoom-1.10/headless/doom_controller.h
 +++ b/linuxdoom-1.10/headless/doom_controller.h
-@@ -24,4 +24,11 @@
+@@ -8,6 +8,13 @@
+ /* DOOM-CI1 v1: the four bytes are the captured ticcmd at byte 24. */
+ #define DOOM_CONTROLLER_BYTES 64
+ 
++/* DOOM-CI3 v1: one armed command per tic, so a tic has one unambiguous
++ * ingress.  The SBF build keeps these cells in the context account; see
++ * doom_ctx.h's DOOM_SBF_PRIVATE_BYTES region. */
++#define DOOM_CONTROLLER_IDLE 0
++#define DOOM_CONTROLLER_ARMED_V1 1
++#define DOOM_CONTROLLER_ARMED_V2 2
++
+ int DoomControllerRead(const char *, uint32_t, uint8_t[4]);
+ 
+ /* DOOM-CI2 v1 is an explicit one-shot runtime ingress. Its four command
+@@ -24,4 +31,11 @@
  int DoomControllerArmV2(const uint8_t[4]);
  int DoomControllerApplyTiccmdV2(ticcmd_t *, uint8_t **);
  
