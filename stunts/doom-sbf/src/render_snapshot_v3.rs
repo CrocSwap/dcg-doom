@@ -656,10 +656,11 @@ fn initialize_buffered_account<'a>(
     }
     let rent_lamports = Rent::get()?.minimum_balance(SNAPSHOT_BYTES);
     let bump_seed = [bump];
+    let buffer_seed = [buffer];
     let signer_seeds: Vec<&[u8]> = if buffer == 0 {
         vec![SNAPSHOT_SEED, context.as_ref(), &bump_seed]
     } else {
-        vec![BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer], &bump_seed]
+        vec![BUFFERED_SNAPSHOT_SEED, context.as_ref(), &buffer_seed, &bump_seed]
     };
     invoke_signed(
         &system_instruction::create_account(payer.key, snapshot.key, rent_lamports, 0, program),
