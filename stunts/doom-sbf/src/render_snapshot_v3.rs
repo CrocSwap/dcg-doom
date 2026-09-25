@@ -23,12 +23,17 @@ pub const OP_SNAPSHOT_LIVE: u8 = 3;
 pub const OP_GROW: u8 = 4;
 pub const OP_INIT_STRIP: u8 = 5;
 pub const OP_SNAPSHOT_LIVE_LATEST: u8 = 6;
+pub const OP_INIT_BUFFERED: u8 = 7;
+pub const OP_SNAPSHOT_LIVE_BUFFERED: u8 = 8;
+pub const OP_GROW_BUFFERED: u8 = 9;
+pub const BUFFER_COUNT: u8 = 2;
 pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 192;
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const SNAPSHOT_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD_BYTES;
 pub const SNAPSHOT_SEED: &[u8] = b"DOOM-RENDER-SNAPSHOT/3";
+pub const BUFFERED_SNAPSHOT_SEED: &[u8] = b"DOOM-RENDER-SNAPSHOT-BUFFER/1";
 pub const SCRATCH_SEED: &[u8] = b"DOOM-RENDER-SCRATCH/1";
 pub const STRIP_SEED: &[u8] = b"DOOM-RENDER-STRIP/1";
 pub const HASH_DOMAIN: &[u8] = b"DOOM-RENDER-SNAPSHOT/3\0";
@@ -39,6 +44,10 @@ pub const STRIP_ACCOUNT_BYTES: usize = STRIP_HEADER_BYTES + STRIP_PIXELS_BYTES;
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 pub const ABI_ID: [u8; 32] = ex2::RENDER_SNAPSHOT_V3_ABI_ID;
 pub const ABI_DESCRIPTOR: &str = ex2::RENDER_SNAPSHOT_V3_ABI_DESCRIPTOR;
+pub const BUFFERED_ABI_ID: [u8; 32] = [
+    0x43, 0xb4, 0xbe, 0x16, 0xe6, 0xe5, 0xb4, 0x17, 0x2e, 0x43, 0x3a, 0x95, 0x5a, 0x0b, 0x8f, 0xc3,
+    0x1f, 0xe9, 0x82, 0xd7, 0x7f, 0x7a, 0xe4, 0x56, 0x2b, 0xd1, 0x1f, 0xe4, 0x23, 0x1f, 0x4c,
+];
 
 const H_VERSION: usize = 8;
 const H_HEADER_BYTES: usize = 12;
@@ -164,6 +173,29 @@ impl RenderRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferedSnapshotRequest {
+    pub buffer: u8,
+}
+
+impl BufferedSnapshotRequest {
+    pub fn encode(self) -> [u8; REQUEST_BYTES] {
+        encode_request(OP_SNAPSHOT_LIVE_BUFFERED, self.buffer, 0, &[0; 32])
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, ProgramError> {
+        validate_request(data, OP_SNAPSHOT_LIVE_BUFFERED)?;
+        if data[14..16] != [0, 0]
+            || data[16..20] != [0; 4]
+            || data[20..52] != [0; 32]
+            || data[13] >= BUFFER_COUNT
+        {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
+        Ok(Self { buffer: data[13] })
+    }
+}
+
 fn encode_request(operation: u8, arg: u8, cursor: u32, digest: &[u8; 32]) -> [u8; REQUEST_BYTES] {
     let mut out = [0; REQUEST_BYTES];
     out[..8].copy_from_slice(MAGIC);
@@ -202,6 +234,24 @@ pub fn encode_grow() -> [u8; INIT_BYTES] {
     out
 }
 
+pub fn encode_init_buffered(buffer: u8) -> [u8; INIT_BYTES] {
+    let mut out = [0; INIT_BYTES];
+    out[..8].copy_from_slice(MAGIC);
+    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    out[12] = OP_INIT_BUFFERED;
+    out[13] = buffer;
+    out
+}
+
+pub fn encode_grow_buffered(buffer: u8) -> [u8; INIT_BYTES] {
+    let mut out = [0; INIT_BYTES];
+    out[..8].copy_from_slice(MAGIC);
+    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    out[12] = OP_GROW_BUFFERED;
+    out[13] = buffer;
+    out
+}
+
 pub fn encode_init_strip(strip_id: u8) -> [u8; INIT_BYTES] {
     let mut out = [0; INIT_BYTES];
     out[..8].copy_from_slice(MAGIC);
@@ -213,6 +263,15 @@ pub fn encode_init_strip(strip_id: u8) -> [u8; INIT_BYTES] {
 
 pub fn snapshot_address(program: &Pubkey, context: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SNAPSHOT_SEED, context.as_ref()], program)
+}
+
+pub fn buffered_snapshot_address(
+    program: &Pubkey,
+    context: &Pubkey,
+    buffer: u8,
+) -> Option<(Pubkey, u8)> {
+    (buffer < BUFFER_COUNT)
+        .then(|| Pubkey::find_program_address(&[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer]], program))
 }
 
 pub fn scratch_address(program: &Pubkey, snapshot: &Pubkey, strip_id: u8) -> (Pubkey, u8) {
@@ -277,13 +336,16 @@ fn payload_shape(payload: &[u8]) -> bool {
     expected == Some(payload.len())
 }
 
-pub fn validate_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> {
+fn validate_snapshot_with_abi(
+    data: &[u8],
+    expected_abi: [u8; 32],
+) -> Result<SnapshotView<'_>, ProgramError> {
     if data.len() != SNAPSHOT_BYTES
         || &data[..8] != MAGIC
         || u32_at(data, H_VERSION) != VERSION
         || u32_at(data, H_HEADER_BYTES) as usize != HEADER_BYTES
         || u32_at(data, H_TOTAL_BYTES) as usize != SNAPSHOT_BYTES
-        || data[H_ABI_ID..HEADER_BYTES] != ABI_ID
+        || data[H_ABI_ID..HEADER_BYTES] != expected_abi
     {
         return Err(refuse(REFUSE_SNAPSHOT));
     }
@@ -311,6 +373,14 @@ pub fn validate_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> 
     })
 }
 
+pub fn validate_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> {
+    validate_snapshot_with_abi(data, ABI_ID)
+}
+
+pub fn validate_buffered_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, ProgramError> {
+    validate_snapshot_with_abi(data, BUFFERED_ABI_ID)
+}
+
 pub fn write_snapshot_header(
     out: &mut [u8],
     cursor: u32,
@@ -319,6 +389,49 @@ pub fn write_snapshot_header(
     resource_hash: &[u8; 32],
     gametic: u32,
     payload_bytes: usize,
+) -> ProgramResult {
+    write_snapshot_header_with_abi(
+        out,
+        cursor,
+        state_root,
+        wad_hash,
+        resource_hash,
+        gametic,
+        payload_bytes,
+        ABI_ID,
+    )
+}
+
+pub fn write_buffered_snapshot_header(
+    out: &mut [u8],
+    cursor: u32,
+    state_root: &[u8; 32],
+    wad_hash: &[u8; 32],
+    resource_hash: &[u8; 32],
+    gametic: u32,
+    payload_bytes: usize,
+) -> ProgramResult {
+    write_snapshot_header_with_abi(
+        out,
+        cursor,
+        state_root,
+        wad_hash,
+        resource_hash,
+        gametic,
+        payload_bytes,
+        BUFFERED_ABI_ID,
+    )
+}
+
+fn write_snapshot_header_with_abi(
+    out: &mut [u8],
+    cursor: u32,
+    state_root: &[u8; 32],
+    wad_hash: &[u8; 32],
+    resource_hash: &[u8; 32],
+    gametic: u32,
+    payload_bytes: usize,
+    abi_id: [u8; 32],
 ) -> ProgramResult {
     if out.len() != SNAPSHOT_BYTES
         || payload_bytes > MAX_PAYLOAD_BYTES
@@ -337,7 +450,7 @@ pub fn write_snapshot_header(
     out[H_STATE_ROOT..H_WAD_HASH].copy_from_slice(state_root);
     out[H_WAD_HASH..H_RESOURCE_HASH].copy_from_slice(wad_hash);
     out[H_RESOURCE_HASH..H_SNAPSHOT_HASH].copy_from_slice(resource_hash);
-    out[H_ABI_ID..HEADER_BYTES].copy_from_slice(&ABI_ID);
+    out[H_ABI_ID..HEADER_BYTES].copy_from_slice(&abi_id);
     let digest = image_hash(out, payload_bytes)?;
     out[H_SNAPSHOT_HASH..H_ABI_ID].copy_from_slice(&digest);
     Ok(())
@@ -481,6 +594,101 @@ fn process_grow(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
         snapshot.realloc(next, false)?;
     }
     Ok(())
+}
+
+fn initialize_buffered_account<'a>(
+    program: &Pubkey,
+    payer: &AccountInfo<'a>,
+    snapshot: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
+    context: &Pubkey,
+    buffer: u8,
+) -> ProgramResult {
+    let Some((expected, bump)) = buffered_snapshot_address(program, context, buffer) else {
+        return Err(refuse(REFUSE_MALFORMED));
+    };
+    if snapshot.key != &expected || !snapshot.is_writable {
+        return Err(refuse(REFUSE_BINDING));
+    }
+    if !payer.is_signer || !payer.is_writable || system.key != &system_program::id() {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    if snapshot.owner == program && snapshot.data_len() == 0 {
+        return Ok(());
+    }
+    if snapshot.owner != &system_program::id() || snapshot.data_len() != 0 {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let rent_lamports = Rent::get()?.minimum_balance(SNAPSHOT_BYTES);
+    let bump_seed = [bump];
+    let signer_seeds: &[&[u8]] = &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer], &bump_seed];
+    invoke_signed(
+        &system_instruction::create_account(payer.key, snapshot.key, rent_lamports, 0, program),
+        &[payer.clone(), snapshot.clone(), system.clone()],
+        &[signer_seeds],
+    )
+}
+
+fn process_grow_buffered(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != INIT_BYTES
+        || &data[..8] != MAGIC
+        || u32_at(data, 8) != VERSION
+        || data[12] != OP_GROW_BUFFERED
+        || data[13] >= BUFFER_COUNT
+        || data[14..16] != [0; 2]
+    {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    let [snapshot, meta] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    let context = context_from_meta(program, meta)?;
+    let Some((expected, _)) = buffered_snapshot_address(program, &context, data[13]) else {
+        return Err(refuse(REFUSE_MALFORMED));
+    };
+    let current = snapshot.data_len();
+    if snapshot.key != &expected
+        || snapshot.owner != program
+        || !snapshot.is_writable
+        || current > SNAPSHOT_BYTES
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let next = current
+        .saturating_add(MAX_ACCOUNT_GROWTH)
+        .min(SNAPSHOT_BYTES);
+    if next != current {
+        snapshot.realloc(next, false)?;
+    }
+    Ok(())
+}
+
+fn process_init_buffered(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != INIT_BYTES
+        || &data[..8] != MAGIC
+        || u32_at(data, 8) != VERSION
+        || data[12] != OP_INIT_BUFFERED
+        || data[13] >= BUFFER_COUNT
+        || data[14..16] != [0; 2]
+    {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    let [payer, meta, snapshot, system] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    if !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let context = context_from_meta(program, meta)?;
+    initialize_buffered_account(program, payer, snapshot, system, &context, data[13])
 }
 
 fn process_init_strip(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -766,11 +974,20 @@ fn process_snapshot_live(
     accounts: &[AccountInfo],
     data: &[u8],
     latest: bool,
+    buffer: Option<u8>,
 ) -> ProgramResult {
-    let request = if latest {
-        SnapshotRequest::decode_live_latest(data)?
+    let buffered_request = if let Some(buffer) = buffer {
+        let request = BufferedSnapshotRequest::decode(data)?;
+        if request.buffer != buffer {
+            return Err(refuse(REFUSE_MALFORMED));
+        }
+        Some(request)
+    } else if latest {
+        let _request = SnapshotRequest::decode_live_latest(data)?;
+        None
     } else {
-        SnapshotRequest::decode_live(data)?
+        let _request = SnapshotRequest::decode_live(data)?;
+        None
     };
     const CONTEXT: usize = 0;
     const META: usize = 1;
@@ -809,7 +1026,7 @@ fn process_snapshot_live(
     {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
-    let (cursor, state_root) = if latest {
+    let (cursor, state_root) = if buffered_request.is_some() || latest {
         let meta_data = accounts[META].try_borrow_data()?;
         (
             u32_at(&meta_data, sim2::M_CURSOR),
@@ -818,6 +1035,7 @@ fn process_snapshot_live(
                 .unwrap(),
         )
     } else {
+        let request = SnapshotRequest::decode_live(data)?;
         (request.cursor, request.state_root)
     };
     sim2::validate_live_snapshot_state(
@@ -830,7 +1048,14 @@ fn process_snapshot_live(
         &state_root,
     )?;
     let context_key = accounts[CONTEXT].key;
-    let (expected_snapshot, _) = snapshot_address(program, context_key);
+    let expected_snapshot = if let Some(request) = buffered_request {
+        let Some((expected, _)) = buffered_snapshot_address(program, context_key, request.buffer) else {
+            return Err(refuse(REFUSE_MALFORMED));
+        };
+        expected
+    } else {
+        snapshot_address(program, context_key).0
+    };
     if accounts[SNAPSHOT].key != &expected_snapshot {
         return Err(refuse(REFUSE_BINDING));
     }
@@ -845,7 +1070,11 @@ fn process_snapshot_live(
         return Err(refuse(REFUSE_SNAPSHOT));
     }
     if snapshot_data[..HEADER_BYTES].iter().any(|byte| *byte != 0) {
-        validate_snapshot(&snapshot_data)?;
+        if buffered_request.is_some() {
+            validate_buffered_snapshot(&snapshot_data)?;
+        } else {
+            validate_snapshot(&snapshot_data)?;
+        }
     }
     let mut payload_len = 0usize;
     #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
@@ -862,15 +1091,27 @@ fn process_snapshot_live(
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
-    write_snapshot_header(
-        &mut snapshot_data,
-        cursor,
-        &state_root,
-        &wad_hash,
-        &resource_hash,
-        gametic,
-        payload_len,
-    )
+    if buffered_request.is_some() {
+        write_buffered_snapshot_header(
+            &mut snapshot_data,
+            cursor,
+            &state_root,
+            &wad_hash,
+            &resource_hash,
+            gametic,
+            payload_len,
+        )
+    } else {
+        write_snapshot_header(
+            &mut snapshot_data,
+            cursor,
+            &state_root,
+            &wad_hash,
+            &resource_hash,
+            gametic,
+            payload_len,
+        )
+    }
 }
 
 fn process_render(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -1025,10 +1266,15 @@ pub fn process(
         OP_INIT => process_init(program, accounts, instruction_data),
         OP_SNAPSHOT => process_snapshot(program, accounts, instruction_data),
         OP_RENDER => process_render(program, accounts, instruction_data),
-        OP_SNAPSHOT_LIVE => process_snapshot_live(program, accounts, instruction_data, false),
-        OP_SNAPSHOT_LIVE_LATEST => process_snapshot_live(program, accounts, instruction_data, true),
+        OP_SNAPSHOT_LIVE => process_snapshot_live(program, accounts, instruction_data, false, None),
+        OP_SNAPSHOT_LIVE_LATEST => process_snapshot_live(program, accounts, instruction_data, true, None),
+        OP_SNAPSHOT_LIVE_BUFFERED => {
+            process_snapshot_live(program, accounts, instruction_data, false, Some(instruction_data[13]))
+        }
         OP_GROW => process_grow(program, accounts, instruction_data),
+        OP_GROW_BUFFERED => process_grow_buffered(program, accounts, instruction_data),
         OP_INIT_STRIP => process_init_strip(program, accounts, instruction_data),
+        OP_INIT_BUFFERED => process_init_buffered(program, accounts, instruction_data),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -1078,6 +1324,29 @@ mod tests {
             0
         );
         assert!(SnapshotRequest::decode_live(&encoded).is_err());
+    }
+
+    #[test]
+    fn buffered_snapshot_request_round_trips() {
+        let encoded = BufferedSnapshotRequest { buffer: 1 }.encode();
+        assert_eq!(encoded[12], OP_SNAPSHOT_LIVE_BUFFERED);
+        assert_eq!(BufferedSnapshotRequest::decode(&encoded).unwrap().buffer, 1);
+        let mut bad = encoded;
+        bad[14] = 1;
+        assert!(BufferedSnapshotRequest::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn buffered_snapshot_addresses_are_distinct() {
+        let program = Pubkey::new_from_array([1; 32]);
+        let context = Pubkey::new_from_array([2; 32]);
+        let old = snapshot_address(&program, &context).0;
+        let first = buffered_snapshot_address(&program, &context, 0).unwrap().0;
+        let second = buffered_snapshot_address(&program, &context, 1).unwrap().0;
+        assert_ne!(old, first);
+        assert_ne!(old, second);
+        assert_ne!(first, second);
+        assert!(buffered_snapshot_address(&program, &context, 2).is_none());
     }
 
     #[test]
