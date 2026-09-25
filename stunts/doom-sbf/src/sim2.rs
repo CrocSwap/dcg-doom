@@ -18,8 +18,9 @@
 //!   publication), then derive ST1/MP1 once and commit the new cursor, state
 //!   root and input chain.  A future ADVANCE/4 that arrives out of order
 //!   refuses atomically.  A sweep that finds nothing staged is a cheap no-op.
-//!   After INIT, ADVANCE is the only instruction that changes CONTEXT, STATE,
-//!   MIRROR or META bytes.
+//!   After INIT, ADVANCE is the only instruction that changes CONTEXT, STATE
+//!   or MIRROR bytes. EXTEND-CAPACITY may change only the bound input buffer's
+//!   capacity and the corresponding capacity field in META.
 //! * INIT binds exactly one meta (a PDA of the context key) to the context,
 //!   the published E2R/5 reconstruction and its authority.  It refuses any
 //!   signer other than the reconstruction authority and any context that
@@ -52,14 +53,19 @@ pub const GROW_BUFFER: u8 = 5;
 /// Cursor-bound ADVANCE wire operation.  ADVANCE/3 remains unchanged for
 /// historical SIM/2 clients; new pipelined senders use this explicit form.
 pub const ADVANCE_EXPECTED_CURSOR: u8 = 6;
-#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer")))]
+/// Extend a live input buffer and its bound meta by one bounded realloc.
+pub const EXTEND_CAPACITY: u8 = 7;
+#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
 pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer")))]
+#[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
 pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(all(feature = "legacy-5120-buffer", not(feature = "metered-sweep")))]
+#[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+#[cfg(feature = "legacy-5120-buffer")]
 pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
-#[cfg(all(feature = "legacy-5120-buffer", feature = "metered-sweep"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=metered:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+SNAPSHOT/4|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
 #[cfg(not(feature = "legacy-5120-buffer"))]
@@ -71,6 +77,7 @@ pub const DEPOSIT_HEADER_BYTES: usize = 24;
 pub const MAX_DEPOSIT_SLOTS: usize = 64;
 pub const GROW_BUFFER_BYTES: usize = 24;
 pub const MAX_BUFFER_GROWTH: usize = 10_240;
+pub const EXTEND_CAPACITY_BYTES: usize = 24;
 pub const ADVANCE_BYTES: usize = 24;
 pub const SNAPSHOT_BYTES: usize = 56;
 
@@ -188,6 +195,7 @@ pub const REFUSE_SNAPSHOT: u32 = 283;
 pub const REFUSE_TIC: u32 = 284;
 pub const REFUSE_BUFFER_GROWTH: u32 = 285;
 pub const REFUSE_CURSOR_MISMATCH: u32 = 286;
+pub const REFUSE_CAPACITY_GROWTH: u32 = 287;
 
 pub const HALT_GAMESTATE: u8 = 1;
 pub const HALT_GAMEACTION: u8 = 2;
@@ -448,6 +456,28 @@ pub fn decode_grow_buffer(data: &[u8]) -> Result<(u32, u32), ProgramError> {
         return Err(refuse(REFUSE_MALFORMED));
     }
     Ok((u32_at(data, 16), u32_at(data, 20)))
+}
+
+pub fn encode_extend_capacity(capacity: u32, expected_current_len: u32) -> Vec<u8> {
+    let mut out = request_header(EXTEND_CAPACITY).to_vec();
+    out.extend_from_slice(&capacity.to_le_bytes());
+    out.extend_from_slice(&expected_current_len.to_le_bytes());
+    out
+}
+
+pub fn decode_extend_capacity(data: &[u8]) -> Result<(u32, u32), ProgramError> {
+    if data.len() != EXTEND_CAPACITY_BYTES || !header_ok(data, EXTEND_CAPACITY) {
+        return Err(refuse(REFUSE_MALFORMED));
+    }
+    Ok((u32_at(data, 16), u32_at(data, 20)))
+}
+
+/// Return the exact new byte length for one post-INIT capacity extension.
+/// Solana limits account-data growth to 10,240 bytes in one instruction.
+pub fn capacity_extension_bytes(current_capacity: usize, new_capacity: usize) -> Option<usize> {
+    let current = buffer_bytes(current_capacity)?;
+    let target = buffer_bytes(new_capacity)?;
+    (new_capacity > current_capacity && target - current <= MAX_BUFFER_GROWTH).then_some(target)
 }
 
 pub fn encode_deposit(first_seq: u32, commands: &[u8]) -> Vec<u8> {
@@ -959,8 +989,7 @@ pub fn validate_live_snapshot_state(
     check_meta_address(program, context.key, meta.key, meta_data[M_BUMP])?;
     let checkpoint = read_checkpoint(context)?;
     if !checkpoint_published(&checkpoint)
-        || meta_data[M_CHECKPOINT..M_CHECKPOINT + 32]
-            != checkpoint_hash(context.key, &checkpoint)
+        || meta_data[M_CHECKPOINT..M_CHECKPOINT + 32] != checkpoint_hash(context.key, &checkpoint)
     {
         return Err(refuse(REFUSE_CONTEXT));
     }
@@ -1339,6 +1368,118 @@ fn process_grow_buffer(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     buffer.realloc(next, true)
 }
 
+/// Extend an initialized SIM2 input buffer without replacing its session.
+/// The capacity and account length change atomically, and one instruction may
+/// add at most the runtime's 10,240-byte account-growth limit.
+#[cfg(feature = "capacity-extension")]
+#[cold]
+#[inline(never)]
+fn process_extend_capacity(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    #[allow(deprecated)]
+    use solana_program::system_instruction;
+    use solana_program::{program::invoke, rent::Rent, sysvar::Sysvar};
+
+    let [meta, buffer, payer, authority, system] = accounts else {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    };
+    if meta.owner != program
+        || meta.data_len() != META_BYTES
+        || !meta.is_writable
+        || meta.is_signer
+        || buffer.owner != program
+        || buffer.data_len() < BUFFER_HEADER_BYTES
+        || !buffer.is_writable
+        || !buffer.is_signer
+        || !payer.is_writable
+        || !payer.is_signer
+        || !authority.is_signer
+        || authority.is_writable
+        || payer.key == buffer.key
+        || *system.key != solana_program::system_program::ID
+        || meta.key == buffer.key
+        || !distinct(accounts)
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let (new_capacity, expected_current_len) = decode_extend_capacity(data)?;
+    let current_len = buffer.data_len();
+    if current_len != expected_current_len as usize {
+        return Err(refuse(REFUSE_CAPACITY_GROWTH));
+    }
+
+    let (context, old_capacity, first_tic, bound_authority, cursor) = {
+        let meta_data = meta.try_borrow_data()?;
+        if &meta_data[..8] != META_MAGIC
+            || u32_at(&meta_data, 8) != VERSION
+            || u32_at(&meta_data, 12) as usize != META_BYTES
+            || u32_at(&meta_data, 16) as usize != META_BYTES
+            || meta_data[22..24] != [0, 0]
+            || !exact_zero(&meta_data[M_RESERVED..])
+        {
+            return Err(refuse(REFUSE_BINDING));
+        }
+        let context =
+            Pubkey::new_from_array(meta_data[M_CONTEXT..M_CONTEXT + 32].try_into().unwrap());
+        check_meta_address(program, &context, meta.key, meta_data[M_BUMP])?;
+        if meta_data[M_BUFFER..M_BUFFER + 32] != buffer.key.as_ref()[..] {
+            return Err(refuse(REFUSE_BINDING));
+        }
+        (
+            context,
+            u32_at(&meta_data, M_CAPACITY) as usize,
+            u32_at(&meta_data, M_FIRST_TIC),
+            Pubkey::new_from_array(meta_data[M_AUTHORITY..M_AUTHORITY + 32].try_into().unwrap()),
+            u32_at(&meta_data, M_CURSOR),
+        )
+    };
+    let Some(new_len) = capacity_extension_bytes(old_capacity, new_capacity as usize) else {
+        return Err(refuse(REFUSE_CAPACITY_GROWTH));
+    };
+    if current_len != buffer_bytes(old_capacity).ok_or_else(|| refuse(REFUSE_CAPACITY_GROWTH))?
+        || first_tic
+            .checked_add(new_capacity)
+            .is_none_or(|end| end > MAX_GAME_TIC)
+        || cursor as usize > old_capacity
+        || authority.key != &bound_authority
+    {
+        return Err(refuse(REFUSE_CAPACITY_GROWTH));
+    }
+    {
+        let buffer_data = buffer.try_borrow_data()?;
+        if !buffer_header_ok(&buffer_data)
+            || u32_at(&buffer_data, B_CAPACITY) as usize != old_capacity
+            || u32_at(&buffer_data, B_FIRST_TIC) != first_tic
+            || buffer_data[B_AUTHORITY..B_AUTHORITY + 32] != bound_authority.as_ref()[..]
+            || buffer_data[B_CONTEXT..B_CONTEXT + 32] != context.as_ref()[..]
+            || buffer_data[B_META..B_META + 32] != meta.key.as_ref()[..]
+        {
+            return Err(refuse(REFUSE_BINDING));
+        }
+    }
+
+    let rent = Rent::get()?.minimum_balance(new_len);
+    let shortfall = rent.saturating_sub(buffer.lamports());
+    if shortfall != 0 {
+        invoke(
+            &system_instruction::transfer(payer.key, buffer.key, shortfall),
+            &[payer.clone(), buffer.clone(), system.clone()],
+        )?;
+    }
+    buffer.realloc(new_len, true)?;
+    {
+        let mut buffer_data = buffer.try_borrow_mut_data()?;
+        put_u32(&mut buffer_data, B_CAPACITY, new_capacity);
+        put_u32(&mut buffer_data, 16, new_len as u32);
+    }
+    let mut meta_data = meta.try_borrow_mut_data()?;
+    put_u32(&mut meta_data, M_CAPACITY, new_capacity);
+    Ok(())
+}
+
 fn process_advance(
     program: &Pubkey,
     accounts: &[AccountInfo],
@@ -1451,6 +1592,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         SNAPSHOT => process_snapshot(program, accounts, data),
         #[cfg(not(feature = "legacy-5120-buffer"))]
         GROW_BUFFER => process_grow_buffer(program, accounts, data),
+        #[cfg(all(feature = "capacity-extension", not(feature = "legacy-5120-buffer")))]
+        EXTEND_CAPACITY => process_extend_capacity(program, accounts, data),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -1512,6 +1655,21 @@ mod tests {
             decode_grow_buffer(&grow_data),
             Ok((DEFAULT_BUFFER_CAPACITY as u32, 10_240))
         );
+        let extension = encode_extend_capacity(2_500, 10_288);
+        assert_eq!(extension[12], EXTEND_CAPACITY);
+        assert_eq!(decode_extend_capacity(&extension), Ok((2_500, 10_288)));
+        let mut wrong_extension_op = extension.clone();
+        wrong_extension_op[12] = SNAPSHOT;
+        assert_eq!(
+            decode_extend_capacity(&wrong_extension_op),
+            Err(refuse(REFUSE_MALFORMED))
+        );
+        let mut trailing_extension_byte = extension.clone();
+        trailing_extension_byte.push(0);
+        assert_eq!(
+            decode_extend_capacity(&trailing_extension_byte),
+            Err(refuse(REFUSE_MALFORMED))
+        );
         assert_eq!(decode_advance(&encode_advance(17)), Ok(17));
         let expected_advance = encode_advance_expected(23, 7);
         assert_eq!(expected_advance[12], ADVANCE_EXPECTED_CURSOR);
@@ -1530,6 +1688,11 @@ mod tests {
         assert_eq!(buffer_bytes(5_120), Some(41_088));
         assert_eq!(initial_buffer_bytes(65_536), Some(10_240));
         assert_eq!(buffer_bytes(MAX_BUFFER_CAPACITY + 1), None);
+        assert_eq!(capacity_extension_bytes(1_270, 2_500), Some(20_128));
+        assert_eq!(capacity_extension_bytes(1_270, 2_550), Some(20_528));
+        assert_eq!(capacity_extension_bytes(1_270, 2_551), None);
+        assert_eq!(capacity_extension_bytes(1_270, 1_270), None);
+        assert_eq!(capacity_extension_bytes(2_500, 1_270), None);
         let mut current = initial_buffer_bytes(DEFAULT_BUFFER_CAPACITY).unwrap();
         let mut steps = 0;
         while current < BUFFER_BYTES {
@@ -1562,6 +1725,12 @@ mod tests {
         assert_eq!(decode_deposit(&deposit_data), Err(refuse(REFUSE_MALFORMED)));
         assert_eq!(
             decode_deposit(&encode_deposit(0, &[0; 4 * (MAX_DEPOSIT_SLOTS + 1)])),
+            Err(refuse(REFUSE_MALFORMED))
+        );
+        let mut extend = encode_extend_capacity(2_500, 10_288);
+        extend[12] = GROW_BUFFER;
+        assert_eq!(
+            decode_extend_capacity(&extend),
             Err(refuse(REFUSE_MALFORMED))
         );
     }

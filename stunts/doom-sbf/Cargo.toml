@@ -39,6 +39,8 @@ diagnostic-profile = []
 # The deployable DOOM-SIM/2 transport profile: E2R/5 + DOOM-STG/1 + SIM/2
 # only (see transport_process_instruction).  Requires the engine.
 sim-transport = ["ctx-engine"]
+# The post-INIT bounded input-buffer extension operation.
+capacity-extension = []
 # Diagnostic-only v3 instruction used to measure clipped 40-column rendering.
 # Never enable this feature in a deployable image.
 render-clip-measurement = ["ctx-engine"]
