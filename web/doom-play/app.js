@@ -87,6 +87,14 @@ const state = {
   session: null,
   relayerBase: null,
   nextSeq: 0,
+  // The chain's committed cursor and the furthest sequence input may still be
+  // deposited at. Input is placed against these two, not against a count of
+  // what the page has sent: the engine consumes tics whether or not anyone
+  // writes them, so a page that does not follow the cursor writes into slots
+  // the game has already read.
+  cursor: 0,
+  stagingFrontier: null,
+  inputWindow: null,
   clientSeq: 0,
   inputsSent: 0,
   latencies: [],
@@ -471,14 +479,20 @@ function syncPad() {
   }
 }
 
-// One batch per animation frame while keys are held. Vanilla Doom runs at 35
-// tics a second; the relayer decides how many of those tics it can actually
-// land, and drops from the front if the slot falls behind.
+// One batch per animation frame while keys are held, placed at the front of
+// the relayer's staging window. Vanilla Doom runs at 35 tics/s; the engine reads
+// an input slot when its cursor reaches it and the producer has already
+// deposited every tic below its own staging limit, so the only tics a keypress
+// can still reach are the handful just behind the relayer's frontier. A page
+// that instead counted the tics it had sent drifted behind the engine at
+// 35 tics/s, and after ten seconds of no keys every batch it offered named a
+// tic the chain had already consumed: inputs accepted, player still.
 //
 // Only one push is ever in flight. Two overlapping pushes would both read the
 // same nextSeq and send the same firstSeq, and the relayer would rightly
 // refuse the second, so the keys a player is holding would silently stop
 // registering.
+const MAX_PUSH_TICS = 8;
 let pushTimer = null;
 let pushInFlight = false;
 function scheduleInputPush() {
@@ -497,13 +511,36 @@ function scheduleInputPush() {
 async function pushInput() {
   if (!state.session || !state.wallet) return;
   const held = Object.values(state.keys).some(Boolean);
-  if (!held && state.nextSeq === 0) return;
-  const count = held ? 8 : 1;
-  const commands = heldToCommands(state.keys, state.nextSeq, count);
+  if (held) {
+    // A fresh window before every signed batch. The frontier moves with the
+    // cursor, so a window read a status poll ago is already tens of tics out
+    // of date and the batch would be signed for slots the engine has read.
+    await readWindow();
+  }
+  // The floor is the relayer's own next sequence, floored at the chain's
+  // cursor: never rewind, and never offer a tic the chain has consumed.
+  const floor = Math.max(state.nextSeq, state.cursor);
+  state.nextSeq = floor;
+  const frontier = state.stagingFrontier ?? floor;
+  // Aim at the live window, which is the last few tics before the frontier. The
+  // producer has already deposited everything below that, so a batch anywhere
+  // else in the staging window is accepted, counted and never read by the game.
+  // The relayer measures the window; the page only has to point at it.
+  const width = Math.max(1, Math.min(state.inputWindow ?? MAX_PUSH_TICS, frontier - floor));
+  if (!held || frontier <= floor) {
+    // No keys, or the frontier has not moved: the next frame offers again.
+    // Nothing is lost by waiting, because a tic nobody writes is a tic with no
+    // keys held.
+    if (held) scheduleInputPush();
+    return;
+  }
+  const firstSeq = Math.max(floor, frontier - width);
+  const count = width;
+  const commands = heldToCommands(state.keys, firstSeq, count);
   state.clientSeq += 1;
   const message = encodeInput({
     slot: state.session.slot,
-    firstSeq: state.nextSeq,
+    firstSeq,
     commands,
     clientSeq: state.clientSeq,
     issuedAt: Math.floor(Date.now() / 1000),
@@ -519,8 +556,25 @@ async function pushInput() {
       body: JSON.stringify({message: toBase64(message), signature: toBase64(signature)}),
     });
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error ?? `relayer returned ${response.status}`);
-    state.nextSeq = payload.next_seq ?? state.nextSeq + count;
+    if (!response.ok) {
+      // A refusal that names a resume point is not a failure to show, it is the
+      // relayer saying where the chain is. Take its word for the sequence and
+      // offer again.
+      if (payload.detail?.next_seq !== undefined) {
+        if (payload.detail.cursor !== undefined) state.cursor = payload.detail.cursor;
+        if (payload.detail.staging_frontier !== undefined) state.stagingFrontier = payload.detail.staging_frontier;
+        if (payload.detail.input_window !== undefined) state.inputWindow = payload.detail.input_window;
+        state.nextSeq = state.cursor;
+        if (held) scheduleInputPush();
+        return;
+      }
+      throw new Error(payload.error ?? `relayer returned ${response.status}`);
+    }
+    adoptAccounts(payload);
+    // The floor is the chain's cursor, which is the only hard bound: the
+    // relayer's own next_seq counts accepted batches and would drag the aim
+    // above the live window, where a write is accepted and never read.
+    state.nextSeq = state.cursor;
     state.inputsSent += count;
     state.latencies.push(performance.now() - sentAt);
     if (state.latencies.length > 40) state.latencies.shift();
@@ -533,6 +587,10 @@ async function pushInput() {
     showError(error, "action");
   } finally {
     pushInFlight = false;
+    // Held keys keep offering, one batch per frame, for as long as they are
+    // down. This is the loop the R8l6 session was missing: one batch per
+    // keydown is eight tics, which is a nudge, not a walk.
+    if (Object.values(state.keys).some(Boolean)) scheduleInputPush();
   }
 }
 
@@ -569,7 +627,6 @@ async function joinSession() {
     throw new Error(`the relayer returned a slot binding that is not 32 bytes of hex: ${session.binding}`);
   }
   state.session = {...session, binding};
-  state.nextSeq = session.next_seq ?? 0;
   state.signature = session.frame?.signature ?? null;
   adoptSession(session);
   rememberSession(localStorage, {
@@ -587,8 +644,7 @@ async function joinSession() {
 // Puts the page into playing shape for a session, whether it was just created
 // or picked back up after a reload.
 function adoptSession(session) {
-  if (session.strip_accounts?.length === 8) net.doom.strips[state.buffer] = session.strip_accounts;
-  if (session.snapshot_account) net.doom.snapshots[state.buffer] = session.snapshot_account;
+  adoptAccounts(session);
   setCell(ui.sessionState, `PLAYING · ${session.id.slice(0, 8)}`, "good");
   setCell(ui.slotCell, String(session.slot));
   ui.join.disabled = true;
@@ -596,17 +652,43 @@ function adoptSession(session) {
   ui.spectatorHint.hidden = true;
 }
 
+// The session's chain accounts, not network.js's. The relayer drives whichever
+// context the operator provisioned, and a page that showed the default one
+// beside the session's own strips and snapshot was describing a deployment
+// nobody was watching.
+function adoptAccounts(payload) {
+  if (!payload) return;
+  if (payload.strip_accounts?.length === 8) net.doom.strips[state.buffer] = payload.strip_accounts;
+  if (payload.snapshot_account) net.doom.snapshots[state.buffer] = payload.snapshot_account;
+  if (payload.context && payload.context !== net.doom.context) {
+    net.doom.context = payload.context;
+    describeChain();
+  }
+  if (payload.cursor !== undefined) state.cursor = payload.cursor;
+  if (payload.staging_frontier !== undefined) state.stagingFrontier = payload.staging_frontier;
+  if (payload.input_window !== undefined && payload.input_window !== null) state.inputWindow = payload.input_window;
+}
+
+// A fresh cursor and staging frontier. The relayer reads the chain for this, so
+// it is the only honest way for the page to learn where input may be written.
+async function readWindow() {
+  if (!state.session) return;
+  const status = await relayer(`/v1/sessions/${encodeURIComponent(state.session.id)}`);
+  adoptAccounts(status);
+  state.nextSeq = Math.max(state.nextSeq, status.cursor ?? 0);
+}
+
 
 async function pollSessionStatus() {
   if (!state.session) return;
   try {
     const status = await relayer(`/v1/sessions/${encodeURIComponent(state.session.id)}`);
-    state.nextSeq = status.next_seq ?? state.nextSeq;
+    adoptAccounts(status);
+    state.nextSeq = Math.max(state.nextSeq, status.cursor ?? 0);
     setCell(ui.slotCell, String(status.slot));
     // Only replace the latency readout when the relayer actually knows a rate.
     if (status.tics_per_second) setCell(ui.inputLatency, `${status.tics_per_second.toFixed(1)} tic/s`);
     if (status.frame?.signature) state.signature = status.frame.signature;
-    if (status.strip_accounts?.length === 8) net.doom.strips[state.buffer] = status.strip_accounts;
     if (status.state && status.state !== "playing") {
       setCell(ui.sessionState, status.state.toUpperCase(), "warn");
     }
