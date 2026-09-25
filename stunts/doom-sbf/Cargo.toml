@@ -44,6 +44,12 @@ capacity-extension = []
 # Diagnostic-only v3 instruction used to measure clipped 40-column rendering.
 # Never enable this feature in a deployable image.
 render-clip-measurement = ["ctx-engine"]
+# Diagnostic-only: run every BSP traversal, column and span setup and every
+# per-pixel texture computation, but drop the framebuffer store.  The CU
+# difference against a diagnostic-profile image is the pixel-write cost of the
+# drawers.  The rendered pixels do not match the native oracle under this
+# feature.  Never enable it in a deployable image.
+render-count-only = ["ctx-engine"]
 # Reproduce the fixed 5,120-slot SIM2INPT/2 profile and its captured DEMO1
 # end marker. New images use the capacity-bound SIM2INPT/3 profile.
 legacy-5120-buffer = []
