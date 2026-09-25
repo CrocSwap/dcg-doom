@@ -1580,11 +1580,16 @@ int doom_engine_rsn3_render_static(
     PROF_ENTER(DOOM_SBF_PROF_FIXED_PRE, 0);
     if (doom_ctx_guard(context)) return 199;
     PROF_ENTER(DOOM_SBF_PROF_REBIND, 1);
-    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !payload ||
-        !strip_out || strip_cap != strip_bytes || strip_id >= 8u ||
-        ((uintptr_t)bootstrap & 15u) != 0 ||
-        rsr_rebind_layout(context, account_bytes, header, header_bytes))
-        return RSR_REFUSE_LAYOUT;
+    /* Each early return below names itself in the log, so a layout refusal is
+     * one line rather than a single undifferentiated code.  A refusal is the
+     * one place a diagnostic image can afford the extra lines: the happy path
+     * spends them on the phase profile. */
+    if (!bootstrap) { doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, 0xba0, 0, 0, 0); return RSR_REFUSE_LAYOUT; }
+    if (bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES) { doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, 0xba1, (unsigned long)bootstrap_bytes, 0, 0); return RSR_REFUSE_LAYOUT; }
+    if (!payload || !strip_out) { doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, 0xba2, 0, 0, 0); return RSR_REFUSE_LAYOUT; }
+    if (strip_cap != strip_bytes || strip_id >= 8u) { doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, 0xba3, (unsigned long)strip_cap, (unsigned long)strip_id, 0); return RSR_REFUSE_LAYOUT; }
+    if (((uintptr_t)bootstrap & 15u) != 0) { doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, 0xba4, (unsigned long)(uintptr_t)bootstrap, 0, 0); return RSR_REFUSE_LAYOUT; }
+    if (rsr_rebind_layout(context, account_bytes, header, header_bytes)) { doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, 0xba5, (unsigned long)account_bytes, (unsigned long)rsr_get32(header + 20), (unsigned long)sizeof(doom_ctx_t)); return RSR_REFUSE_LAYOUT; }
     /* BUILD leaves cached lump metadata and renderer tables at the front of
      * this carrier.  Preserve its allocation cursor so the per-frame mobj
      * and framebuffer allocations cannot overwrite those static resources. */
