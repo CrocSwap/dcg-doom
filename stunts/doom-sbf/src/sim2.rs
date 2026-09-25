@@ -30,13 +30,14 @@
 //!   signer other than the reconstruction authority and any context that
 //!   already has a meta.
 //! * RESET/9 returns the context to the start state its meta was initialised
-//!   with.  The caller re-stages that image into the bound state account with
-//!   the ordinary STG/1 path; RESET/9 accepts it only if the recomputed state
-//!   root equals the root recorded at INIT, rewinds the cursor, the input
-//!   chain, the halt and sweep counters, clears the staged slots and derives
-//!   the mirror from the decoded engine.  It is authority-signed, it does not
-//!   realloc, and it is refused on a halted slot unless the request sets the
-//!   force flag.  One provisioned context, many sessions; no rent recovered.
+//!   with.  The image comes from a supplied start account (a staged account is
+//!   sealed once, so the bound state account cannot be re-staged) and RESET/9
+//!   accepts it only if the recomputed state root equals the root recorded at
+//!   INIT.  It then rewinds the cursor, the input chain, the halt and sweep
+//!   counters, clears the staged slots and derives the mirror from the decoded
+//!   engine.  It is authority-signed, it does not realloc, and it is refused on
+//!   a halted slot unless the request sets the force flag.  One provisioned
+//!   context, many sessions; no rent recovered.
 //! * SNAPSHOT is the read-side check a renderer must pass: it refuses unless
 //!   the caller's cursor and state root equal the committed meta.
 //!
@@ -50,7 +51,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     hash::{hash, hashv},
     program_error::ProgramError,
-    program_memory::{sol_memcmp, sol_memset},
+    program_memory::{sol_memcmp, sol_memcpy, sol_memset},
     pubkey::Pubkey,
 };
 
@@ -83,15 +84,15 @@ pub const ADVANCE_STARVED: u8 = 8;
 /// slot reusable, it does not recover rent.
 pub const RESET: u8 = 9;
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=6:authority-signed:start-root-committed:halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=6:authority-signed:start-root-committed:halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=6:authority-signed:start-root-committed:halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=6:authority-signed:start-root-committed:halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(feature = "legacy-5120-buffer")]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=6:authority-signed:start-root-committed:halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
@@ -110,10 +111,14 @@ pub const RESET_BYTES: usize = 24;
 /// RESET/9 flags word (instruction bytes 16..20): bit 0 permits a reset of a
 /// halted slot.  Every other bit must be zero.
 pub const RESET_FORCE: u32 = 1;
-/// RESET/9 start-state selector (instruction bytes 20..24).  Only the start
-/// state this meta was initialised with is accepted in this version; any other
-/// selector is a malformed request.
+/// RESET/9 start-state selector (instruction bytes 20..24): the start image is
+/// the bound state account's own, which is where it is before the first
+/// advance.
 pub const RESET_START_META: u32 = 0;
+/// RESET/9 start-state selector: the start image is in the supplied start
+/// account.  This is the reusable-slot case, because a staged account is sealed
+/// once and DOOM-STG/1 refuses to write it again.
+pub const RESET_START_STATE: u32 = 1;
 pub const SNAPSHOT_BYTES: usize = 56;
 
 pub const META_SEED: &[u8] = b"DOOM-SIM2-META";
@@ -239,8 +244,9 @@ pub const REFUSE_UNCONSUMED_INPUT: u32 = 288;
 pub const REFUSE_HALTED: u32 = 289;
 /// A dead player pressed use: the pre-tic guard's restart request (shared with
 /// the host oracle in `doom_sim2_guard.h`).  Nothing is committed and the meta
-/// is not halted, so the answer is RESET/9 rather than a lost slot.
-pub const REFUSE_RESTART_REQUEST: u32 = 290;
+/// is not halted, so the answer is RESET/9 rather than a lost slot.  290 to 294
+/// belong to DOOM-STG/1, so the SIM/2 range continues at 295.
+pub const REFUSE_RESTART_REQUEST: u32 = 295;
 
 pub const HALT_GAMESTATE: u8 = 1;
 pub const HALT_GAMEACTION: u8 = 2;
@@ -609,7 +615,7 @@ pub fn decode_reset(data: &[u8]) -> Result<(u32, bool), ProgramError> {
     }
     let flags = u32_at(data, 16);
     let selector = u32_at(data, 20);
-    if flags & !RESET_FORCE != 0 || selector != RESET_START_META {
+    if flags & !RESET_FORCE != 0 || selector > RESET_START_STATE {
         return Err(refuse(REFUSE_MALFORMED));
     }
     Ok((selector, flags & RESET_FORCE != 0))
@@ -817,9 +823,10 @@ pub trait Budget {
 }
 
 /// The reset half of a resident engine: re-seed it from a committed start
-/// image and derive the mirror from the decoded engine.  The mirror is derived
-/// rather than read from an account, so a reset cannot install a pool that
-/// disagrees with the state it claims to describe.
+/// image and derive the mirror from the decoded engine.  The image is read,
+/// never written, and the mirror is derived rather than read from an account,
+/// so a reset cannot install a pool that disagrees with the state it claims to
+/// describe.
 pub trait ResetEngine {
     fn reset(&mut self, state: &[u8], mirror: &mut [u8]) -> Result<(), u32>;
 }
@@ -1063,6 +1070,7 @@ pub fn reset(
     meta: &mut [u8],
     buffer: &mut [u8],
     state: &mut [u8],
+    start: &[u8],
     mirror: &mut [u8],
     keys: &SweepKeys,
     checkpoint: &[u8],
@@ -1082,10 +1090,20 @@ pub fn reset(
     if meta[M_HALT] != 0 && !force {
         return Err(refuse(REFUSE_HALTED));
     }
-    let state_len = state_len_checked(state)?;
+    // The start image is checked before the state account is touched, so a
+    // malformed or misplaced image cannot leave a half-reset slot behind even
+    // before the transaction rollback is considered.
+    let state_len = state_len_checked(start)?;
     let first_tic = u32_at(meta, M_FIRST_TIC);
-    if u32_at(state, 20) != first_tic {
+    if u32_at(start, 20) != first_tic {
         return Err(refuse(REFUSE_TIC));
+    }
+    if start.as_ptr() as usize != state.as_ptr() as usize {
+        // A supplied start account: install the image and its zero tail into
+        // the bound state account, which is the account every later read, the
+        // render path included, is bound to.
+        sol_memcpy(state, start, state_len, state_len);
+        sol_memset(&mut state[state_len..], 0, state.len() - state_len);
     }
     crate::diagnostic_phase(926);
     engine.reset(state, mirror).map_err(refuse)?;
@@ -1776,12 +1794,18 @@ fn process_advance(
     Ok(())
 }
 
-/// RESET/9.  The same six accounts ADVANCE uses, so the account-count constant
-/// and the C ABI do not change.  `payer` is the fee payer and the authority
-/// signer; the reset itself moves no lamports and does not realloc, which is
-/// exactly why it needs no system program and no new account.
+/// RESET/9.  Six of the seven accounts are exactly the ones ADVANCE uses, so
+/// the account-count constant and the C ABI do not change; the seventh is the
+/// start image, needed because a staged account is sealed once and can never
+/// be re-staged (DOOM-STG/1 refuses a sealed target).  `payer` is the fee payer
+/// and the authority signer; the reset moves no lamports and does not realloc,
+/// which is why it needs no system program.
+///
+/// The start account is not bound by address: any ST1 whose recomputed state
+/// root equals the root this meta was initialised with is this slot's start
+/// state, and any other image is refused with 280.
 fn process_reset(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [context, state, mirror, meta, buffer, payer] = accounts else {
+    let [context, state, mirror, meta, buffer, start, payer] = accounts else {
         return Err(refuse(REFUSE_ACCOUNTS));
     };
     if !owned(program, context, resource_sbf::CONTEXT_BYTES, true)
@@ -1790,27 +1814,38 @@ fn process_reset(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
         || !owned(program, meta, META_BYTES, true)
         || buffer.data_len() < BUFFER_HEADER_BYTES
         || !owned(program, buffer, buffer.data_len(), true)
+        || !owned(program, start, resource_sbf::STATE_MAX_BYTES, false)
         || !payer.is_signer
         || !payer.is_writable
         || !distinct(accounts)
     {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
-    let (_selector, force) = decode_reset(data)?;
+    let (selector, force) = decode_reset(data)?;
     let checkpoint = read_checkpoint(context)?;
     let mut meta_data = meta.try_borrow_mut_data()?;
     check_meta_address(program, context.key, meta.key, meta_data[M_BUMP])?;
     let mut buffer_data = buffer.try_borrow_mut_data()?;
     let mut state_data = state.try_borrow_mut_data()?;
+    let start_data = start.try_borrow_data()?;
     let mut mirror_data = mirror.try_borrow_mut_data()?;
     let mut context_data = context.try_borrow_mut_data()?;
     let mut engine = ResidentEngine {
         context: context_data.as_mut_ptr(),
     };
+    // Selector 0 reads the start image from the state account itself, which is
+    // where it is before the first advance; selector 1 reads the supplied
+    // account and installs it.
+    let start_slice: &[u8] = if selector == RESET_START_STATE {
+        &start_data
+    } else {
+        &state_data
+    };
     let root = reset(
         &mut meta_data,
         &mut buffer_data,
         &mut state_data,
+        start_slice,
         &mut mirror_data,
         &SweepKeys {
             context: context.key,
@@ -2472,6 +2507,7 @@ mod tests {
             &mut g.meta,
             &g.buffer,
             &mut g.state,
+            &start_image,
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2566,12 +2602,14 @@ mod tests {
     #[test]
     fn reset_returns_a_played_slot_to_its_start_state() {
         let (mut g, start_state, start_mirror) = played(true);
+        let start_image = start_state.clone();
         stage_start(&mut g, &start_state);
         let mut engine = mock_reset(start_mirror.clone());
         let root = reset(
             &mut g.meta,
             &mut g.buffer,
             &mut g.state,
+            &start_image,
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2607,6 +2645,7 @@ mod tests {
             &mut g.meta,
             &mut g.buffer,
             &mut g.state,
+            &start_image,
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2624,6 +2663,41 @@ mod tests {
         assert_eq!(&g.meta[..M_RESETS], &first[..M_RESETS]);
     }
 
+    /// The reusable-slot case: the start image arrives in its own sealed
+    /// account, so the reset installs it into the bound state account with a
+    /// zero tail before the decode.  Without this the state account would
+    /// still hold the finished session and the root check could never pass.
+    #[test]
+    fn reset_installs_a_supplied_start_account_into_the_state_account() {
+        let (mut g, start_state, start_mirror) = played(true);
+        // The state account still holds the finished session here: no STG/1.
+        assert_eq!(u32_at(&g.state, 20), 4);
+        // A supplied start account is a whole sealed ST1 account: the encoded
+        // image and a zero tail out to STATE_MAX_BYTES.
+        let mut supplied = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+        supplied[..start_state.len()].copy_from_slice(&start_state);
+        let start_image = supplied.clone();
+        let mut engine = mock_reset(start_mirror);
+        let root = reset(
+            &mut g.meta,
+            &mut g.buffer,
+            &mut g.state,
+            &start_image,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            false,
+            &mut engine,
+        )
+        .unwrap();
+        assert_eq!(g.state, supplied, "the state account is the start image");
+        assert_eq!(u32_at(&g.state, 20), 0, "the start state's own tic");
+        assert_eq!(&g.meta[M_STATE_ROOT..M_STATE_ROOT + 32], &root);
+        assert_eq!(u32_at(&g.meta, M_CURSOR), 0);
+        assert_eq!(u32_at(&g.meta, M_RESETS), 1);
+        validate_meta(&g.meta, &g.keys, &g.checkpoint).unwrap();
+    }
+
     /// A reset lands on *the* provisioned start state, not on one supplied at
     /// reset time.  The state is shape-valid and at the right tic; only the
     /// root differs, and the refusal commits nothing: the cursor, the chain and
@@ -2639,12 +2713,14 @@ mod tests {
         // untouched), so only the root check can catch it.
         wrong[24..28].copy_from_slice(&29u32.to_le_bytes());
         stage_start(&mut g, &wrong);
+        let start_image = wrong.clone();
         let mut engine = mock_reset(start_mirror);
         assert_eq!(
             reset(
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2665,6 +2741,7 @@ mod tests {
     fn reset_refuses_a_state_from_another_tic_before_the_decode() {
         let (mut g, mut start_state, start_mirror) = played(true);
         put_u32(&mut start_state, 20, 8);
+        let start_image = start_state.clone();
         stage_start(&mut g, &start_state);
         let mut engine = mock_reset(start_mirror);
         assert_eq!(
@@ -2672,6 +2749,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2687,6 +2765,7 @@ mod tests {
     #[test]
     fn reset_refuses_a_state_the_engine_cannot_decode() {
         let (mut g, start_state, start_mirror) = played(true);
+        let start_image = start_state.clone();
         stage_start(&mut g, &start_state);
         let mut engine = mock_reset(start_mirror);
         engine.refuse = Some(232);
@@ -2695,6 +2774,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2712,6 +2792,7 @@ mod tests {
     #[test]
     fn reset_refuses_a_malformed_state_account() {
         let (mut g, start_state, start_mirror) = played(true);
+        let start_image = start_state.clone();
         let mut engine = mock_reset(start_mirror);
         let mut state = g.state.clone();
         state[0] = b'X';
@@ -2719,6 +2800,7 @@ mod tests {
             &mut g.meta,
             &mut g.buffer,
             &mut state,
+            &start_image,
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2740,6 +2822,7 @@ mod tests {
             (false, 0u8, Ok(())),
         ] {
             let (mut g, start_state, start_mirror) = played(true);
+            let start_image = start_state.clone();
             stage_start(&mut g, &start_state);
             g.meta[M_HALT] = halted;
             let mut engine = mock_reset(start_mirror);
@@ -2747,6 +2830,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2774,6 +2858,7 @@ mod tests {
     #[test]
     fn reset_checks_authority_and_binding_before_anything_else() {
         let (mut g, start_state, start_mirror) = played(true);
+        let start_image = start_state.clone();
         stage_start(&mut g, &start_state);
         let stranger = Pubkey::new_from_array([0xa2; 32]);
         let other = SweepKeys {
@@ -2790,6 +2875,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &other,
                 &g.checkpoint,
@@ -2808,6 +2894,7 @@ mod tests {
                 &mut g.meta,
                 &mut other_buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2827,6 +2914,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &checkpoint,
@@ -2838,7 +2926,7 @@ mod tests {
         assert_eq!(engine.resets, 0);
     }
 
-    /// The dead player's use press.  `doom_sim2_guard.h` returns 290 from the
+    /// The dead player's use press.  `doom_sim2_guard.h` returns 295 from the
     /// pre-tic guard, which reaches the sweep as an engine error: the tic does
     /// not run, nothing is committed, and the meta is not halted, so the answer
     /// is RESET/9 rather than a lost slot.
@@ -2853,6 +2941,7 @@ mod tests {
                 &mut g.meta,
                 &g.buffer,
                 &mut g.state,
+                &start_image,
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,

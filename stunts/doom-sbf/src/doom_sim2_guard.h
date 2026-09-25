@@ -32,7 +32,7 @@
  * (return the context to its committed start state).  A live player pressing
  * BT_USE is ordinary input and is untouched.
  *
- * Return: 0 = run, 1..5 = halt reason, 232 = refused command, 290 = restart
+ * Return: 0 = run, 1..5 = halt reason, 232 = refused command, 295 = restart
  * requested.
  */
 #ifndef DOOM_SIM2_GUARD_H
@@ -48,7 +48,7 @@
 #define DOOM_SIM2_BT_USE 0x01u
 /* A dead player asked to restart.  Not a halt: the tic does not run, nothing
  * is committed, and the meta keeps whatever halt state it had. */
-#define DOOM_SIM2_REFUSE_RESTART 290
+#define DOOM_SIM2_REFUSE_RESTART 295
 
 static int doom_sim2_pretic_guard(const uint8_t *command)
 {
