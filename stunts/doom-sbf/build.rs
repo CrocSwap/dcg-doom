@@ -1393,6 +1393,17 @@ fn compile_ctx_engine(target: &str) {
     } else {
         direct_tree
     };
+    if matches!(target, "sbf-solana-solana" | "sbpf-solana-solana")
+        && env::var("CARGO_FEATURE_SIM_TRANSPORT").is_ok()
+    {
+        let r_draw = fs::read_to_string(tree.join("r_draw.c")).unwrap_or_else(|err| {
+            panic!("read Doom renderer source {}: {err}", tree.join("r_draw.c").display())
+        });
+        assert!(
+            r_draw.contains("#define DOOM_RENDER_CLIP_MODE"),
+            "SBF sim-transport requires the 0015 clipped-strip renderer; regenerate DOOM_SCRATCH with stunts/doom-host/build.sh"
+        );
+    }
     let ctx_h = tree.join("headless/doom_ctx.h");
     assert!(
         ctx_h.is_file(),
