@@ -1299,15 +1299,30 @@ static int r2_v2_apply_table(uint32_t id, uint32_t n, const uint8_t *p, void *op
 /* doom-lowdetail-3: the native half of the strip-path comparison.  Prints the
  * renderer inputs the chain rebuilds for every strip, so the first divergence
  * between the two paths can be read off directly instead of inferred from
- * pixels.  The subsector census is the one that matters: R_RenderBSPNode skips
- * a subsector whose validcount already equals the global one, so a stale
- * identity left by the image import silently drops that subsector's walls,
- * flats and sprites. */
+ * pixels.  The sector census is the one that matters: R_AddSprites returns
+ * early for a sector whose validcount_m already equals the global one, so a
+ * stale identity left by the image import silently drops that sector's flats
+ * and sprites. */
 static void doom_lowdetail3_probe(subsector_t *subs, int numsubs, int vc)
 {
-    int i, stale = 0, x;
+    int i, stale = 0, subs_done = 0, x;
     unsigned long h = 1469598103934665603ul;
-    for (i = 0; i < numsubs; i++) if (subs[i].validcount == vc) stale++;
+    /* Spell the two player fields through the bare globals.  A member access
+     * like players[displayplayer].extralight cannot be written in this
+     * translation unit: the forced-include header turns every Doom global into
+     * an object-like macro, so the member name expands to (DOOM_CTX->extralight)
+     * and the '.' is followed by a '(' -- "expected identifier".  The two
+     * globals hold exactly the display player's values, which is who this
+     * probe is about. */
+    int probe_extralight = extralight;
+    lighttable_t *probe_fixedcolormap = fixedcolormap;
+    /* The per-frame dedup is keyed on sector_t::validcount_m, not on the
+     * subsector: R_Subsector calls R_AddSprites(sec), which returns early when
+     * sec->validcount_m already equals the global, and subsector_t has no
+     * cached identity of its own in this cut.  So the census is over sectors.
+     * `subs` is still walked, for the count the caller asked about. */
+    for (i = 0; i < numsubs; i++) subs_done += subs[i].numlines > 0;
+    for (i = 0; i < numsectors; i++) if (sectors[i].validcount_m == vc) stale++;
     for (x = 0; x <= viewwidth; x++)
     {
         h = (h ^ (unsigned long)(uint32_t)xtoviewangle[x]) * 1099511628211ul;
@@ -1317,15 +1332,15 @@ static void doom_lowdetail3_probe(subsector_t *subs, int numsubs, int vc)
         h = (h ^ (unsigned long)(uint32_t)yslope[i]) * 1099511628211ul;
     for (i = 0; i < FINEANGLES/2; i++)
         h = (h ^ (unsigned long)(uint32_t)viewangletox[i]) * 1099511628211ul;
-    printf("PROBE validcount=%#x subs=%d stale=%d viewwidth=%d viewheight=%d "
+    printf("PROBE validcount=%#x subs=%d subs_live=%d stale_sectors=%d viewwidth=%d viewheight=%d "
            "centerx=%d centerxfrac=%#x centery=%d centeryfrac=%#x detailshift=%d "
            "projection=%#x viewangle=%#x viewx=%d viewy=%d viewz=%d "
            "extralight=%d fixedcolormap=%d xtoviewangle0=%#x tables=%#lx\n",
-           (unsigned)vc, numsubs, stale, viewwidth, viewheight, centerx,
+           (unsigned)vc, numsubs, subs_done, stale, viewwidth, viewheight, centerx,
            (unsigned)centerxfrac, centery, (unsigned)centeryfrac, detailshift,
            (unsigned)projection, (unsigned)viewangle, (int)viewx, (int)viewy,
-           (int)viewz, players[displayplayer].extralight,
-           players[displayplayer].fixedcolormap, (unsigned)xtoviewangle[0], h);
+           (int)viewz, probe_extralight,
+           (int)(intptr_t)probe_fixedcolormap, (unsigned)xtoviewangle[0], h);
     fflush(stdout);
 }
 
