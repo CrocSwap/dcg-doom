@@ -295,15 +295,21 @@ mod layout_tests {
         assert_ne!(previous, HEADER_OFFSET);
 
         // A previous image's resource: a full 512-byte built header at the old
-        // offset, which straddles the new one.
+        // offset.  The new offset is 32 bytes *into* that header, so what it
+        // reads is the old header's tail followed by the first 32 bytes of the
+        // bootstrap -- neither of which is a header, and neither of which is
+        // zero.  The old header is built in its own buffer because the two
+        // regions overlap.
+        let mut old_header = vec![0u8; HEADER_BYTES];
+        old_header[..8].copy_from_slice(MAGIC);
+        put_u32(&mut old_header, 8, VERSION);
+        put_u32(&mut old_header, H_BOOTSTRAP_OFFSET, previous as u32);
+        put_u32(&mut old_header, H_BUILD_NEXT, BUILD_FINAL_CURSOR);
         let mut account = vec![0u8; ACCOUNT_BYTES];
-        account[previous..previous + 8].copy_from_slice(MAGIC);
-        put_u32(&mut account, previous + 8, VERSION);
-        // The tail of that old header is what the new offset now reads.
-        for index in 0..HEADER_BYTES {
-            account[HEADER_OFFSET + index] = account[previous + index];
-        }
+        account[previous..previous + HEADER_BYTES].copy_from_slice(&old_header);
         let header = &account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
+        assert_eq!(&header[..8], &old_header[32..40]);
+        assert_ne!(&header[..8], MAGIC, "a stale tail is not a header magic");
         assert!(
             &header[..8] != MAGIC || u32_at(header, 8) != VERSION,
             "a stale header must not satisfy REBUILD/4's built-header gate"
