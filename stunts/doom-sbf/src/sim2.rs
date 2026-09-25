@@ -1808,10 +1808,10 @@ mod tests {
         let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
         mirror[..8].copy_from_slice(b"DOOM-MP1");
         put_u32(&mut mirror, 8, 1);
-        put_u32(&mut mirror, 12, MIRROR_HEADER_BYTES);
-        put_u32(&mut mirror, 16, resource_sbf::MIRROR_BYTES);
-        put_u32(&mut mirror, 20, MIRROR_SLOT_BYTES);
-        put_u32(&mut mirror, 24, MIRROR_SLOTS);
+        put_u32(&mut mirror, 12, MIRROR_HEADER_BYTES as u32);
+        put_u32(&mut mirror, 16, resource_sbf::MIRROR_BYTES as u32);
+        put_u32(&mut mirror, 20, MIRROR_SLOT_BYTES as u32);
+        put_u32(&mut mirror, 24, MIRROR_SLOTS as u32);
         mirror[36..68].copy_from_slice(&WAD_HASH);
         put_u32(&mut mirror, 28, 0);
         put_u32(&mut mirror, 32, 0);
