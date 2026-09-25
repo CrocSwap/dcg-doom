@@ -29,6 +29,23 @@
 //!    ADVANCE/3 on the same state commits, so the refusal is the receipt
 //!    rule and not the input.
 //!
+//! `--new-game-start` runs the same gate from the pinned E1M1 new-game start
+//! state instead of the retained E1M5 demo capture: the frame cursors need not
+//! be past the captured DEMO1 end (which belongs to a different level and says
+//! nothing about this run), and the position baseline is the start state
+//! itself.  The host lockstep oracle, the strip comparison and the controls
+//! are unchanged, so the two runs are the same measurement over a different
+//! committed start state.
+//!
+//! The reset half at the end is the reusable-slot claim: a staged start
+//! account, RESET/9, and the same staged commands replayed from cursor 0,
+//! landing on the same ST1, MP1, state root and input chain at every cursor
+//! the first run committed.  It also carries the refusals: a stranger's
+//! authority, a start account holding a different image, and a halted slot
+//! without the force flag.  The restart-request half stages a canonical dead
+//! player, presses use, and measures the guard's 295, with a live player's use
+//! on the same state as the control.
+//!
 //! The loaded image must advertise `ADVANCE/5` and the receipt rule in its own
 //! ABI descriptor before any work starts: a transport image without the rule
 //! is refused here rather than silently measured as "no refusals".
@@ -44,8 +61,8 @@ use std::{env, error::Error, fs, io::Write, path::PathBuf, time::Instant};
 
 use common::Capture;
 use doom_sbf::{
-    continuation_split_sbf, render_snapshot_v3 as rsn3, resource, resource_sbf, sim2,
-    static_resource as rsr, stage,
+    continuation_split_sbf, render_snapshot_v3 as rsn3, resource, resource_sbf, sim2, stage,
+    static_resource as rsr,
 };
 use serde_json::json;
 use solana_account::Account;
@@ -228,7 +245,13 @@ impl Session {
         Ok(())
     }
 
-    fn e2r_ix(&self, continuation: Pubkey, operation: u8, cursor: u32, state_len: usize) -> Instruction {
+    fn e2r_ix(
+        &self,
+        continuation: Pubkey,
+        operation: u8,
+        cursor: u32,
+        state_len: usize,
+    ) -> Instruction {
         let mut accounts = vec![
             meta(
                 self.keys.context.pubkey(),
@@ -337,6 +360,45 @@ impl Session {
         }
     }
 
+    /// SIM/2 RESET/9.  Seven accounts: ADVANCE's six with the authority marked
+    /// writable (it is the fee payer), plus the sealed start account holding
+    /// the image to re-seed from.
+    fn reset_ix(&self, start: Pubkey, selector: u32, force: bool) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.context.pubkey(), true, false),
+                meta(self.keys.state.pubkey(), true, false),
+                meta(self.keys.mirror.pubkey(), true, false),
+                meta(self.keys.meta, true, false),
+                meta(self.keys.buffer.pubkey(), true, false),
+                meta(start, false, false),
+                meta(self.keys.authority.pubkey(), true, true),
+            ],
+            data: sim2::encode_reset(selector, force),
+        }
+    }
+
+    /// The same packet signed by a key that is not the meta's authority.
+    fn reset_ix_as(&self, start: Pubkey, stranger: &Keypair) -> Instruction {
+        let mut ix = self.reset_ix(start, sim2::RESET_START_STATE, false);
+        *ix.accounts.last_mut().unwrap() = meta(stranger.pubkey(), true, true);
+        ix
+    }
+
+    /// SIM/2 SNAPSHOT, the read-side check a renderer must pass.
+    fn snapshot_ix(&self, cursor: u32, root: &[u8; 32]) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.meta, false, false),
+                meta(self.keys.state.pubkey(), false, false),
+                meta(self.keys.mirror.pubkey(), false, false),
+            ],
+            data: sim2::encode_snapshot(cursor, root),
+        }
+    }
+
     fn grow_ix(&self, capacity: u32, expected_len: u32) -> Instruction {
         Instruction {
             program_id: base::PROGRAM,
@@ -389,7 +451,11 @@ impl Session {
             accounts: vec![
                 meta(static_key, true, false),
                 meta(snapshot, false, false),
-                meta(rsn3::strip_address(&base::PROGRAM, &snapshot, strip).0, true, false),
+                meta(
+                    rsn3::strip_address(&base::PROGRAM, &snapshot, strip).0,
+                    true,
+                    false,
+                ),
             ],
             data: request.encode().to_vec(),
         }
@@ -450,7 +516,9 @@ async fn grow_buffer(
     .await?;
     while len < total {
         let ix = session.grow_ix(capacity, len as u32);
-        let grown = session.send(vec![ix], &[buffer], base::NORMAL_LIMIT).await?;
+        let grown = session
+            .send(vec![ix], &[buffer], base::NORMAL_LIMIT)
+            .await?;
         if grown.result.is_err() {
             return Err(format!("SIM2 GROW-BUFFER at {len}: {:?}", grown.result).into());
         }
@@ -480,7 +548,9 @@ async fn reconstruct(
     let context_signer = session.keys.context.insecure_clone();
     session.stage_account(&state_signer, staged_state).await?;
     session.stage_account(&mirror_signer, mirror).await?;
-    session.stage_account(&controller_signer, controller).await?;
+    session
+        .stage_account(&controller_signer, controller)
+        .await?;
     let continuation = Keypair::new();
     create_owned(
         &mut session.ctx,
@@ -523,7 +593,9 @@ async fn reconstruct(
         solana_program::hash::hash(controller).to_bytes(),
         solana_program::hash::hash(&vec![0u8; resource_sbf::RI2_FRAME_BYTES]).to_bytes(),
     );
-    let init = session.send(vec![ix], &[&authority], base::NORMAL_LIMIT).await?;
+    let init = session
+        .send(vec![ix], &[&authority], base::NORMAL_LIMIT)
+        .await?;
     if init.result.is_err() {
         return Err(format!("SIM2 INIT {:?}", init.result).into());
     }
@@ -620,6 +692,46 @@ fn controller_for_gametic(controller: &[u8], gametic: u32) -> Result<Vec<u8>, Bo
     out[20..24].copy_from_slice(&gametic.to_le_bytes());
     out[28..].fill(0);
     Ok(out)
+}
+
+/// One committed field changed, nothing else: a canonical ST1 that is not this
+/// slot's committed start state.  Used as the wrong-start-image control, where
+/// the shape checks must pass and only the root check can refuse it.
+fn doctored_start_state(state: &[u8]) -> Vec<u8> {
+    let mut out = state.to_vec();
+    let moved = (i32_at(state, 24) as u32).wrapping_add(1);
+    out[24..28].copy_from_slice(&moved.to_le_bytes());
+    out
+}
+
+/// The same image with the console player marked dead.  `PST_DEAD` is inside
+/// the range the state codec's strict scan accepts, so this is a canonical ST1
+/// and the decode it goes through is the real one.
+fn dead_player_state(state: &[u8]) -> Vec<u8> {
+    let mut out = state.to_vec();
+    out[common::ST1_PLAYER0_PLAYERSTATE_OFFSET..common::ST1_PLAYER0_PLAYERSTATE_OFFSET + 4]
+        .copy_from_slice(&common::PST_DEAD.to_le_bytes());
+    out
+}
+
+/// One sealed start account holding `state`, freshly created and program-owned
+/// exactly as a relayer would provision it.
+async fn stage_start_account(
+    session: &mut Session,
+    state: &[u8],
+) -> Result<Keypair, Box<dyn Error>> {
+    let key = Keypair::new();
+    create_owned(
+        &mut session.ctx,
+        &key,
+        resource_sbf::STATE_MAX_BYTES,
+        Rent::default().minimum_balance(resource_sbf::STATE_MAX_BYTES),
+    )
+    .await?;
+    session
+        .stage_account(&key, &base::padded_state(state))
+        .await?;
+    Ok(key)
 }
 
 /// What the host ingress does with an ST1 image: `Err(rc)` from the import, a
@@ -745,9 +857,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut advance_tics = 4u32;
     let mut frames_at: Vec<u32> = vec![5_040, 5_076, 5_112];
     let mut starve_cursor = 2_048u32;
+    let mut new_game_start = false;
     while let Some(flag) = args.next() {
         let mut value = || -> Result<String, Box<dyn Error>> {
-            args.next().ok_or_else(|| format!("{flag} needs a value").into())
+            args.next()
+                .ok_or_else(|| format!("{flag} needs a value").into())
         };
         match flag.as_str() {
             "--profile" => profile = value()?,
@@ -761,6 +875,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .collect::<Result<Vec<u32>, _>>()?
             }
             "--starve-state-cursor" => starve_cursor = value()?.parse()?,
+            "--new-game-start" => new_game_start = true,
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
@@ -773,7 +888,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let image_bytes = base::read(&image)?;
     let manifest_bytes = base::read(&manifest)?;
-    if base::sha(&image_bytes) != expected_image || base::sha(&manifest_bytes) != expected_manifest {
+    if base::sha(&image_bytes) != expected_image || base::sha(&manifest_bytes) != expected_manifest
+    {
         return Err("image/manifest identity mismatch".into());
     }
     let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
@@ -800,7 +916,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("image manifest context size is not the driver's".into());
     }
     fs::write(inputs.join("doom_sbf.so"), &image_bytes)?;
-    fs::write(inputs.join("doom_ex2_source_manifest.json"), &manifest_bytes)?;
+    fs::write(
+        inputs.join("doom_ex2_source_manifest.json"),
+        &manifest_bytes,
+    )?;
     env::set_var("BPF_OUT_DIR", image.parent().ok_or("image has no parent")?);
     env::set_var("SBF_OUT_DIR", image.parent().ok_or("image has no parent")?);
 
@@ -813,8 +932,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_cursor = base::u32_at(&capture_data.state, 24);
     // The captured lump is the bound: past it there is no recorded ticcmd, so
     // the controller ingress is the only thing that can drive a tic.
-    let demo_tics = capture_data.looped_demo_commands(tics as usize)?.1 as u32;
-    if demo_tics < 5_000 || demo_tics >= tics {
+    let demo_tics = capture_data.looped_demo_commands(tics.max(1) as usize)?.1 as u32;
+    if !new_game_start && (demo_tics < 5_000 || demo_tics >= tics) {
         return Err(format!(
             "captured DEMO1 carries {demo_tics} tics, which does not leave room in a {tics}-tic run"
         )
@@ -824,15 +943,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("--advance-tics is out of range".into());
     }
     for cursor in &frames_at {
-        if *cursor <= demo_tics || *cursor % advance_tics != 0 || *cursor > tics {
+        // A new-game start state carries a demo cursor into the shareware lump
+        // (13, the first DEMO1 ticcmd) purely so the SIM/2 cursor validation has
+        // real bounds; under SIM2INPT/3 the lump is not the source of player
+        // input, and its length is a property of E1M5, not of this run.  So the
+        // frame cursors only have to be inside the run and on a batch boundary.
+        let inside = *cursor > 0 && *cursor % advance_tics == 0 && *cursor <= tics;
+        if !inside || (!new_game_start && *cursor <= demo_tics) {
+            let past = if new_game_start {
+                String::new()
+            } else {
+                format!(" and past the {demo_tics}-tic demo end")
+            };
             return Err(format!(
-                "frame cursor {cursor} must be past the {demo_tics}-tic demo end, on a {advance_tics}-tic boundary and inside the run"
+                "frame cursor {cursor} must be inside the {tics}-tic run on a {advance_tics}-tic boundary{past}"
             )
             .into());
         }
     }
-    if starve_cursor == 0 || starve_cursor >= demo_tics {
-        return Err("--starve-state-cursor must be inside the demo portion".into());
+    if starve_cursor == 0 || (!new_game_start && starve_cursor >= demo_tics) {
+        return Err("--starve-state-cursor must be inside the run".into());
     }
 
     // --- host lockstep oracle ------------------------------------------------
@@ -898,11 +1028,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut render_rows: Vec<serde_json::Value> = Vec::new();
     let mut position_rows: Vec<serde_json::Value> = Vec::new();
     let mut st1_at_demo_end: Option<(u32, Vec<u8>)> = None;
+    // With a new-game start state the demo end is not in this run, so the
+    // "what did the live input move" comparison is against the start state
+    // itself, which is the state every other claim is relative to.
+    let baseline_state = if new_game_start {
+        capture_data.state.clone()
+    } else {
+        Vec::new()
+    };
     let mut chain_states: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut chain_frames: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut strips_written = 0usize;
     let mut equal_sweeps = 0usize;
     let mut first_past_demo = None;
+    // Per-batch (cursor, st1, mp1, root, chain) of the first run, so the
+    // post-reset replay is compared against it rather than against a rerun.
+    let mut first_run: Vec<(u32, String, String, [u8; 32], [u8; 32])> = Vec::new();
     let mut cursor = 0u32;
     let mut sent = 0usize;
     let started = Instant::now();
@@ -974,6 +1115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         equal_sweeps += 1;
+        first_run.push((last, base::sha(&state), base::sha(&mirror), root, chain));
         writeln!(
             sweeps,
             "{}",
@@ -1033,7 +1175,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let snapshot_bytes = session.data(snapshot_key).await?;
             let snapshot = rsn3::validate_snapshot(&snapshot_bytes)?;
             if snapshot.cursor != last || snapshot.state_root != root {
-                return Err(format!("SNAPSHOT-LIVE at {last} does not bind the committed cursor").into());
+                return Err(
+                    format!("SNAPSHOT-LIVE at {last} does not bind the committed cursor").into(),
+                );
             }
             let directory = receipt.join(format!("strips/cursor-{last:05}"));
             fs::create_dir_all(&directory)?;
@@ -1045,14 +1189,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let ix = session.render_ix(static_key, snapshot_key, strip_id, request);
                 let rendered = session.send(vec![ix], &[], RENDER_LIMIT).await?;
                 if rendered.result.is_err() {
-                    return Err(format!("RENDER strip {strip_id} at {last}: {:?}", rendered.result).into());
+                    return Err(format!(
+                        "RENDER strip {strip_id} at {last}: {:?}",
+                        rendered.result
+                    )
+                    .into());
                 }
                 strip_units.push(base::units(&rendered)?);
                 let key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, strip_id).0;
                 let strip_bytes = session.data(key).await?;
                 let strip = rsn3::validate_strip(&strip_bytes)?;
                 if strip.cursor != last || strip.state_root != root {
-                    return Err(format!("strip {strip_id} at {last} does not bind the cursor").into());
+                    return Err(
+                        format!("strip {strip_id} at {last} does not bind the cursor").into(),
+                    );
                 }
                 strip_equal += usize::from(strip.strip_id == u32::from(strip_id));
                 for row in 0..200 {
@@ -1060,14 +1210,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let to = row * 320 + usize::from(strip_id) * 40;
                     reconstructed[to..to + 40].copy_from_slice(&strip.pixels[from..from + 40]);
                 }
-                fs::write(directory.join(format!("strip-{strip_id}.px8")), &strip.pixels)?;
+                fs::write(
+                    directory.join(format!("strip-{strip_id}.px8")),
+                    &strip.pixels,
+                )?;
                 strips_written += 1;
             }
             fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
             let (segment, forward, strafe) = common::r8l_segment(last - 1);
-            let (demo_end_cursor, base_state) = st1_at_demo_end
-                .clone()
-                .ok_or("the run never committed a cursor at or before the demo end")?;
+            let (demo_end_cursor, base_state) = if new_game_start {
+                (0u32, baseline_state.clone())
+            } else {
+                st1_at_demo_end
+                    .clone()
+                    .ok_or("the run never committed a cursor at or before the demo end")?
+            };
             let changed = changed_fields(&base_state, &state);
             let chain_frame_sha = base::sha(&reconstructed);
             chain_frames.push((last, reconstructed));
@@ -1079,7 +1236,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .count();
             position_rows.push(json!({
                 "cursor": last,
-                "tics_past_demo_end": last - demo_tics,
+                "tics_past_demo_end": if new_game_start { json!(null) } else { json!(last - demo_tics) },
                 "compared_against_cursor": demo_end_cursor,
                 "input_segment": segment,
                 "segment_moves_forward": forward,
@@ -1091,7 +1248,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }));
             render_rows.push(json!({
                 "cursor": last,
-                "tics_past_demo_end": last - demo_tics,
+                "tics_past_demo_end": if new_game_start { json!(null) } else { json!(last - demo_tics) },
                 "snapshot_live_cu": snapshot_units,
                 "strip_cu": strip_units.clone(),
                 "strip_cu_max": strip_units.iter().max(),
@@ -1103,8 +1260,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     sweeps.flush()?;
     let sweep_seconds = started.elapsed().as_secs_f64();
-    if position_rows.iter().all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0)) {
-        return Err("the ST1 image did not change past the demo end".into());
+    if position_rows
+        .iter()
+        .all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0))
+    {
+        return Err(if new_game_start {
+            "the ST1 image did not change from the start state".into()
+        } else {
+            "the ST1 image did not change past the demo end".into()
+        });
     }
     if chain_frames.len() < 2 {
         return Err("fewer than two rendered cursors past the demo end".into());
@@ -1122,8 +1286,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         fs::write(directory.join("host-frame.fb1"), &frame)?;
         let mut strip_equal = 0usize;
         for strip_id in 0..8u8 {
-            let bytes =
-                fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
+            let bytes = fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
             if bytes == slice_frame(&frame, usize::from(strip_id)) {
                 strip_equal += 1;
             }
@@ -1199,8 +1362,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("the starved control needs a GS_LEVEL state".into());
     }
     let console_player = i32_at(&source_state, common::ST1_CONSOLEPLAYER_OFFSET);
-    let flags: [u8; 4] = source_state[common::ST1_PLAYERINGAME_OFFSET
-        ..common::ST1_PLAYERINGAME_OFFSET + 4]
+    let flags: [u8; 4] = source_state
+        [common::ST1_PLAYERINGAME_OFFSET..common::ST1_PLAYERINGAME_OFFSET + 4]
         .try_into()
         .unwrap();
     if flags != [1, 0, 0, 0] {
@@ -1217,7 +1380,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::write(receipt.join("starved.st1"), &starved_state)?;
     fs::write(receipt.join("starved-source.st1"), &source_state)?;
     if host_unmodified != 0 {
-        return Err(format!("the unmodified state did not run a consumed tic: {host_unmodified}").into());
+        return Err(
+            format!("the unmodified state did not run a consumed tic: {host_unmodified}").into(),
+        );
     }
     if host_starved >= 0 {
         return Err(format!(
@@ -1253,8 +1418,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let starve_mirror_signer_kp = starve.keys.mirror.insecure_clone();
     let starve_controller_signer_kp = starve.keys.controller.insecure_clone();
     let staged_starved = base::padded_state(&starved_state);
-    starve.stage_account(&starve_state_signer_kp, &staged_starved).await?;
-    starve.stage_account(&starve_mirror_signer_kp, &source_mirror).await?;
+    starve
+        .stage_account(&starve_state_signer_kp, &staged_starved)
+        .await?;
+    starve
+        .stage_account(&starve_mirror_signer_kp, &source_mirror)
+        .await?;
     starve
         .stage_account(&starve_controller_signer_kp, &starve_controller)
         .await?;
@@ -1278,7 +1447,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } else {
             continuation_split_sbf::STEP
         };
-        let ix = starve.e2r_ix(starve_continuation.pubkey(), operation, cursor, starved_state_len);
+        let ix = starve.e2r_ix(
+            starve_continuation.pubkey(),
+            operation,
+            cursor,
+            starved_state_len,
+        );
         let signers: Vec<&Keypair> = if cursor == 0 {
             vec![&starve_authority, &starve_context_signer]
         } else {
@@ -1291,9 +1465,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
     }
-    let prepare_code = starve_refusal.as_ref().and_then(|(cursor, text)| {
-        custom_code_text(cursor, text)
-    });
+    let prepare_code = starve_refusal
+        .as_ref()
+        .and_then(|(cursor, text)| custom_code_text(cursor, text));
     if starve_refusal.is_none() {
         return Err("E2R/5 reconstructed a state with no console player in the game".into());
     }
@@ -1391,13 +1565,529 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     });
 
+    // --- 3b. RESET/9: the same slot, the same roots, from a fresh start -------
+    // Everything above measured one session.  This measures that the slot can
+    // serve another one: a sealed start account, one RESET/9, and the same
+    // staged commands replayed from cursor 0 landing on the same ST1, MP1, state
+    // root and input chain at every cursor the first run committed.  The
+    // refusals come first, on the played slot, so each one is measured against
+    // a state that really has something to lose.
+    let (final_cursor, _, _, final_root, _) = *first_run
+        .last()
+        .ok_or("the run committed no batch to replay over")?;
+    let staged_start = capture_data.state_account();
+    let start_key = stage_start_account(&mut session, &capture_data.state).await?;
+    let wrong_key =
+        stage_start_account(&mut session, &doctored_start_state(&capture_data.state)).await?;
+    let stranger = Keypair::new();
+    let before_reset = (
+        session.data(session.keys.state.pubkey()).await?,
+        session.data(session.keys.mirror.pubkey()).await?,
+        session.data(session.keys.buffer.pubkey()).await?,
+        session.data(session.keys.meta).await?,
+    );
+    let mut reset_refusals = Vec::new();
+    for (name, ix, signers, want) in [
+        (
+            "stranger_authority",
+            session.reset_ix_as(start_key.pubkey(), &stranger),
+            vec![&stranger],
+            sim2::REFUSE_AUTHORITY,
+        ),
+        (
+            "not_the_committed_start_state",
+            session.reset_ix(wrong_key.pubkey(), sim2::RESET_START_STATE, false),
+            vec![&authority],
+            sim2::REFUSE_STATE_ROOT,
+        ),
+    ] {
+        let result = session.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        let code = custom_code(&result);
+        if result.result.is_err() {
+            let units = base::units(&result)?;
+            if code != Some(want) {
+                return Err(format!("{name}: refused with {code:?}, wanted {want}").into());
+            }
+            reset_refusals.push(json!({"case": name, "refused_with": code, "cu": units}));
+        } else {
+            return Err(format!("{name}: the image accepted a reset it must refuse").into());
+        }
+        let after = (
+            session.data(session.keys.state.pubkey()).await?,
+            session.data(session.keys.mirror.pubkey()).await?,
+            session.data(session.keys.buffer.pubkey()).await?,
+            session.data(session.keys.meta).await?,
+        );
+        if after != before_reset {
+            return Err(format!("{name}: a refused reset changed an account").into());
+        }
+    }
+
+    let reset_ix = session.reset_ix(start_key.pubkey(), sim2::RESET_START_STATE, false);
+    let reset = session
+        .send(vec![reset_ix], &[&authority], base::NORMAL_LIMIT)
+        .await?;
+    if reset.result.is_err() {
+        return Err(format!("RESET/9 {:?}", reset.result).into());
+    }
+    let reset_cu = base::units(&reset)?;
+    let view = session.view().await?;
+    let start_root = sim2::verified_state_root(&staged_start, &capture_data.mirror)
+        .map_err(|e| format!("start state root: {e:?}"))?
+        .1;
+    let state_after_reset = session.data(session.keys.state.pubkey()).await?;
+    let mirror_after_reset = session.data(session.keys.mirror.pubkey()).await?;
+    let buffer_after_reset = session.data(session.keys.buffer.pubkey()).await?;
+    if view.cursor != 0
+        || view.halt != 0
+        || view.sweeps != 0
+        || view.resets != 1
+        || view.state_root != start_root
+        || view.start_root != start_root
+        || view.input_chain != sim2::chain_init(&session.keys.context.pubkey(), view.first_tic)
+        || state_after_reset != staged_start
+        || mirror_after_reset != capture_data.mirror
+        || !buffer_after_reset[sim2::BUFFER_HEADER_BYTES..]
+            .iter()
+            .all(|byte| *byte == 0)
+        || &buffer_after_reset[..8] != sim2::BUFFER_MAGIC
+    {
+        return Err(format!(
+            "RESET/9 did not return the slot to its start state: cursor={} halt={} sweeps={} resets={} root={} start_root={} chain={} state={} mirror={} slots_cleared={}",
+            view.cursor,
+            view.halt,
+            view.sweeps,
+            view.resets,
+            common::hex(&view.state_root) == common::hex(&start_root),
+            view.start_root == start_root,
+            view.input_chain == sim2::chain_init(&session.keys.context.pubkey(), view.first_tic),
+            state_after_reset == staged_start,
+            mirror_after_reset == capture_data.mirror,
+            buffer_after_reset[sim2::BUFFER_HEADER_BYTES..].iter().all(|byte| *byte == 0),
+        )
+        .into());
+    }
+
+    // A renderer holding a frame from before the reset is refused: its cursor
+    // and root no longer equal the meta.  The same packet with the reset's own
+    // cursor and root is accepted, so the refusal is the binding and not the
+    // packet.
+    let stale = session.snapshot_ix(final_cursor, &final_root);
+    let stale_result = session.send(vec![stale], &[], base::NORMAL_LIMIT).await?;
+    let stale_code = custom_code(&stale_result);
+    if stale_result.result.is_err() {
+        if stale_code != Some(sim2::REFUSE_SNAPSHOT) {
+            return Err(format!("a stale snapshot refused with {stale_code:?}").into());
+        }
+    } else {
+        return Err("a frame from before the reset still passed the snapshot check".into());
+    }
+    let fresh = session.snapshot_ix(0, &start_root);
+    let fresh_result = session.send(vec![fresh], &[], base::NORMAL_LIMIT).await?;
+    if fresh_result.result.is_err() {
+        return Err(format!(
+            "the reset slot refused its own snapshot: {:?}",
+            fresh_result.result
+        )
+        .into());
+    }
+
+    // The replay: the same commands, from cursor 0, against a fresh host
+    // session locked to them, and against the first run's bytes per batch.
+    let mut host = resource::NativeSimSession::open(
+        capture_data.wad_refs(),
+        &capture_data.resource,
+        &capture_data.state,
+    )
+    .map_err(|rc| format!("replay oracle session open rc={rc}"))?;
+    let mut chain = sim2::chain_init(&session.keys.context.pubkey(), view.first_tic);
+    let mut replay_equal = 0usize;
+    let mut replay_units: Vec<u64> = Vec::new();
+    let mut cursor = 0u32;
+    while cursor < tics {
+        let first = cursor;
+        let last = (cursor + advance_tics).min(tics);
+        let deposit = session.deposit_ix(first, &commands[first as usize * 4..last as usize * 4]);
+        let deposited = session
+            .send(vec![deposit], &[&authority], base::NORMAL_LIMIT)
+            .await?;
+        if deposited.result.is_err() {
+            return Err(format!("replay deposit {first}: {:?}", deposited.result).into());
+        }
+        session.cursor_before = first;
+        let advance = session.advance_ix(sim2::ADVANCE_STARVED, last - first);
+        let result = session
+            .send(vec![advance], &[&authority], base::NORMAL_LIMIT)
+            .await?;
+        if result.result.is_err() {
+            return Err(format!("replay ADVANCE/5 at {first}: {:?}", result.result).into());
+        }
+        replay_units.push(base::units(&result)?);
+        for seq in first..last {
+            let command: [u8; 4] = commands[seq as usize * 4..seq as usize * 4 + 4]
+                .try_into()
+                .unwrap();
+            if host.step(&command) != 0 {
+                return Err(format!("replay oracle starved at tic {seq}").into());
+            }
+            chain = sim2::chain_step(&chain, seq, &command);
+        }
+        host.publish(&mut host_state, &mut host_mirror)
+            .map_err(|rc| format!("replay oracle publish at {last}: rc={rc}"))?;
+        let state = session.data(state_signer.pubkey()).await?;
+        let mirror = session.data(mirror_signer.pubkey()).await?;
+        let (checked, root) = sim2::verified_state_root(&state, &mirror)
+            .map_err(|e| format!("replay state root at {last}: {e:?}"))?;
+        let view = session.view().await?;
+        let prior = first_run
+            .iter()
+            .find(|(at, ..)| *at == last)
+            .ok_or("the replay reached a cursor the first run did not commit")?;
+        if state != host_state
+            || mirror != host_mirror
+            || checked != base::u32_at(&state, 16) as usize
+            || root != view.state_root
+            || view.input_chain != chain
+            || view.cursor != last
+            || base::sha(&state) != prior.1
+            || base::sha(&mirror) != prior.2
+            || root != prior.3
+            || chain != prior.4
+        {
+            return Err(format!(
+                "the replay at {last} is not the first run: st1={} mp1={} root={} chain={} cursor={} prior_st1={} prior_mp1={} prior_root={} prior_chain={}",
+                state == host_state,
+                mirror == host_mirror,
+                root == view.state_root,
+                view.input_chain == chain,
+                view.cursor == last,
+                base::sha(&state) == prior.1,
+                base::sha(&mirror) == prior.2,
+                root == prior.3,
+                chain == prior.4,
+            )
+            .into());
+        }
+        replay_equal += 1;
+        cursor = last;
+    }
+    if replay_equal != first_run.len() {
+        return Err("the replay committed a different number of batches".into());
+    }
+
+    // The live-player control for the restart rule: on the reset slot, whose
+    // committed start state has a live player, a use command is ordinary input
+    // and commits a tic.  It is the same command the dead-player session below
+    // is refused.
+    let use_command = [0u8, 0, 0, 0x01];
+    let use_batch = vec![use_command; 1].concat();
+    let use_deposit = session.deposit_ix(cursor, &use_batch);
+    let deposited = session
+        .send(vec![use_deposit], &[&authority], base::NORMAL_LIMIT)
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("live-use deposit: {:?}", deposited.result).into());
+    }
+    session.cursor_before = cursor;
+    let use_advance = session.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let used = session
+        .send(vec![use_advance], &[&authority], base::NORMAL_LIMIT)
+        .await?;
+    if used.result.is_err() {
+        return Err(format!("a live player's use command was refused: {:?}", used.result).into());
+    }
+    let use_view = session.view().await?;
+    let live_use = json!({
+        "player_state_at_start": common::PST_LIVE,
+        "command_buttons": 1,
+        "committed": true,
+        "cursor_before": cursor,
+        "cursor_after": use_view.cursor,
+        "cu": base::units(&used)?,
+    });
+
+    // --- 3c. the dead player's use press, and the restart it asks for ---------
+    // A separate slot whose *committed start state* is a canonical ST1 with the
+    // console player dead.  A dead player is ordinary input to the guard (a
+    // PST_DEAD player is not PST_REBORN), so tics run; pressing use is the one
+    // thing that is not, and it is refused with 295 rather than swallowed.
+    let dead_state = dead_player_state(&capture_data.state);
+    let dead_keys = session_keys(Keypair::new());
+    let dead_bank = bank_with(
+        &capture_data,
+        dead_keys.context.pubkey(),
+        dead_keys.state.pubkey(),
+        dead_keys.mirror.pubkey(),
+        dead_keys.controller.pubkey(),
+        dead_keys.authority.pubkey(),
+        None,
+    );
+    let dead_ctx = dead_bank.start_with_context().await;
+    let mut dead = Session {
+        ctx: dead_ctx,
+        keys: dead_keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let dead_authority = dead.keys.authority.insecure_clone();
+    let dead_state_signer = dead.keys.state.insecure_clone();
+    let dead_mirror_signer = dead.keys.mirror.insecure_clone();
+    let dead_controller = controller_for_gametic(&controller, base::u32_at(&dead_state, 20))?;
+    let (_, dead_init_cu) = reconstruct(
+        &mut dead,
+        &base::padded_state(&dead_state),
+        &capture_data.mirror,
+        &dead_controller,
+        &capture_data,
+        capacity,
+    )
+    .await?;
+    let dead_start_key = stage_start_account(&mut dead, &dead_state).await?;
+    let dead_mirror_at_start = dead.data(dead_mirror_signer.pubkey()).await?;
+
+    // (a) four non-use tics from a dead player commit.
+    let move_batch = vec![[16u8, 0, 0, 0]; 4].concat();
+    let deposit = dead.deposit_ix(0, &move_batch);
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("dead-slot deposit: {:?}", deposited.result).into());
+    }
+    dead.cursor_before = 0;
+    let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 4);
+    let moved = dead
+        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    if moved.result.is_err() {
+        return Err(format!("a dead player could not tic: {:?}", moved.result).into());
+    }
+    let dead_view = dead.view().await?;
+    let moved_cursor = dead_view.cursor;
+    if moved_cursor != 4 {
+        return Err("the dead slot did not commit its tics".into());
+    }
+    let state_before_use = dead.data(dead_state_signer.pubkey()).await?;
+
+    // (b) the use press is refused 295 and commits nothing.
+    let press = [0u8, 0, 0, 0x01];
+    let deposit = dead.deposit_ix(4, &press);
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("dead-slot use deposit: {:?}", deposited.result).into());
+    }
+    dead.cursor_before = 4;
+    let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let refused = dead
+        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    let restart_code = custom_code(&refused);
+    if refused.result.is_err() {
+        if restart_code != Some(sim2::REFUSE_RESTART_REQUEST) {
+            return Err(format!("use while dead refused with {restart_code:?}").into());
+        }
+    } else {
+        return Err("a dead player's use press was committed as a tic".into());
+    }
+    let state_after_use = dead.data(dead_state_signer.pubkey()).await?;
+    let view_after_use = dead.view().await?;
+    if state_after_use != state_before_use
+        || view_after_use.cursor != 4
+        || view_after_use.halt != 0
+        || view_after_use.state_root != dead_view.state_root
+    {
+        return Err("the refused restart request committed something".into());
+    }
+
+    // (c) the answer: RESET/9 returns the dead slot to its committed start
+    // state, and the slot runs again.
+    let reset_ix = dead.reset_ix(dead_start_key.pubkey(), sim2::RESET_START_STATE, false);
+    let reset = dead
+        .send(vec![reset_ix], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    if reset.result.is_err() {
+        return Err(format!("dead-slot RESET/9: {:?}", reset.result).into());
+    }
+    let dead_reset_cu = base::units(&reset)?;
+    let dead_view = dead.view().await?;
+    let dead_state_after = dead.data(dead_state_signer.pubkey()).await?;
+    let dead_mirror_after = dead.data(dead_mirror_signer.pubkey()).await?;
+    if dead_view.cursor != 0
+        || dead_view.halt != 0
+        || dead_view.resets != 1
+        || dead_state_after != base::padded_state(&dead_state)
+        || dead_mirror_after != dead_mirror_at_start
+    {
+        return Err("the dead slot was not returned to its start state".into());
+    }
+    // And the restarted slot takes input again.  Its committed start state is
+    // the one with the dead player, so a *use* press is still a restart request
+    // -- the rule is about the committed state, not about the reset -- and a
+    // non-use command is what has to commit here.
+    let deposit = dead.deposit_ix(0, &[16u8, 0, 0, 0]);
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("restarted-slot deposit: {:?}", deposited.result).into());
+    }
+    dead.cursor_before = 0;
+    let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let restarted = dead
+        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .await?;
+    if restarted.result.is_err() {
+        return Err(format!(
+            "the restarted slot refused its first tic: {:?}",
+            restarted.result
+        )
+        .into());
+    }
+    let restart = json!({
+        "committed_start_player_state": common::PST_DEAD,
+        "why": "vanilla single-player has no use-to-respawn: G_Ticker calls G_DoReborn only for PST_REBORN, and in single player G_DoReborn sets gameaction = ga_loadlevel, which this profile halts on.  So the press cannot resurrect a run; the guard refuses it with its own code and the answer is RESET/9.",
+        "dead_player_tics_commit": moved_cursor == 4,
+        "init_cu": dead_init_cu,
+        "move_batch_cu": base::units(&moved)?,
+        "use_press_refused_with": restart_code,
+        "use_press_committed_nothing": true,
+        "use_press_cu": base::units(&refused).ok(),
+        "reset_cu": dead_reset_cu,
+        "restarted_first_command": "forward 16, no buttons",
+        "restarted_cursor": dead.view().await?.cursor,
+        "restarted_first_tic_cu": base::units(&restarted)?,
+        "live_use_control": live_use,
+    });
+
+    // --- 3d. a halted slot, and the force flag --------------------------------
+    // A halt is latched and terminal, and the only way to reach one from a
+    // committed start state is a start state the guard refuses.  This slot's
+    // committed start state is a canonical ST1 whose gamestate is not
+    // GS_LEVEL, so its first sweep latches halt reason 1.  RESET/9 then refuses
+    // 289 without the force flag and lands on the slot's own start state with
+    // it: the force flag is the operator saying "discard this session", not a
+    // way to install a different start state.
+    let halt_state = {
+        let mut out = capture_data.state.clone();
+        let at = common::ST1_GAMESTATE_OFFSET;
+        out[at..at + 4].copy_from_slice(&2i32.to_le_bytes());
+        out
+    };
+    let halt_keys = session_keys(Keypair::new());
+    let halt_bank = bank_with(
+        &capture_data,
+        halt_keys.context.pubkey(),
+        halt_keys.state.pubkey(),
+        halt_keys.mirror.pubkey(),
+        halt_keys.controller.pubkey(),
+        halt_keys.authority.pubkey(),
+        None,
+    );
+    let halt_ctx = halt_bank.start_with_context().await;
+    let mut halt = Session {
+        ctx: halt_ctx,
+        keys: halt_keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let halt_authority = halt.keys.authority.insecure_clone();
+    let halt_state_signer = halt.keys.state.insecure_clone();
+    let halt_mirror_signer = halt.keys.mirror.insecure_clone();
+    let halt_controller = controller_for_gametic(&controller, base::u32_at(&halt_state, 20))?;
+    let (halt_phases, halt_init_cu) = reconstruct(
+        &mut halt,
+        &base::padded_state(&halt_state),
+        &capture_data.mirror,
+        &halt_controller,
+        &capture_data,
+        capacity,
+    )
+    .await?;
+    let halt_start_key = stage_start_account(&mut halt, &halt_state).await?;
+    let deposit = halt.deposit_ix(0, &[0u8, 0, 0, 0]);
+    let deposited = halt
+        .send(vec![deposit], &[&halt_authority], base::NORMAL_LIMIT)
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("halt-slot deposit: {:?}", deposited.result).into());
+    }
+    halt.cursor_before = 0;
+    let advance = halt.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let halted = halt
+        .send(vec![advance], &[&halt_authority], base::NORMAL_LIMIT)
+        .await?;
+    if halted.result.is_err() {
+        return Err(format!("the halt control did not latch: {:?}", halted.result).into());
+    }
+    let halt_view = halt.view().await?;
+    if halt_view.halt != sim2::HALT_GAMESTATE || halt_view.cursor != 0 {
+        return Err(format!(
+            "the halt control did not latch reason 1: halt={} cursor={}",
+            halt_view.halt, halt_view.cursor
+        )
+        .into());
+    }
+    let halted_meta = halt.data(halt.keys.meta).await?;
+    let refused = halt
+        .send(
+            vec![halt.reset_ix(halt_start_key.pubkey(), sim2::RESET_START_STATE, false)],
+            &[&halt_authority],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    let halted_code = custom_code(&refused);
+    if refused.result.is_err() {
+        if halted_code != Some(sim2::REFUSE_HALTED) {
+            return Err(format!("a halted slot refused with {halted_code:?}, wanted 289").into());
+        }
+    } else {
+        return Err("a halted slot accepted a reset with no force flag".into());
+    }
+    if halt.data(halt.keys.meta).await? != halted_meta {
+        return Err("the refused reset changed a halted slot's meta".into());
+    }
+    let forced = halt
+        .send(
+            vec![halt.reset_ix(halt_start_key.pubkey(), sim2::RESET_START_STATE, true)],
+            &[&halt_authority],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    if forced.result.is_err() {
+        return Err(format!("the forced reset of a halted slot: {:?}", forced.result).into());
+    }
+    let forced_cu = base::units(&forced)?;
+    let forced_view = halt.view().await?;
+    if forced_view.halt != 0 || forced_view.cursor != 0 || forced_view.resets != 1 {
+        return Err("the forced reset did not clear the halt".into());
+    }
+    let halted = json!({
+        "why": "gamestate != GS_LEVEL, so the shared pre-tic guard halts reason 1 before G_Ticker; the halt is latched in the meta and every later sweep is a no-op",
+        "committed_start_gamestate": 2,
+        "e2r5_phase_cu": halt_phases,
+        "init_cu": halt_init_cu,
+        "halt_reason": halt_view.halt,
+        "cursor_after_halt": halt_view.cursor,
+        "reset_without_force_refused_with": halted_code,
+        "refused_reset_changed_nothing": true,
+        "reset_with_force_cu": forced_cu,
+        "halt_after_forced_reset": forced_view.halt,
+        "cursor_after_forced_reset": forced_view.cursor,
+        "resets": forced_view.resets,
+    });
+
     // --- 4. receipts -----------------------------------------------------------
     let final_state = session.data(state_signer.pubkey()).await?;
     let final_mirror = session.data(mirror_signer.pubkey()).await?;
     let final_view = session.view().await?;
     fs::write(receipt.join("final-state.st1"), &final_state)?;
     fs::write(receipt.join("final-mirror.mp1"), &final_mirror)?;
-    fs::write(receipt.join("final-meta.bin"), &session.data(meta_key).await?)?;
+    fs::write(
+        receipt.join("final-meta.bin"),
+        &session.data(meta_key).await?,
+    )?;
     let mut sorted = advance_units.clone();
     sorted.sort_unstable();
     let report = json!({
@@ -1441,6 +2131,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "rsr2_build_cu_max": build_units.iter().max(),
         "render": render_rows,
         "strips_written": strips_written,
+        "new_game_start": new_game_start,
+        "reset9": {
+            "start_account_bytes": resource_sbf::STATE_MAX_BYTES,
+            "selector": sim2::RESET_START_STATE,
+            "start_state_root": common::hex(&start_root),
+            "refusals": reset_refusals,
+            "cu": reset_cu,
+            "cursor_after_reset": 0,
+            "state_after_reset_equals_start": true,
+            "mirror_after_reset_equals_derived": true,
+            "staged_slots_cleared": true,
+            "stale_snapshot_refused_with": stale_code,
+            "post_reset_snapshot_accepted": true,
+            "replay_batches": replay_equal,
+            "replay_equal_to_first_run": true,
+            "replay_cu_min": replay_units.iter().min(),
+            "replay_cu_max": replay_units.iter().max(),
+            "replay_note": "same staged commands from cursor 0: same ST1, MP1, state root and input chain at every cursor the first run committed, and equal to a fresh host session locked to those commands",
+        },
+        "restart_request": restart,
+        "halted_slot": halted,
         "position": position_rows,
         "controls": controls,
         "host_ingress": "resource::NativeSimSession::step, the chain per-tic contract verbatim (pre-tic guard, DoomControllerArmV2, G_Ticker, gametic++, DOOM-CI3 receipt), locked to the same staged commands",
@@ -1475,8 +2186,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
          all {equal_sweeps} equal to the host ingress, 0 refusals; first cursor past the \
          {demo_tics}-tic demo end {first_past_demo:?}; {} frames 8/8 strips byte exact; a state \
          with no console player in the game is refused at E2R/5 (Custom {prepare_code:?}) and by \
-         the host import, so a 288 cannot be staged; receipt={}",
+         the host import, so a 288 cannot be staged; RESET/9 {reset_cu} CU then {} replay batches \
+         land on the first run's bytes; a dead player's use press is refused Custom {:?}; receipt={}",
         strips_written / 8,
+        replay_equal,
+        restart_code,
         receipt.display()
     );
     Ok(())

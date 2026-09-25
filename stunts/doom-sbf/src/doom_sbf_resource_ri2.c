@@ -1306,6 +1306,37 @@ int doom_sbf_sim2_publish(
     return 0;
 }
 
+/* DOOM-SIM/2 RESET/9: return the resident engine to a committed start state.
+ *
+ * DoomStateDecode is the same commit the E2R/5 parse phase performs: it
+ * releases the current thinkers and rebuilds them from the image, so this
+ * needs no resource import, no WAD, no allocation beyond the plan the decoder
+ * makes and releases, and no render.  The mirror is derived here rather than
+ * read from the account, so a reset cannot install a pool that disagrees with
+ * the state it claims to describe; the caller then recomputes the state root
+ * over the pair and refuses unless it equals the root this meta was
+ * initialised with.  Nothing here is atomic on its own: the Rust handler
+ * validates every check before it calls, and the instruction fails (rolling
+ * the whole transaction back) on any refusal. */
+int doom_sbf_sim2_reset(
+    uint8_t *context, const uint8_t *state, unsigned long state_len,
+    uint8_t *mirror_out, unsigned long mirror_cap)
+{
+    RI2_PHASE(930);
+    if (doom_ctx_guard(context)) return 199;
+    if (!ri2_state_shape(state, (size_t)state_len) ||
+        !mirror_out || mirror_cap < RI2_MIRROR_BYTES) return 232;
+    if (doom_sbf_arena_exhausted()) return 239;
+    if (DoomStateDecode(state, (size_t)state_len)) return 232;
+    RI2_PHASE(931);
+    if (doom_sbf_arena_exhausted()) return 239;
+    /* fill_pool clears the whole 64 KiB pool before writing its header and
+     * slots, so the mirror account needs no staging buffer. */
+    if (doom_sbf_fill_pool(mirror_out, ri2_wad_hash)) return 233;
+    RI2_PHASE(932);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* DOOM-RSR/2 pinned-base static renderer resource account              */
 

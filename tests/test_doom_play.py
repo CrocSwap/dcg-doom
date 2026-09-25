@@ -202,7 +202,7 @@ class TestDoomPlay:
         assert "@media (prefers-reduced-motion: reduce)" in css
         assert ".pad" in css, "there are touch controls"
 
-    def test_the_relayer_refuses_to_start_in_chain_mode(self):
+    def test_the_relayer_refuses_chain_mode_without_keys(self):
         result = run_node(
             "--input-type=module",
             "-e",
@@ -215,8 +215,8 @@ class TestDoomPlay:
         assert result.returncode == 0, result.stderr
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["threw"] is True
-        assert report["code"] == "not_wired"
-        assert "doom_r8b_tokyo_pipeline" in report["message"]
+        assert report["code"] == "no_keys"
+        assert "--keys-dir" in report["message"]
 
     def test_the_relayer_does_not_own_a_key(self):
         # The relayer pays fees, so in chain mode it will need a key, but this
