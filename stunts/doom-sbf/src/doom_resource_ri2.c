@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1260,6 +1261,39 @@ static int r2_v2_apply_table(uint32_t id, uint32_t n, const uint8_t *p, void *op
     return r2_apply_table(id, n, p, opaque);
 }
 
+/* doom-lowdetail-3: the native half of the strip-path comparison.  Prints the
+ * renderer inputs the chain rebuilds for every strip, so the first divergence
+ * between the two paths can be read off directly instead of inferred from
+ * pixels.  The subsector census is the one that matters: R_RenderBSPNode skips
+ * a subsector whose validcount already equals the global one, so a stale
+ * identity left by the image import silently drops that subsector's walls,
+ * flats and sprites. */
+static void doom_lowdetail3_probe(subsector_t *subs, int numsubs, int vc)
+{
+    int i, stale = 0, x;
+    unsigned long h = 1469598103934665603ul;
+    for (i = 0; i < numsubs; i++) if (subs[i].validcount == vc) stale++;
+    for (x = 0; x <= viewwidth; x++)
+    {
+        h = (h ^ (unsigned long)(uint32_t)xtoviewangle[x]) * 1099511628211ul;
+        h = (h ^ (unsigned long)(uint32_t)distscale[x]) * 1099511628211ul;
+    }
+    for (i = 0; i < viewheight; i++)
+        h = (h ^ (unsigned long)(uint32_t)yslope[i]) * 1099511628211ul;
+    for (i = 0; i < FINEANGLES/2; i++)
+        h = (h ^ (unsigned long)(uint32_t)viewangletox[i]) * 1099511628211ul;
+    printf("PROBE validcount=%#x subs=%d stale=%d viewwidth=%d viewheight=%d "
+           "centerx=%d centerxfrac=%#x centery=%d centeryfrac=%#x detailshift=%d "
+           "projection=%#x viewangle=%#x viewx=%d viewy=%d viewz=%d "
+           "extralight=%d fixedcolormap=%d xtoviewangle0=%#x tables=%#lx\n",
+           (unsigned)vc, numsubs, stale, viewwidth, viewheight, centerx,
+           (unsigned)centerxfrac, centery, (unsigned)centeryfrac, detailshift,
+           (unsigned)projection, (unsigned)viewangle, (int)viewx, (int)viewy,
+           (int)viewz, players[displayplayer].extralight,
+           players[displayplayer].fixedcolormap, (unsigned)xtoviewangle[0], h);
+    fflush(stdout);
+}
+
 static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
                         const uint8_t *image, const uint8_t *wad, size_t wad_bytes,
                         const uint8_t hash[32],
@@ -1309,7 +1343,21 @@ static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true; fixedcolormap = 0; setsizeneeded = false;
     if (run_tic) {
-        G_Ticker(); clipangle = xtoviewangle[0]; fixedcolormap = 0; R_RenderPlayerView(&players[displayplayer]); gametic++;
+        /* doom-lowdetail-3: the native strip probe.  DOOM_NATIVE_STRIP selects
+         * the strip whose clip word the render runs in, so the chain's strip
+         * path (image import + decoded state + clip mode 1) is exercised in
+         * this process and its frame can be compared with the oracle strip for
+         * strip.  DOOM_NATIVE_PROBE=1 additionally prints the renderer inputs
+         * the chain rebuilds, so the two sides can be compared.  Nothing
+         * changes when neither variable is set. */
+        const char *probe = getenv("DOOM_NATIVE_STRIP");
+        const char *report = getenv("DOOM_NATIVE_PROBE");
+        if (report) doom_lowdetail3_probe(subsectors, numsubsectors, validcount);
+        G_Ticker();
+        if (probe) doom_render_fuzz_columns = (1u << 30) | ((unsigned long)atol(probe) << 27);
+        clipangle = xtoviewangle[0]; fixedcolormap = 0; R_RenderPlayerView(&players[displayplayer]); gametic++;
+        if (report) printf("PROBE after drawsegs=%d vissprites=%d subs=%d\n",
+                           (int)(ds_p - drawsegs), (int)(vissprite_p - vissprites), numsubsectors);
     }
     derived = (uint8_t *)malloc(RI2_MIRROR_BYTES); if (!derived || doom_engine_ex2_fill_mirror(derived, wad, wad_bytes, hash) || DoomStateEncode(&encoded, &encoded_bytes) || encoded_bytes > RI2_STATE_MAX) { free(derived); free(encoded); free(frame); free(carrier); return 238; }
     memcpy(*state_out, encoded, encoded_bytes); *state_out_len = encoded_bytes; memcpy(mirror_out, derived, RI2_MIRROR_BYTES); memcpy(frame_out, screens[0], RI2_FRAME_BYTES);
