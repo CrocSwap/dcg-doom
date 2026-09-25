@@ -12,15 +12,21 @@
 //                  page is exercised against locally, and what the API tests
 //                  run against.
 //
-//   createPipelineSender
-//                  the binding to scripts/doom_r8b_tokyo_pipeline.py. It is
-//                  deliberately not wired: another worker is changing that
-//                  sender's interface right now, and this dispatch must not
-//                  edit it. The contract is written out so the binding is one
-//                  function to fill in once that interface settles.
+//   PipelineSender   the binding to scripts/doom_relayer_server.py, which
+//                    holds the R8m sender (scripts/doom_r7_render_loop.py
+//                    fire_blind) and the R8b frame pipeline open for the life
+//                    of a session and takes the player's input as a stream.
+//                    See PIPELINE_REQUIREMENTS below.
 //
-// Nothing in this file signs or sends anything. MockSender never touches the
-// network, and createPipelineSender refuses to start until it is filled in.
+// Nothing in this file signs or sends anything itself. MockSender never touches
+// the network; PipelineSender spawns a process that holds the keys, and the
+// relayer itself never sees one.
+
+import {spawn} from "node:child_process";
+import {existsSync} from "node:fs";
+import {createInterface} from "node:readline";
+import {dirname, resolve} from "node:path";
+import {fileURLToPath} from "node:url";
 
 import {STRIP_ACCOUNT_BYTES, STRIP_HEADER_BYTES, STRIP_PIXELS_BYTES, stripDigest, toHex} from "../../web/doom-play/strip.js";
 
@@ -284,8 +290,10 @@ export class MockSender {
 // --------------------------------------------------------------- pipeline
 
 // The interface the Python side has to expose, written out so it can be
-// reviewed rather than guessed at. The relayer needs five things; the existing
-// script already has four of them as functions and one that does not exist yet.
+// reviewed rather than guessed at. Four of the five operations already existed
+// as functions somewhere in scripts/; the fifth, a way to keep one context
+// advancing from an external source of commands, is
+// `scripts/doom_relayer_server.py`.
 //
 //   deposit        SIM2 DEPOSIT, firstSeq + up to 64 commands.  Already
 //                  derivable from the buffer and authority in scripts/
@@ -296,41 +304,384 @@ export class MockSender {
 //                  doom_r8b_tokyo_pipeline.py:1015 (snapshot_instruction).
 //   renderStrip    RENDER for one strip id.  doom_r8b_tokyo_pipeline.py:1029
 //                  (strip_instruction).
-//   longLived      NEW. A way to keep one context advancing from an external
-//                  source of commands. `run` today takes --seconds and a
-//                  scripted command table (key_command, line 573), so it is a
-//                  batch driver, not a server.
-//
-// Until (5) exists, a relayer cannot play: it would have to shell out to `run`
-// per batch, which would restart the sender each time and lose the cursor
-// binding that ADVANCE_EXPECTED_CURSOR exists to provide.
+//   longLived      scripts/doom_relayer_server.py: one process for the life of
+//                  a session, JSON lines on stdin and stdout, so the cursor
+//                  binding that ADVANCE_EXPECTED_CURSOR provides survives from
+//                  one player batch to the next.
 export const PIPELINE_REQUIREMENTS = {
-  module: "scripts/doom_r8b_tokyo_pipeline.py",
-  note: "do not edit that file from this dispatch; another worker owns it",
+  module: "scripts/doom_relayer_server.py",
+  note: "do not edit doom_r7_render_loop.py or doom_r8b_tokyo_pipeline.py from this dispatch",
   operations: ["deposit", "advance", "snapshot", "renderStrip", "longLived"],
   existing: {
     deposit: "scripts/doom_sweep_testnet.py:1450 deposit_ix",
     advance: "scripts/doom_sweep_testnet.py:1454 advance_ix",
     snapshot: "scripts/doom_r8b_tokyo_pipeline.py:1015 FramePipeline.snapshot_instruction",
     renderStrip: "scripts/doom_r8b_tokyo_pipeline.py:1029 FramePipeline.strip_instruction",
+    longLived: "scripts/doom_relayer_server.py",
   },
-  missing: {
-    longLived: "a command source the relayer can push signed batches into, with a stable cursor binding",
-  },
+  missing: {},
   transport: "JSON lines on stdin and stdout, one request and one response per line, so the relayer can hold the process open for the life of a session",
-  request: {op: "deposit", slot: "slot label", firstSeq: 0, commands: "base64"},
+  request: {op: "deposit", first_seq: 0, commands: "base64"},
   response: {ok: true, signature: "base58", cursor: 0, gametic: 0, tics: 8},
 };
 
+// --------------------------------------------------------------- pipeline
+
+// A relayer holding one long-lived sender process, speaking JSON lines to it.
+//
+// The division of labour is the whole point. The advance pipeline, the deposit
+// pacer, the render loop and every refund/reconciliation rule stay in the
+// Python sender that R8m measured: this class never signs, never sends and
+// never computes. It does three things the batch driver could not do:
+//
+//   1. it holds the process open for the life of a session rather than for
+//      --seconds, so the cursor binding survives between player batches;
+//   2. it stages the player's key state as a command stream, so a keypress is
+//      a range of tics rather than a scripted table;
+//   3. it reports the staging frontier, so the relayer can refuse input the
+//      chain is not going to consume for another second. Without that a
+//      player outrunning the engine builds a backlog whose latency grows
+//      without bound, which is exactly the R8l5 failure.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+export class PipelineSender {
+  constructor(options = {}) {
+    this.mode = "chain";
+    // The advance pipeline and the frame loop run inside the child, on their
+    // own schedule. The relayer's job is to hand over input, not to schedule.
+    this.background = true;
+    this.options = options;
+    this.python = options.python ?? "python3";
+    this.script = options.script ?? resolve(REPO_ROOT, "scripts", "doom_relayer_server.py");
+    this.keysDir = options.keysDir ?? null;
+    this.payerKey = options.payerKey ?? null;
+    if (!this.keysDir || !this.payerKey) {
+      throw new SenderError(
+        "chain mode needs --keys-dir and --payer-key: the Doom keys stay on the host next to the relayer and are never sent anywhere",
+        "no_keys",
+      );
+    }
+    this.child = null;
+    this.pending = new Map();
+    this.nextId = 1;
+    this.lines = [];
+    this.logger = options.logger ?? null;
+    this.hello = null;
+    this.status = null;
+    this.closed = false;
+    this.onFrame = options.onFrame ?? null;
+    this.startedAt = null;
+    // Checked here rather than at the first input, so a relayer pointed at the
+    // wrong tree says so while it is starting instead of after a player has
+    // joined and is pressing keys.
+    if (!existsSync(this.script)) {
+      throw new SenderError(
+        `the pipeline server is not at ${this.script}`,
+        "no_pipeline_script",
+        {script: this.script},
+      );
+    }
+  }
+
+  log(...parts) {
+    this.logger?.(...parts);
+  }
+
+  // Everything the child is told, in one place, so a receipt can name the
+  // configuration that produced it.
+  argv() {
+    const options = this.options;
+    const argv = [
+      this.script,
+      "--run-dir", options.runDir ?? resolve(REPO_ROOT, "out", "doom-relayer-session"),
+      "--keys-dir", this.keysDir,
+      "--payer-key", this.payerKey,
+    ];
+    if (options.rpcA) argv.push("--rpc-a", options.rpcA);
+    if (options.rpcB) argv.push("--rpc-b", options.rpcB);
+    if (options.imageSha256) argv.push("--image-sha256", options.imageSha256);
+    if (options.imageBytes) argv.push("--image-bytes", String(options.imageBytes));
+    if (options.seconds) argv.push("--seconds", String(options.seconds));
+    argv.push(options.render === false ? "--no-render" : "--render");
+    argv.push("--render-buffers", String(options.renderBuffers ?? 1));
+    argv.push("--strip-rate", String(options.stripRate ?? 16));
+    argv.push("--advance-tics", String(options.advanceTics ?? 4));
+    argv.push("--advance-pipeline-depth", String(options.advancePipelineDepth ?? 4));
+    argv.push("--sweep-rate", String(options.sweepRate ?? 8));
+    argv.push("--input-tics-per-second", String(options.inputTicsPerSecond ?? 35));
+    if (options.inputStageLeadTics) argv.push("--input-stage-lead-tics", String(options.inputStageLeadTics));
+    if (options.waitForAdvance === false) argv.push("--no-wait-for-advance");
+    if (options.startCursor !== undefined && options.startCursor !== null) {
+      argv.push("--start-cursor", String(options.startCursor));
+    }
+    argv.push("--spend-cap-fogo", String(options.spendCapFogo ?? 10));
+    return argv;
+  }
+
+  async start() {
+    if (this.child) return this.hello;
+    const env = {...process.env};
+    // The child imports the sweep and pipeline modules out of scripts/ and the
+    // basanos package out of src/, exactly as the batch driver does.
+    env.PYTHONPATH = [resolve(REPO_ROOT, "src"), dirname(this.script), env.PYTHONPATH]
+      .filter(Boolean)
+      .join(":");
+    this.child = spawn(this.python, this.argv(), {env, stdio: ["pipe", "pipe", "pipe"]});
+    this.startedAt = Date.now();
+    const lines = createInterface({input: this.child.stdout});
+    lines.on("line", (line) => this.#onLine(line));
+    this.child.stderr.on("data", (chunk) => {
+      const text = String(chunk).trimEnd();
+      if (text) this.log(`[pipeline stderr] ${text}`);
+    });
+    this.child.on("exit", (code, signal) => {
+      this.closed = true;
+      const error = new SenderError(
+        `the pipeline process exited with ${signal ?? `code ${code}`}`,
+        "pipeline_exited",
+        {code, signal, lines: this.lines.slice(-20)},
+      );
+      for (const [, waiter] of this.pending) waiter.reject(error);
+      this.pending.clear();
+      this.log(`pipeline process exited: ${signal ?? code}`);
+    });
+    // The child answers hello only after its own preflight, so a relayer that
+    // joins against a program that moved, or a context that is full, finds out
+    // here rather than mid-game.
+    const started = this.#waitForEvent("started", 90_000);
+    await started;
+    this.hello = await this.request({op: "hello"});
+    return this.hello;
+  }
+
+  #onLine(line) {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      this.log(`[pipeline] non-JSON line: ${line.slice(0, 200)}`);
+      return;
+    }
+    this.lines.push(message);
+    if (this.lines.length > 400) this.lines.shift();
+    if (message.id !== undefined && this.pending.has(message.id)) {
+      const waiter = this.pending.get(message.id);
+      this.pending.delete(message.id);
+      if (message.ok === false) waiter.reject(new SenderError(message.error ?? "the pipeline refused the request", "pipeline_refused", message));
+      else waiter.resolve(message);
+      return;
+    }
+    if (message.event === "progress") {
+      this.status = message;
+      return;
+    }
+    if (message.event === "frame") {
+      this.onFrame?.(message);
+      return;
+    }
+    if (message.event === "started" || message.event === "finished" || message.event) {
+      this.log(`[pipeline] ${JSON.stringify(message)}`);
+      for (const [id, waiter] of this.pending) {
+        if (waiter.event === message.event) {
+          this.pending.delete(id);
+          waiter.resolve(message);
+        }
+      }
+      return;
+    }
+    this.log(`[pipeline] ${line.slice(0, 200)}`);
+  }
+
+  #waitForEvent(event, timeoutMs) {
+    return new Promise((resolvePromise, reject) => {
+      const id = this.nextId++;
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new SenderError(`the pipeline did not report ${event} within ${timeoutMs / 1000} s`, "pipeline_timeout", {
+          lines: this.lines.slice(-20),
+        }));
+      }, timeoutMs);
+      this.pending.set(id, {
+        event,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolvePromise(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+    });
+  }
+
+  request(payload, {timeoutMs = 30_000} = {}) {
+    if (this.closed || !this.child) {
+      return Promise.reject(new SenderError("the pipeline process is not running", "pipeline_exited"));
+    }
+    const id = this.nextId++;
+    const line = `${JSON.stringify({...payload, id})}\n`;
+    return new Promise((resolvePromise, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new SenderError(`the pipeline did not answer ${payload.op} within ${timeoutMs / 1000} s`, "pipeline_timeout"));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolvePromise(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      this.child.stdin.write(line, (error) => {
+        if (error) {
+          this.pending.delete(id);
+          clearTimeout(timer);
+          reject(new SenderError(`could not write to the pipeline: ${error.message}`, "pipeline_gone"));
+        }
+      });
+    });
+  }
+
+  // -- the contract, against a background sender ----------------------------
+
+  // The slot is the context the child is already driving. There is nothing to
+  // provision: a context costs about 73 FOGO of rent, so the operator made it
+  // before the relayer started rather than per player.
+  async provisionSlot() {
+    const hello = await this.start();
+    return {
+      slot: 0,
+      label: `chain-${hello.context.slice(0, 8)}`,
+      context: hello.context,
+      meta: hello.meta,
+      inputBuffer: hello.buffer,
+      authority: hello.authority,
+      state: hello.state,
+      mirror: hello.mirror,
+      snapshot: hello.snapshot_account,
+      strips: hello.strip_accounts,
+      inputCapacity: hello.capacity,
+      cursor: hello.cursor,
+      gametic: hello.gametic,
+      // Above whatever a previous session staged but never advanced, so the
+      // player's first batch does not try to rewrite tics the chain already
+      // holds.
+      nextSeq: hello.staged_frontier ?? hello.start_cursor,
+      stagedFrontier: hello.staging_frontier,
+    };
+  }
+
+  // The player's key state, staged as the next tics' commands. The child
+  // deposits them at its own 10/s producer rate, exactly as the measured
+  // session did.
+  async deposit({slot, firstSeq, commands}) {
+    if (this.closed) throw new SenderError("the pipeline process is not running", "pipeline_exited");
+    const reply = await this.request({
+      op: "commands",
+      first_seq: firstSeq,
+      commands: Buffer.from(commands).toString("base64"),
+    });
+    if (reply.accepted !== commands.length / 4) {
+      throw new SenderError(
+        `the pipeline accepted ${reply.accepted} of ${commands.length / 4} tics at ${firstSeq}`,
+        "short_deposit",
+        reply,
+      );
+    }
+    return {accepted: reply.accepted, firstSeq, signature: null, cursor: reply.cursor};
+  }
+
+  // The advance is not this method's job any more: the child runs the
+  // cursor-bound pipeline continuously, so asking it to advance would be asking
+  // for a second scheduler. This reports where the chain is.
+  async advance() {
+    const status = await this.readProgress();
+    return {cursor: status.cursor, gametic: status.gametic, tics: 0, signature: null, background: true};
+  }
+
+  // Likewise the frame: the child's render loop is what paints one, and the
+  // viewer reads the strip accounts off the chain itself. This reports the
+  // newest frame the child knows landed.
+  async renderFrame() {
+    const status = await this.readProgress();
+    const frame = status.last_frame;
+    if (!frame) throw new SenderError("no frame has landed yet", "no_frame");
+    return {
+      cursor: frame.cursor,
+      gametic: frame.gametic,
+      snapshotHash: frame.snapshot_hash,
+      stateRoot: frame.state_root,
+      signature: frame.signature,
+      strips: null,
+      background: true,
+    };
+  }
+
+  async readProgress() {
+    const status = await this.request({op: "status"}, {timeoutMs: 10_000});
+    this.status = status;
+    return {
+      cursor: status.cursor,
+      gametic: status.gametic,
+      capacity: status.capacity,
+      halted: Boolean(status.halt),
+      ticsPerSecond: status.tics_per_second,
+      framesCompleted: status.frames_completed,
+      framesPerSecond: status.frames_per_second,
+      spendFogo: status.spend_fogo,
+    };
+  }
+
+  // How far past the committed cursor input may be staged. The relayer refuses
+  // a batch beyond it rather than queueing input the chain will not run for
+  // another second, which is what made R8l5's input latency drift upward
+  // through a session.
+  async stagingFrontier() {
+    const status = this.status ?? (await this.request({op: "status"}, {timeoutMs: 10_000}));
+    return status.staging_frontier;
+  }
+
+  // The viewer reads the chain in chain mode, so the relayer has no bytes to
+  // hand it. Saying so beats returning eight empty accounts.
+  async readStrips() {
+    throw new SenderError(
+      "chain mode has no strip bytes to hand out: the frame pipeline writes the strip accounts and " +
+        "the viewer reads them from the network, which is the design in docs/design/doom-relayer-api-2026-09-25.md",
+      "no_strip_bytes",
+    );
+  }
+
+  async close() {
+    if (!this.child || this.closed) return;
+    this.closed = true;
+    try {
+      // The documented stop: the child writes its receipt, then exits.
+      await this.request({op: "stop"}, {timeoutMs: 5_000});
+    } catch {
+      // A child that is already gone needs no stop.
+    }
+    const exited = new Promise((resolvePromise) => {
+      const timer = setTimeout(() => {
+        this.child?.kill("SIGTERM");
+        resolvePromise();
+      }, 20_000);
+      this.child.once("exit", () => {
+        clearTimeout(timer);
+        resolvePromise();
+      });
+    });
+    await exited;
+    this.child?.stdin?.end();
+  }
+}
+
 export function createPipelineSender(options = {}) {
-  throw new SenderError(
-    "the chain sender is not wired. " +
-      `It needs ${PIPELINE_REQUIREMENTS.missing.longLived} from ${PIPELINE_REQUIREMENTS.module}, ` +
-      `over ${PIPELINE_REQUIREMENTS.transport}. ` +
-      "Run the relayer in mock mode until that binding exists.",
-    "not_wired",
-    {requirements: PIPELINE_REQUIREMENTS, options},
-  );
+  return new PipelineSender(options);
 }
 
 export function createSender({mode = "mock", ...options} = {}) {
