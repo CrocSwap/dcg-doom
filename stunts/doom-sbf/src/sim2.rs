@@ -2424,6 +2424,447 @@ mod tests {
         );
     }
 
+    // ---- RESET/9 ---------------------------------------------------------
+
+    /// Re-seeds a resident engine from a committed start image and derives the
+    /// mirror, exactly as `doom_sbf_sim2_reset` does.  `refusals` is the code
+    /// the real decode would return, so the refusal paths are reachable.
+    struct MockReset {
+        start_state: Vec<u8>,
+        start_mirror: Vec<u8>,
+        resets: u32,
+        refuse: Option<u32>,
+    }
+
+    impl ResetEngine for MockReset {
+        fn reset(&mut self, state: &mut [u8], mirror: &mut [u8]) -> Result<(), u32> {
+            self.resets += 1;
+            if let Some(code) = self.refuse {
+                return Err(code);
+            }
+            let len = u32_at(&self.start_state, 16) as usize;
+            state[..len].copy_from_slice(&self.start_state[..len]);
+            state[len..].fill(0);
+            mirror.copy_from_slice(&self.start_mirror);
+            Ok(())
+        }
+    }
+
+    /// A golden slot that has been swept once: the cursor has moved, the input
+    /// chain has moved with it, and the meta records the start root INIT wrote.
+    /// The staged start state and mirror are the copies a reset restores.
+    fn played(start_root: bool) -> (Golden, Vec<u8>, Vec<u8>) {
+        let mut g = golden();
+        let (start_state, start_mirror) = (g.state.clone(), g.mirror.clone());
+        let root = start_state.len().to_le_bytes();
+        let _ = root;
+        if start_root {
+            let (_, start) = verified_state_root(&start_state, &start_mirror).unwrap();
+            g.meta[M_START_ROOT..M_START_ROOT + 32].copy_from_slice(&start);
+        }
+        let mut engine = MockEngine::new(None);
+        sweep(
+            &mut g.meta,
+            &g.buffer,
+            &mut g.state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            8,
+            true,
+            &mut engine,
+            &NoBudget,
+        )
+        .unwrap();
+        assert_eq!(u32_at(&g.meta, M_CURSOR), 4);
+        (g, start_state, start_mirror)
+    }
+
+    fn mock_reset(start_state: Vec<u8>, start_mirror: Vec<u8>) -> MockReset {
+        MockReset { start_state, start_mirror, resets: 0, refuse: None }
+    }
+
+    #[test]
+    fn reset_wire_is_24_bytes_and_only_names_the_meta_start_state() {
+        let data = encode_reset(RESET_START_META, false);
+        assert_eq!(data.len(), RESET_BYTES);
+        assert_eq!(data[12], RESET);
+        assert_eq!(decode_reset(&data), Ok((RESET_START_META, false)));
+        let forced = encode_reset(RESET_START_META, true);
+        assert_eq!(decode_reset(&forced), Ok((RESET_START_META, true)));
+        // A selector this version does not serve, an unknown flag bit, a
+        // trailing byte and the wrong operation number are all malformed.
+        assert_eq!(
+            decode_reset(&encode_reset(1, false)),
+            Err(refuse(REFUSE_MALFORMED))
+        );
+        let mut bad_flag = encode_reset(RESET_START_META, true);
+        put_u32(&mut bad_flag, 16, RESET_FORCE | 2);
+        assert_eq!(decode_reset(&bad_flag), Err(refuse(REFUSE_MALFORMED)));
+        let mut trailing = encode_reset(RESET_START_META, false);
+        trailing.push(0);
+        assert_eq!(decode_reset(&trailing), Err(refuse(REFUSE_MALFORMED)));
+        let mut wrong_op = encode_reset(RESET_START_META, false);
+        wrong_op[12] = SNAPSHOT;
+        assert_eq!(decode_reset(&wrong_op), Err(refuse(REFUSE_MALFORMED)));
+    }
+
+    /// INIT records the start root once, and the meta it writes is still
+    /// shape-valid afterwards: the reserved tail starts where the new fields
+    /// end, so the binding check's zero scan still covers every byte nothing
+    /// claims.
+    #[test]
+    fn init_records_the_start_root_and_keeps_the_reserved_tail_zero() {
+        let context = Pubkey::new_from_array([0xc0; 32]);
+        let state = Pubkey::new_from_array([0x51; 32]);
+        let mirror = Pubkey::new_from_array([0x52; 32]);
+        let buffer = Pubkey::new_from_array([0x53; 32]);
+        let meta_key = Pubkey::new_from_array([0x54; 32]);
+        let authority = Pubkey::new_from_array([0xa1; 32]);
+        let capacity = 64usize;
+        let mut buffer_bytes = vec![0u8; buffer_bytes(capacity).unwrap()];
+        let mut meta_bytes = vec![0u8; META_BYTES];
+        let root = [0x5a; 32];
+        init_layout(
+            &mut meta_bytes,
+            &mut buffer_bytes,
+            &InitParams {
+                context,
+                state,
+                mirror,
+                buffer,
+                meta: meta_key,
+                authority,
+                bump: 254,
+                capacity: capacity as u32,
+                first_tic: 0,
+                state_len: 64,
+                state_root: root,
+                checkpoint_hash: [0x11; 32],
+            },
+        )
+        .unwrap();
+        assert_eq!(&meta_bytes[M_START_ROOT..M_START_ROOT + 32], &root);
+        assert_eq!(u32_at(&meta_bytes, M_RESETS), 0);
+        assert!(exact_zero(&meta_bytes[M_RESERVED..]));
+        let view = MetaView::parse(&meta_bytes).unwrap();
+        assert_eq!(view.start_root, root);
+        assert_eq!(view.resets, 0);
+        assert_eq!(view.state_root, root);
+    }
+
+    /// The whole point: a swept slot, its staged input cleared, its cursor,
+    /// chain, halt and sweep counters rewound, and the committed state back to
+    /// the start image.  A second reset of the same slot is byte-identical to
+    /// the first apart from the reset counter, which is what makes a slot
+    /// reusable rather than merely re-runnable.
+    #[test]
+    fn reset_returns_a_played_slot_to_its_start_state() {
+        let (mut g, start_state, start_mirror) = played(true);
+        let mut engine = mock_reset(start_state.clone(), start_mirror.clone());
+        let root = reset(
+            &mut g.meta,
+            &mut g.buffer,
+            &mut g.state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            false,
+            &mut engine,
+        )
+        .unwrap();
+        assert_eq!(engine.resets, 1);
+        assert_eq!(u32_at(&g.meta, M_CURSOR), 0);
+        assert_eq!(g.meta[M_HALT], 0);
+        assert_eq!(u32_at(&g.meta, M_SWEEPS), 0);
+        assert_eq!(u32_at(&g.meta, M_LAST_SWEEP_TICS), 0);
+        assert_eq!(u32_at(&g.meta, M_RESETS), 1);
+        assert_eq!(&g.meta[M_STATE_ROOT..M_STATE_ROOT + 32], &root);
+        assert_eq!(&g.meta[M_START_ROOT..M_START_ROOT + 32], &root);
+        assert_eq!(
+            &g.meta[M_INPUT_CHAIN..M_INPUT_CHAIN + 32],
+            &chain_init(g.keys.context, 0)
+        );
+        assert_eq!(g.state, start_state, "state is the start image again");
+        assert_eq!(g.mirror, start_mirror, "mirror is derived, not supplied");
+        // Every staged slot is gone, the header is not.
+        assert!(exact_zero(&g.buffer[BUFFER_HEADER_BYTES..]));
+        assert_eq!(&g.buffer[..8], BUFFER_MAGIC);
+        assert_eq!(u32_at(&g.buffer, B_CAPACITY), 64);
+        assert_eq!(&g.buffer[B_AUTHORITY..B_AUTHORITY + 32], &[0xa1; 32]);
+        // The rewritten meta is still a valid meta for this slot.
+        validate_meta(&g.meta, &g.keys, &g.checkpoint).unwrap();
+        // And a second reset lands on exactly the same bytes.
+        let after_first = (g.meta.clone(), g.buffer.clone(), g.state.clone(), g.mirror.clone());
+        let mut again = mock_reset(start_state.clone(), start_mirror.clone());
+        let second = reset(
+            &mut g.meta,
+            &mut g.buffer,
+            &mut g.state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            false,
+            &mut again,
+        )
+        .unwrap();
+        assert_eq!(second, root);
+        assert_eq!(g.state, after_first.2);
+        assert_eq!(g.mirror, after_first.3);
+        assert_eq!(g.buffer, after_first.1);
+        assert_eq!(u32_at(&g.meta, M_RESETS), 2);
+        assert_eq!(g.meta[..M_RESETS], {
+            let mut first = after_first.0;
+            put_u32(&mut first, M_RESETS, 2);
+            first[..M_RESETS]
+        });
+    }
+
+    /// A reset lands on *the* provisioned start state, not on one supplied at
+    /// reset time.  The state is shape-valid and at the right tic; only the
+    /// root differs, and the refusal commits nothing: the cursor, the chain and
+    /// the staged slots are exactly as they were.
+    #[test]
+    fn reset_refuses_a_state_that_is_not_the_committed_start_state() {
+        let (mut g, start_state, start_mirror) = played(true);
+        let meta_before = g.meta.clone();
+        let buffer_before = g.buffer.clone();
+        let mut wrong = start_state.clone();
+        // A canonical ST1 at the same tic with one different committed field.
+        wrong[64..68].copy_from_slice(&[0x5a, 0x5a, 0x5a, 0x5a]);
+        let mut engine = mock_reset(wrong, start_mirror);
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_STATE_ROOT))
+        );
+        assert_eq!(engine.resets, 1, "the decode ran and the root did not match");
+        assert_eq!(g.meta, meta_before);
+        assert_eq!(g.buffer, buffer_before);
+        assert_ne!(u32_at(&g.state, 64), 0x5a5a5a5a);
+    }
+
+    /// A state from another tic is refused before the engine is touched: the
+    /// root would have caught it too, but the tic check is the one that says
+    /// "this is not a start state", and it costs nothing.
+    #[test]
+    fn reset_refuses_a_state_from_another_tic_before_the_decode() {
+        let (mut g, mut start_state, start_mirror) = played(true);
+        put_u32(&mut start_state, 20, 8);
+        let mut engine = mock_reset(start_state, start_mirror);
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_TIC))
+        );
+        assert_eq!(engine.resets, 0, "no decode ran");
+    }
+
+    /// A decode refusal is the decode's own code, and it too commits nothing.
+    #[test]
+    fn reset_refuses_a_state_the_engine_cannot_decode() {
+        let (mut g, start_state, start_mirror) = played(true);
+        let mut engine = mock_reset(start_state, start_mirror);
+        engine.refuse = Some(232);
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(232))
+        );
+        assert_eq!(u32_at(&g.meta, M_CURSOR), 4);
+        assert_eq!(u32_at(&g.meta, M_RESETS), 0);
+    }
+
+    /// A malformed ST1 account is refused by the shape check (281) before the
+    /// engine sees it.
+    #[test]
+    fn reset_refuses_a_malformed_state_account() {
+        let (mut g, start_state, start_mirror) = played(true);
+        let mut engine = mock_reset(start_state, start_mirror);
+        let mut state = g.state.clone();
+        state[0] = b'X';
+        let result = reset(
+            &mut g.meta,
+            &mut g.buffer,
+            &mut state,
+            &mut g.mirror,
+            &g.keys,
+            &g.checkpoint,
+            false,
+            &mut engine,
+        );
+        assert_eq!(result, Err(refuse(REFUSE_STATE_SHAPE)));
+        assert_eq!(engine.resets, 0);
+    }
+
+    /// A halt is latched and terminal, so a reset ignores one only when the
+    /// request says so.  This is the griefing bound: without the authority and
+    /// without the flag, a reset cannot erase a session someone is auditing.
+    #[test]
+    fn reset_refuses_a_halted_slot_unless_the_request_forces_it() {
+        for (force, halted, expect) in [
+            (false, true, Err(REFUSE_HALTED)),
+            (true, true, Ok(())),
+            (false, 0u8, Ok(())),
+        ] {
+            let (mut g, start_state, start_mirror) = played(true);
+            g.meta[M_HALT] = halted;
+            let mut engine = mock_reset(start_state, start_mirror);
+            let result = reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                force,
+                &mut engine,
+            );
+            match expect {
+                Ok(()) => {
+                    result.unwrap();
+                    assert_eq!(g.meta[M_HALT], 0, "force={force} halted={halted}");
+                    assert_eq!(u32_at(&g.meta, M_CURSOR), 0);
+                }
+                Err(code) => {
+                    assert_eq!(result, Err(refuse(code)), "force={force}");
+                    assert_eq!(engine.resets, 0, "force={force}");
+                    assert_eq!(u32_at(&g.meta, M_CURSOR), 4, "force={force}");
+                }
+            }
+        }
+    }
+
+    /// Authority, account binding and the published checkpoint, all through the
+    /// one `validate_meta` the sweep already uses: RESET/9 grants no more
+    /// authority over a slot than ADVANCE does.
+    #[test]
+    fn reset_checks_authority_and_binding_before_anything_else() {
+        let (mut g, start_state, start_mirror) = played(true);
+        let stranger = Pubkey::new_from_array([0xa2; 32]);
+        let mut other = g.keys.clone();
+        other.signer = Box::leak(Box::new(stranger));
+        let mut engine = mock_reset(start_state.clone(), start_mirror.clone());
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &other,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_AUTHORITY))
+        );
+        assert_eq!(engine.resets, 0);
+        // A buffer that is not this meta's bound input buffer.
+        let mut other_buffer = g.buffer.clone();
+        other_buffer[B_META..B_META + 32].copy_from_slice(&[0x77; 32]);
+        let mut engine = mock_reset(start_state.clone(), start_mirror.clone());
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut other_buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_BINDING))
+        );
+        assert_eq!(engine.resets, 0);
+        // A context whose E2R/5 publication is no longer the one the meta
+        // committed.
+        let mut checkpoint = g.checkpoint.clone();
+        checkpoint[12..16].copy_from_slice(&7);
+        let mut engine = mock_reset(start_state, start_mirror);
+        assert_eq!(
+            reset(
+                &mut g.meta,
+                &mut g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &checkpoint,
+                false,
+                &mut engine,
+            ),
+            Err(refuse(REFUSE_CONTEXT))
+        );
+        assert_eq!(engine.resets, 0);
+    }
+
+    /// The dead player's use press.  `doom_sim2_guard.h` returns 290 from the
+    /// pre-tic guard, which reaches the sweep as an engine error: the tic does
+    /// not run, nothing is committed, and the meta is not halted, so the answer
+    /// is RESET/9 rather than a lost slot.
+    #[test]
+    fn a_restart_request_refuses_the_sweep_and_commits_nothing() {
+        let mut g = golden();
+        let meta_before = g.meta.clone();
+        let state_before = g.state.clone();
+        let mut engine = RestartRequest;
+        assert_eq!(
+            sweep(
+                &mut g.meta,
+                &g.buffer,
+                &mut g.state,
+                &mut g.mirror,
+                &g.keys,
+                &g.checkpoint,
+                8,
+                true,
+                &mut engine,
+                &NoBudget,
+            ),
+            Err(refuse(REFUSE_RESTART_REQUEST))
+        );
+        assert_eq!(g.meta, meta_before);
+        assert_eq!(g.state, state_before);
+        assert_eq!(g.meta[M_HALT], 0, "a restart request is not a halt");
+    }
+
+    /// A press on a live player is ordinary input: only a *dead* player's use
+    /// becomes a restart request, so this control runs the same command and
+    /// gets a committed tic.
+    struct RestartRequest;
+    impl Engine for RestartRequest {
+        fn step(&mut self, _command: &[u8; 4]) -> Result<StepResult, u32> {
+            Err(REFUSE_RESTART_REQUEST)
+        }
+        fn publish(&mut self, state: &mut [u8], _mirror: &mut [u8]) -> Result<usize, u32> {
+            Ok(u32_at(state, 16) as usize)
+        }
+    }
+
     #[test]
     fn exact_zero_matches_bytewise_scan() {
         for len in [0usize, 1, 2, 7, 4096] {
