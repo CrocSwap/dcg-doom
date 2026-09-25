@@ -51,11 +51,15 @@ export class InputError extends Error {
 }
 
 // The 32-byte value that ties a signed batch to one chain context. Both sides
-// derive it the same way; it is not a secret.
+// derive it the same way; it is not a secret. A relayer running in mock mode
+// has placeholder accounts that are not base58, so an unparseable address
+// hashes its ASCII instead of throwing. That keeps the function total and
+// keeps the browser and the relayer in agreement, which is all a binding needs
+// to do: it is not a validity check on the address.
 export async function slotBinding({context, meta, inputBuffer}) {
   const parts = [new TextEncoder().encode("DOOM-SLOT/1\0")];
   for (const value of [context, meta, inputBuffer]) {
-    parts.push(value ? decodeAddress(value) : new Uint8Array(32));
+    parts.push(await addressBytes(value));
   }
   let total = 0;
   for (const part of parts) total += part.length;
@@ -70,21 +74,31 @@ export async function slotBinding({context, meta, inputBuffer}) {
 
 const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-function decodeAddress(text) {
+function decodeBase58To32(text) {
   let value = 0n;
   for (const char of text) {
     const digit = BASE58.indexOf(char);
-    if (digit < 0) throw new InputError(`not a base58 address: ${text}`);
+    if (digit < 0) return null;
     value = value * 58n + BigInt(digit);
   }
   let hex = value.toString(16);
   if (hex.length % 2) hex = `0${hex}`;
-  if (hex.length > 64) hex = hex.slice(hex.length - 64);
+  if (hex.length > 64) return null;
   const bytes = new Uint8Array(32);
   for (let i = 0; i < bytes.length; i += 1) {
     bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2).padStart(2, "0"), 16);
   }
   return bytes;
+}
+
+async function addressBytes(value) {
+  if (!value) return new Uint8Array(32);
+  const decoded = decodeBase58To32(value);
+  if (decoded) return decoded;
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`DOOM-SLOT/1-NONBASE58\0${value}`)),
+  );
+  return digest.subarray(0, 32);
 }
 
 // commands: Uint8Array of count * 4 bytes, or an array of [fwd, side, turn, buttons].

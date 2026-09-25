@@ -19,6 +19,29 @@ Then open <http://localhost:8000/web/doom-play/>.
 Query parameters: `?net=testnet` picks a network from `network.js`, and
 `?relayer=http://localhost:8787` prefills the relayer URL.
 
+## Playing
+
+With no relayer the page spectates: it reads frames and shows them, which is
+what the R8i deployment supports today. To play, start a relayer and press
+JOIN:
+
+```sh
+node stunts/doom-relayer/server.mjs --mode mock --port 8787 --slots 4
+```
+
+In mock mode the relayer has no chain accounts, so the page falls back to the
+relayer's copy of the same eight strip accounts when the network read fails.
+The bytes go through the same decoder either way.
+
+A page reload re-attaches to the session it already had rather than taking a
+second slot, because the burner key in localStorage is the same one.
+
+Keys: arrows or WASD to move and turn, Q and E to strafe, Space or F to fire,
+R to use, Shift to run. On a phone there is a pad. Turn is contributed on every
+fourth tic, as vanilla Doom accumulates it, so a held key turns at the rate a
+real keyboard would.
+
+
 ## The files
 
 | File | What it is |

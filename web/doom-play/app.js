@@ -5,11 +5,11 @@
 // signs input batches with a throwaway key so the relayer can attribute them
 // to a player. Everything network-specific is in network.js.
 
-import {DEFAULT_NETWORK, NETWORKS, explorerAddress, explorerTransaction, requireNetwork} from "./network.js";
+import {DEFAULT_NETWORK, explorerAddress, explorerTransaction, requireNetwork} from "./network.js";
 import {ChainReader, WadImageReader, readPlaypal, base58ToBytes, bytesToBase58} from "./rpc.js";
 import {decodeFrame, frameToRgba, toHex, StripError, FRAME_WIDTH, FRAME_HEIGHT} from "./strip.js";
 import {loadOrCreateBurner, forgetSession, recallSession, rememberSession, ed25519Available} from "./burner.js";
-import {encodeInput, heldToCommands, slotBinding, MAX_COMMANDS_PER_BATCH} from "./input.js";
+import {encodeInput, heldToCommands} from "./input.js";
 
 const THEME_KEY = "doom-play.theme";
 const RELAYER_KEY = "doom-play.relayer";
@@ -112,7 +112,12 @@ for (let i = 0; i < 8; i += 1) {
   stripChips.push(chip);
 }
 
-function showError(error) {
+// Two error channels. A read error is transient and clears itself on the next
+// good frame. An action error, from joining or sending input, stays until the
+// player does something about it, so a successful frame read does not silently
+// wipe "no free slot" off the screen.
+function showError(error, source = "read") {
+  if (state.errorSource !== "action" || source === "action") state.errorSource = source;
   const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   if (text === state.lastError) return;
   state.lastError = text;
@@ -120,13 +125,39 @@ function showError(error) {
   ui.error.hidden = false;
 }
 
-function clearError() {
+function clearError(source = "read") {
+  // An action error outranks a read error and is not cleared by a good frame.
+  if (state.errorSource === "action" && source !== "action") return;
   state.lastError = null;
+  state.errorSource = null;
   ui.error.hidden = true;
 }
 
 const shorten = (text, head = 6, tail = 6) =>
   !text ? "—" : text.length <= head + tail + 1 ? text : `${text.slice(0, head)}…${text.slice(-tail)}`;
+
+function toBase64(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+// The relayer hands the slot binding over as hex, because JSON has no byte
+// array. encodeInput wants the 32 bytes themselves.
+function fromHex(text) {
+  if (typeof text !== "string" || !/^[0-9a-fA-F]{64}$/.test(text)) return null;
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) bytes[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+// A mock relayer's placeholder accounts are not base58, so linking them to an
+// explorer would just be a broken link. Real addresses always are.
+const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+function explorerFor(address) {
+  return BASE58.test(address ?? "") ? explorerAddress(net, address) : null;
+}
 
 function link(text, href) {
   if (!href) return document.createTextNode(text);
@@ -204,15 +235,16 @@ function updateStatus() {
   setCell(ui.statSlot, state.lastFrameSlot === null ? "—" : String(state.lastFrameSlot));
   setCell(ui.statCommitment, state.reader?.paintCommitment ?? net.commitment.paint, "good");
 
-  const explorer = state.signature
-    ? explorerTransaction(net, state.signature)
-    : explorerAddress(net, net.doom.snapshots[state.buffer]);
-  ui.statExplorer.textContent = state.signature ? shorten(state.signature, 10, 8) : "snapshot account ↗";
+  const snapshot = net.doom.snapshots[state.buffer];
+  const explorer = state.signature ? explorerTransaction(net, state.signature) : explorerFor(snapshot);
   if (explorer) {
+    ui.statExplorer.textContent = state.signature ? shorten(state.signature, 10, 8) : "snapshot account ↗";
     ui.statExplorer.href = explorer;
     ui.statExplorer.title = explorer;
   } else {
+    ui.statExplorer.textContent = state.signature ? shorten(state.signature, 10, 8) : "no explorer for this address";
     ui.statExplorer.removeAttribute("href");
+    ui.statExplorer.removeAttribute("title");
   }
 
   ui.footFrame.textContent = `frame sha256 ${shorten(frame.digest ?? "…", 12, 12)} · ${state.paintedFrames} painted`;
@@ -265,13 +297,44 @@ function readCachedPalette() {
   }
 }
 
+// A session's strips live on chain, and the viewer reads them from the network
+// like any other reader. A mock relayer has no chain accounts at all, so when
+// the network read fails and a session is open, the relayer's copy of the same
+// eight strip accounts is used instead. Same decoder either way: the bytes are
+// the bytes.
+async function readFromRelayer() {
+  if (!state.session || !state.relayerBase) return null;
+  const response = await fetch(`${state.relayerBase}/v1/sessions/${encodeURIComponent(state.session.id)}/frame`);
+  if (!response.ok) return null;
+  const payload = await response.json();
+  if (!Array.isArray(payload.strips) || payload.strips.length !== 8) return null;
+  return {
+    slot: null,
+    payloads: payload.strips.map((encoded) => {
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }),
+  };
+}
+
 async function readOnce() {
   const addresses = net.doom.strips[state.buffer];
   if (!addresses || addresses.length !== 8) {
     showError(new Error(`buffer ${state.buffer} has no strip accounts configured`));
     return;
   }
-  const {slot, payloads} = await state.reader.getAccounts(addresses);
+  let slot = null;
+  let payloads = null;
+  try {
+    ({slot, payloads} = await state.reader.getAccounts(addresses));
+  } catch (error) {
+    const relayed = await readFromRelayer().catch(() => null);
+    if (!relayed) throw error;
+    ({slot, payloads} = relayed);
+    setCell(ui.stageState, "MOCK MODE · RELAYER FRAME");
+  }
   const present = payloads.filter(Boolean).length;
   ui.stripSummary.textContent = `${present} / 8`;
   for (let i = 0; i < 8; i += 1) {
@@ -411,11 +474,22 @@ function syncPad() {
 // One batch per animation frame while keys are held. Vanilla Doom runs at 35
 // tics a second; the relayer decides how many of those tics it can actually
 // land, and drops from the front if the slot falls behind.
+//
+// Only one push is ever in flight. Two overlapping pushes would both read the
+// same nextSeq and send the same firstSeq, and the relayer would rightly
+// refuse the second, so the keys a player is holding would silently stop
+// registering.
 let pushTimer = null;
+let pushInFlight = false;
 function scheduleInputPush() {
   if (pushTimer !== null) return;
   pushTimer = requestAnimationFrame(() => {
     pushTimer = null;
+    if (pushInFlight) {
+      // Try again on the next frame rather than dropping the keystroke.
+      scheduleInputPush();
+      return;
+    }
     void pushInput();
   });
 }
@@ -436,13 +510,13 @@ async function pushInput() {
     binding: state.session.binding,
   });
   const signature = await state.wallet.sign(message);
-  const base64 = (bytes) => btoa(String.fromCharCode(...bytes));
   const sentAt = performance.now();
+  pushInFlight = true;
   try {
     const response = await fetch(`${state.relayerBase}/v1/sessions/${encodeURIComponent(state.session.id)}/input`, {
       method: "POST",
       headers: {"content-type": "application/json"},
-      body: JSON.stringify({message: base64(message), signature: base64(signature)}),
+      body: JSON.stringify({message: toBase64(message), signature: toBase64(signature)}),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error ?? `relayer returned ${response.status}`);
@@ -454,9 +528,11 @@ async function pushInput() {
     setCell(ui.inputLatency, `${median.toFixed(0)} ms`);
     setCell(ui.inputsSent, String(state.inputsSent));
     if (payload.frame?.signature) state.signature = payload.frame.signature;
-    clearError();
+    clearError("action");
   } catch (error) {
-    showError(error);
+    showError(error, "action");
+  } finally {
+    pushInFlight = false;
   }
 }
 
@@ -488,20 +564,38 @@ async function joinSession() {
       buffer: state.buffer,
     }),
   });
-  state.session = session;
+  const binding = fromHex(session.binding);
+  if (!binding) {
+    throw new Error(`the relayer returned a slot binding that is not 32 bytes of hex: ${session.binding}`);
+  }
+  state.session = {...session, binding};
   state.nextSeq = session.next_seq ?? 0;
   state.signature = session.frame?.signature ?? null;
-  if (session.strip_accounts?.length) net.doom.strips[state.buffer] = session.strip_accounts;
+  adoptSession(session);
+  rememberSession(localStorage, {
+    id: session.id,
+    slot: session.slot,
+    base,
+    buffer: state.buffer,
+    publicKey: state.wallet.publicKeyHex,
+    binding: toHex(session.binding),
+  });
+  await pollSessionStatus();
+  scheduleInputPush();
+}
+
+// Puts the page into playing shape for a session, whether it was just created
+// or picked back up after a reload.
+function adoptSession(session) {
+  if (session.strip_accounts?.length === 8) net.doom.strips[state.buffer] = session.strip_accounts;
   if (session.snapshot_account) net.doom.snapshots[state.buffer] = session.snapshot_account;
-  rememberSession(localStorage, {id: session.id, slot: session.slot, base, buffer: state.buffer, publicKey: state.wallet.publicKeyHex});
   setCell(ui.sessionState, `PLAYING · ${session.id.slice(0, 8)}`, "good");
   setCell(ui.slotCell, String(session.slot));
   ui.join.disabled = true;
   ui.leave.disabled = false;
   ui.spectatorHint.hidden = true;
-  await pollSessionStatus();
-  scheduleInputPush();
 }
+
 
 async function pollSessionStatus() {
   if (!state.session) return;
@@ -509,7 +603,8 @@ async function pollSessionStatus() {
     const status = await relayer(`/v1/sessions/${encodeURIComponent(state.session.id)}`);
     state.nextSeq = status.next_seq ?? state.nextSeq;
     setCell(ui.slotCell, String(status.slot));
-    setCell(ui.inputLatency, status.tics_per_second ? `${status.tics_per_second.toFixed(1)} tic/s` : "—");
+    // Only replace the latency readout when the relayer actually knows a rate.
+    if (status.tics_per_second) setCell(ui.inputLatency, `${status.tics_per_second.toFixed(1)} tic/s`);
     if (status.frame?.signature) state.signature = status.frame.signature;
     if (status.strip_accounts?.length === 8) net.doom.strips[state.buffer] = status.strip_accounts;
     if (status.state && status.state !== "playing") {
@@ -517,7 +612,7 @@ async function pollSessionStatus() {
     }
     clearError();
   } catch (error) {
-    showError(error);
+    showError(error, "action");
   }
 }
 
@@ -526,7 +621,7 @@ async function leaveSession() {
   try {
     await relayer(`/v1/sessions/${encodeURIComponent(state.session.id)}`, {method: "DELETE"});
   } catch (error) {
-    showError(error);
+    showError(error, "action");
   }
   state.session = null;
   forgetSession(localStorage);
@@ -541,7 +636,7 @@ async function leaveSession() {
 ui.join.addEventListener("click", () => {
   ui.join.disabled = true;
   joinSession().catch((error) => {
-    showError(error);
+    showError(error, "action");
     ui.join.disabled = false;
   });
 });
@@ -563,13 +658,14 @@ ui.bufferSelect.addEventListener("change", () => {
 
 // ---------------------------------------------------------------- boot
 
+// Boot-time notes go to the console; the page has a status bar for the rest.
+const pageLog = (...parts) => console.info("[doom-play]", ...parts);
+
 function describeChain() {
   const doom = net.doom;
-  ui.chainProgram.replaceChildren(link(shorten(doom.program, 8, 8), explorerAddress(net, doom.program)));
-  ui.chainContext.replaceChildren(link(shorten(doom.context, 8, 8), explorerAddress(net, doom.context)));
-  ui.chainSnapshot.replaceChildren(
-    link(shorten(doom.snapshots[state.buffer] ?? "—", 8, 8), explorerAddress(net, doom.snapshots[state.buffer] ?? "")),
-  );
+  ui.chainProgram.replaceChildren(link(shorten(doom.program, 8, 8), explorerFor(doom.program)));
+  ui.chainContext.replaceChildren(link(shorten(doom.context, 8, 8), explorerFor(doom.context)));
+  ui.chainSnapshot.replaceChildren(link(shorten(doom.snapshots[state.buffer] ?? "—", 8, 8), explorerFor(doom.snapshots[state.buffer])));
   ui.chainCapacity.textContent = doom.inputCapacity ? `${doom.inputCapacity.toLocaleString()} slots` : "—";
   ui.hintCapacity.textContent = doom.inputCapacity ? doom.inputCapacity.toLocaleString() : "all";
   ui.networkBadge.textContent = net.label;
@@ -611,6 +707,38 @@ async function boot() {
   }
 
   startPolling();
+
+  // A reload presents the same burner key, so try to pick the session back up
+  // before making the player press JOIN again.
+  const remembered = recallSession(localStorage);
+  if (remembered?.id && remembered.publicKey === state.wallet.publicKeyHex) {
+    state.relayerBase = remembered.base;
+    ui.relayerUrl.value = remembered.base;
+    if (remembered.buffer !== undefined) {
+      state.buffer = remembered.buffer;
+      ui.bufferSelect.value = String(state.buffer);
+    }
+    try {
+      const status = await relayer(`/v1/sessions/${encodeURIComponent(remembered.id)}`);
+      if (status.state === "playing") {
+        state.session = {...status, binding: fromHex(remembered.binding ?? "") ?? null};
+        if (!state.session.binding) {
+          const fresh = await relayer("/v1/sessions", {
+            method: "POST",
+            headers: {"content-type": "application/json"},
+            body: JSON.stringify({publicKey: state.wallet.publicKeyHex, network: networkName, buffer: state.buffer}),
+          });
+          state.session = {...fresh, binding: fromHex(fresh.binding)};
+        }
+        adoptSession(state.session);
+        pageLog(`re-attached to session ${status.id.slice(0, 8)} on slot ${status.slot}`);
+      }
+    } catch {
+      // The relayer is gone or the session ended. Start clean.
+      forgetSession(localStorage);
+    }
+  }
+
   setInterval(() => void pollSessionStatus(), 2000);
   setInterval(() => {
     const now = performance.now();
