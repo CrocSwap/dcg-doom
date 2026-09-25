@@ -1100,7 +1100,7 @@ pub fn reset(
     // SLOT_WRITTEN byte; the header, and with it the capacity, the first tic,
     // the authority and the account bindings, is left alone so the checks
     // above keep holding.
-    sol_memset(&mut buffer[BUFFER_HEADER_BYTES..], 0);
+    sol_memset(&mut buffer[BUFFER_HEADER_BYTES..], 0, buffer.len() - BUFFER_HEADER_BYTES);
     put_u32(meta, M_CURSOR, 0);
     put_u32(meta, M_STATE_LEN, state_len as u32);
     put_u32(meta, M_SWEEPS, 0);
@@ -2437,7 +2437,7 @@ mod tests {
     }
 
     impl ResetEngine for MockReset {
-        fn reset(&mut self, state: &mut [u8], mirror: &mut [u8]) -> Result<(), u32> {
+        fn reset(&mut self, state: &[u8], mirror: &mut [u8]) -> Result<(), u32> {
             self.resets += 1;
             if let Some(code) = self.refuse {
                 return Err(code);
@@ -2456,8 +2456,6 @@ mod tests {
     fn played(start_root: bool) -> (Golden, Vec<u8>, Vec<u8>) {
         let mut g = golden();
         let (start_state, start_mirror) = (g.state.clone(), g.mirror.clone());
-        let root = start_state.len().to_le_bytes();
-        let _ = root;
         if start_root {
             let (_, start) = verified_state_root(&start_state, &start_mirror).unwrap();
             g.meta[M_START_ROOT..M_START_ROOT + 32].copy_from_slice(&start);
@@ -2613,11 +2611,9 @@ mod tests {
         assert_eq!(g.mirror, after_first.3);
         assert_eq!(g.buffer, after_first.1);
         assert_eq!(u32_at(&g.meta, M_RESETS), 2);
-        assert_eq!(g.meta[..M_RESETS], {
-            let mut first = after_first.0;
-            put_u32(&mut first, M_RESETS, 2);
-            first[..M_RESETS]
-        });
+        let mut first = after_first.0;
+        put_u32(&mut first, M_RESETS, 2);
+        assert_eq!(&g.meta[..M_RESETS], &first[..M_RESETS]);
     }
 
     /// A reset lands on *the* provisioned start state, not on one supplied at
@@ -2727,8 +2723,8 @@ mod tests {
     #[test]
     fn reset_refuses_a_halted_slot_unless_the_request_forces_it() {
         for (force, halted, expect) in [
-            (false, true, Err(REFUSE_HALTED)),
-            (true, true, Ok(())),
+            (false, 1u8, Err(REFUSE_HALTED)),
+            (true, 1u8, Ok(())),
             (false, 0u8, Ok(())),
         ] {
             let (mut g, start_state, start_mirror) = played(true);
@@ -2766,8 +2762,14 @@ mod tests {
     fn reset_checks_authority_and_binding_before_anything_else() {
         let (mut g, start_state, start_mirror) = played(true);
         let stranger = Pubkey::new_from_array([0xa2; 32]);
-        let mut other = g.keys.clone();
-        other.signer = Box::leak(Box::new(stranger));
+        let other = SweepKeys {
+            context: g.keys.context,
+            state: g.keys.state,
+            mirror: g.keys.mirror,
+            buffer: g.keys.buffer,
+            meta: g.keys.meta,
+            signer: Box::leak(Box::new(stranger)),
+        };
         let mut engine = mock_reset(start_state.clone(), start_mirror.clone());
         assert_eq!(
             reset(
@@ -2804,7 +2806,7 @@ mod tests {
         // A context whose E2R/5 publication is no longer the one the meta
         // committed.
         let mut checkpoint = g.checkpoint.clone();
-        checkpoint[12..16].copy_from_slice(&7);
+        checkpoint[12..16].copy_from_slice(&7u32.to_le_bytes());
         let mut engine = mock_reset(start_state, start_mirror);
         assert_eq!(
             reset(
