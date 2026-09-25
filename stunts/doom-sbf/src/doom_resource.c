@@ -41,9 +41,9 @@ extern int doom_engine_ex2_fill_mirror(
 /* The protocol's pinned start level.  A new game starts at episode 1 map 1
    (the skill is the caller's), so the static graph the producer encodes, the
    level name every image header carries, and the level the on-chain validators
-   accept are one decision recorded once here.  `ri_level_name_check` is a
-   compile-time assertion that the name cannot drift from the numbers: the name
-   is spelled "E<episode>M<map>". */
+   accept are one decision recorded once here.  The two compile-time checks
+   below keep the name from drifting from the numbers: the name is spelled
+   "E<episode>M<map>" and is eight bytes. */
 #define RI_LEVEL_EPISODE 1
 #define RI_LEVEL_MAP 1
 #define RI_LEVEL_SKILL 3

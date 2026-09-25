@@ -52,8 +52,8 @@ extern int doom_resource_ri1_validate_graph(const uint8_t *image, size_t image_b
    different map cannot be paired with a start state, and a capture from this
    map cannot be paired with a different graph.  This block is inside the
    slice build.rs hands the SBF consumer, so the on-chain validator pins the
-   same level as the native producer.  `r2_level_name_check` is a compile-time
-   assertion that the name cannot drift from the numbers. */
+   same level as the native producer.  The two compile-time checks below keep
+   the name from drifting from the numbers and from being the wrong length. */
 #define RI2_LEVEL_EPISODE 1
 #define RI2_LEVEL_MAP 1
 #define RI2_LEVEL_NAME "E1M1\0\0\0\0"
