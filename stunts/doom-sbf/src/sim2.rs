@@ -1820,7 +1820,8 @@ mod tests {
         buffer[..8].copy_from_slice(BUFFER_MAGIC);
         put_u32(&mut buffer, 8, BUFFER_FORMAT_VERSION);
         put_u32(&mut buffer, 12, BUFFER_HEADER_BYTES as u32);
-        put_u32(&mut buffer, 16, buffer.len() as u32);
+        let buffer_len = buffer.len() as u32;
+        put_u32(&mut buffer, 16, buffer_len);
         put_u32(&mut buffer, B_CAPACITY, capacity as u32);
         put_u32(&mut buffer, B_FIRST_TIC, 0);
         put_u32(&mut buffer, B_SLOT_BYTES, SLOT_BYTES as u32);
