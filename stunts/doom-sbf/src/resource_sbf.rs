@@ -1,7 +1,7 @@
 //! DOOM-E2R/1: the additive resource-account successor to DOOM-E2S/1.
 //!
 //! E2S/1 remains the retained WAD-copy/state-only ABI.  E2R/1 adds one
-//! read-only, sealed DOOM-RI1 account containing the pointer-free E1M5 static
+//! read-only, sealed DOOM-RI1 account containing the pointer-free static
 //! graph.  Every invocation still creates a fresh context and rebinds native
 //! pointers from section indices; no account address, C pointer, or mutable
 //! global is a persisted input.
@@ -17,7 +17,16 @@ pub const TIC: u8 = 2;
 pub const INSTRUCTION_BYTES: usize = 32;
 pub const ABI_ID: [u8; 32] = super::ex2::RESOURCE_SBF_ABI_ID;
 pub const RESOURCE_SBF_ABI_DESCRIPTOR: &str = super::ex2::RESOURCE_SBF_ABI_DESCRIPTOR;
-pub const RI2_VERSION: u32 = 2;
+/// The resource-image version this protocol pins.  Version 2 is the retired
+/// E1M5 image; 3 belongs to the diagnostic-only clipped-render measurement
+/// request above, which carries its own magic and is never a resource image;
+/// 4 is the pinned E1M1 new-game start image.
+pub const RI2_VERSION: u32 = 4;
+/// The pinned start level, mirrored from `doom_resource_ri2.c` so the Rust
+/// header check and the C preflight accept the same image and no other.
+pub const RI2_LEVEL_EPISODE: u32 = 1;
+pub const RI2_LEVEL_MAP: u32 = 1;
+pub const RI2_LEVEL_NAME: [u8; 8] = *b"E1M1\0\0\0\0";
 /// Diagnostic-only clipped-render measurement ABI. Deployable images leave
 /// `render-clip-measurement` disabled and reject this request.
 pub const RI3_VERSION: u32 = 3;
@@ -370,6 +379,7 @@ pub(crate) fn validate_resource_header_ri2(account: &AccountInfo, expected_bytes
         || u32_at(&data, 28) != 5
         || u32_at(&data, 32) != 5
         || u32_at(&data, 36) as usize != RESOURCE_HEADER_BYTES
+        || data[104..112] != RI2_LEVEL_NAME
     {
         return Err(ProgramError::Custom(240));
     }

@@ -1,4 +1,4 @@
-Subject: [PATCH 0018] Capture a new-game start state instead of a DEMO1 start state
+Subject: [PATCH 0021] Capture a new-game start state instead of a DEMO1 start state
 
 Every retained start state is the image the account-backed driver holds
 right after G_DoPlayDemo(): the DEMO1 header chose E1M1 and its recorded
@@ -36,7 +36,7 @@ This patch touches only the headless driver.  g_game.c, p_setup.c and
 every translation unit the SBF image folds in are untouched, so no
 program behaviour changes and the built image is unaffected.
 
-Applies on top of 0001-0017.
+Applies on top of 0001-0020.
 
 --- a/linuxdoom-1.10/headless/doom_headless.c
 +++ b/linuxdoom-1.10/headless/doom_headless.c

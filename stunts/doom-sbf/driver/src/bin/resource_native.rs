@@ -2,8 +2,8 @@
 //! fresh-process consumer without the full setup path.
 //!
 //! `run` deliberately forks the encoder, importer, and malformed-input check
-//! into separate processes.  The image is produced from the retained E1M5 WAD
-//! accounts, then imported and re-encoded in a fresh address space before one
+//! into separate processes.  The image is produced from the retained shareware
+//! WAD accounts, then imported and re-encoded in a fresh address space before one
 //! real ST1/CI2 tic is compared with a retained source-matched native output.
 //! This is host-only experimental evidence; it is not an E2S/1 or E2R/1 ABI or
 //! SBF run.
@@ -22,7 +22,10 @@ use sha2::{Digest, Sha256};
 const WAD_ACCOUNT_BYTES: usize = 1_048_576;
 const WAD_HEADER_BYTES: usize = 32;
 const WAD_PAYLOAD_BYTES: usize = WAD_ACCOUNT_BYTES - WAD_HEADER_BYTES;
-const STATE_BYTES: usize = 59_604;
+/// Any canonical ST1 capture is accepted: the start state is the pinned
+/// new-game capture (35,664 bytes), not the retired E1M5 demo capture.  The
+/// shape, not the length, is what identifies it.
+const STATE_MAX_BYTES: usize = 126_976;
 const MIRROR_BYTES: usize = 65_536;
 const CONTROLLER_BYTES: usize = 64;
 
@@ -92,14 +95,14 @@ fn capture_inputs(
     let state = read(&capture.join("dumped-doom-st1.bin"))?;
     let mirror = read(&capture.join("mobj_pool.bin"))?;
     let controller = read(controller_path)?;
-    if state.len() != STATE_BYTES
+    if !(64..=STATE_MAX_BYTES).contains(&state.len())
         || &state[..8] != b"DOOM-ST1"
         || u32_at(&state, 8) != 0
         || u32_at(&state, 12) != 64
         || u32_at(&state, 16) as usize != state.len()
         || u32_at(&state, 20) != 0
     {
-        return Err("refusing non-retained E1M5 ST1 capture".into());
+        return Err("refusing a non-canonical ST1 capture".into());
     }
     if mirror.len() != MIRROR_BYTES
         || &mirror[..8] != b"DOOM-MP1"

@@ -43,6 +43,17 @@ extern void R_ExecuteSetViewSize(void);
 #define E2R_REFUSE_OUTPUT 238
 #define E2R_REFUSE_ARENA 239
 
+/* The protocol's pinned start level.  Same decision as the RI2 codec in
+   doom_resource_ri2.c: the image header names it and the validator pins it,
+   so a start state and a static graph from different maps cannot be paired. */
+#define RI_LEVEL_EPISODE 1
+#define RI_LEVEL_MAP 1
+#define RI_LEVEL_NAME "E1M1\0\0\0\0"
+typedef char ri_level_name_check[
+    (RI_LEVEL_NAME[0] == 'E' && RI_LEVEL_NAME[1] == '0' + RI_LEVEL_EPISODE &&
+     RI_LEVEL_NAME[2] == 'M' && RI_LEVEL_NAME[3] == '0' + RI_LEVEL_MAP &&
+     RI_LEVEL_NAME[4] == 0 && sizeof(RI_LEVEL_NAME) == 9) ? 1 : -1];
+
 #define RI_HEADER_BYTES 256u
 #define RI_SECTION_COUNT 10u
 #define RI_SECTION_DIR_OFFSET 256u
@@ -118,7 +129,7 @@ static int e2r_header(const uint8_t *image, size_t bytes,
         e2r_u32(image + 28) != 5 || e2r_u32(image + 72) != RI_SECTION_COUNT ||
         e2r_u32(image + 80) != RI_SECTION_DIR_OFFSET ||
         memcmp(image + 84, e2r_engine_id, 32) || memcmp(image + RI_WAD_HASH_OFFSET, e2r_wad_hash, 32) ||
-        memcmp(image + 148, "E1M5\0\0\0\0", 8)) return -1;
+        memcmp(image + 148, RI_LEVEL_NAME, 8)) return -1;
     dir_end = RI_SECTION_DIR_OFFSET + RI_SECTION_COUNT * 16u;
     previous = dir_end;
     for (i = 0; i < RI_SECTION_COUNT; i++) {
