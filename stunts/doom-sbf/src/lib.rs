@@ -17,6 +17,8 @@ pub mod continuation_split_sbf;
 pub mod ex2;
 #[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
+#[cfg(feature = "diagnostic-profile")]
+pub mod prof;
 #[cfg(feature = "ctx-engine")]
 pub mod render_snapshot;
 #[cfg(feature = "ctx-engine")]
@@ -74,8 +76,13 @@ pub const CTX_GUARD_REFUSED: u32 = 199;
 /// The driver asserts the SBF-side sizeof the probe writes back against its
 /// own copy, so layout drift between the host-measured constant and the SBF
 /// struct fails loudly instead of aliasing engine state.
+///
+/// Patch 0030 adds the diagnostic render-phase accumulator as the last member
+/// of doom_ctx_t: fifteen CU cells plus four mark registers, 152 bytes, with
+/// every field offset above them unchanged. They exist in host builds too, so
+/// the host oracle and the chain agree on sizeof(doom_ctx_t).
 #[cfg(feature = "ctx-engine")]
-pub const CTX_MIN_BYTES: usize = 3_440_952 + 24;
+pub const CTX_MIN_BYTES: usize = 3_440_952 + 152 + 24;
 
 /// Numeric phase-log magic used only by the bounded diagnostic SBF image.
 /// The feature changes the image identity; no normal or positive qualification

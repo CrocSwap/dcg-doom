@@ -51,6 +51,31 @@ extern void doom_sbf_phase_marker(unsigned long phase);
 #define RI2_PHASE(phase) ((void)0)
 #endif
 
+/* Patch 0030: emit the accumulated render-phase cells.  Solana keeps ten
+ * program-log lines per transaction and a flat per-phase marker list needs
+ * more than that for one strip, so the strip driver aggregates.  Three cells
+ * per sol_log_64 line, five lines, the first argument tagging the group.
+ * doom_sbf_prof_log is a Rust shim: the C side has no declaration for the
+ * log syscall and the image must not gain writable static data. */
+#ifdef DOOM_SBF_PHASE_PROFILE
+#define DOOM_SBF_PROF_MAGIC 0x444f4f4d50524f31ul
+#define DOOM_SBF_PROF_GROUPS 6ul
+extern void doom_sbf_prof_log(unsigned long magic, unsigned long group,
+                              unsigned long a, unsigned long b, unsigned long c);
+static void rsr_prof_emit(void)
+{
+    unsigned long g;
+    for (g = 0; g < DOOM_SBF_PROF_GROUPS; g++)
+        doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, g,
+                          doom_sbf_prof[g * 3ul],
+                          doom_sbf_prof[g * 3ul + 1ul],
+                          doom_sbf_prof[g * 3ul + 2ul]);
+}
+#define RSR_PROF_EMIT() rsr_prof_emit()
+#else
+#define RSR_PROF_EMIT() ((void)0)
+#endif
+
 #define RI2_REFUSE_STATE 232
 #define RI2_REFUSE_POOL 233
 #define RI2_REFUSE_RESOURCE 234
@@ -1551,8 +1576,10 @@ int doom_engine_rsn3_render_static(
     size_t strip_bytes = 40u * 200u;
     unsigned long transient_mark;
     int rc, y, x;
-    RI2_PHASE(1100);
+    for (rc = 0; rc < DOOM_SBF_PROF_SLOTS; rc++) doom_sbf_prof[rc] = 0;
+    PROF_ENTER(DOOM_SBF_PROF_FIXED_PRE, 0);
     if (doom_ctx_guard(context)) return 199;
+    PROF_ENTER(DOOM_SBF_PROF_REBIND, 1);
     if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !payload ||
         !strip_out || strip_cap != strip_bytes || strip_id >= 8u ||
         ((uintptr_t)bootstrap & 15u) != 0 ||
@@ -1565,11 +1592,10 @@ int doom_engine_rsn3_render_static(
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
                                RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
-    RI2_PHASE(1101);
+    PROF_EXIT(DOOM_SBF_PROF_REBIND, 1);
     transient_mark = doom_sbf_arena_mark();
     rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
     if (rc) return rc;
-    RI2_PHASE(1102);
     frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
     if (!frame) return RI2_REFUSE_OUTPUT;
     screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES;
@@ -1584,9 +1610,9 @@ int doom_engine_rsn3_render_static(
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true;
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
-    RI2_PHASE(1103);
+    PROF_EXIT(DOOM_SBF_PROF_FIXED_PRE, 0);
     R_RenderPlayerView(&players[displayplayer]);
-    RI2_PHASE(1104);
+    PROF_ENTER(DOOM_SBF_PROF_FIXED_POST, 0);
     if (doom_sbf_arena_exhausted()) {
         free(frame);
         (void)doom_sbf_arena_rewind(transient_mark);
@@ -1595,10 +1621,10 @@ int doom_engine_rsn3_render_static(
     for (y = 0; y < 200; y++) for (x = 0; x < 40; x++)
         strip_out[(size_t)y * 40u + (size_t)x] =
             frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
-    RI2_PHASE(1105);
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     free(frame);
     if (!doom_sbf_arena_rewind(transient_mark)) return RI2_REFUSE_ARENA;
-    RI2_PHASE(1106);
+    PROF_EXIT(DOOM_SBF_PROF_FIXED_POST, 0);
+    RSR_PROF_EMIT();
     return 0;
 }
