@@ -43,7 +43,7 @@ const WAD_ACCOUNT_SHA256: [&str; 5] = [
 ];
 const WAD_CONCAT_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
 const RESOURCE_IMAGE_SHA256: &str =
-    "9e1427c7c740d61a7ce686cde35959e2228d0e011413d0ce83da1dcc1843b980";
+    "a8a716edc79b58c433fdbedefce6b842536b5ec00c2a1140768a6be1e3ab250a";
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/continuation_sbf.rs"
