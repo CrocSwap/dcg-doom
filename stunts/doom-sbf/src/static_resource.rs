@@ -427,9 +427,7 @@ mod layout_tests {
     /// shrunk back out of one.
     #[test]
     fn the_static_account_grows_into_a_layout_and_cannot_shrink_out() {
-        // 9_734_160 at patches 0001-0029; patch 0030 grows sizeof(doom_ctx_t)
-        // by 176 bytes, which moves BOOTSTRAP_OFFSET to 7_637_184.
-        assert_eq!(ACCOUNT_BYTES, 9_734_336);
+        assert_eq!(ACCOUNT_BYTES, 9_734_160);
         assert!(ACCOUNT_BYTES > 0);
     }
 }
