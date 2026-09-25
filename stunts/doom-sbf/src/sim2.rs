@@ -1070,7 +1070,7 @@ pub fn reset(
     meta: &mut [u8],
     buffer: &mut [u8],
     state: &mut [u8],
-    start: &[u8],
+    start: Option<&[u8]>,
     mirror: &mut [u8],
     keys: &SweepKeys,
     checkpoint: &[u8],
@@ -1092,18 +1092,26 @@ pub fn reset(
     }
     // The start image is checked before the state account is touched, so a
     // malformed or misplaced image cannot leave a half-reset slot behind even
-    // before the transaction rollback is considered.
-    let state_len = state_len_checked(start)?;
+    // before the transaction rollback is considered.  `None` means the start
+    // image is the state account's own, which is where it is before the first
+    // advance; `Some` is a supplied sealed start account, because a staged
+    // account cannot be written twice.
+    let image: &[u8] = match start {
+        Some(bytes) => bytes,
+        None => state,
+    };
+    let state_len = state_len_checked(image)?;
     let first_tic = u32_at(meta, M_FIRST_TIC);
-    if u32_at(start, 20) != first_tic {
+    if u32_at(image, 20) != first_tic {
         return Err(refuse(REFUSE_TIC));
     }
-    if start.as_ptr() as usize != state.as_ptr() as usize {
-        // A supplied start account: install the image and its zero tail into
-        // the bound state account, which is the account every later read, the
-        // render path included, is bound to.
-        sol_memcpy(state, start, state_len);
-        sol_memset(&mut state[state_len..], 0, state.len() - state_len);
+    if let Some(bytes) = start {
+        // Install the image and its zero tail into the bound state account,
+        // which is the account every later read, the render path included, is
+        // bound to.
+        sol_memcpy(state, bytes, state_len);
+        let tail = state.len() - state_len;
+        sol_memset(&mut state[state_len..], 0, tail);
     }
     crate::diagnostic_phase(926);
     engine.reset(state, mirror).map_err(refuse)?;
@@ -1836,16 +1844,16 @@ fn process_reset(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     // Selector 0 reads the start image from the state account itself, which is
     // where it is before the first advance; selector 1 reads the supplied
     // account and installs it.
-    let start_slice: &[u8] = if selector == RESET_START_STATE {
-        &start_data
+    let start_image: Option<&[u8]> = if selector == RESET_START_STATE {
+        Some(&start_data)
     } else {
-        &state_data
+        None
     };
     let root = reset(
         &mut meta_data,
         &mut buffer_data,
         &mut state_data,
-        start_slice,
+        start_image,
         &mut mirror_data,
         &SweepKeys {
             context: context.key,
@@ -2608,7 +2616,7 @@ mod tests {
             &mut g.meta,
             &mut g.buffer,
             &mut g.state,
-            &start_image,
+            Some(&start_image),
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2644,7 +2652,7 @@ mod tests {
             &mut g.meta,
             &mut g.buffer,
             &mut g.state,
-            &start_image,
+            Some(&start_image),
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2681,7 +2689,7 @@ mod tests {
             &mut g.meta,
             &mut g.buffer,
             &mut g.state,
-            &start_image,
+            Some(&start_image),
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2719,7 +2727,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2748,7 +2756,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2773,7 +2781,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2799,7 +2807,7 @@ mod tests {
             &mut g.meta,
             &mut g.buffer,
             &mut state,
-            &start_image,
+            Some(&start_image),
             &mut g.mirror,
             &g.keys,
             &g.checkpoint,
@@ -2829,7 +2837,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2874,7 +2882,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &other,
                 &g.checkpoint,
@@ -2893,7 +2901,7 @@ mod tests {
                 &mut g.meta,
                 &mut other_buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &g.keys,
                 &g.checkpoint,
@@ -2913,7 +2921,7 @@ mod tests {
                 &mut g.meta,
                 &mut g.buffer,
                 &mut g.state,
-                &start_image,
+                Some(&start_image),
                 &mut g.mirror,
                 &g.keys,
                 &checkpoint,
