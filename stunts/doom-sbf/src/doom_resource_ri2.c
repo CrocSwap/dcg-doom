@@ -1299,34 +1299,45 @@ static int r2_v2_apply_table(uint32_t id, uint32_t n, const uint8_t *p, void *op
 /* doom-lowdetail-3: the native half of the strip-path comparison.  Prints the
  * renderer inputs the chain rebuilds for every strip, so the first divergence
  * between the two paths can be read off directly instead of inferred from
- * pixels.  The subsector census is the one that matters: R_RenderBSPNode skips
- * a subsector whose validcount already equals the global one, so a stale
- * identity left by the image import silently drops that subsector's walls,
- * flats and sprites. */
+ * pixels.  The sector census is the one that matters: R_RenderBSPNode skips
+ * subsectors whose mark already equals the global counter, and
+ * R_ProjectSprite skips a sector's sprites on the same test, so a stale
+ * identity left by the image import silently drops that sector's walls,
+ * flats and sprites.
+ *
+ * The engine headers turn `validcount`, `extralight`, `fixedcolormap`,
+ * `fuzzpos`, `framecount`, `numlines` and `numsectors` into `DOOM_CTX`
+ * macros, so those tokens cannot appear as struct member names here, and the
+ * counts arrive as arguments rather than being read out of the context.  The
+ * version `main` carried read `subs[i].validcount` and
+ * `players[displayplayer].extralight`, which the preprocessor rewrites into
+ * nonsense, so the probe did not compile in either build. */
 #ifndef DOOM_SBF_BUILD
-static void doom_lowdetail3_probe(subsector_t *subs, int numsubs, int vc)
+static void doom_lowdetail3_probe(int vc, int nlines, int nsec)
 {
-    int i, stale = 0, x;
+    int i, stale = 0;
     unsigned long h = 1469598103934665603ul;
-    for (i = 0; i < numsubs; i++) if (subs[i].validcount == vc) stale++;
-    for (x = 0; x <= viewwidth; x++)
+    for (i = 0; i < nsec; i++) if (sectors[i].validcount_m == vc) stale++;
+    for (i = 0; i <= viewwidth; i++)
     {
-        h = (h ^ (unsigned long)(uint32_t)xtoviewangle[x]) * 1099511628211ul;
-        h = (h ^ (unsigned long)(uint32_t)distscale[x]) * 1099511628211ul;
+        h = (h ^ (unsigned long)(uint32_t)xtoviewangle[i]) * 1099511628211ul;
+        h = (h ^ (unsigned long)(uint32_t)distscale[i]) * 1099511628211ul;
     }
     for (i = 0; i < viewheight; i++)
         h = (h ^ (unsigned long)(uint32_t)yslope[i]) * 1099511628211ul;
     for (i = 0; i < FINEANGLES/2; i++)
         h = (h ^ (unsigned long)(uint32_t)viewangletox[i]) * 1099511628211ul;
-    printf("PROBE validcount=%#x subs=%d stale=%d viewwidth=%d viewheight=%d "
-           "centerx=%d centerxfrac=%#x centery=%d centeryfrac=%#x detailshift=%d "
-           "projection=%#x viewangle=%#x viewx=%d viewy=%d viewz=%d "
-           "extralight=%d fixedcolormap=%d xtoviewangle0=%#x tables=%#lx\n",
-           (unsigned)vc, numsubs, stale, viewwidth, viewheight, centerx,
-           (unsigned)centerxfrac, centery, (unsigned)centeryfrac, detailshift,
-           (unsigned)projection, (unsigned)viewangle, (int)viewx, (int)viewy,
-           (int)viewz, players[displayplayer].extralight,
-           players[displayplayer].fixedcolormap, (unsigned)xtoviewangle[0], h);
+    printf("PROBE validcount=%#x sectors=%d stale_sectors=%d viewwidth=%d "
+           "viewheight=%d centerx=%d detailshift=%d xtoviewangle0=%#x tables=%#lx\n",
+           (unsigned)vc, nsec, stale, viewwidth, viewheight, centerx, detailshift,
+           (unsigned)xtoviewangle[0], h);
+    for (i = 0; i < nsec; i++)
+        if (sectors[i].validcount_m == vc)
+            printf("PROBE sector %d validcount_m=%#x light=%d\n", i,
+                   (unsigned)sectors[i].validcount_m, sectors[i].lightlevel);
+    for (i = 0; i < nlines; i++)
+        if (lines[i].flags & ML_MAPPED)
+            printf("PROBE line %d flags=%#x\n", i, (unsigned)lines[i].flags);
     fflush(stdout);
 }
 #else
@@ -1388,20 +1399,28 @@ static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
          * this process and its frame can be compared with the oracle strip for
          * strip.  DOOM_NATIVE_PROBE=1 additionally prints the renderer inputs
          * the chain rebuilds, so the two sides can be compared.  Nothing
-         * changes when neither variable is set. */
+         * changes when neither variable is set.  DOOM_NATIVE_PRIME=1 applies
+         * the same per-strip frame identity the SBF render entries now prime,
+         * so the native half of a strip comparison can be run against the
+         * chain's convention rather than the inherited one. */
 #ifdef DOOM_SBF_BUILD
         const char *probe = 0;
         const char *report = 0;
+        const char *want_prime = 0;
 #else
         const char *probe = getenv("DOOM_NATIVE_STRIP");
         const char *report = getenv("DOOM_NATIVE_PROBE");
+        const char *want_prime = getenv("DOOM_NATIVE_PRIME");
 #endif
-        if (report) doom_lowdetail3_probe(subsectors, numsubsectors, validcount);
+        if (report) doom_lowdetail3_probe(validcount, DOOM_CTX->numlines, numsectors);
         G_Ticker();
         if (probe) doom_render_fuzz_columns = (1u << 30) | ((unsigned long)atol(probe) << 27);
+        /* The same prime the SBF render entries now apply, so the native half
+         * of a strip comparison can be run against the chain's convention. */
+        if (want_prime) validcount = (int)(0x40000000u + (unsigned long)atol(probe ? probe : "0") * 2u);
         clipangle = xtoviewangle[0]; fixedcolormap = 0; R_RenderPlayerView(&players[displayplayer]); gametic++;
-        if (report) printf("PROBE after drawsegs=%d vissprites=%d subs=%d\n",
-                           (int)(ds_p - drawsegs), (int)(vissprite_p - vissprites), numsubsectors);
+        if (report) printf("PROBE after drawsegs=%d vissprites=%d\n",
+                           (int)(ds_p - drawsegs), (int)(vissprite_p - vissprites));
     }
     derived = (uint8_t *)malloc(RI2_MIRROR_BYTES); if (!derived || doom_engine_ex2_fill_mirror(derived, wad, wad_bytes, hash) || DoomStateEncode(&encoded, &encoded_bytes) || encoded_bytes > RI2_STATE_MAX) { free(derived); free(encoded); free(frame); free(carrier); return 238; }
     memcpy(*state_out, encoded, encoded_bytes); *state_out_len = encoded_bytes; memcpy(mirror_out, derived, RI2_MIRROR_BYTES); memcpy(frame_out, screens[0], RI2_FRAME_BYTES);
