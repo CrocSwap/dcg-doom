@@ -294,10 +294,15 @@ mod layout_tests {
         assert_eq!(previous % ALLOC_ALIGNMENT, 0);
         assert_ne!(previous, HEADER_OFFSET);
 
-        // REBUILD/4's gate: the header at the current offset must already be a
-        // built header.  A previous image's header is not there at all.
+        // A previous image's resource: a full 512-byte built header at the old
+        // offset, which straddles the new one.
         let mut account = vec![0u8; ACCOUNT_BYTES];
         account[previous..previous + 8].copy_from_slice(MAGIC);
+        put_u32(&mut account, previous + 8, VERSION);
+        // The tail of that old header is what the new offset now reads.
+        for index in 0..HEADER_BYTES {
+            account[HEADER_OFFSET + index] = account[previous + index];
+        }
         let header = &account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES];
         assert!(
             &header[..8] != MAGIC || u32_at(header, 8) != VERSION,
