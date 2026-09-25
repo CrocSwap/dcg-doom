@@ -1432,15 +1432,22 @@ fn compile_ctx_engine(target: &str) {
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
     let diagnostic_profile = is_sbf && env::var("CARGO_FEATURE_DIAGNOSTIC_PROFILE").is_ok();
+    // Diagnostic-only drawer ablation: the same image shape as the phase
+    // profile build with the framebuffer stores removed, so the CU difference
+    // between the two images is the pixel-write cost of the drawers.
+    let render_count_only = is_sbf && env::var("CARGO_FEATURE_RENDER_COUNT_ONLY").is_ok();
     let legacy_5120_buffer = env::var("CARGO_FEATURE_LEGACY_5120_BUFFER").is_ok();
     let out_dir =
         PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
-    let identity_flags: Vec<&str> = if diagnostic_profile {
-        common
-            .iter()
-            .copied()
-            .chain(["-DDOOM_SBF_PHASE_PROFILE"])
-            .collect()
+    let identity_flags: Vec<&str> = if diagnostic_profile || render_count_only {
+        let mut flags: Vec<&str> = common.to_vec();
+        if diagnostic_profile {
+            flags.push("-DDOOM_SBF_PHASE_PROFILE");
+        }
+        if render_count_only {
+            flags.push("-DDOOM_SBF_RENDER_COUNT_ONLY");
+        }
+        flags
     } else {
         common.to_vec()
     };
@@ -1488,6 +1495,9 @@ fn compile_ctx_engine(target: &str) {
     }
     if diagnostic_profile {
         platform.define("DOOM_SBF_PHASE_PROFILE", None);
+    }
+    if render_count_only {
+        engine.define("DOOM_SBF_RENDER_COUNT_ONLY", None);
     }
     for tu in ENGINE_TUS {
         engine.file(tree.join(format!("{tu}.c")));
