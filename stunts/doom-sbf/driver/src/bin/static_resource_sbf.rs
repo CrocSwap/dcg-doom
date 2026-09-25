@@ -210,8 +210,9 @@ struct SnapshotFields {
 
 fn snapshot_fields(data: &[u8]) -> Result<SnapshotFields, Box<dyn Error>> {
     let legacy_abi: [u8; 32] = [
-        0xac, 0xca, 0x87, 0x87, 0x5d, 0x1e, 0xaf, 0xb6, 0xc0, 0x0e, 0x53, 0xb8, 0x6b, 0xf1, 0x2a, 0xa5,
-        0xf8, 0x2e, 0xb2, 0xfa, 0x90, 0xb3, 0x8f, 0x08, 0x2e, 0x97, 0x87, 0x39, 0x3e, 0xb8, 0x23, 0x4a,
+        0xac, 0xca, 0x87, 0x87, 0x5d, 0x1e, 0xaf, 0xb6, 0xc0, 0x0e, 0x53, 0xf4, 0x4f, 0xd3, 0x72,
+        0x58, 0x4e, 0x03, 0xef, 0xae, 0x83, 0xc0, 0xb8, 0x46, 0x27, 0x5b, 0xdb, 0xab, 0x97, 0xe4,
+        0x57, 0x65,
     ];
     if data.len() != rsn3::SNAPSHOT_BYTES
         || &data[..8] != b"DOOM-RSN"
@@ -356,7 +357,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bank.add_program("doom_sbf", program, None);
     bank.add_account(static_key, account(program, vec![0; rsr::ACCOUNT_BYTES]));
     if buffered && !compact {
-        bank.add_account(context, account(program, vec![0; resource_sbf::CONTEXT_BYTES]));
+        bank.add_account(
+            context,
+            account(program, vec![0; resource_sbf::CONTEXT_BYTES]),
+        );
     }
     bank.add_account(RESOURCE, account(program, resource_image.clone()));
     for (ordinal, bytes) in wad_accounts.iter().enumerate() {
@@ -425,17 +429,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut render_units_total = 0u64;
     for strip_id in 0..8u8 {
         let request = if compact {
-            rsr::Request::render_buffered_compact(
-                0,
-                strip_id,
-                context.as_ref().try_into().unwrap(),
-            )
-            .encode()
+            rsr::Request::render_buffered_compact(0, strip_id, context.as_ref().try_into().unwrap())
+                .encode()
         } else if buffered {
             rsr::Request::render_buffered(0, strip_id).encode()
         } else {
-            rsr::Request::render(strip_id, snapshot.cursor, snapshot.snapshot_hash)
-                .encode()
+            rsr::Request::render(strip_id, snapshot.cursor, snapshot.snapshot_hash).encode()
         };
         let instruction = if buffered {
             buffered_render_instruction(
@@ -450,12 +449,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } else {
             render_instruction(program, static_key, snapshot_key, strip_id, &request)
         };
-        let (units, logs) = submit(
-            &mut client.banks_client,
-            &payer,
-            instruction,
-        )
-        .await?;
+        let (units, logs) = submit(&mut client.banks_client, &payer, instruction).await?;
         fs::write(
             receipt.join(format!("render-strip-{strip_id}-logs.txt")),
             logs,
