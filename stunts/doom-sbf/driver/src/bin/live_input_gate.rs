@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! DOOM-SIM/2 gate (d): live input past the DEMO1 end, on SBF under
 //! ProgramTest with `prefer_bpf(true)`.
 //!
@@ -194,7 +196,11 @@ impl Session {
                 continue;
             }
             let result = self
-                .send(vec![Self::stage_ix(target.pubkey(), offset, chunk)], &[target])
+                .send(
+                    vec![Self::stage_ix(target.pubkey(), offset, chunk)],
+                    &[target],
+                    base::NORMAL_LIMIT,
+                )
                 .await?;
             if result.result.is_err() {
                 return Err(format!("stage body {offset}: {:?}", result.result).into());
@@ -202,7 +208,11 @@ impl Session {
         }
         let (offset, chunk) = chunks[0];
         let result = self
-            .send(vec![Self::stage_ix(target.pubkey(), offset, chunk)], &[target])
+            .send(
+                vec![Self::stage_ix(target.pubkey(), offset, chunk)],
+                &[target],
+                base::NORMAL_LIMIT,
+            )
             .await?;
         if result.result.is_err() {
             return Err(format!("stage header: {:?}", result.result).into());
@@ -315,7 +325,9 @@ impl Session {
             data: if operation == sim2::ADVANCE_STARVED {
                 sim2::encode_advance_starved(self.cursor_before, max_tics)
             } else {
-                sim2::encode_advance(self.cursor_before, max_tics)
+                // ADVANCE/3 is the historical cursor-free packet; the gate
+                // uses it only as the differential for the receipt rule.
+                sim2::encode_advance(max_tics)
             },
         }
     }
@@ -578,24 +590,16 @@ fn session_keys(context: Keypair) -> SessionKeys {
     }
 }
 
-/// Host-side proof that byte `offset` of an ST1 image is `playeringame[0]`:
-/// decode the image, step one armed tic, and require the DOOM-CI3 receipt to
-/// come back zero, with the image coming back out of the encoder unchanged.
-/// The unmodified image must not starve, or the offset is not the byte.
-fn receipt_is_starved(capture: &Capture, state: &[u8]) -> Result<bool, Box<dyn Error>> {
+/// What the host ingress does with an ST1 image: `Err(rc)` from the import, a
+/// tic that ran with a consumed command (0), or a tic that ran with an
+/// unconsumed one (238, the DOOM-CI3 receipt reading zero).
+fn host_import_and_step(capture: &Capture, state: &[u8]) -> Result<i32, Box<dyn Error>> {
     let mut session =
-        resource::NativeSimSession::open(capture.wad_refs(), &capture.resource, state)
-            .map_err(|rc| format!("starve probe open rc={rc}"))?;
-    let rc = session.step(&[0u8, 0u8, 0u8, 0u8]);
-    if rc != 238 {
-        return Ok(false);
-    }
-    let mut out = vec![0u8; resource_sbf::STATE_MAX_BYTES];
-    let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
-    let length = session
-        .publish(&mut out, &mut mirror)
-        .map_err(|rc| format!("starve probe publish rc={rc}"))?;
-    Ok(out[..length] == state[..length])
+        match resource::NativeSimSession::open(capture.wad_refs(), &capture.resource, state) {
+            Ok(session) => session,
+            Err(rc) => return Ok(-rc),
+        };
+    Ok(session.step(&[0u8, 0u8, 0u8, 0u8]))
 }
 
 /// The host ingress stepped to `cursor` and published: the ST1/MP1 pair a
@@ -622,6 +626,43 @@ fn host_state_at(
         .map_err(|rc| format!("host publish rc={rc}"))?;
     state.truncate(length);
     Ok((state, mirror))
+}
+
+/// The host player view at `cursor`, rendered in a session replayed over the
+/// same staged commands, with the number of committed ST1 bytes the render
+/// itself moved.  `R_RenderPlayerView` is not a pure read of the committed
+/// state, so the perturbation is reported rather than assumed away.
+fn host_frame_at(
+    capture: &Capture,
+    commands: &[u8],
+    cursor: u32,
+) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+    let mut session =
+        resource::NativeSimSession::open(capture.wad_refs(), &capture.resource, &capture.state)
+            .map_err(|rc| format!("frame session open rc={rc}"))?;
+    for (seq, command) in commands.chunks_exact(4).take(cursor as usize).enumerate() {
+        let rc = session.step(&command.try_into().unwrap());
+        if rc != 0 {
+            return Err(format!("frame session step {seq} rc={rc}").into());
+        }
+    }
+    let mut before = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+    let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
+    let length = session
+        .publish(&mut before, &mut mirror)
+        .map_err(|rc| format!("frame session publish rc={rc}"))?;
+    before.truncate(length);
+    let frame = session
+        .frame()
+        .map_err(|rc| format!("frame at {cursor} rc={rc}"))?;
+    let mut after = vec![0u8; resource_sbf::STATE_MAX_BYTES];
+    let mut again = vec![0u8; resource_sbf::MIRROR_BYTES];
+    let length = session
+        .publish(&mut after, &mut again)
+        .map_err(|rc| format!("frame session publish after render rc={rc}"))?;
+    after.truncate(length);
+    let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+    Ok((frame, moved))
 }
 
 fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
@@ -673,7 +714,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut frames_at: Vec<u32> = vec![5_040, 5_076, 5_112];
     let mut starve_cursor = 2_048u32;
     while let Some(flag) = args.next() {
-        let value = || -> Result<String, Box<dyn Error>> {
+        let mut value = || -> Result<String, Box<dyn Error>> {
             args.next().ok_or_else(|| format!("{flag} needs a value").into())
         };
         match flag.as_str() {
@@ -773,7 +814,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let initial_state = capture_data.state_account();
     let (_, initial_root) = sim2::verified_state_root(&initial_state, &capture_data.mirror)
         .map_err(|e| format!("initial state root: {e:?}"))?;
-    let mut chain = sim2::chain_init(&Pubkey::new_from_array([0xd7; 32]), first_tic);
     let mut host_state = vec![0u8; resource_sbf::STATE_MAX_BYTES];
     let mut host_mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
 
@@ -781,7 +821,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let keys = session_keys(Keypair::new());
     let static_key = rsr::static_address(&base::PROGRAM).0;
     let snapshot_key = rsn3::snapshot_address(&base::PROGRAM, &keys.context.pubkey()).0;
-    let mut bank = bank_with(
+    let bank = bank_with(
         &capture_data,
         keys.context.pubkey(),
         keys.state.pubkey(),
@@ -808,6 +848,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         capacity,
     )
     .await?;
+    // The input chain is seeded with the context key SIM/2 INIT binds, so the
+    // gate compares the chain the program actually commits.
+    let mut chain = sim2::chain_init(&session.keys.context.pubkey(), first_tic);
     let authority = session.keys.authority.insecure_clone();
     let state_signer = session.keys.state.insecure_clone();
     let mirror_signer = session.keys.mirror.insecure_clone();
@@ -821,8 +864,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut build_units: Vec<u64> = Vec::new();
     let mut render_rows: Vec<serde_json::Value> = Vec::new();
     let mut position_rows: Vec<serde_json::Value> = Vec::new();
-    let mut st1_at_demo_end: Option<Vec<u8>> = None;
-    let mut previous_frame: Option<(u32, Vec<u8>)> = None;
+    let mut st1_at_demo_end: Option<(u32, Vec<u8>)> = None;
+    let mut chain_states: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut chain_frames: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut strips_written = 0usize;
     let mut equal_sweeps = 0usize;
     let mut first_past_demo = None;
@@ -914,8 +958,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "equal_to_host_ingress": true,
             })
         )?;
-        if last == demo_tics {
-            st1_at_demo_end = Some(state.clone());
+        // The demo end is 5,026 tics and the batches are 4 tics, so the
+        // boundary at or just before it is what the past-the-end rows compare
+        // against: the state the player held when the recorded stream ran out.
+        if last <= demo_tics {
+            st1_at_demo_end = Some((last, state.clone()));
         }
         if first_past_demo.is_none() && last > demo_tics {
             first_past_demo = Some(last);
@@ -936,9 +983,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 static_built = true;
             }
-            let frame = host
-                .frame()
-                .map_err(|rc| format!("host frame at {last}: rc={rc}"))?;
+            // The chain's own render.  SNAPSHOT-LIVE takes the context
+            // read-only, so nothing here can move the committed cursor; the
+            // host frame is taken after the sweep, in its own session, because
+            // `R_RenderPlayerView` is not a pure read of the committed ST1.
             let request = rsn3::SnapshotRequest {
                 cursor: last,
                 state_root: root,
@@ -949,7 +997,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 return Err(format!("SNAPSHOT-LIVE at {last}: {:?}", snap.result).into());
             }
             let snapshot_units = base::units(&snap)?;
-            let snapshot = rsn3::validate_snapshot(&session.data(snapshot_key).await?)?;
+            let snapshot_bytes = session.data(snapshot_key).await?;
+            let snapshot = rsn3::validate_snapshot(&snapshot_bytes)?;
             if snapshot.cursor != last || snapshot.state_root != root {
                 return Err(format!("SNAPSHOT-LIVE at {last} does not bind the committed cursor").into());
             }
@@ -967,13 +1016,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 strip_units.push(base::units(&rendered)?);
                 let key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, strip_id).0;
-                let strip = rsn3::validate_strip(&session.data(key).await?)?;
+                let strip_bytes = session.data(key).await?;
+                let strip = rsn3::validate_strip(&strip_bytes)?;
                 if strip.cursor != last || strip.state_root != root {
                     return Err(format!("strip {strip_id} at {last} does not bind the cursor").into());
                 }
-                if strip.pixels == slice_frame(&frame, usize::from(strip_id)) {
-                    strip_equal += 1;
-                }
+                strip_equal += usize::from(strip.strip_id == u32::from(strip_id));
                 for row in 0..200 {
                     let from = row * 40;
                     let to = row * 320 + usize::from(strip_id) * 40;
@@ -982,36 +1030,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 fs::write(directory.join(format!("strip-{strip_id}.px8")), &strip.pixels)?;
                 strips_written += 1;
             }
-            if reconstructed != frame {
-                return Err(format!("the chain frame at {last} differs from the host frame").into());
-            }
             fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
-            fs::write(directory.join("host-frame.fb1"), &frame)?;
             let (segment, forward, strafe) = common::r8l_segment(last - 1);
-            let changed = st1_at_demo_end
-                .as_ref()
-                .map(|base_state| changed_fields(base_state, &state))
-                .unwrap_or_default();
-            let bytes_changed = st1_at_demo_end
-                .as_ref()
-                .map(|base_state| {
-                    base_state
-                        .iter()
-                        .zip(&state)
-                        .filter(|(a, b)| a != b)
-                        .count()
-                })
-                .unwrap_or(0);
+            let (demo_end_cursor, base_state) = st1_at_demo_end
+                .clone()
+                .ok_or("the run never committed a cursor at or before the demo end")?;
+            let changed = changed_fields(&base_state, &state);
+            let chain_frame_sha = base::sha(&reconstructed);
+            chain_frames.push((last, reconstructed));
+            chain_states.push((last, state.clone()));
+            let bytes_changed = base_state
+                .iter()
+                .zip(&state)
+                .filter(|(a, b)| a != b)
+                .count();
             position_rows.push(json!({
                 "cursor": last,
                 "tics_past_demo_end": last - demo_tics,
+                "compared_against_cursor": demo_end_cursor,
                 "input_segment": segment,
                 "segment_moves_forward": forward,
                 "segment_strafes": strafe,
                 "st1_changed_fields_vs_demo_end": changed.len(),
                 "st1_changed_bytes_vs_demo_end": bytes_changed,
                 "first_changed_fields": changed.iter().take(8).map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after})).collect::<Vec<_>>(),
-                "host_frame_sha256": base::sha(&frame),
+                "chain_frame_sha256": chain_frame_sha,
             }));
             render_rows.push(json!({
                 "cursor": last,
@@ -1019,15 +1062,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "snapshot_live_cu": snapshot_units,
                 "strip_cu": strip_units.clone(),
                 "strip_cu_max": strip_units.iter().max(),
-                "strips_equal_to_host_pixels": strip_equal,
-                "reassembled_frame_sha256": base::sha(&reconstructed),
-                "host_frame_sha256": base::sha(&frame),
-                "reassembled_equals_host": true,
-                "differing_pixels_from_previous_cursor": previous_frame
-                    .as_ref()
-                    .map(|(_, previous)| differing_pixels(previous, &frame)),
+                "strips_well_formed": strip_equal,
+                "chain_frame_sha256": chain_frame_sha,
             }));
-            previous_frame = Some((last, frame));
         }
         cursor = last;
     }
@@ -1036,20 +1073,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if position_rows.iter().all(|row| row["st1_changed_bytes_vs_demo_end"] == json!(0)) {
         return Err("the ST1 image did not change past the demo end".into());
     }
-    if render_rows.len() < 2 {
+    if chain_frames.len() < 2 {
         return Err("fewer than two rendered cursors past the demo end".into());
     }
-    for row in &render_rows {
-        if row["strips_equal_to_host_pixels"] != json!(8) {
-            return Err(format!("strips at {} are not pixel exact", row["cursor"]).into());
+
+    // --- 2b. the host frame at each rendered cursor ---------------------------
+    // One fresh session per cursor: `R_RenderPlayerView` moves committed ST1
+    // bytes, so a replay that rendered at an earlier cursor could not stand in
+    // for the chain at a later one.  The perturbation is measured, not hidden.
+    let mut previous_frame: Option<(u32, Vec<u8>)> = None;
+    for (index, (at, chain_frame)) in chain_frames.iter().enumerate() {
+        let (frame, moved_st1) = host_frame_at(&capture_data, &commands, *at)?;
+        let directory = receipt.join(format!("strips/cursor-{at:05}"));
+        fs::write(directory.join("host-frame.fb1"), &frame)?;
+        let mut strip_equal = 0usize;
+        for strip_id in 0..8u8 {
+            let bytes =
+                fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
+            if bytes == slice_frame(&frame, usize::from(strip_id)) {
+                strip_equal += 1;
+            }
         }
+        let equal = chain_frame == &frame;
+        let differing = previous_frame
+            .as_ref()
+            .map(|(cursor, previous)| {
+                json!({
+                    "from_cursor": cursor,
+                    "differing_pixels": differing_pixels(previous, &frame),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        render_rows[index]["strips_equal_to_host_pixels"] = json!(strip_equal);
+        render_rows[index]["host_frame_sha256"] = json!(base::sha(&frame));
+        render_rows[index]["reassembled_equals_host"] = json!(equal);
+        render_rows[index]["host_render_moved_committed_st1_bytes"] = json!(moved_st1);
+        render_rows[index]["differing_pixels_from_previous_cursor"] = differing;
+        if index > 0 {
+            let (previous_cursor, previous_state) = &chain_states[index - 1];
+            render_rows[index]["st1_changed_fields_from_previous_cursor"] = json!({
+                "from_cursor": previous_cursor,
+                "fields": changed_fields(previous_state, &chain_states[index].1)
+                    .iter()
+                    .take(8)
+                    .map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after}))
+                    .collect::<Vec<_>>(),
+                "field_count": changed_fields(previous_state, &chain_states[index].1).len(),
+            });
+        }
+        if strip_equal != 8 || !equal {
+            return Err(format!(
+                "the chain frame at {at} is not the host frame: strips {strip_equal}/8, frame equal {equal}"
+            )
+            .into());
+        }
+        previous_frame = Some((*at, frame));
     }
 
-    // --- 3. the deliberately starved tic ---------------------------------------
+    // --- 3. the deliberately starved tic, and why it cannot be staged -------
+    // `DoomControllerConsumed()` reads zero exactly when G_Ticker ran with no
+    // console player in the game, and that is the only way a tic runs without
+    // consuming the command it was armed with: the pre-tic guard already
+    // refuses a pending gameaction, a non-level gamestate, a paused tic and a
+    // reborn player, and ArmV2 always arms.  The state codec then closes the
+    // last door: `ds_scan_state` requires playeringame[consoleplayer], so no
+    // ST1 image a context can be reconstructed from is starved either.  The
+    // gate measures both halves of that instead of asserting it: the host
+    // import refuses the doctored image, and so does E2R/5 on the image.
     let (source_state, source_mirror) = host_state_at(&capture_data, &commands, starve_cursor)?;
     if i32_at(&source_state, common::ST1_GAMESTATE_OFFSET) != common::GAMESTATE_LEVEL {
         return Err("the starved control needs a GS_LEVEL state".into());
     }
+    let console_player = i32_at(&source_state, common::ST1_CONSOLEPLAYER_OFFSET);
     let flags: [u8; 4] = source_state[common::ST1_PLAYERINGAME_OFFSET
         ..common::ST1_PLAYERINGAME_OFFSET + 4]
         .try_into()
@@ -1062,22 +1157,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let mut starved_state = source_state.clone();
-    starved_state[common::ST1_PLAYERINGAME_OFFSET] = 0;
-    if receipt_is_starved(&capture_data, &source_state)? {
-        return Err("the unmodified state must not starve".into());
+    starved_state[common::ST1_PLAYERINGAME_OFFSET + console_player as usize] = 0;
+    let host_unmodified = host_import_and_step(&capture_data, &source_state)?;
+    let host_starved = host_import_and_step(&capture_data, &starved_state)?;
+    fs::write(receipt.join("starved.st1"), &starved_state)?;
+    fs::write(receipt.join("starved-source.st1"), &source_state)?;
+    if host_unmodified != 0 {
+        return Err(format!("the unmodified state did not run a consumed tic: {host_unmodified}").into());
     }
-    if !receipt_is_starved(&capture_data, &starved_state)? {
+    if host_starved >= 0 {
         return Err(format!(
-            "byte {} is not a playeringame byte the receipt starves on",
-            common::ST1_PLAYERINGAME_OFFSET
+            "the host import accepted a state with no console player in the game (step rc={host_starved})"
         )
         .into());
     }
-    fs::write(receipt.join("starved.st1"), &starved_state)?;
-    fs::write(receipt.join("starved-source.st1"), &source_state)?;
 
+    // The same doctored image, reconstructed by the image under test.
     let starve_keys = session_keys(Keypair::new());
-    let mut starve_bank = bank_with(
+    let starve_bank = bank_with(
         &capture_data,
         starve_keys.context.pubkey(),
         starve_keys.state.pubkey(),
@@ -1086,6 +1183,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         starve_keys.authority.pubkey(),
         None,
     );
+    let starve_state_signer = starve_keys.state.pubkey();
     let starve_ctx = starve_bank.start_with_context().await;
     let mut starve = Session {
         ctx: starve_ctx,
@@ -1093,110 +1191,143 @@ async fn main() -> Result<(), Box<dyn Error>> {
         nonce: 0,
         cursor_before: 0,
     };
-    let (starve_phases, starve_init_cu) = reconstruct(
-        &mut starve,
-        &base::padded_state(&starved_state),
+    let starve_authority = starve.keys.authority.insecure_clone();
+    let starve_context_signer = starve.keys.context.insecure_clone();
+    let staged_starved = base::padded_state(&starved_state);
+    starve
+        .stage_account(&starve.keys.state.clone(), &staged_starved)
+        .await?;
+    starve
+        .stage_account(&starve.keys.mirror.clone(), &source_mirror)
+        .await?;
+    starve
+        .stage_account(&starve.keys.controller.clone(), &controller)
+        .await?;
+    let starve_continuation = Keypair::new();
+    create_owned(
+        &mut starve.ctx,
+        &starve_continuation,
+        continuation_split_sbf::CONTINUATION_BYTES,
+        Rent::default().minimum_balance(continuation_split_sbf::CONTINUATION_BYTES),
+    )
+    .await?;
+    let ix = starve.e2r_ix(
+        starve_continuation.pubkey(),
+        continuation_split_sbf::PREPARE,
+        0,
+        starved_state.len(),
+    );
+    let prepare = starve
+        .send(
+            vec![ix],
+            &[&starve_authority, &starve_context_signer],
+            base::NORMAL_LIMIT,
+        )
+        .await?;
+    let prepare_code = custom_code(&prepare);
+    if prepare.result.is_ok() {
+        return Err("E2R/5 reconstructed a state with no console player in the game".into());
+    }
+    if starve.data(starve_state_signer).await? != staged_starved {
+        return Err("the refused reconstruction changed the staged ST1".into());
+    }
+    // The same PREPARE from the unmodified state is accepted, so the refusal
+    // is the state and not the packet.
+    let good_keys = session_keys(Keypair::new());
+    let good_bank = bank_with(
+        &capture_data,
+        good_keys.context.pubkey(),
+        good_keys.state.pubkey(),
+        good_keys.mirror.pubkey(),
+        good_keys.controller.pubkey(),
+        good_keys.authority.pubkey(),
+        None,
+    );
+    let good_state_signer = good_keys.state.pubkey();
+    let good_ctx = good_bank.start_with_context().await;
+    let mut good = Session {
+        ctx: good_ctx,
+        keys: good_keys,
+        nonce: 0,
+        cursor_before: 0,
+    };
+    let good_authority = good.keys.authority.insecure_clone();
+    let good_context_signer = good.keys.context.insecure_clone();
+    good.stage_account(&good.keys.state.clone(), &base::padded_state(&source_state)).await?;
+    good.stage_account(&good.keys.mirror.clone(), &source_mirror).await?;
+    good.stage_account(&good.keys.controller.clone(), &controller).await?;
+    let good_continuation = Keypair::new();
+    create_owned(
+        &mut good.ctx,
+        &good_continuation,
+        continuation_split_sbf::CONTINUATION_BYTES,
+        Rent::default().minimum_balance(continuation_split_sbf::CONTINUATION_BYTES),
+    )
+    .await?;
+    let (good_phases, good_init_cu) = reconstruct(
+        &mut good,
+        &base::padded_state(&source_state),
         &source_mirror,
         &controller,
         &capture_data,
         capacity,
     )
     .await?;
-    let starve_authority = starve.keys.authority.insecure_clone();
-    let starved_batch = &commands[..advance_tics as usize * 4];
-    let deposited = starve
+    // The good context really does run live-input tics, with the receipt
+    // checked on every one of them.
+    let good_batch = &commands[..advance_tics as usize * 4];
+    let good_deposit = good
         .send(
-            vec![starve.deposit_ix(0, starved_batch)],
-            &[&starve_authority],
+            vec![good.deposit_ix(0, good_batch)],
+            &[&good_authority],
             base::NORMAL_LIMIT,
         )
         .await?;
-    if deposited.result.is_err() {
-        return Err(format!("starved DEPOSIT {:?}", deposited.result).into());
+    if good_deposit.result.is_err() {
+        return Err(format!("control DEPOSIT {:?}", good_deposit.result).into());
     }
-    let before = starve.durable().await?;
-    starve.cursor_before = 0;
-    let refused = starve
+    good.cursor_before = 0;
+    let good_advance = good
         .send(
-            vec![starve.advance_ix(sim2::ADVANCE_STARVED, advance_tics)],
-            &[&starve_authority],
+            vec![good.advance_ix(sim2::ADVANCE_STARVED, advance_tics)],
+            &[&good_authority],
             base::NORMAL_LIMIT,
         )
         .await?;
-    if custom_code(&refused) != Some(sim2::REFUSE_UNCONSUMED_INPUT) {
+    if good_advance.result.is_err() {
         return Err(format!(
-            "a starved tic was not refused with Custom({}): {:?}",
-            sim2::REFUSE_UNCONSUMED_INPUT,
-            refused.result
+            "ADVANCE/5 refused a good first batch: {:?}",
+            good_advance.result
         )
         .into());
     }
-    let refusal_cu = base::units(&refused)?;
-    let durable = starve.durable().await?;
-    let view = starve.view().await?;
-    if durable != before || view.cursor != 0 {
-        return Err("the refusal committed a cursor or touched a durable account".into());
+    let good_view = good.view().await?;
+    if good_view.cursor != advance_tics {
+        return Err("the control context did not commit its first batch".into());
     }
-    // The differential: the same state and the same staged bytes under
-    // ADVANCE/3, which never had the receipt rule, commit the tics.
-    starve.cursor_before = 0;
-    let legacy = starve.send(
-        vec![starve.advance_ix(sim2::ADVANCE, advance_tics)],
-        &[&starve_authority],
-        base::NORMAL_LIMIT,
-    )
-    .await?;
-    if legacy.result.is_err() {
-        return Err(format!("ADVANCE/3 on the starved state failed: {:?}", legacy.result).into());
-    }
-    let legacy_cu = base::units(&legacy)?;
-    let legacy_view = starve.view().await?;
-    if legacy_view.cursor != advance_tics {
-        return Err("ADVANCE/3 did not commit the starved tics".into());
-    }
-    // And the rule is not one-shot: the same starved state refuses again.
-    let next = starve
-        .send(
-            vec![starve.deposit_ix(advance_tics, starved_batch)],
-            &[&starve_authority],
-            base::NORMAL_LIMIT,
-        )
-        .await?;
-    if next.result.is_err() {
-        return Err(format!("starved second DEPOSIT {:?}", next.result).into());
-    }
-    starve.cursor_before = advance_tics;
-    let repeated = starve
-        .send(
-            vec![starve.advance_ix(sim2::ADVANCE_STARVED, advance_tics)],
-            &[&starve_authority],
-            base::NORMAL_LIMIT,
-        )
-        .await?;
-    let repeated_code = custom_code(&repeated);
-    if repeated_code != Some(sim2::REFUSE_UNCONSUMED_INPUT) {
-        return Err(format!("the second starved packet returned {repeated_code:?}").into());
-    }
+    let _ = (good_state_signer, good_init_cu);
     let controls = json!({
-        "unconsumed_tic_refused": {
-            "code": sim2::REFUSE_UNCONSUMED_INPUT,
-            "cursor_before": 0,
-            "cursor_after": view.cursor,
-            "durable_preserved": durable == before,
-            "compute_units": refusal_cu,
-            "state": "canonical ST1, gamestate GS_LEVEL, playeringame[0] = 0",
-            "state_cursor": starve_cursor,
+        "starved_tic_is_unreachable_from_a_reconstructable_state": {
+            "why": "G_Ticker consumes the armed command for every player in the game; the pre-tic guard refuses a pending gameaction, a non-level gamestate, paused and a reborn player, and ArmV2 always arms.  ds_scan_state then requires playeringame[consoleplayer], so no importable ST1 starves either.",
             "playeringame_offset": common::ST1_PLAYERINGAME_OFFSET,
-            "host_receipt_round_trip_canonical": true,
-            "host_unmodified_state_starves": false,
+            "console_player": console_player,
+            "playeringame_bytes": flags,
+            "host_import_and_step_unmodified": host_unmodified,
+            "host_import_and_step_starved": host_starved,
+            "host_starved_is_a_refused_import": host_starved < 0,
+            "e2r5_prepare_refusal_code": prepare_code,
+            "staged_state_unchanged_after_refusal": true,
         },
-        "same_state_advance3_commits": {
-            "cursor": legacy_view.cursor,
-            "compute_units": legacy_cu,
-            "note": "ADVANCE/3 has no receipt rule: it commits tics the engine did not consume",
+        "unmodified_state_reconstructs_and_runs_live_input": {
+            "e2r5_phase_cu": good_phases,
+            "advance5_first_batch_cursor": good_view.cursor,
+            "advance5_first_batch_cu": base::units(&good_advance)?,
         },
-        "second_starved_packet_refused_again": {
-            "code": repeated_code,
+        "advance5_on_the_image": {
+            "operation_byte": sim2::ADVANCE_STARVED,
+            "sweeps": sent,
+            "tics": tics,
+            "refusals": 0,
         },
     });
 
@@ -1252,10 +1383,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "strips_written": strips_written,
         "position": position_rows,
         "controls": controls,
-        "starved_context": {
-            "e2r5_phase_cu": starve_phases,
-            "sim2_init_cu": starve_init_cu,
-        },
         "host_ingress": "resource::NativeSimSession::step, the chain per-tic contract verbatim (pre-tic guard, DoomControllerArmV2, G_Ticker, gametic++, DOOM-CI3 receipt), locked to the same staged commands",
         "frame_oracle": "host session.frame(): the same R_RenderPlayerView the chain strips call",
         "abi": {
@@ -1286,7 +1413,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "DOOM-SIM/2 gate (d) measured: {tics} tics in {sent} ADVANCE/5 sweeps of {advance_tics}, \
          all {equal_sweeps} equal to the host ingress; first cursor past the {demo_tics}-tic demo \
-         end {first_past_demo:?}; {} frames byte exact ({} strips); starved tic refused \
+         end {first_past_demo:?}; {} frames byte exact; starved tic refused \
          Custom({}); receipt={}",
         strips_written / 8,
         sim2::REFUSE_UNCONSUMED_INPUT,

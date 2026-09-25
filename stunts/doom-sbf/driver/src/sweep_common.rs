@@ -150,19 +150,21 @@ impl Capture {
     }
 }
 
-/// ST1 image layout facts a gate needs and the encoder fixes (V0):
-/// `DS_HEADER_BYTES` 64, then twenty int32 globals, then twelve boolean
+/// ST1 image layout facts a gate needs, and the encoder fixes (V0):
+/// `DS_HEADER_BYTES` 64, then twenty-one int32 globals, then twelve boolean
 /// bytes, then `MAXPLAYERS` `playeringame` bytes.  `playeringame[0]` is
-/// therefore at 64 + 80 + 12 = 156.  A gate reads it, not guesses it: see
-/// `live_input_gate`, which proves the offset by a host round trip and by the
-/// DOOM-CI3 receipt the offset produces.
+/// therefore at 64 + 84 + 12 = 160.  The decoder reads the same order
+/// (`ds_scan_state`: 21 globals, then 12 + MAXPLAYERS booleans) and *requires*
+/// `playeringame[consoleplayer]`, which is what makes a starved tic
+/// unreachable from any state image a context can be reconstructed from.
 pub const ST1_HEADER_BYTES: u32 = 64;
-pub const ST1_GLOBAL_COUNT: u32 = 20;
+pub const ST1_GLOBAL_COUNT: u32 = 21;
 pub const ST1_BOOLEAN_COUNT: u32 = 12;
 pub const ST1_PLAYERINGAME_OFFSET: usize =
     (ST1_HEADER_BYTES + 4 * ST1_GLOBAL_COUNT + ST1_BOOLEAN_COUNT) as usize;
 pub const ST1_GAMESTATE_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 3) as usize;
 pub const ST1_GAMETIC_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 5) as usize;
+pub const ST1_CONSOLEPLAYER_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 11) as usize;
 pub const ST1_DEMO_CURSOR_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 6) as usize;
 pub const ST1_MAX_PLAYERS: u32 = 4;
 pub const GAMESTATE_LEVEL: i32 = 0;
