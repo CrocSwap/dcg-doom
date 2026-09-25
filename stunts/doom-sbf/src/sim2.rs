@@ -2634,8 +2634,10 @@ mod tests {
         let meta_before = g.meta.clone();
         let buffer_before = g.buffer.clone();
         let mut wrong = start_state.clone();
-        // A canonical ST1 at the same tic with one different committed field.
-        wrong[64..68].copy_from_slice(&[0x5a, 0x5a, 0x5a, 0x5a]);
+        // A canonical ST1 at the same tic with one different committed header
+        // field: still shape-valid (the encoded length and the zero tail are
+        // untouched), so only the root check can catch it.
+        wrong[24..28].copy_from_slice(&29u32.to_le_bytes());
         stage_start(&mut g, &wrong);
         let mut engine = mock_reset(start_mirror);
         assert_eq!(
