@@ -1303,6 +1303,7 @@ static int r2_v2_apply_table(uint32_t id, uint32_t n, const uint8_t *p, void *op
  * a subsector whose validcount already equals the global one, so a stale
  * identity left by the image import silently drops that subsector's walls,
  * flats and sprites. */
+#ifndef DOOM_SBF_BUILD
 static void doom_lowdetail3_probe(subsector_t *subs, int numsubs, int vc)
 {
     int i, stale = 0, x;
@@ -1328,6 +1329,9 @@ static void doom_lowdetail3_probe(subsector_t *subs, int numsubs, int vc)
            players[displayplayer].fixedcolormap, (unsigned)xtoviewangle[0], h);
     fflush(stdout);
 }
+#else
+#define doom_lowdetail3_probe(a, b, c) ((void)0)
+#endif
 
 static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
                         const uint8_t *image, const uint8_t *wad, size_t wad_bytes,
@@ -1385,8 +1389,13 @@ static int r2_v2_commit(const r2_v2_plan_t *plan, const r2_section_t *s,
          * strip.  DOOM_NATIVE_PROBE=1 additionally prints the renderer inputs
          * the chain rebuilds, so the two sides can be compared.  Nothing
          * changes when neither variable is set. */
+#ifdef DOOM_SBF_BUILD
+        const char *probe = 0;
+        const char *report = 0;
+#else
         const char *probe = getenv("DOOM_NATIVE_STRIP");
         const char *report = getenv("DOOM_NATIVE_PROBE");
+#endif
         if (report) doom_lowdetail3_probe(subsectors, numsubsectors, validcount);
         G_Ticker();
         if (probe) doom_render_fuzz_columns = (1u << 30) | ((unsigned long)atol(probe) << 27);
