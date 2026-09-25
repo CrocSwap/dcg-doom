@@ -3,7 +3,7 @@
  *
  * This is deliberately host-native and additive.  It is not the DOOM-E2S/1
  * account ABI.  The image contains canonical scalar records and explicit
- * section offsets/indexes for the retained E1M5 static map graph.  No C
+ * section offsets/indexes for the pinned start level's static map graph.  No C
  * struct, data pointer, allocator pointer, or action/code pointer crosses the
  * image boundary.  Import validates the complete graph before it resets the
  * engine context or changes any engine global.
@@ -37,6 +37,28 @@ extern int doom_engine_ex2_make_wad(
 extern int doom_engine_ex2_fill_mirror(
     uint8_t *out, const uint8_t *wad, size_t wad_bytes,
     const uint8_t wad_hash[32]);
+
+/* The protocol's pinned start level.  A new game starts at episode 1 map 1
+   (the skill is the caller's), so the static graph the producer encodes, the
+   level name every image header carries, and the level the on-chain validators
+   accept are one decision recorded once here.  The two compile-time checks
+   below keep the name from drifting from the numbers: the name is spelled
+   "E<episode>M<map>" and is eight bytes. */
+#define RI_LEVEL_EPISODE 1
+#define RI_LEVEL_MAP 1
+#define RI_LEVEL_SKILL 3
+#define RI_LEVEL_NAME "E1M1\0\0\0\0"
+/* The two halves are separate so the front end folds both to plain constants:
+   a typedef whose size expression indexes a string literal is diagnosed as a
+   folded variable-length array, which is a warning in a build that has to stay
+   clean. */
+typedef char ri_level_name_check_bytes[sizeof(RI_LEVEL_NAME) == 9 ? 1 : -1];
+enum {
+    RI_LEVEL_NAME_SPELLS_THE_LEVEL = (RI_LEVEL_NAME[0] == 'E' &&
+        RI_LEVEL_NAME[1] == '0' + RI_LEVEL_EPISODE && RI_LEVEL_NAME[2] == 'M' &&
+        RI_LEVEL_NAME[3] == '0' + RI_LEVEL_MAP && RI_LEVEL_NAME[4] == 0),
+};
+typedef char ri_level_name_check_spelling[RI_LEVEL_NAME_SPELLS_THE_LEVEL ? 1 : -1];
 
 #define RI_MAGIC "DOOM-RI1"
 #define RI_VERSION 1u
@@ -172,7 +194,7 @@ static int ri_header(const uint8_t *image, size_t bytes, ri_section_t out[RI_MAX
         ri_u32(image + 80) != RI_SECTION_DIR_OFFSET ||
         memcmp(image + 84, ri_engine_id, RI_ENGINE_ID_BYTES) ||
         memcmp(image + 116, ri_pinned_wad, 32) ||
-        memcmp(image + 148, "E1M5\0\0\0\0", 8)) return -1;
+        memcmp(image + 148, RI_LEVEL_NAME, 8)) return -1;
     dir_end = RI_SECTION_DIR_OFFSET + RI_SECTION_COUNT * 16u;
     previous = dir_end;
     for (i = 0; i < RI_SECTION_COUNT; i++) {
@@ -282,7 +304,19 @@ static int ri_setup_engine(const uint8_t *wad, size_t wad_bytes, uint8_t **carri
     if (demo_len < 17) return -1;
     demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
     defdemoname = "DEMO1"; demobuffer = demo; demo_p = demo;
-    G_DoPlayDemo();
+    /* A new game at the pinned level, not a replay of the recorded demo.  The
+       caller-supplied values G_InitNew's vanilla comment asks for are the demo
+       header's (a zeroed players[], playeringame[0] and consoleplayer 0), so
+       the same engine state a player gets for "new game" is what the graph is
+       captured from.  demo_p stays on the first DEMO1 ticcmd slot, which is
+       the cursor the start-state capture commits, and the lump is still
+       PU_STATIC so the captured bounds stay real. */
+    memset(players, 0, sizeof(players));
+    memset(playeringame, 0, sizeof(playeringame));
+    playeringame[0] = 1;
+    DOOM_CTX->consoleplayer = 0; displayplayer = 0;
+    demo_p = demo + 13;
+    G_InitNew((skill_t)RI_LEVEL_SKILL, RI_LEVEL_EPISODE, RI_LEVEL_MAP);
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
     return 0;
 }
@@ -292,10 +326,11 @@ static int ri_encode_graph(uint8_t **out, size_t *out_bytes, uintptr_t *anchor)
     uint32_t nv=(uint32_t)numvertexes, ns=(uint32_t)numsectors, nsi=(uint32_t)numsides;
     uint32_t nl=(uint32_t)DOOM_CTX->numlines, ng=(uint32_t)numsegs, nss=(uint32_t)numsubsectors;
     uint32_t nn=(uint32_t)DOOM_CTX->numnodes, i, j, nli=0, nb, nr, total, cursor;
-    int map_lump = W_GetNumForName("E1M5");
+    int map_lump = W_GetNumForName(RI_LEVEL_NAME);
     ri_section_t s[RI_MAX_SECTIONS];
     uint8_t *image, *p;
-    if (!out || !out_bytes || !anchor || gameepisode != 1 || gamemap != 5 ||
+    if (!out || !out_bytes || !anchor ||
+        gameepisode != RI_LEVEL_EPISODE || gamemap != RI_LEVEL_MAP ||
         nv == 0 || ns == 0 || nsi == 0 || nl == 0 || !vertexes || !sectors || !sides ||
         !lines || !segs || !subsectors || !nodes || !blockmaplump || !rejectmatrix) return -1;
     for (i=0;i<ns;i++) { if (sectors[i].linecount < 0) return -1; nli += (uint32_t)sectors[i].linecount; }
@@ -321,7 +356,7 @@ static int ri_encode_graph(uint8_t **out, size_t *out_bytes, uintptr_t *anchor)
     ri_put32(image+32,nv);ri_put32(image+36,ns);ri_put32(image+40,nsi);ri_put32(image+44,nl);
     ri_put32(image+48,ng);ri_put32(image+52,nss);ri_put32(image+56,nn);ri_put32(image+60,nb);
     ri_put32(image+64,nr);ri_put32(image+68,nli);ri_put32(image+72,RI_SECTION_COUNT);ri_put32(image+80,RI_SECTION_DIR_OFFSET);
-    memcpy(image+84,ri_engine_id,32); memcpy(image+116,ri_pinned_wad,32); memcpy(image+148,"E1M5\0\0\0\0",8);
+    memcpy(image+84,ri_engine_id,32); memcpy(image+116,ri_pinned_wad,32); memcpy(image+148,RI_LEVEL_NAME,8);
     ri_put32(image+156,(uint32_t)bmapwidth);ri_put32(image+160,(uint32_t)bmapheight);
     ri_put32(image+164,(uint32_t)bmaporgx);ri_put32(image+168,(uint32_t)bmaporgy);
     for(i=0;i<RI_SECTION_COUNT;i++)ri_section_write(image,i,&s[i]);

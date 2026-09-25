@@ -47,9 +47,44 @@ extern int doom_resource_ri1_import_graph(const uint8_t *image, size_t image_byt
                                           uintptr_t *anchor);
 extern int doom_resource_ri1_validate_graph(const uint8_t *image, size_t image_bytes);
 
+/* The protocol's pinned start level, recorded once for this file.  The
+   producer writes the name into the image header and every validator (the
+   on-chain preflight included) compares it, so a graph captured from a
+   different map cannot be paired with a start state, and a capture from this
+   map cannot be paired with a different graph.  This block is inside the
+   slice build.rs hands the SBF consumer, so the on-chain validator pins the
+   same level as the native producer.  The two compile-time checks below keep
+   the name from drifting from the numbers and from being the wrong length. */
+#define RI2_LEVEL_EPISODE 1
+#define RI2_LEVEL_MAP 1
+#define RI2_LEVEL_NAME "E1M1\0\0\0\0"
+/* The two halves are separate so the front end folds both to plain constants:
+   a typedef whose size expression indexes a string literal is diagnosed as a
+   folded variable-length array, which is a warning in a build that has to stay
+   clean. */
+typedef char r2_level_name_check_bytes[sizeof(RI2_LEVEL_NAME) == 9 ? 1 : -1];
+enum {
+    RI2_LEVEL_NAME_SPELLS_THE_LEVEL = (RI2_LEVEL_NAME[0] == 'E' &&
+        RI2_LEVEL_NAME[1] == '0' + RI2_LEVEL_EPISODE && RI2_LEVEL_NAME[2] == 'M' &&
+        RI2_LEVEL_NAME[3] == '0' + RI2_LEVEL_MAP && RI2_LEVEL_NAME[4] == 0),
+};
+typedef char r2_level_name_check_spelling[RI2_LEVEL_NAME_SPELLS_THE_LEVEL ? 1 : -1];
+
 #define RI2_MAGIC "DOOM-RI2"
 #define RI2_VERSION_V1 1u
-#define RI2_VERSION 2u
+/* Version 2 is the retired E1M5 image: the shareware DEMO1 start state, the
+   level every retained context was provisioned at.  It is named here so the
+   one-way step to the pinned new-game start image is visible in the source,
+   and it is no longer accepted: `r2_sections` takes only the version the
+   protocol pins, so an E1M5 image is refused on chain. */
+#define RI2_VERSION_E1M5 2u
+/* Version 4 is the pinned E1M1 new-game start image.  It is 4 and not 3
+   because 3 is the number the diagnostic-only clipped-render measurement
+   request (DOOM-RC3, resource_sbf::RI3_VERSION) already uses, and the Rust
+   entry point dispatches on the version field alone: an image version of 3
+   would make the two requests indistinguishable there. */
+#define RI2_VERSION_E1M1 4u
+#define RI2_VERSION RI2_VERSION_E1M1
 #define RI2_HEADER_BYTES 256u
 #define RI2_SCHEMA 2u
 #define RI2_SECTION_COUNT 5u
@@ -206,7 +241,7 @@ static int r2_sections_version(const uint8_t *image, size_t bytes,
         r2_u32(image + 28) != 5 || r2_u32(image + 32) != RI2_SECTION_COUNT ||
         r2_u32(image + 36) != RI2_SECTION_DIR_OFFSET ||
         memcmp(image + 40, r2_engine_id, RI2_ENGINE_ID_BYTES) ||
-        memcmp(image + 72, r2_wad_hash, 32) || memcmp(image + 104, "E1M5\0\0\0\0", 8)) return -1;
+        memcmp(image + 72, r2_wad_hash, 32) || memcmp(image + 104, RI2_LEVEL_NAME, 8)) return -1;
     directory_end = RI2_SECTION_DIR_OFFSET + RI2_SECTION_COUNT * 16u;
     previous = directory_end;
     for (i = 0; i < RI2_SECTION_COUNT; i++) {
@@ -622,7 +657,7 @@ static int r2_build(const uint8_t *graph, size_t graph_bytes, r2_builder_t *scal
     r2_put32(image + 20, RI2_SCHEMA); r2_put32(image + 24, 1); r2_put32(image + 28, 5);
     r2_put32(image + 32, RI2_SECTION_COUNT); r2_put32(image + 36, RI2_SECTION_DIR_OFFSET);
     memcpy(image + 40, r2_engine_id, 32); memcpy(image + 72, r2_wad_hash, 32);
-    memcpy(image + 104, "E1M5\0\0\0\0", 8); r2_put32(image + 112, scalars->count);
+    memcpy(image + 104, RI2_LEVEL_NAME, 8); r2_put32(image + 112, scalars->count);
     r2_put32(image + 116, tables->count); r2_put32(image + 120, relocs->count);
     r2_put32(image + 124, functions->count); r2_put32(image + 128, (uint32_t)graph_bytes);
     for (i = 0; i < 5; i++) {
