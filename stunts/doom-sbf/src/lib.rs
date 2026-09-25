@@ -78,7 +78,7 @@ pub const CTX_GUARD_REFUSED: u32 = 199;
 /// struct fails loudly instead of aliasing engine state.
 ///
 /// Patch 0030 adds the diagnostic render-phase accumulator as the last member
-/// of doom_ctx_t: fifteen CU cells plus four mark registers, 160 bytes, with
+/// of doom_ctx_t: eighteen CU cells plus four mark registers, 176 bytes, with
 /// every field offset above them unchanged. They exist in host builds too, so
 /// the host oracle and the chain agree on sizeof(doom_ctx_t). The constant has
 /// to be exact, not merely large enough: the static resource header records
@@ -86,7 +86,7 @@ pub const CTX_GUARD_REFUSED: u32 = 199;
 /// sizeof(doom_ctx_t), so an eight-byte drift here is a Custom(302) at the
 /// first RENDER with nothing in the log to explain it.
 #[cfg(feature = "ctx-engine")]
-pub const CTX_MIN_BYTES: usize = 3_440_952 + 160 + 24;
+pub const CTX_MIN_BYTES: usize = 3_440_952 + 176 + 24;
 
 /// Numeric phase-log magic used only by the bounded diagnostic SBF image.
 /// The feature changes the image identity; no normal or positive qualification
