@@ -36,12 +36,15 @@ Slots, in emission order, three per line:
  11   of which the masked mid-texture seg range loop
  12   of which R_DrawPlayerSprites
  13 fixed post-render  (strip extraction, free, arena rewind)
- 14 R_RenderPlayerView as a whole, as a cross-check on 1,2,3,6,8
+ 14 the 32-root relink and the arena rebind alone, so the dynamic state import
+    beside them can be priced apart (0 minus 14 is the state import and the
+    framebuffer allocation)
+ 15 R_RenderPlayerView as a whole, as a cross-check on 1,2,3,6,8
 
 Applies on top of 0001-0017.
 
 diff --git a/linuxdoom-1.10/headless/doom_ctx.h b/linuxdoom-1.10/headless/doom_ctx.h
-index cbb3f82..3a5991a 100644
+index cbb3f82..5746237 100644
 --- a/linuxdoom-1.10/headless/doom_ctx.h
 +++ b/linuxdoom-1.10/headless/doom_ctx.h
 @@ -50,6 +50,51 @@
@@ -107,7 +110,7 @@ index cbb3f82..3a5991a 100644
  } doom_ctx_t;
  
  void doom_ctx_init(void);
-@@ -902,6 +951,26 @@ extern doom_ctx_t doom_ctx_host_backing;
+@@ -902,6 +951,29 @@ extern doom_ctx_t doom_ctx_host_backing;
  #define doom_sbf_controller_applied ((int *)&DOOM_CTX->doom_sbf_private[8])
  #define doom_sbf_private_alloc_fail ((long *)&DOOM_CTX->doom_sbf_private[16])
  #define doom_sbf_private_alloc_calls ((long *)&DOOM_CTX->doom_sbf_private[24])
@@ -124,9 +127,12 @@ index cbb3f82..3a5991a 100644
 +extern unsigned long doom_sbf_prof_cu(void);
 +#define PROF_ENTER(slot, depth) \
 +    (doom_sbf_prof_mark[(depth)] = doom_sbf_prof_cu())
++/* The meter only ever falls, so the interval is the mark minus the later
++ * reading.  Written the other way round it underflows, which is unsigned
++ * arithmetic doing exactly what it was told. */
 +#define PROF_EXIT(slot, depth) \
 +    (doom_sbf_prof[(slot)] += \
-+     doom_sbf_prof_cu() - doom_sbf_prof_mark[(depth)])
++     doom_sbf_prof_mark[(depth)] - doom_sbf_prof_cu())
 +#else
 +#define PROF_ENTER(slot, depth) ((void)0)
 +#define PROF_EXIT(slot, depth) ((void)0)
