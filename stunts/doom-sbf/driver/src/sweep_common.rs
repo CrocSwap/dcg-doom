@@ -444,3 +444,55 @@ pub fn scrambled_runs(rng: &mut Rng, count: u32, max_run: u32, hold: &[u32]) -> 
     rng.shuffle(&mut runs);
     runs
 }
+
+#[cfg(test)]
+mod command_profile_tests {
+    use super::*;
+
+    /// `command-file:` is how a gate compares the chain against the chain: the
+    /// bytes are the ones the sender committed, not a synthetic stand-in.  It
+    /// must therefore refuse anything that cannot be the sender's stream, and
+    /// it must refuse to run a *different* number of tics than it was asked for
+    /// rather than silently looping or truncating.
+    #[test]
+    fn command_file_reads_exact_bytes_and_refuses_a_short_file() {
+        let dir = std::env::temp_dir().join(format!("doom-command-file-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("command-stream.bin");
+        let mut expected = Vec::new();
+        for seq in 0..6u8 {
+            expected.extend_from_slice(&[seq, 0, seq ^ 0xff, 1]);
+        }
+        fs::write(&path, &expected).expect("write stream");
+
+        let profile = format!("command-file:{}", path.display());
+        let (commands, cycle) = input_commands(&profile, 6).expect("six tics");
+        assert_eq!(commands, expected);
+        assert_eq!(cycle, 0, "a command file does not repeat");
+
+        // Exactly as many tics as asked for, even when the file is longer.
+        let (shorter, _) = input_commands(&profile, 4).expect("four tics");
+        assert_eq!(shorter, expected[..16]);
+
+        // A file that cannot cover the request is an error, never a rerun.
+        let err = input_commands(&profile, 7).expect_err("seven tics from a six-tic file");
+        assert!(err.to_string().contains("7 tics need 28"), "{err}");
+
+        // A file that is not a whole number of tics is an error too.
+        fs::write(&path, &expected[..10]).expect("write ragged stream");
+        let err = input_commands(&profile, 2).expect_err("ragged stream");
+        assert!(err.to_string().contains("whole number of tics"), "{err}");
+
+        // A missing file is an error, not an empty stream.
+        let missing = format!("command-file:{}", dir.join("absent.bin").display());
+        let err = input_commands(&missing, 1).expect_err("missing stream");
+        assert!(err.to_string().contains("cannot read command file"), "{err}");
+
+        // And the synthetic profiles are still themselves, not the sender's.
+        let (synthetic, _) = input_commands("r8l-move", 4).expect("r8l-move");
+        assert_ne!(synthetic, expected[..16]);
+        assert!(input_commands("no-such-profile", 1).is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}
