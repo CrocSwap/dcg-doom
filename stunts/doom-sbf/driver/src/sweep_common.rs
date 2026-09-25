@@ -150,6 +150,71 @@ impl Capture {
     }
 }
 
+/// ST1 image layout facts a gate needs and the encoder fixes (V0):
+/// `DS_HEADER_BYTES` 64, then twenty int32 globals, then twelve boolean
+/// bytes, then `MAXPLAYERS` `playeringame` bytes.  `playeringame[0]` is
+/// therefore at 64 + 80 + 12 = 156.  A gate reads it, not guesses it: see
+/// `live_input_gate`, which proves the offset by a host round trip and by the
+/// DOOM-CI3 receipt the offset produces.
+pub const ST1_HEADER_BYTES: u32 = 64;
+pub const ST1_GLOBAL_COUNT: u32 = 20;
+pub const ST1_BOOLEAN_COUNT: u32 = 12;
+pub const ST1_PLAYERINGAME_OFFSET: usize =
+    (ST1_HEADER_BYTES + 4 * ST1_GLOBAL_COUNT + ST1_BOOLEAN_COUNT) as usize;
+pub const ST1_GAMESTATE_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 3) as usize;
+pub const ST1_GAMETIC_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 5) as usize;
+pub const ST1_DEMO_CURSOR_OFFSET: usize = (ST1_HEADER_BYTES + 4 * 6) as usize;
+pub const ST1_MAX_PLAYERS: u32 = 4;
+pub const GAMESTATE_LEVEL: i32 = 0;
+
+/// A staged-input profile, independent of the DEMO1 lump.  Every profile
+/// returns `count` ticcmd bytes and the length of the cycle it repeats (0 when
+/// it does not repeat).  `r8l-move` is the profile the R8b sender's
+/// KEY_SCRIPTS produces: every 200-tic segment either moves or turns, so a
+/// receiver cannot mistake "input arrived" for "the player moved".
+pub fn input_commands(profile: &str, count: usize) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+    let mut commands = Vec::with_capacity(count.checked_mul(4).ok_or("command size overflow")?);
+    match profile {
+        "neutral" => commands.resize(count * 4, 0),
+        "orbit-fire" => {
+            for seq in 0..count {
+                let turn = if (seq / 256) % 2 == 0 { 1u8 } else { 255u8 };
+                let side = if (seq / 128) % 2 == 0 { 8u8 } else { 248u8 };
+                commands.extend_from_slice(&[16, side, turn, 1]);
+            }
+        }
+        // 16 is a signed-char forward ticcmd move; 8/248 strafe; 1/255 is a
+        // +-1 turn byte (the engine reads it as the high byte of a signed
+        // short).  The four segments cycle, so `seq / 200 % 4` names the
+        // segment a cursor falls in: 0 forward only, 1 strafe only,
+        // 2 turn and fire, 3 forward and turn.
+        "r8l-move" => {
+            for seq in 0..count {
+                let (forward, side, turn, buttons) = match (seq / 200) % 4 {
+                    0 => (16u8, 0u8, 0u8, 0u8),
+                    1 => (0, 8, 0, 0),
+                    2 => (0, 0, 1, 1),
+                    _ => (16, 0, 255, 0),
+                };
+                commands.extend_from_slice(&[forward, side, turn, buttons]);
+            }
+        }
+        other => return Err(format!("unsupported input profile {other:?}").into()),
+    }
+    Ok((commands, 0))
+}
+
+/// The `r8l-move` segment a tic index falls in, and what that segment does.
+/// A gate uses it to pick cursors where only one degree of freedom moves.
+pub fn r8l_segment(seq: u32) -> (&'static str, bool, bool) {
+    match (seq / 200) % 4 {
+        0 => ("forward", true, false),
+        1 => ("strafe", false, true),
+        2 => ("turn-fire", false, false),
+        _ => ("forward-turn", true, false),
+    }
+}
+
 /// `sim2::Engine` over the resident host session.  The budget cell models
 /// the compute meter: each step spends `tic_cost`.
 pub struct NativeEngine {

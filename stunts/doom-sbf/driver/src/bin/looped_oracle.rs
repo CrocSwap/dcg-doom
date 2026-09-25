@@ -56,34 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let capture_data = Capture::load(&capture, &resource_path)?;
     let (commands, cycle_len) = match input_profile.as_str() {
         "demo-loop" => capture_data.looped_demo_commands(requested)?,
-        "neutral" => (vec![0; requested * 4], 0),
-        "orbit-fire" => {
-            let mut commands = Vec::with_capacity(requested * 4);
-            for seq in 0..requested {
-                let turn = if (seq / 256) % 2 == 0 { 1u8 } else { 255u8 };
-                let side = if (seq / 128) % 2 == 0 { 8u8 } else { 248u8 };
-                commands.extend_from_slice(&[16, side, turn, 1]);
-            }
-            (commands, 0)
-        }
-        // R8l: every segment moves or turns, the way the R8b sender's
-        // KEY_SCRIPTS does.  16 is a signed-char forward ticcmd move; 8/248
-        // strafe; 1/255 is a +-1 turn byte (the engine reads it as the high
-        // byte of a signed short).
-        "r8l-move" => {
-            let mut commands = Vec::with_capacity(requested * 4);
-            for seq in 0..requested {
-                let (forward, side, turn, buttons) = match (seq / 200) % 4 {
-                    0 => (16u8, 0u8, 0u8, 0u8),
-                    1 => (0, 8, 0, 0),
-                    2 => (0, 0, 1, 1),
-                    _ => (16, 0, 255, 0),
-                };
-                commands.extend_from_slice(&[forward, side, turn, buttons]);
-            }
-            (commands, 0)
-        }
-        profile => return Err(format!("unsupported input profile {profile:?}").into()),
+        profile => common::input_commands(profile, requested)?,
     };
     let mut session = resource::NativeSimSession::open(
         capture_data.wad_refs(),
@@ -100,7 +73,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut mirror = vec![0u8; resource_sbf::MIRROR_BYTES];
     let mut tic_rows = fs::File::create(output.join("oracle-per-tic.jsonl"))?;
     let mut frame_rows = fs::File::create(output.join("oracle-frames.jsonl"))?;
-    let mut want_frame = frames_at.contains(&0);
+    // Ascending, so one index walks every requested cursor: a single
+    // `want_frame` flag could only ever write the first frame.
+    let mut pending: Vec<u32> = frames_at.clone();
+    pending.sort_unstable();
+    pending.dedup();
+    let mut frames_written = 0usize;
     let start = Instant::now();
     let mut completed = 0usize;
     let mut halt = None;
@@ -112,26 +90,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
         chain = sim2::chain_step(&chain, seq as u32, &command);
-        if want_frame {
-            // Cursor seq+1 is the state after this tic, which is the state the
-            // chain renders at that cursor.
+        // Cursor seq+1 is the state after this tic, which is the state the
+        // chain renders at that cursor.
+        while pending.first() == Some(&(seq as u32 + 1)) {
+            let cursor = pending.remove(0);
             let frame = session
                 .frame()
-                .map_err(|rc| format!("frame at cursor {} rc={rc}", seq + 1))?;
-            let path = output.join(format!("oracle-frame-{:05}.fb1", seq + 1));
+                .map_err(|rc| format!("frame at cursor {cursor} rc={rc}"))?;
+            let path = output.join(format!("oracle-frame-{cursor:05}.fb1"));
             fs::write(&path, &frame)?;
             writeln!(
                 frame_rows,
                 "{}",
                 serde_json::json!({
-                    "cursor": seq + 1,
+                    "cursor": cursor,
                     "gametic": first_tic + seq as u32 + 1,
                     "frame_path": path.file_name().unwrap().to_string_lossy(),
                     "frame_sha256": base::sha(&frame),
                     "frame_bytes": frame.len(),
                 })
             )?;
-            want_frame = false;
+            frames_written += 1;
         }
         let state_len = session
             .publish(&mut state, &mut mirror)
@@ -188,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "halt_code": halt,
         "streaming": true,
         "frames_requested": frames_at.clone(),
-        "frames_written": frames_at.iter().filter(|c| **c <= completed as u32).count(),
+        "frames_written": frames_written,
         "ingress": "host-session: doom_resource_sim_session_step (guard + DoomControllerArmV2 + G_Ticker + gametic++ + DOOM-CI3 receipt) on the captured DEMO1 lump",
     });
     common::write_json(&output.join("summary.json"), &summary)?;
