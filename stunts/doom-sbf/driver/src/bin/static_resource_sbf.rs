@@ -127,6 +127,70 @@ fn build_instruction(program: Pubkey, static_key: Pubkey, cursor: u32) -> Instru
     }
 }
 
+fn clear_instruction(program: Pubkey, static_key: Pubkey) -> Instruction {
+    Instruction {
+        program_id: program,
+        accounts: vec![meta(static_key, true)],
+        data: rsr::Request::clear().encode().to_vec(),
+    }
+}
+
+/// The static account as the *previous* image left it: a built header at the
+/// offset that image used, so the current offset reads that header's tail.  The
+/// 32-byte step is patch 0017's growth of `doom_ctx_t`; it is written here
+/// rather than read from a receipt so the fixture cannot drift with the
+/// constant it is testing.
+fn stale_header(data: &mut [u8]) {
+    let previous = rsr::HEADER_OFFSET - 32;
+    let mut old_header = vec![0u8; rsr::HEADER_BYTES];
+    old_header[..8].copy_from_slice(rsr::MAGIC);
+    old_header[8..12].copy_from_slice(&2u32.to_le_bytes());
+    old_header[12..16].copy_from_slice(&(rsr::HEADER_BYTES as u32).to_le_bytes());
+    old_header[32..36].copy_from_slice(&(previous as u32).to_le_bytes());
+    old_header[288..292].copy_from_slice(&rsr::BUILD_FINAL_CURSOR.to_le_bytes());
+    data[previous..previous + rsr::HEADER_BYTES].copy_from_slice(&old_header);
+}
+
+/// Send a transaction and report what happened, in the terms the receipts use:
+/// the compute units on success, or the program's refusal code.  A refusal is
+/// data here, not a failure: CLEAR/6 is supposed to refuse a valid header.
+async fn submit_result(
+    banks: &mut BanksClient,
+    payer: &solana_keypair::Keypair,
+    instruction: Instruction,
+) -> Result<u64, u32> {
+    let blockhash = banks.get_latest_blockhash().await?;
+    let transaction = Transaction::new(
+        &[payer],
+        Message::new_with_blockhash(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_LIMIT),
+                instruction,
+            ],
+            Some(&payer.pubkey()),
+            &blockhash,
+        ),
+        blockhash,
+    );
+    let result = banks
+        .process_transaction_with_metadata(transaction)
+        .await
+        .map_err(|error| format!("banks client: {error}"))?;
+    let units = result
+        .metadata
+        .as_ref()
+        .ok_or("ProgramTest omitted transaction metadata")?
+        .compute_units_consumed;
+    match result.result {
+        Ok(()) => Ok(units),
+        Err(solana_transaction_error::TransactionError::InstructionError(
+            _,
+            solana_transaction_error::InstructionError::Custom(code),
+        )) => Err(code),
+        Err(error) => Err(format!("non-custom transaction error: {error}")),
+    }
+}
+
 fn render_instruction(
     program: Pubkey,
     static_key: Pubkey,
@@ -360,7 +424,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bank.prefer_bpf(true);
     bank.set_compute_max_units(u64::from(COMPUTE_LIMIT));
     bank.add_program("doom_sbf", program, None);
-    bank.add_account(static_key, account(program, vec![0; rsr::ACCOUNT_BYTES]));
+    // Genesis the static account in the state a `doom_ctx_t` growth leaves it
+    // in: the previous image's header at the previous offset, which is the
+    // one-way door CLEAR/6 exists to open.  Everything else is zero, as a
+    // program-owned account that has never been grown is not.
+    let mut stale = vec![0u8; rsr::ACCOUNT_BYTES];
+    stale_header(&mut stale);
+    bank.add_account(static_key, account(program, stale.clone()));
     if buffered {
         bank.add_account(
             context,
@@ -382,6 +452,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut client = bank.start_with_context().await;
     let payer = client.payer.insecure_clone();
+
+    // Step 0: the clear.  Genesis carried a stale header across the current
+    // offset, so BUILD cursor 0 would refuse; the clear has to open that gate
+    // before any BUILD transaction can land.
+    let stale_header_bytes = {
+        let account = client
+            .banks_client
+            .get_account(static_key)
+            .await?
+            .ok_or("static resource account missing before CLEAR/6")?;
+        account.data[rsr::HEADER_OFFSET..rsr::HEADER_OFFSET + rsr::HEADER_BYTES].to_vec()
+    };
+    if !stale_header_bytes.iter().any(|byte| *byte != 0) {
+        return Err("genesis fixture did not carry a stale header".into());
+    }
+    if stale_header_bytes == stale[rsr::HEADER_OFFSET..rsr::HEADER_OFFSET + rsr::HEADER_BYTES] {
+        return Err("stale fixture is byte-identical to the region it seeds".into());
+    }
+    let clear_units = submit_result(
+        &mut client.banks_client,
+        &payer,
+        clear_instruction(program, static_key),
+    )
+    .await?;
+    let cleared = client
+        .banks_client
+        .get_account(static_key)
+        .await?
+        .ok_or("static resource account missing after CLEAR/6")?;
+    if cleared
+        .data[rsr::HEADER_OFFSET..rsr::HEADER_OFFSET + rsr::HEADER_BYTES]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err("CLEAR/6 left non-zero bytes in the header region".into());
+    }
+    if cleared.data[..rsr::HEADER_OFFSET] != stale[..rsr::HEADER_OFFSET]
+        || cleared.data[rsr::HEADER_OFFSET + rsr::HEADER_BYTES..]
+            != stale[rsr::HEADER_OFFSET + rsr::HEADER_BYTES..]
+    {
+        return Err("CLEAR/6 wrote outside the header region".into());
+    }
+    let clear_second_units = submit_result(
+        &mut client.banks_client,
+        &payer,
+        clear_instruction(program, static_key),
+    )
+    .await?;
+    drop(cleared);
+
     let mut build_units = Vec::new();
     let mut build_logs = String::new();
     for cursor in 0..=rsr::BUILD_FINAL_CURSOR {
@@ -428,6 +548,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("BUILD did not retain account-relative pointer roots".into());
     }
     drop(built);
+
+    // The gate, measured through the SBF entrypoint this time: the account now
+    // holds a valid built header, so CLEAR/6 must refuse 307 and write nothing.
+    let before_refused_clear = sha(
+        &client
+            .banks_client
+            .get_account(static_key)
+            .await?
+            .ok_or("static resource account missing before the clear refusal control")?
+            .data,
+    );
+    let refused_clear = submit_result(
+        &mut client.banks_client,
+        &payer,
+        clear_instruction(program, static_key),
+    )
+    .await;
+    let after_refused_clear = client
+        .banks_client
+        .get_account(static_key)
+        .await?
+        .ok_or("static resource account missing after the clear refusal control")?;
+    let refused_clear_code = match refused_clear {
+        Ok(_) => return Err("CLEAR/6 accepted a valid built header".into()),
+        Err(code) => code,
+    };
+    if refused_clear_code != rsr::REFUSE_HEADER_VALID {
+        return Err(format!(
+            "CLEAR/6 refused a valid header with {refused_clear_code}, not {}",
+            rsr::REFUSE_HEADER_VALID
+        )
+        .into());
+    }
+    if sha(&after_refused_clear.data) != before_refused_clear {
+        return Err("a refused CLEAR/6 wrote to the static account".into());
+    }
+    drop(after_refused_clear);
 
     let mut strip_results = Vec::new();
     let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
@@ -545,6 +702,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "static_resource_layout_roots": rsr::ROOT_COUNT,
         "static_account_sha256_after_build": static_account_sha_after_build,
         "static_account_sha256_after_render": static_account_sha_after_render,
+        "clear_operation": 6,
+        "clear_genesis_fixture": "previous image's 512-byte header at HEADER_OFFSET-32",
+        "clear_compute_units": clear_units,
+        "clear_idempotent_compute_units": clear_second_units,
+        "clear_header_region_zero_after": true,
+        "clear_wrote_nothing_outside_the_header_region": true,
+        "clear_refusal_on_valid_header": refused_clear_code,
+        "clear_refused_valid_header_without_writing": true,
         "build_transaction_count": build_units.len(),
         "build_compute_units": build_units,
         "build_compute_units_max": build_units.iter().max(),
@@ -594,7 +759,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     println!(
-        "RSR/2 ProgramTest measured: BUILD={} transactions, max={} CU; RENDER mean={mean_before} -> {mean_after} CU; 8/8 strips exact; receipts={}",
+        "RSR/2 ProgramTest measured: CLEAR/6 {} CU then {} CU idempotent, refused {} on the built header; BUILD={} transactions, max={} CU; RENDER mean={mean_before} -> {mean_after} CU; 8/8 strips exact; receipts={}",
+        clear_units,
+        clear_second_units,
+        refused_clear_code,
         build_units.len(),
         build_units.iter().max().copied().unwrap_or(0),
         receipt.display()
