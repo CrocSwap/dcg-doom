@@ -630,6 +630,7 @@ export class PipelineSender {
       gametic: status.gametic,
       capacity: status.capacity,
       halted: Boolean(status.halt),
+      stagingFrontier: status.staging_frontier,
       ticsPerSecond: status.tics_per_second,
       framesCompleted: status.frames_completed,
       framesPerSecond: status.frames_per_second,

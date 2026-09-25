@@ -132,6 +132,7 @@ export class Relayer {
     maxSkewSeconds = 120,
     seqWindow = 240,
     ticsPerFrame = 16,
+    advanceTics = 4,
   } = {}) {
     this.networkName = network;
     this.network = NETWORKS[network];
@@ -142,6 +143,8 @@ export class Relayer {
     // A frame is nine transactions, so the relayer renders on a tic cadence
     // rather than per batch. Measured on R8i: 17.3 strips/s at the sender.
     this.ticsPerFrame = ticsPerFrame;
+    // How wide the live input window is: one advance packet's worth of tics.
+    this.advanceTics = advanceTics;
     this.sender = sender ?? createSender({mode});
     this.pool = pool ?? new SlotPool({slots: []});
     this.sessions = new Map();
@@ -252,15 +255,59 @@ export class Relayer {
     return this.bindings.get(slot.label);
   }
 
+  // Ask the sender where the chain is, and fold it into the slot.
+  //
+  // The cursor is the only authority on where input may be written: a tic the
+  // chain has already consumed is gone, and a DEPOSIT into that slot is
+  // invisible to the game. `nextSeq` is therefore anchored to the cursor rather
+  // than left to count only the tics this relayer has accepted. A relayer that
+  // lets nextSeq lag the cursor accepts input into dead slots and reports
+  // inputsAccepted while the player stands still, which is the R8l6 failure.
+  //
+  // Mock mode is exempt: there the cursor is what the player's own batches
+  // advance, so there is nothing external to read.
+  async refreshSlot(slot) {
+    if (!this.sender.background) return slot;
+    let progress;
+    try {
+      progress = await this.sender.readProgress({slot: slot.label});
+    } catch (error) {
+      // The child is between requests, or the context is dead. A status that
+      // is a little stale beats a status that is an error.
+      this.log(`cursor read failed on slot ${slot.slot}: ${error.message}`);
+      return slot;
+    }
+    slot.cursor = progress.cursor;
+    slot.gametic = progress.gametic;
+    slot.ticsPerSecond = progress.ticsPerSecond ?? null;
+    slot.stagingFrontier = progress.stagingFrontier ?? null;
+    slot.nextSeq = Math.max(slot.nextSeq, slot.cursor);
+    return slot;
+  }
+
+  // The tics a keystroke can still reach: the last `advance-tics` before the
+  // staging frontier. The producer has already deposited everything below its
+  // own stage limit, which is the same reach and lead the frontier is built
+  // from, so the rest of the window is a dead zone -- a write there is accepted,
+  // reported and never read by the game. The page aims here; the relayer is the
+  // only side that knows both numbers.
+  inputWindow(slot) {
+    if (!this.sender.background || slot.stagingFrontier === null || slot.stagingFrontier === undefined) return null;
+    return Math.max(1, Math.min(this.advanceTics, slot.stagingFrontier - slot.cursor));
+  }
+
   // Everything the page needs to render a session: where the frame lives and
-  // which tic it is.
+  // which tic it is. `next_seq` and `staging_frontier` bound where the page may
+  // write: at or after the first, at or before the second.
   status(slot) {
     return {
       slot: slot.slot,
       next_seq: slot.nextSeq,
       cursor: slot.cursor,
       gametic: slot.gametic,
-      tics_per_second: null,
+      tics_per_second: slot.ticsPerSecond ?? null,
+      staging_frontier: slot.stagingFrontier ?? null,
+      input_window: this.inputWindow(slot),
       input_capacity: slot.inputCapacity,
       tics_landed: slot.ticsLanded,
       frames_landed: slot.framesLanded,
@@ -362,6 +409,11 @@ export class Relayer {
       throw error;
     }
     const slot = session.slot;
+    // Read the cursor before judging the batch, not after staging it. The page's
+    // own next_seq is only as fresh as its last answer, and the engine runs at
+    // about 35 tics/s, so between two player batches the chain can consume
+    // hundreds of tics the page still believes it owns.
+    await this.refreshSlot(slot);
 
     let decoded;
     try {
@@ -413,7 +465,15 @@ export class Relayer {
       expectedBinding: await this.bindingForSlot(slot),
       nowSeconds: Math.floor(Date.now() / 1000),
       maxSkewSeconds: this.maxSkewSeconds,
-      nextSeq: slot.nextSeq,
+      // The floor is the chain's committed cursor, floored by the highest
+      // sequence this relayer has accepted. A tic below the cursor has been
+      // read by the engine, so writing it is a no-op the chain cannot undo; and
+      // a page aiming at the live staging window has to be allowed to rewrite
+      // the tics it is still filling, or it drifts behind the engine at its own
+      // tic rate and its keystrokes land in slots the game has already read.
+      // Mock mode has no frontier and no drift, so it keeps the strict floor
+      // that stops two racing batches depositing the same tics twice.
+      nextSeq: this.sender.background ? Math.min(slot.nextSeq, slot.cursor) : slot.nextSeq,
       window: this.seqWindow,
     });
     if (!verdict.ok) {
@@ -421,6 +481,15 @@ export class Relayer {
       const error = new Error(verdict.reason);
       error.status = 409;
       error.code = "batch_refused";
+      // Where to resume. A client whose first_seq has fallen behind the cursor
+      // cannot fix that by retrying the same batch, so the refusal carries the
+      // cursor, the resume point and the frontier rather than only prose.
+      error.detail = {
+        first_seq: decoded.firstSeq,
+        next_seq: slot.nextSeq,
+        cursor: slot.cursor,
+        staging_frontier: slot.stagingFrontier ?? null,
+      };
       throw error;
     }
 
@@ -434,8 +503,9 @@ export class Relayer {
     // written exactly once, by the batch that was accepted for it.
     let commands = decoded.commands;
     let accepted = decoded.count;
+    let frontier = null;
     if (this.sender.background) {
-      const frontier = await this.sender.stagingFrontier();
+      frontier = await this.sender.stagingFrontier();
       const room = frontier - decoded.firstSeq;
       if (room <= 0) {
         this.stats.inputsRejected += 1;
@@ -445,6 +515,12 @@ export class Relayer {
         );
         error.status = 409;
         error.code = "input_window_full";
+        error.detail = {
+          first_seq: decoded.firstSeq,
+          next_seq: slot.nextSeq,
+          cursor: slot.cursor,
+          staging_frontier: frontier,
+        };
         throw error;
       }
       if (room < accepted) {
@@ -504,6 +580,7 @@ export class Relayer {
       next_seq: slot.nextSeq,
       cursor: slot.cursor,
       gametic: slot.gametic,
+      staging_frontier: frontier,
       tics: advanced.tics,
       deposit_signature: result.signature,
       advance_signature: advanced.signature,
@@ -637,6 +714,11 @@ const ROUTES = [
   }},
   {method: "GET", pattern: /^\/v1\/sessions\/([^/]+)$/, handler: async (relayer, request, [sessionId]) => {
     const session = relayer.getSession(decodeURIComponent(sessionId));
+    // A status poll is the only thing a player with no keys down is sending, so
+    // it is the only thing keeping the reported cursor fresh. Without this the
+    // panel shows the cursor as of the last keystroke, which reads as a hung
+    // session while the engine runs on.
+    await relayer.refreshSlot(session.slot);
     return {id: session.id, slot: session.slot.slot, state: session.state, ...relayer.status(session.slot)};
   }},
   {method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/input$/, handler: async (relayer, request, [sessionId]) => {
@@ -660,7 +742,10 @@ const ROUTES = [
   {method: "DELETE", pattern: /^\/v1\/sessions\/([^/]+)$/, handler: async (relayer, request, [sessionId]) =>
     relayer.endSession(decodeURIComponent(sessionId)),
   },
-  {method: "GET", pattern: /^\/v1\/slots$/, handler: async (relayer) => ({pool: relayer.pool.summary(), slots: relayer.pool.list()})},
+  {method: "GET", pattern: /^\/v1\/slots$/, handler: async (relayer) => {
+    for (const slot of relayer.pool.slots) await relayer.refreshSlot(slot);
+    return {pool: relayer.pool.summary(), slots: relayer.pool.list()};
+  }},
 ];
 
 export function createServer(relayer, {onLog = null, corsOrigin = "*"} = {}) {
@@ -779,6 +864,7 @@ if (isMain()) {
     slotCount: Number(args.get("slots") ?? 2),
     logger,
     sender,
+    advanceTics: args.get("advance-tics") ? Number(args.get("advance-tics")) : 4,
   });
   const corsOrigin = args.get("cors-origin") ?? "*";
   const server = createServer(relayer, {onLog: (line) => logger(line), corsOrigin});
