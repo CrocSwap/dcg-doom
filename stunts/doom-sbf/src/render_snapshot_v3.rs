@@ -270,8 +270,14 @@ pub fn buffered_snapshot_address(
     context: &Pubkey,
     buffer: u8,
 ) -> Option<(Pubkey, u8)> {
-    (buffer < BUFFER_COUNT)
-        .then(|| Pubkey::find_program_address(&[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer]], program))
+    match buffer {
+        0 => Some(snapshot_address(program, context)),
+        1 => Some(Pubkey::find_program_address(
+            &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer]],
+            program,
+        )),
+        _ => None,
+    }
 }
 
 pub fn scratch_address(program: &Pubkey, snapshot: &Pubkey, strip_id: u8) -> (Pubkey, u8) {
@@ -381,6 +387,13 @@ pub fn validate_buffered_snapshot(data: &[u8]) -> Result<SnapshotView<'_>, Progr
     validate_snapshot_with_abi(data, BUFFERED_ABI_ID)
 }
 
+pub fn validate_buffered_snapshot_for(
+    data: &[u8],
+    buffer: u8,
+) -> Result<SnapshotView<'_>, ProgramError> {
+    validate_snapshot_with_abi(data, if buffer == 0 { ABI_ID } else { BUFFERED_ABI_ID })
+}
+
 pub fn write_snapshot_header(
     out: &mut [u8],
     cursor: u32,
@@ -411,6 +424,28 @@ pub fn write_buffered_snapshot_header(
     gametic: u32,
     payload_bytes: usize,
 ) -> ProgramResult {
+    write_buffered_snapshot_header_for(
+        out,
+        cursor,
+        state_root,
+        wad_hash,
+        resource_hash,
+        gametic,
+        payload_bytes,
+        1,
+    )
+}
+
+pub fn write_buffered_snapshot_header_for(
+    out: &mut [u8],
+    cursor: u32,
+    state_root: &[u8; 32],
+    wad_hash: &[u8; 32],
+    resource_hash: &[u8; 32],
+    gametic: u32,
+    payload_bytes: usize,
+    buffer: u8,
+) -> ProgramResult {
     write_snapshot_header_with_abi(
         out,
         cursor,
@@ -419,7 +454,7 @@ pub fn write_buffered_snapshot_header(
         resource_hash,
         gametic,
         payload_bytes,
-        BUFFERED_ABI_ID,
+        if buffer == 0 { ABI_ID } else { BUFFERED_ABI_ID },
     )
 }
 
@@ -621,7 +656,11 @@ fn initialize_buffered_account<'a>(
     }
     let rent_lamports = Rent::get()?.minimum_balance(SNAPSHOT_BYTES);
     let bump_seed = [bump];
-    let signer_seeds: &[&[u8]] = &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer], &bump_seed];
+    let signer_seeds: Vec<&[u8]> = if buffer == 0 {
+        vec![SNAPSHOT_SEED, context.as_ref(), &bump_seed]
+    } else {
+        vec![BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer], &bump_seed]
+    };
     invoke_signed(
         &system_instruction::create_account(payer.key, snapshot.key, rent_lamports, 0, program),
         &[payer.clone(), snapshot.clone(), system.clone()],
@@ -1070,8 +1109,8 @@ fn process_snapshot_live(
         return Err(refuse(REFUSE_SNAPSHOT));
     }
     if snapshot_data[..HEADER_BYTES].iter().any(|byte| *byte != 0) {
-        if buffered_request.is_some() {
-            validate_buffered_snapshot(&snapshot_data)?;
+        if let Some(request) = buffered_request {
+            validate_buffered_snapshot_for(&snapshot_data, request.buffer)?;
         } else {
             validate_snapshot(&snapshot_data)?;
         }
@@ -1091,8 +1130,8 @@ fn process_snapshot_live(
     if rc != 0 {
         return Err(ProgramError::Custom(rc.unsigned_abs()));
     }
-    if buffered_request.is_some() {
-        write_buffered_snapshot_header(
+    if let Some(request) = buffered_request {
+        write_buffered_snapshot_header_for(
             &mut snapshot_data,
             cursor,
             &state_root,
@@ -1100,6 +1139,7 @@ fn process_snapshot_live(
             &resource_hash,
             gametic,
             payload_len,
+            request.buffer,
         )
     } else {
         write_snapshot_header(
@@ -1343,7 +1383,7 @@ mod tests {
         let old = snapshot_address(&program, &context).0;
         let first = buffered_snapshot_address(&program, &context, 0).unwrap().0;
         let second = buffered_snapshot_address(&program, &context, 1).unwrap().0;
-        assert_ne!(old, first);
+        assert_eq!(old, first);
         assert_ne!(old, second);
         assert_ne!(first, second);
         assert!(buffered_snapshot_address(&program, &context, 2).is_none());

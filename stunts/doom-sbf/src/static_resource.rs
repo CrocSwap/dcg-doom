@@ -839,7 +839,7 @@ fn process_render_buffered(
         return Err(refuse(REFUSE_BINDING));
     }
     let snapshot_data = accounts[SNAPSHOT].try_borrow_data()?;
-    let snapshot = rsn3::validate_buffered_snapshot(&snapshot_data)?;
+    let snapshot = rsn3::validate_buffered_snapshot_for(&snapshot_data, request.cursor as u8)?;
     render_snapshot_to_strip(
         program,
         &accounts[STATIC],
