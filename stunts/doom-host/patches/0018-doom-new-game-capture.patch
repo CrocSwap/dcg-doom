@@ -1,0 +1,89 @@
+Subject: [PATCH 0018] Capture a new-game start state instead of a DEMO1 start state
+
+Every retained start state is the image the account-backed driver holds
+right after G_DoPlayDemo(): the DEMO1 header chose E1M1 and its recorded
+skill, and the recorded player (health, armour and angle already spent
+one demo tic of input) is the start.  A play demo wants the other thing:
+the state G_InitNew(sk_hard, 1, 1) leaves, which is what a player gets
+for pressing "new game".
+
+G_DoPlayDemo and G_InitNew converge on the same engine.  G_DoPlayDemo
+reads skill, episode, map, consoleplayer and playeringame[] out of the
+13-byte demo header and then calls G_InitNew, which calls G_DoLoadLevel.
+The only things G_DoPlayDemo contributes are the demo's own values, so a
+new-game start state needs no engine change at all, only a different
+caller.
+
+--new-game SKILL selects the G_InitNew path in place of G_DoPlayDemo: it
+sets the three values G_InitNew's vanilla comment requires the caller to
+supply (a zeroed players[] array, playeringame[0] and consoleplayer 0 --
+the demo header supplies them today), calls G_InitNew(skill, 1, 1), and
+leaves demo_p on the first DEMO1 ticcmd slot so the ST1 header's
+demo-cursor field is the 13 the demo capture carries.  The demo lump is
+still cached PU_STATIC, so DoomControllerSetCapturedDemoBounds still has
+its real bounds and DOOM-SIM/2's cursor validation is unchanged.
+
+--new-game-precache keeps precache at its D_DoomMain value across
+G_InitNew; without it precache is cleared for the load, which is what
+G_DoPlayDemo does.  Measured on this source the two captures are
+byte-identical, because precache only selects R_PrecacheLevel()
+(p_setup.c:664) and that touches no thinker, no mobj and no ST1 field.
+The flag is kept because the demo path clears precache and a capture
+should record what the engine did rather than what it skipped, and
+because that is a property of this revision, not of the format.
+
+This patch touches only the headless driver.  g_game.c, p_setup.c and
+every translation unit the SBF image folds in are untouched, so no
+program behaviour changes and the built image is unaffected.
+
+Applies on top of 0001-0017.
+
+--- a/linuxdoom-1.10/headless/doom_headless.c
++++ b/linuxdoom-1.10/headless/doom_headless.c
+@@ -70,7 +70,7 @@
+ static void le32(uint8_t out[4], uint32_t n) {out[0]=n;out[1]=n>>8;out[2]=n>>16;out[3]=n>>24;}
+ static void hash_record(const char *tag,const uint8_t wad[32],uint32_t tic,uint32_t strip,const uint8_t *pixels,size_t n,char out[65]) { sha256_t s;uint8_t x[4],d[32];sha_init(&s);sha_update(&s,tag,strlen(tag));le32(x,0);sha_update(&s,x,4);sha_update(&s,wad,32);le32(x,tic);sha_update(&s,x,4);le32(x,strip);sha_update(&s,x,4);sha_update(&s,pixels,n);sha_final(&s,d);hex(d,out); }
+ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec*1000.0+(double)t.tv_nsec/1000000.0; }
+-static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--controller-ingress FILE] [--controller-ingress-v2 FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR]\n",argv0); }
++static void usage(const char *argv0) { fprintf(stderr,"usage: %s -headless (-iwad DOOM1.WAD | -account-manifest manifest.json) [-demo DEMO1] -frames frames.jsonl [-state-hashes states.jsonl] [--account-level-state FILE --account-mobj-pool FILE] [--save-at N --save FILE | --load FILE [--resave FILE]] [--s0 FILE] [--flip-forwardmove-tic N] [--reentrant-parity FILE] [-probe-refusals FILE] [--max-tics N] [--controller FILE] [--controller-ingress FILE] [--controller-ingress-v2 FILE] [--allocation-fail N --decoder-report FILE] [--publish-dir DIR --publish-fail-after N] [--import-pair-dir DIR] [--new-game SKILL] [--new-game-precache]\n",argv0); }
+ static char *arg_after(int argc,char **argv,const char *name) {int i;for(i=1;i+1<argc;i++)if(!strcmp(argv[i],name))return argv[i+1];return 0;}
+ static int has_arg(int argc,char **argv,const char *name) {int i;for(i=1;i<argc;i++)if(!strcmp(argv[i],name))return 1;return 0;}
+ /* One census line per named phase: the non-purgeable zone bytes are the hard
+@@ -126,11 +126,12 @@
+ }
+ 
+ int main(int argc, char **argv) {
+-  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller"), *controller_ingress_path=arg_after(argc,argv,"--controller-ingress"), *controller_ingress_v2_path=arg_after(argc,argv,"--controller-ingress-v2");
++  char *iwad=arg_after(argc,argv,"-iwad"), *manifest=arg_after(argc,argv,"-account-manifest"), *demo_name=arg_after(argc,argv,"-demo"), *frames=arg_after(argc,argv,"-frames"), *parity_path=arg_after(argc,argv,"--reentrant-parity"), *probe_path=arg_after(argc,argv,"-probe-refusals"), *flip=arg_after(argc,argv,"--flip-forwardmove-tic"), *statehashes=arg_after(argc,argv,"-state-hashes"), *save=arg_after(argc,argv,"--save"), *load=arg_after(argc,argv,"--load"), *resave=arg_after(argc,argv,"--resave"), *s0=arg_after(argc,argv,"--s0"), *save_at_arg=arg_after(argc,argv,"--save-at"), *account_level=arg_after(argc,argv,"--account-level-state"), *account_pool=arg_after(argc,argv,"--account-mobj-pool"), *max_tics_arg=arg_after(argc,argv,"--max-tics"), *zone_census_path=arg_after(argc,argv,"--zone-census"), *mb_used_arg=arg_after(argc,argv,"-mb-used"), *controller_path=arg_after(argc,argv,"--controller"), *controller_ingress_path=arg_after(argc,argv,"--controller-ingress"), *controller_ingress_v2_path=arg_after(argc,argv,"--controller-ingress-v2"), *new_game=arg_after(argc,argv,"--new-game");
+   char *allocation_fail_arg=arg_after(argc,argv,"--allocation-fail"), *decoder_report=arg_after(argc,argv,"--decoder-report"), *publish_dir=arg_after(argc,argv,"--publish-dir"), *publish_fail_arg=arg_after(argc,argv,"--publish-fail-after"), *import_pair_dir=arg_after(argc,argv,"--import-pair-dir");
+-  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000, published=0, continuation_v2=0; long allocation_fail=-1, publish_fail_after=-1; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
++  byte *demo; int demo_len, flip_tic=-1, tic, save_at=-1, max_tics=100000, published=0, continuation_v2=0, new_game_skill=-1, new_game_precache=0; long allocation_fail=-1, publish_fail_after=-1; FILE *out, *stateout=0, *parityout=0, *probeout=0, *censusout=0; uint8_t wad_hash[32], strip[STRIP_BYTES], *state_image; size_t state_bytes; char digest[65]; double tic_ms=0.0, render_ms=0.0; int rendered=0; doom_account_t *account=0; uint8_t *render_scratch=0; byte full_frame[FB_WIDTH*FB_HEIGHT], assembled[FB_WIDTH*FB_HEIGHT], strip_account[DOOM_RENDER_STRIP_ACCOUNT_BYTES]; doom_render_metrics_t tic_metrics[STRIPS]; uint8_t controller_command[4];
+   if(!has_arg(argc,argv,"-headless")||(!iwad&&!manifest)|| (iwad&&manifest) ||!frames){usage(argv[0]);return 2;} if(!demo_name)demo_name="DEMO1"; if(flip){char *end=0;long v=strtol(flip,&end,10);if(!end||*end||v<0||v>1000000){fprintf(stderr,"bad --flip-forwardmove-tic\n");return 2;}flip_tic=(int)v;}
+   if(max_tics_arg){char *end=0;long v=strtol(max_tics_arg,&end,10);if(!end||*end||v<1||v>1000000){fprintf(stderr,"bad --max-tics\n");return 2;}max_tics=(int)v;}
++  if(new_game){char *end=0;long v=strtol(new_game,&end,10);if(!end||*end||v<0||v>4){fprintf(stderr,"--new-game takes a skill in 0..4\n");return 2;}new_game_skill=(int)v;if(has_arg(argc,argv,"--new-game-precache"))new_game_precache=1;}
+   if(decoder_report&&!load&&!import_pair_dir){fprintf(stderr,"--decoder-report requires --load or --import-pair-dir\n");return 2;}
+   if(allocation_fail_arg){char *end=0;long v=strtol(allocation_fail_arg,&end,10);if(!end||*end||v<-1||v>1000000){fprintf(stderr,"bad --allocation-fail\n");return 2;}allocation_fail=v;}
+   if(publish_fail_arg){char *end=0;long v=strtol(publish_fail_arg,&end,10);if(!end||*end||v<-1||v>2){fprintf(stderr,"bad --publish-fail-after\n");return 2;}publish_fail_after=v;}
+@@ -144,7 +145,21 @@
+   Z_Init(); zone_census(censusout,"z_init"); if(manifest){if(DoomAccountOpenManifest(manifest,&account)){fprintf(stderr,"refusing account manifest %s\n",manifest);return 2;}memcpy(wad_hash,DoomAccountWadHash(account),32);}else W_InitFile(iwad); V_Init(); zone_census(censusout,"wad_open"); R_Init(); R_ExecuteSetViewSize(); P_Init(); zone_census(censusout,"engine_init");
+   demo_len=W_LumpLength(W_GetNumForName(demo_name)); demo=W_CacheLumpName(demo_name,PU_STATIC); if(demo_len<14){fprintf(stderr,"demo too short\n");return 2;}
+   if(account && (demo[2]!=1 || demo[3]<1 || demo[3]>9 || DoomAccountBeginLevel(account,demo[2],demo[3]))){fprintf(stderr,"account loader accepts only E1 shareware DEMO1\n");return 2;}
+-  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;G_DoPlayDemo(); DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len); zone_census(censusout,"load_level");
++  defdemoname=demo_name;demobuffer=demo;demo_p=demo;doom_headless_demo_done=false;
++  if(new_game_skill>=0){
++    /* The three values G_InitNew's vanilla comment requires the caller to supply,
++       which the demo header carries today.  demo_p is left on the first DEMO1
++       ticcmd slot so the ST1 header's cursor field is 13, as it is for the demo
++       capture.  G_DoPlayDemo clears precache for the load, so the default here
++       matches the demo capture; --new-game-precache keeps it, which on this
++       revision only selects R_PrecacheLevel() and yields a byte-identical ST1. */
++    memset(players,0,sizeof(players));memset(playeringame,0,sizeof(playeringame));
++    playeringame[0]=1;(DOOM_CTX->consoleplayer)=0;displayplayer=0;demo_p=demo+13;
++    if(!new_game_precache)precache=false;
++    G_InitNew((skill_t)new_game_skill,1,1);
++    if(!new_game_precache)precache=true;
++  } else G_DoPlayDemo();
++  DoomControllerSetCapturedDemoBounds(demo,(size_t)demo_len); zone_census(censusout,"load_level");
+   if(account && DoomAccountCommitLevel(account)){fprintf(stderr,"cannot commit fixed account image\n");return 2;}
+   if(import_pair_dir && (!account || (decoder_report?decoder_gate_import_pair(import_pair_dir,decoder_report,wad_hash,account):DoomAccountImportPublishedPair(account,import_pair_dir)))){fprintf(stderr,"cannot import published LS1/MP1 pair %s\n",import_pair_dir);return 2;}
+   if(publish_dir && (!account || DoomAccountCommitLevelStrict(account) || DoomAccountPublishPair(account,publish_dir,0,-1))){fprintf(stderr,"cannot publish initial LS1/MP1 pair %s\n",publish_dir);return 3;}
