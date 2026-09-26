@@ -142,6 +142,60 @@ When the context is spent, the pipeline has stopped, or the session is gone, a
 red banner replaces the numbers. A page whose job is to say whether keys are
 landing cannot also be the page that quietly swallows them.
 
+### Proven on chain, 2026-09-26 04:16-04:18 UTC
+
+`node proof-input-panel.mjs <out-dir>` against context
+`2mDH886tnFU6gNDLkZHSm29TE8UAZ6QQPWzXMAPoeXLN` on the R12 keys, through Chrome's
+own key path, with the panel's `input_fate` ledger live (receipts in
+`out/runs/doom-panel-proof-2026-09-26/`). Six presses of 1.4 s each, one row
+per key, every one of them with at least one landed tic and a transaction link:
+
+| key | tics offered | landed | missed the slot | links | angleturn the chain was given | button |
+|---|---:|---:|---:|---:|---|---|
+| forward | 42 | 42 | 0 | 11 | — | — |
+| back | 28 | 28 | 0 | 8 | — | — |
+| left | 41 | 38 | 3 | 10 | `0x0400` (+1024) | — |
+| right | 51 | 50 | 1 | 13 | `0xfc00` (−1024) | — |
+| fire | 51 | 47 | 4 | 13 | — | `0x01` BT_ATTACK |
+| use | 53 | 53 | 0 | 14 | — | `0x02` BT_USE |
+
+* **258 of 266 tics landed, 0 pending, landed ratio 0.970** over resolved tics.
+  The relayer's own receipt for the same session says
+  `input_command_tics_deposited: 233` of `input_tics_staged: 552` and
+  `input_refusals: {}`; that is a different denominator (every tic the page
+  offered, against every tic deposited) and both are reported rather than
+  reconciled.
+* **Left turns left, read off the chain rather than off a picture.** The panel
+  holds the exact `commands` bytes the producer was given, and `left` deposits
+  angleturn `0x0400` where `right` deposits `0xfc00`. Doom's `angleturn` is
+  counter-clockwise positive, which is the whole of commit `49c282ebc`.
+* Key-to-picture latency: **2 samples, 517 ms and 7,740 ms** — the panel only
+  takes a sample when a frame paints while a key is down, and the page painted
+  16 frames in the 74 s window (151 torn reads, counted, not raised). Thin.
+* Input lead 17 tics = 616 ms at 27.6 tic/s, over a measured 361 ms POST round
+  trip. The banner was correctly absent.
+
+Two defects had to be fixed before that run could mean anything, and both were
+in this panel rather than on the chain:
+
+1. **`input_fate` was never published.** The ledger existed only in the
+   end-of-session result, and `status` is answered from the progress dict, so a
+   page was told `zero_deposited_through` with no runs and read every keystroke
+   as missed. That is the defect the first proof run failed on, and the fix was
+   committed without being re-proved — and, as it turned out, never even reached
+   the relayer tree on Tokyo, which ran the unfixed `doom_r7_render_loop.py`.
+   The relayer tree is rsynced from a worktree, so a fix in a commit is not a fix
+   on the host; check the sha256 before believing a runbook.
+2. **`render()` raised on its first line.** `bannerNode` was a free variable
+   rather than a parameter, so every call threw
+   `ReferenceError: bannerNode is not defined`: no row was ever drawn, the
+   summary line never moved off "no keys pressed", the banner never appeared, and
+   — because the read loop calls `render` after a paint — the same throw is what
+   froze the picture at 10 painted frames. The eleven offline tests passed because
+   the test file said, correctly as far as it went, that the drawing is
+   `document` calls over the answers worth testing, and then never called it.
+   There are now two tests that do, against a small DOM stub.
+
 ### What the relayer has to expose for it
 
 Two fields on the session status, both of which ride on an answer the relayer
@@ -157,6 +211,16 @@ Plus `producer_next_cursor`, which is not the same number as
 `generated_cursor` is the *end* of the batch the producer has already published,
 so it runs `round(35 * 0.1)` = 4 tics ahead of the producer's real position.
 And `pipeline`, which says whether keystrokes can still reach the engine at all.
+
+`pipeline.stalled_seconds` is the **greater** of two clocks, and it has to be.
+The producer publishes its own, which is the better number while the producer is
+alive, but it is only refreshed when the producer calls `publish_progress`, so a
+child that wedges completely freezes it — usually at 0, because the cursor had
+just moved, and a frozen 0 reads as "not stalled". The relayer's own 32-byte
+cursor probe is the second clock: it kept running at its full rate (4,174 samples
+over 458 s, the last at 458.0 s) through the play session that stalled, so it can
+see a cursor that has stopped without asking the child anything.
+`pipeline.stalled_observed_by` says which side saw it.
 
 ## The input message
 

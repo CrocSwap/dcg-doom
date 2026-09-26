@@ -188,13 +188,19 @@ const before = await evaluate(`(async () => {
 })()`);
 console.log("first frame:", before);
 
+// `key` is what a player presses; `action` is the id the page files it under.
+// They differ for fire: the page's KEY_MAP calls Space and F `attack` (the
+// engine's button name) and labels the row FIRE, so asking the panel for a
+// press named "fire" finds nothing and reports zero offered tics. Measured on
+// the 2026-09-26 proof run against the live R12 context: `fire offered 0`
+// while the receipt said 226 command tics landed.
 const KEYS = [
-  {action: "forward", code: "ArrowUp", keyName: "ArrowUp", vk: 38},
-  {action: "back", code: "ArrowDown", keyName: "ArrowDown", vk: 40},
-  {action: "left", code: "ArrowLeft", keyName: "ArrowLeft", vk: 37},
-  {action: "right", code: "ArrowRight", keyName: "ArrowRight", vk: 39},
-  {action: "fire", code: "Space", keyName: " ", vk: 32},
-  {action: "use", code: "KeyR", keyName: "r", vk: 82},
+  {key: "forward", action: "forward", code: "ArrowUp", keyName: "ArrowUp", vk: 38},
+  {key: "back", action: "back", code: "ArrowDown", keyName: "ArrowDown", vk: 40},
+  {key: "left", action: "left", code: "ArrowLeft", keyName: "ArrowLeft", vk: 37},
+  {key: "right", action: "right", code: "ArrowRight", keyName: "ArrowRight", vk: 39},
+  {key: "fire", action: "attack", code: "Space", keyName: " ", vk: 32},
+  {key: "use", action: "use", code: "KeyR", keyName: "r", vk: 82},
 ];
 
 const rows = [];
@@ -212,6 +218,23 @@ for (const spec of KEYS) {
     const byFate = {};
     for (const t of tics) byFate[t.fate] = (byFate[t.fate] ?? 0) + 1;
     const links = [...document.querySelectorAll("#inputlog-list .fate.landed a")].map((a) => a.getAttribute("href"));
+    // What the CHAIN was given for this press's landed tics, not what the page
+    // offered: the producer's ledger is the only copy of the bytes that reached
+    // a DEPOSIT, and the sign of angleturn's high byte is what says whether left
+    // turned left. Measured wrong once already: commit 49c282ebc swapped them
+    // and only the player's own eyes caught it.
+    const landed = tics.filter((t) => t.fate === "landed").map((t) => t.seq);
+    const chain = [];
+    for (const [runSeq, run] of log.runs) {
+      for (const seq of landed) {
+        if (seq < runSeq || seq >= runSeq + run.count) continue;
+        const at = (seq - runSeq) * 4;
+        const b = run.bytes.subarray(at, at + 4);
+        if (b.length === 4) chain.push({seq, hex: [...b].map((x) => x.toString(16).padStart(2, "0")).join("")});
+      }
+    }
+    const turns = [...new Set(chain.map((c) => c.hex.slice(4, 6)))].sort();
+    const buttons = [...new Set(chain.map((c) => c.hex.slice(6, 8)))].sort();
     return {
       action: ${JSON.stringify(spec.action)},
       label: press?.label ?? null,
@@ -219,6 +242,10 @@ for (const spec of KEYS) {
       byFate,
       signatures: [...new Set(tics.filter((t) => t.fate === "landed" && t.signature).map((t) => t.signature))],
       links,
+      rowLinks: [...document.querySelectorAll("#inputlog-list .inputlog-row")].find((n) => n.dataset.action === ${JSON.stringify(spec.action)})?.querySelectorAll(".fate.landed a").length ?? 0,
+      chainLanded: chain.length,
+      chainTurnBytes: turns,
+      chainButtonBytes: buttons,
       summary,
       panelRowText: [...document.querySelectorAll("#inputlog-list .inputlog-row")].find((n) => n.dataset.action === ${JSON.stringify(spec.action)})?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
       banner: document.getElementById("inputlog-banner")?.hidden ? null : document.getElementById("inputlog-banner")?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
@@ -230,10 +257,12 @@ for (const spec of KEYS) {
   const pictureAfter = await evaluate(`window.doomPlay.state.lastFrame?.digest ?? null`);
   rows.push({...spec, pictureBefore, pictureAfter, pictureChanged: pictureBefore !== pictureAfter, ...row});
   console.log(
-    spec.action.padEnd(8),
+    spec.key.padEnd(8),
     "offered", String(row.offered).padStart(3),
     JSON.stringify(row.byFate),
-    "links", row.links.length,
+    "links", String(row.rowLinks).padStart(2),
+    "turn", (row.chainTurnBytes ?? []).join(",") || "-",
+    "btn", (row.chainButtonBytes ?? []).join(",") || "-",
     "picture", pictureBefore === pictureAfter ? "same" : "CHANGED",
     row.banner ? `BANNER: ${row.banner.slice(0, 60)}` : "",
   );

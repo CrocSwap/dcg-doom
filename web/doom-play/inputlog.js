@@ -374,7 +374,16 @@ export class InputLog {
 
   // -- drawing ------------------------------------------------------------
 
-  render(list, summaryNode, leadNode, tornNode, tornReads) {
+  // `bannerNode` is a parameter and not a field because it is the one node the
+  // panel may be drawn without: `node --test` has no document, and the offline
+  // tests that check the drawing pass `null`.  It was a free variable instead,
+  // so every call raised `ReferenceError: bannerNode is not defined` on the
+  // first line and the panel never drew a row, the summary line never moved off
+  // "no keys pressed", and the banner never appeared.  Measured on the
+  // 2026-09-26 proof run against the live R12 context: six key presses, 278
+  // tics offered, 204 resolved as landed with their deposit signatures in the
+  // model, and zero rows in `#inputlog-list`.
+  render(list, summaryNode, leadNode, tornNode, tornReads, bannerNode = null) {
     const banner = this.banner();
     if (bannerNode) {
       bannerNode.hidden = banner === null;

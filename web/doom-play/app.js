@@ -195,7 +195,10 @@ const inputLog = new InputLog({
 
 function renderInputLog() {
   inputLog.setLead(state.leadTics, state.ticsPerSecond);
-  inputLog.render(ui.inputlogList, ui.inputlogSummary, ui.inputlogLead, ui.inputlogTorn, state.tornReads);
+  inputLog.render(
+    ui.inputlogList, ui.inputlogSummary, ui.inputlogLead, ui.inputlogTorn, state.tornReads,
+    ui.inputlogBanner,
+  );
 }
 
 const keys = () => state.keys;
