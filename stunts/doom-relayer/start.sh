@@ -50,7 +50,7 @@
 # Usage: start.sh [name] [seconds] [strip-rate]
 set -eu
 RD=${RELAYER_DIR:-/home/ec2-user/doom-relayer-20260925}
-NAME=${1:-play-r14}
+NAME=${1:-play-r15}
 SECONDS_LIMIT=${2:-300}
 STRIP_RATE=${3:-32}
 REPO=${RELAYER_REPO:-$RD}
@@ -69,7 +69,7 @@ export PYTHONPATH=/home/ec2-user/basanos-main/src
 cd "$RD"
 exec node "$RD/stunts/doom-relayer/server.mjs" \
   --mode chain --port 8787 --host 127.0.0.1 \
-  --keys-dir ${KEYS_DIR:-/home/ec2-user/doom-keys/r14-page} \
+  --keys-dir ${KEYS_DIR:?KEYS_DIR must name the context keys directory} \
   --payer-key /home/ec2-user/doom-keys/tokyo-testnet-payer.json \
   --python "$PY" \
   --script "$RD/scripts/doom_relayer_server.py" \
