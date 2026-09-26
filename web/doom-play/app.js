@@ -567,7 +567,17 @@ async function pushInput() {
   }
   // The floor is the relayer's own next sequence, floored at the chain's
   // cursor: never rewind, and never offer a tic the chain has consumed.
-  const floor = Math.max(state.nextSeq, state.cursor);
+  //
+  // And floored one past the producer's generated cursor, which is the bound
+  // that actually decides the batch's fate: a write at or below it names tics
+  // DEPOSIT has already fixed, so it is refused as `input_stale` with the
+  // sequence to resume at. The producer generates at 35 tics/s against an engine
+  // at 26, so it runs ahead of the chain cursor by 12-16 tics; a floor at the
+  // cursor therefore aimed every batch at a sequence the engine had already
+  // read, and the page held a key for a minute with 21 refusals and 0 tics
+  // deposited. The writable window is (generated_cursor, stage_limit].
+  const generated = state.producerGeneratedCursor;
+  const floor = Math.max(state.nextSeq, state.cursor, generated === null || generated === undefined ? -1 : generated + 1);
   state.nextSeq = floor;
   const frontier = state.stagingFrontier ?? floor;
   // Aim at the live window, which is the last few tics before the frontier. The
@@ -618,17 +628,21 @@ async function pushInput() {
         if (payload.detail.producer_stage_limit !== undefined) {
           state.producerStageLimit = payload.detail.producer_stage_limit;
         }
-        state.nextSeq = state.cursor;
+        // Take the relayer's word for the sequence to write next. It is the
+        // producer's own position, which is the only side that knows it; the
+        // chain cursor is below it and a floor there is a refusal.
+        state.nextSeq = payload.detail.next_seq;
         if (held) scheduleInputPush();
         return;
       }
       throw new Error(payload.error ?? `relayer returned ${response.status}`);
     }
     adoptAccounts(payload);
-    // The floor is the chain's cursor, which is the only hard bound: the
-    // relayer's own next_seq counts accepted batches and would drag the aim
-    // above the live window, where a write is accepted and never read.
-    state.nextSeq = state.cursor;
+    // The next tic to write is the one after the batch just deposited. The
+    // relayer's own next_seq is not read back here: it counts accepted batches
+    // and would drag the aim above the live window, where a write is accepted
+    // and never read.
+    state.nextSeq = firstSeq + count;
     state.inputsSent += count;
     state.latencies.push(performance.now() - sentAt);
     if (state.latencies.length > 40) state.latencies.shift();
