@@ -303,6 +303,12 @@ mod request_tests {
     /// account.  A relayer that has not learned the field is exactly this
     /// case, and it must be loud rather than quietly rendering whatever the
     /// buffer happens to hold.
+    ///
+    /// The rule is "not all zero", not "no zero bytes": a name is a SHA-256
+    /// and roughly one in 4.3 billion of them has a zero byte somewhere, so
+    /// refusing those would refuse honest senders.  The test below pins both
+    /// halves of that, because the second half is the one that would be easy to
+    /// tighten by accident.
     #[test]
     fn buffered_render_request_without_a_snapshot_name_is_malformed() {
         let zeroed = Request::render_buffered(0, 0, [0; 32]).encode();
@@ -312,12 +318,13 @@ mod request_tests {
             "an all-zero name must be refused as malformed"
         );
         for byte in 0..32usize {
-            let mut partial = Request::render_buffered(0, 0, [0xff; 32]).encode();
-            partial[20 + byte] = 0;
+            let mut single = [0u8; 32];
+            single[byte] = 1;
+            let encoded = Request::render_buffered(0, 0, single).encode();
             assert_eq!(
-                Request::decode(&partial),
-                Err(refuse(REFUSE_MALFORMED)),
-                "a name that is zero at byte {byte} is not a name"
+                Request::decode(&encoded),
+                Ok(Request::render_buffered(0, 0, single)),
+                "a name whose only set byte is {byte} is still a name"
             );
         }
     }
