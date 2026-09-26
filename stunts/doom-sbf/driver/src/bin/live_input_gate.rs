@@ -1149,10 +1149,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("image manifest does not carry the live render path".into());
     }
     let layout = Layout::from_manifest(&manifest_json)?;
-    if !manifest_json["resource_ri2_sbf_abi_descriptor"]
-        .as_str()
-        .unwrap_or_default()
-        .contains(&format!("context={}", layout.context_bytes))
+    // The pinned E2R/2 descriptor names a context size that is a literal in
+    // both build.rs and the library, and it is deliberately *not* the
+    // diagnostic layout: it is the same string in a diagnostic image and in a
+    // production one, which is why the ABI id the snapshot header binds does
+    // not move. So the descriptor still checks the runner against the image's
+    // pinned ABI, and the account sizes come from `Layout` instead.
+    if manifest_json["resource_ri2_sbf_abi_descriptor"]
+        != resource_sbf::RESOURCE_RI2_SBF_ABI_DESCRIPTOR
     {
         return Err("image manifest context size is not the driver's".into());
     }
