@@ -57,10 +57,10 @@ const sha256hex = (bytes) => createHash("sha256").update(Buffer.from(bytes)).dig
 // the next, and every strip digest recomputed over the new bytes. Nothing here
 // is a shortcut past `decodePushedFrame`: if the digest is wrong the page
 // refuses the frame, which is what the tests would then see.
-export async function makeFrame(index, {strips: base, meta, startCursor = 6016, ticsPerFrame = 8, cursor: cursorOverride = null} = {}) {
+export async function makeFrame(index, {strips: base, meta, startCursor = 6016, ticsPerFrame = 8, cursor: cursorOverride = null, gameticOffset = 0} = {}) {
   const source = base ?? fixtureStrips().strips;
   const cursor = cursorOverride ?? startCursor + index * ticsPerFrame;
-  const gametic = cursor;
+  const gametic = cursor + gameticOffset;
   const snapshotHash = new Uint8Array(createHash("sha256").update(`snap:${index}`).digest());
   const stateRoot = new Uint8Array(createHash("sha256").update(`root:${index}`).digest());
   const out = [];
@@ -196,6 +196,7 @@ export class FakeRelayer {
     ringLimit = 4,
     ticsPerSecond = 35,
     startCursor = 6016,
+    gameticOffset = 0,
     leadTics = null,
     chainLagFrames = 1,
     verifySignatures = true,
@@ -207,6 +208,7 @@ export class FakeRelayer {
     const fixture = fixtureStrips();
     this.meta = fixture.meta;
     this.startCursor = startCursor;
+    this.gameticOffset = gameticOffset;
     this.ticsPerSecond = ticsPerSecond;
     // The producer's resolved lead, the way it resolves one: twice the measured
     // round trip at the configured rate, never below twelve. 61 at 35 tic/s,
@@ -322,6 +324,7 @@ export class FakeRelayer {
         meta: fixture.meta,
         startCursor: this.startCursor,
         cursor: this.frameCursor(index),
+        gameticOffset: this.gameticOffset,
       }));
     }
     return this.frameCache.get(index);
@@ -491,7 +494,7 @@ export class FakeRelayer {
       slot: 0,
       next_seq: this.lastAccepted,
       cursor: this.cursor,
-      gametic: this.cursor,
+      gametic: this.cursor + this.gameticOffset,
       tics_per_second: this.ticsPerSecond,
       tics_per_second_cap: 35,
       staging_frontier: generated + 64,
@@ -516,7 +519,7 @@ export class FakeRelayer {
       lead_tics: this.leadTics,
       measured_round_trip_seconds: MEASURED_INPUT_ROUND_TRIP_SECONDS,
       frame_counters: {frames_submitted: this.pushed, frame_stalls: 0, frame_skips: 0, frame_retries: 0, frame_deadline_seconds: 1},
-      latest_frame: {buffer: 0, snapshot_account: ADDRESSES.snapshot, strip_accounts: ADDRESSES.strips, cursor: this.cursor, gametic: this.cursor},
+      latest_frame: {buffer: 0, snapshot_account: ADDRESSES.snapshot, strip_accounts: ADDRESSES.strips, cursor: this.cursor, gametic: this.cursor + this.gameticOffset},
       context: ADDRESSES.context,
       snapshot_account: ADDRESSES.snapshot,
       strip_accounts: ADDRESSES.strips,
@@ -524,7 +527,7 @@ export class FakeRelayer {
       tics_landed: this.landedTics,
       frames_landed: this.pushed,
       input_tics_staged: this.stagedTics,
-      frame: {cursor: this.cursor, gametic: this.cursor, signature: null, explorer: null},
+      frame: {cursor: this.cursor, gametic: this.cursor + this.gameticOffset, signature: null, explorer: null},
       state: session?.state ?? "playing",
     };
   }

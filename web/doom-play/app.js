@@ -166,11 +166,12 @@ const state = {
   // takes to show. They are different quantities, and conflating them is how a
   // The latency meter must wait for the picture containing the stamped tic.
   //
-  //   stampLatencies       keydown -> the first painted frame whose gametic is
-  //                        at or past the tic this press's input was stamped
-  //                        for. This is the latency a player feels, and the one
-  //                        the bar is written against.
-  //   nextPictureLatencies keydown -> the first painted frame past the gametic
+  //   stampLatencies       keydown -> the first painted frame whose cursor is
+  //                        past the tic this press's input was stamped for.
+  //                        Cursor and input stamps share a sequence even when
+  //                        RESET restores a game state with a nonzero gametic.
+  //                        This is the latency a player feels.
+  //   nextPictureLatencies keydown -> the first painted frame past the cursor
   //                        that was on screen when the key went down. "Time to
   //                        the next picture": it says the page is drivable, and
   //                        it says nothing about whether the key is in the
@@ -185,9 +186,9 @@ const state = {
   // what made the first version of this meter report zero samples on a live
   // session -- every press was closed before its frame arrived.
   //
-  // `stampSamples` is the per-press log: which key, how long, and the pair that
-  // makes the sample checkable (the tic it was stamped for and the gametic of
-  // the frame that ended the wait).
+  // `stampSamples` is the per-press log: which key, how long, and the cursor
+  // pair that makes the sample checkable (the stamped tic and the cursor of the
+  // frame that ended the wait). The frame's gametic is retained as context.
   holds: [],
   holdsStarted: 0,
   holdsUnstamped: 0,
@@ -195,8 +196,9 @@ const state = {
   stampLatencies: [],
   nextPictureLatencies: [],
   stampSamples: [],
-  // (paintedAt, gametic) for recent paints, so a stamp that arrives after its
-  // frame was painted is timed against that paint rather than the answer.
+  // Recent paints by cursor, so a stamp that arrives after its frame was
+  // painted is timed against that paint rather than the answer. `at` also
+  // excludes frames painted before keydown.
   paintTics: [],
   clientSeq: 0,
   inputsSent: 0,
@@ -373,20 +375,22 @@ async function paintFrame(frame) {
   while (state.paintTimes.length > 2 && state.paintedAt - state.paintTimes[0] > 4000) {
     state.paintTimes.shift();
   }
-  // The (paint time, gametic) ring, so a stamp that arrives after its frame was
-  // painted can still be timed against the paint rather than against the answer.
-  state.paintTics.push({at: state.paintedAt, gametic: frame.gametic});
-  if (state.paintTics.length > 64) state.paintTics.shift();
-  measureKeypress(frame.gametic, state.paintedAt);
+  // The (paint time, cursor, gametic) ring, so a stamp that arrives after its
+  // frame was painted can still be timed against the paint rather than against
+  // the answer. Cursor shares the input sequence; gametic can start elsewhere
+  // after RESET.
+  state.paintTics.push({at: state.paintedAt, cursor: frame.cursor, gametic: frame.gametic});
+  if (state.paintTics.length > 4096) state.paintTics.shift();
+  measureKeypress(frame.cursor, frame.gametic, state.paintedAt);
   updateStatus();
 }
 
 // The two keypress meters, and the one place either of them is recorded.
 //
-// `nextPicture`: the first frame past the gametic that was on screen when the
+// `nextPicture`: the first frame past the cursor that was on screen when the
 // key went down. Recorded once per press, whatever else happens.
 //
-// `stamp`: the first frame at or past the tic the press's input was stamped for.
+// `stamp`: the first frame past the cursor tic the press's input was stamped for.
 // `stampTic` is null until the relayer answers, so this does nothing until the
 // page knows the tic, and then it fires on the very next qualifying paint -- or,
 // if that paint has already happened, on the paint ring's earliest entry at or
@@ -396,27 +400,27 @@ async function paintFrame(frame) {
 // Every open press is offered the frame, not just the newest one: two presses a
 // few hundred milliseconds apart have two stamped tics, and each closes on its
 // own frame.
-function measureKeypress(gametic, at) {
-  if (!state.holds.length || typeof gametic !== "number") return;
+function measureKeypress(cursor, gametic, at) {
+  if (!state.holds.length || typeof cursor !== "number") return;
   const done = [];
   for (const hold of state.holds) {
-    if (hold.nextPictureMs === null && gametic > hold.gameticAtKeyDown) {
+    if (at < hold.downAt) continue;
+    if (hold.nextPictureMs === null && cursor > hold.cursorAtKeyDown) {
       hold.nextPictureMs = at - hold.downAt;
       state.nextPictureLatencies.push(hold.nextPictureMs);
       if (state.nextPictureLatencies.length > 40) state.nextPictureLatencies.shift();
     }
-    // `gametic` is the cursor after the tics represented by this picture. A
-    // frame at exactly the input sequence predates that tic's execution.
-    if (hold.stampGametic === null || gametic <= hold.stampGametic) continue;
+    // A frame at exactly the input sequence predates that tic's execution.
+    if (hold.stampTic === null || cursor <= hold.stampTic) continue;
     hold.stampMs = at - hold.downAt;
-    // The stamped tic and the gametic of the frame that ended the wait, together.
+    // The stamped tic and the cursor of the frame that ended the wait, together.
     // They are only comparable as a pair: a held key keeps offering batches and
     // each one is stamped at a later tic, so the page's *latest* stamped tic
     // belongs to a later press than the sample this one produced.
     const sample = {
       key: hold.key,
       tic: hold.stampTic,
-      stamped_gametic: hold.stampGametic,
+      cursor,
       gametic,
       ms: hold.stampMs,
       next_picture_ms: hold.nextPictureMs,
@@ -482,17 +486,17 @@ function refreshKeyTimingBreakdown() {
 // does not have a tic yet: presses are seconds apart in anything a person plays,
 // and a held key offers a batch every 100 ms, so the first answer after a
 // keydown is that keydown's.
-function noteStampedTic(tic, targetHold = null, stampGametic = tic) {
+function noteStampedTic(tic, targetHold = null) {
   if (typeof tic !== "number" || !Number.isFinite(tic)) return;
   pruneHolds();
   const hold = targetHold ?? [...state.holds].reverse().find((row) => row.stampTic === null);
   if (hold === undefined) return;
   hold.stampTic = tic;
-  hold.stampGametic = stampGametic;
   // If the frame carrying that tic is already on screen the paint ring knows
-  // when it was painted; otherwise the next qualifying paint records it.
-  const first = state.paintTics.find((row) => row.gametic > stampGametic);
-  if (first) measureKeypress(first.gametic, first.at);
+  // when it was painted; otherwise the next qualifying paint records it. A
+  // frame painted before keydown cannot count as the press's picture.
+  const first = state.paintTics.find((row) => row.at >= hold.downAt && row.cursor > tic);
+  if (first) measureKeypress(first.cursor, first.gametic, first.at);
 }
 
 // A press that will never get a stamp: every key of it is up, nothing has
@@ -610,7 +614,7 @@ function updateStatus() {
       `${state.holds.length} still open, ${state.holdsDropped} dropped at the bound` +
       (state.lastStampSample
         ? `; last: ${state.lastStampSample.key} stamped at tic ${state.lastStampSample.tic}, ` +
-          `painted at gametic ${state.lastStampSample.gametic}`
+          `painted at cursor ${state.lastStampSample.cursor}`
         : "");
   }
   const next = median(state.nextPictureLatencies);
@@ -967,9 +971,8 @@ function pressKey(name, label) {
     key: name,
     downAt: performance.now(),
     downWallMs: Date.now(),
-    gameticAtKeyDown: state.lastFrame ? state.lastFrame.gametic : -1,
+    cursorAtKeyDown: state.lastFrame ? state.lastFrame.cursor : -1,
     stampTic: null,
-    stampGametic: null,
     nextPictureMs: null,
     stampMs: null,
     keys: [name],
@@ -1125,13 +1128,12 @@ async function pushQueuedInput() {
     if (state.latencies.length > 40) state.latencies.shift();
     state.inputsSent += 1;
     const stampTic = payload.stamp_tic ?? payload.accepted_from;
-    const stampGametic = payload.stamp_gametic ?? stampTic;
     if (typeof stampTic === "number") {
       state.lastStampedTic = stampTic;
       const oneTic = heldToCommands(flight.keys, stampTic, 1);
       for (const hold of flight.holds) {
         inputLog.noteStampedState(hold.inputRecord, stampTic, oneTic);
-        noteStampedTic(stampTic, hold, stampGametic);
+        noteStampedTic(stampTic, hold);
       }
     }
     state.keyPostSamples ??= [];

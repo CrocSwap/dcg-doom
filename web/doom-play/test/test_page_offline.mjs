@@ -387,10 +387,10 @@ if (!chromeAvailable()) {
   });
 
   test("the keypress meter waits for the stamped tic, and the next-picture meter does not", {timeout: 180_000}, async () => {
-    // The stamped tic is the relayer's first free slot. A picture at the same
-    // cursor still predates that tic; the meter closes only after a later
-    // gametic. This fake sweep has one frame of atomic delivery and no page
-    // lead, so the measured wait should remain below one second.
+    // The stamped tic and frame cursor share one sequence; gametic need not.
+    // RESET can restore cursor zero while the saved game state starts at a
+    // nonzero gametic. A picture at the same cursor still predates the tic.
+    // This fake starts at cursor zero and gametic 6016 to preserve that case.
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
       const before = await snapshot(page);
@@ -435,12 +435,15 @@ if (!chromeAvailable()) {
       // The definitional check: this frame's cursor is past the input sequence.
       assert.ok(after.lastStampSample !== null, "no sample recorded the pair it waited on");
       assert.ok(
-        after.lastStampSample.gametic > after.lastStampSample.stamped_gametic,
-        `the wait ended on gametic ${after.lastStampSample.gametic} against a stamped tic of ${after.lastStampSample.stamped_gametic}`,
+        after.lastStampSample.cursor > after.lastStampSample.tic,
+        `the wait ended on cursor ${after.lastStampSample.cursor} against a stamped tic of ${after.lastStampSample.tic}`,
       );
+      assert.equal(after.lastStampSample.gametic, after.lastStampSample.cursor + 6016);
       // Both meters should be bounded by one frame cadence in this simulation.
       const stamp = stamps[0].ms;
       const next = nexts[0];
+      assert.ok(stamp >= 0, `a frame painted before keydown produced ${stamp.toFixed(0)} ms`);
+      assert.ok(next >= 0, `a frame painted before keydown produced ${next.toFixed(0)} ms`);
       assert.ok(stamp < 1000, `atomic key-to-picture wait was ${stamp.toFixed(0)} ms`);
       assert.ok(
         next <= stamp,
@@ -449,7 +452,7 @@ if (!chromeAvailable()) {
       );
       assert.ok(after.painted > before.painted, "the page painted nothing during the press");
       assert.equal(after.holdsOpen, 0, "the press never closed");
-    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
+    }, {relayerOptions: {...FAST, startCursor: 0, gameticOffset: 6016}, query: "&cross-check-every=0"});
   });
 
   test("a keypress is signed, accepted and consumed by the engine", {timeout: 180_000}, async () => {

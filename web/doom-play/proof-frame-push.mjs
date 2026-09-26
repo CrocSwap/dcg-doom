@@ -209,6 +209,7 @@ const SNAPSHOT = `(() => {
   const stream = s.stream;
   return {
     painted: s.paintedFrames,
+    pageNow: performance.now(),
     torn: s.tornReads,
     paints: s.paintTimes.slice(),
     paintTics: (s.paintTics ?? []).slice(),
@@ -306,9 +307,10 @@ const windowSeconds = (Date.now() - windowStart) / 1000;
 const paintedInWindow = after.painted - before.painted;
 const tornInWindow = after.torn - before.torn;
 const pushedInWindow = (after.stream?.pushed ?? 0) - (before.stream?.pushed ?? 0);
-const oldGametics = new Set(before.paintTics.map((row) => row.gametic).filter(Number.isFinite));
-const newGametics = new Set(after.paintTics.map((row) => row.gametic).filter(Number.isFinite));
-const newPicturesInWindow = [...newGametics].filter((gametic) => !oldGametics.has(gametic)).length;
+const newCursors = new Set(after.paintTics
+  .filter((row) => row.at >= before.pageNow && row.at <= after.pageNow && Number.isFinite(row.cursor))
+  .map((row) => row.cursor));
+const newPicturesInWindow = newCursors.size;
 console.log(`window ${windowSeconds.toFixed(1)} s: painted ${paintedInWindow} ` +
   `(${(paintedInWindow / windowSeconds).toFixed(2)} fps), new ${newPicturesInWindow} ` +
   `(${(newPicturesInWindow / windowSeconds).toFixed(2)} pictures/s), pushed ${pushedInWindow}, torn ${tornInWindow}`);
@@ -318,8 +320,8 @@ await shot("proof-fps");
 //    dead-player use/reset path. Two numbers come out of each press and they are different
 //    quantities:
 //
-//      keypress  keydown to the first painted frame whose gametic is at or past
-//                the tic the relayer stamped this hold's input for. The page's
+//      keypress  keydown to the first painted frame whose cursor is past the
+//                tic the relayer stamped this hold's input for. The page's
 //                `stampLatencies` entry for the hold, and the number the
 //                playability bar is written against.
 //      next pic  keydown to the next painted frame of any kind. The page's
@@ -333,12 +335,15 @@ const KEYS = [
   {key: "back", code: "ArrowDown", keyName: "ArrowDown", vk: 40},
   {key: "left", code: "ArrowLeft", keyName: "ArrowLeft", vk: 37},
   {key: "right", code: "ArrowRight", keyName: "ArrowRight", vk: 39},
-  {key: "fire", code: "Space", keyName: " ", vk: 32},
+  {key: "attack", code: "Space", keyName: " ", vk: 32},
+  {key: "strafeLeft", code: "KeyQ", keyName: "q", vk: 81},
+  {key: "strafeRight", code: "KeyE", keyName: "e", vk: 69},
+  {key: "run", code: "ShiftLeft", keyName: "Shift", vk: 16},
 ];
 const presses = [];
 for (let index = 0; index < PRESSES; index += 1) {
   const spec = KEYS[index % KEYS.length];
-  const pictureBefore = await evaluate(`window.doomPlay.state.lastFrame?.gametic ?? null`);
+  const pictureBefore = await evaluate(`window.doomPlay.state.lastFrame?.cursor ?? null`);
   // The page's per-press log, by count. Attribution is the page's, because the
   // page knows which key each clock was opened for and when; slicing the two
   // latency rings after a fixed settle would attribute a slow press's sample to
@@ -356,12 +361,13 @@ for (let index = 0; index < PRESSES; index += 1) {
     key: spec.key,
     index,
     pictureBefore,
-    pictureAfter: row.lastGametic,
-    pictureMoved: pictureBefore !== row.lastGametic,
+    pictureAfter: row.lastCursor,
+    pictureMoved: pictureBefore !== row.lastCursor,
     // Keydown to a frame at or past the tic this press's input was stamped for,
     // with the pair that makes it checkable.
     keypressMs: sample ? sample.ms : null,
     stampedTic: sample ? sample.tic : null,
+    paintedCursor: sample ? sample.cursor : null,
     paintedGametic: sample ? sample.gametic : null,
     // Keydown to the next frame of any kind. Not a keypress latency.
     nextPictureMs: sample ? sample.next_picture_ms : null,
@@ -415,6 +421,7 @@ for (const press of presses) {
     const sample = late[late.length - 1];
     press.keypressMs = sample.ms;
     press.stampedTic = sample.tic;
+    press.paintedCursor = sample.cursor;
     press.paintedGametic = sample.gametic;
     press.nextPictureMs = sample.next_picture_ms;
     press.late = true;
@@ -481,7 +488,7 @@ const result = {
     samples: final.stampSamples.length,
   },
   // Every sample, with the pair that makes each one checkable: the tic the
-  // input was stamped for and the gametic of the frame that ended the wait.
+  // input was stamped for and the cursor of the frame that ended the wait.
   samples: final.stampSamples,
   timing_breakdown: final.keyTimingBreakdown,
   timing_breakdown_coverage: {
