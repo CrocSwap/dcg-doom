@@ -51,6 +51,60 @@ extern void doom_sbf_phase_marker(unsigned long phase);
 #define RI2_PHASE(phase) ((void)0)
 #endif
 
+/* Patch 0030: emit the accumulated render-phase cells.  Solana keeps ten
+ * program-log lines per transaction and a flat per-phase marker list needs
+ * more than that for one strip, so the strip driver aggregates.  Three cells
+ * per sol_log_64 line, six lines, the first argument tagging the group.
+ * doom_sbf_prof_log is a Rust shim: the C side has no declaration for the
+ * log syscall and the image must not gain writable static data.
+ *
+ * Everything in this block, and the accumulator cells it reads, exists only
+ * when DOOM_SBF_PHASE_PROFILE is defined.  build.rs defines that for a
+ * `diagnostic-profile` image and nothing else, so a production image compiles
+ * the whole accumulator away and keeps sizeof(doom_ctx_t) exactly where it
+ * was.  The production cost of that decision is that the refused-layout lines
+ * below lose their log lines outside a diagnostic image, which is the right
+ * trade: the refusal code is unambiguous, and a diagnostic image is the only
+ * one that can afford to spend a line saying which of six layout conditions
+ * failed. */
+#ifdef DOOM_SBF_PHASE_PROFILE
+#define DOOM_SBF_PROF_MAGIC 0x444f4f4d50524f31ul
+#define DOOM_SBF_PROF_GROUPS 6ul
+extern void doom_sbf_prof_log(unsigned long magic, unsigned long group,
+                              unsigned long a, unsigned long b, unsigned long c);
+static void rsr_prof_emit(void)
+{
+    unsigned long g;
+    for (g = 0; g < DOOM_SBF_PROF_GROUPS; g++)
+        doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, g,
+                          doom_sbf_prof[g * 3ul],
+                          doom_sbf_prof[g * 3ul + 1ul],
+                          doom_sbf_prof[g * 3ul + 2ul]);
+}
+#define RSR_PROF_EMIT() rsr_prof_emit()
+/* Zero the cells.  A context account outlives the transaction that used it, so
+ * without this a diagnostic image would report the previous strip's cells as
+ * this strip's. */
+#define RSR_PROF_RESET()                                         \
+    do {                                                         \
+        int rsr_rc;                                              \
+        for (rsr_rc = 0; rsr_rc < DOOM_SBF_PROF_SLOTS; rsr_rc++) \
+            doom_sbf_prof[rsr_rc] = 0;                           \
+    } while (0)
+/* Name a refusal.  The tag values are 0xba0.. so they cannot collide with a
+ * phase group index (0..5) read off the same magic.  The four arguments are
+ * sol_log_64's four data arguments, so a reader does not have to know which
+ * refusal spends which one. */
+#define RSR_REFUSE_NOTE(tag, a, b, c) \
+    doom_sbf_prof_log(DOOM_SBF_PROF_MAGIC, (tag), (a), (b), (c))
+#else
+#define RSR_PROF_EMIT() ((void)0)
+#define RSR_PROF_RESET() ((void)0)
+/* Every argument is a pure expression -- a cast, a byte read, a sizeof -- so
+ * dropping the call drops nothing that has to happen. */
+#define RSR_REFUSE_NOTE(tag, a, b, c) ((void)0)
+#endif
+
 #define RI2_REFUSE_STATE 232
 #define RI2_REFUSE_POOL 233
 #define RI2_REFUSE_RESOURCE 234
@@ -1679,13 +1733,19 @@ int doom_engine_rsn3_render_static(
     unsigned long transient_mark;
     int rc, y, x;
     ri2_render_saved_t ri2_saved;
+    RSR_PROF_RESET();
     RI2_PHASE(1100);
+    PROF_ENTER(DOOM_SBF_PROF_FIXED_PRE, 0);
     if (doom_ctx_guard(context)) return 199;
-    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES || !payload ||
-        !strip_out || strip_cap != strip_bytes || strip_id >= 8u ||
-        ((uintptr_t)bootstrap & 15u) != 0 ||
-        rsr_rebind_layout(context, account_bytes, header, header_bytes))
-        return RSR_REFUSE_LAYOUT;
+    PROF_ENTER(DOOM_SBF_PROF_REBIND, 1);
+    /* Each condition below returns separately, so a layout refusal names
+     * itself in the log instead of arriving as one undifferentiated code. */
+    if (!bootstrap) { RSR_REFUSE_NOTE(0xba0ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES) { RSR_REFUSE_NOTE(0xba1ul, (unsigned long)bootstrap_bytes, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (!payload || !strip_out) { RSR_REFUSE_NOTE(0xba2ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (strip_cap != strip_bytes || strip_id >= 8u) { RSR_REFUSE_NOTE(0xba3ul, (unsigned long)strip_cap, (unsigned long)strip_id, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (((uintptr_t)bootstrap & 15u) != 0) { RSR_REFUSE_NOTE(0xba4ul, (unsigned long)(uintptr_t)bootstrap, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (rsr_rebind_layout(context, account_bytes, header, header_bytes)) { RSR_REFUSE_NOTE(0xba5ul, (unsigned long)account_bytes, (unsigned long)rsr_get32(header + 20), (unsigned long)sizeof(doom_ctx_t)); return RSR_REFUSE_LAYOUT; }
     /* BUILD leaves cached lump metadata and renderer tables at the front of
      * this carrier.  Preserve its allocation cursor so the per-frame mobj
      * and framebuffer allocations cannot overwrite those static resources. */
@@ -1693,16 +1753,29 @@ int doom_engine_rsn3_render_static(
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
                                RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
+    PROF_EXIT(DOOM_SBF_PROF_REBIND, 1);
     RI2_PHASE(1101);
     transient_mark = doom_sbf_arena_mark();
+    PROF_ENTER(DOOM_SBF_PROF_RSN3_APPLY, 1);
     rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
+    PROF_EXIT(DOOM_SBF_PROF_RSN3_APPLY, 1);
     if (rc) return rc;
     RI2_PHASE(1102);
-    frame = (uint8_t *)calloc(1, 4u * RI2_FRAME_BYTES);
+    PROF_ENTER(DOOM_SBF_PROF_FRAME_SETUP, 1);
+    /* One screen, not four.  This path publishes screens[0] and reads no
+     * other: the drawers write dest = screens[0], R_DrawPlayerSprites uses
+     * screens[0], and the only other screens[1] write in the 41-TU cut is
+     * R_DrawBorder, which returns before touching it when scaledviewwidth ==
+     * 320.  The three extra 64,000-byte allocations were 192,000 bytes of
+     * arena zeroed per strip and handed straight back at the rewind.  The
+     * spare pointers become zero rather than pointing past the allocation, so
+     * a path that did reach one traps instead of writing through a stale
+     * pointer. */
+    frame = (uint8_t *)calloc(1, RI2_FRAME_BYTES);
     if (!frame) return RI2_REFUSE_OUTPUT;
-    screens[0] = frame; screens[1] = frame + RI2_FRAME_BYTES;
-    screens[2] = frame + 2u * RI2_FRAME_BYTES;
-    screens[3] = frame + 3u * RI2_FRAME_BYTES; screens[4] = 0;
+    screens[0] = frame; screens[1] = 0;
+    screens[2] = 0;
+    screens[3] = 0; screens[4] = 0;
     viewimage = screens[0];
     for (rc = 0; rc < viewheight; rc++) ylookup[rc] = screens[0] + (size_t)rc * 320u;
     viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
@@ -1711,7 +1784,19 @@ int doom_engine_rsn3_render_static(
     pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
     pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
     clipangle = xtoviewangle[0]; viewactive = true;
+#ifdef DOOM_SBF_RENDER_FULLWIDTH
+    /* Diagnostic-only: no clip at all, so this strip's CU is the whole frame's
+     * render cost.  The extraction below still takes this strip's 40 columns,
+     * and with nothing clipped the framebuffer holds the full native frame, so
+     * the 8-of-8 native pixel gate still holds.  That is the point: it turns
+     * the scene-once note's extrapolated full-width scene pass into a measured
+     * one without touching the render path. */
+    doom_render_fuzz_columns = 0u;
+#else
     doom_render_fuzz_columns = (1u << 30) | (strip_id << 27);
+#endif
+    PROF_EXIT(DOOM_SBF_PROF_FRAME_SETUP, 1);
+    PROF_EXIT(DOOM_SBF_PROF_FIXED_PRE, 0);
     RI2_PHASE(1103);
     /* The static entry publishes no state, so it needs no array snapshot, but
      * the frame identity it inherits is the static image's own: the counters
@@ -1723,18 +1808,34 @@ int doom_engine_rsn3_render_static(
     R_RenderPlayerView(&players[displayplayer]);
     ri2_render_end(&ri2_saved);
     RI2_PHASE(1104);
+    PROF_ENTER(DOOM_SBF_PROF_FIXED_POST, 0);
     if (doom_sbf_arena_exhausted()) {
         free(frame);
         (void)doom_sbf_arena_rewind(transient_mark);
         return RI2_REFUSE_ARENA;
     }
-    for (y = 0; y < 200; y++) for (x = 0; x < 40; x++)
-        strip_out[(size_t)y * 40u + (size_t)x] =
-            frame[(size_t)y * 320u + (size_t)strip_id * 40u + (size_t)x];
+    /* Four bytes at a time.  The byte loop ran 8,000 iterations per strip and
+     * the measured cost of this whole tail was 65,148 CU, which is 39 CU per
+     * published byte; a word loop runs 2,000.  Both ends are 4-aligned for
+     * every strip id: frame comes from a 16-aligned arena block, 40*strip_id
+     * is a multiple of 8, the source row stride is 320, the destination row
+     * stride is 40, and strip_out is the strip account at offset 128.  An
+     * explicit loop rather than memcpy, because the SBF libc memcpy has no
+     * wide path. */
+    {
+        const uint32_t *src = (const uint32_t *)(frame + (size_t)strip_id * 40u);
+        uint32_t *dst = (uint32_t *)strip_out;
+        for (y = 0; y < 200; y++)
+            for (x = 0; x < 10; x++)
+                dst[(size_t)y * 10u + (size_t)x] =
+                    src[(size_t)y * 80u + (size_t)x];
+    }
     RI2_PHASE(1105);
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     free(frame);
     if (!doom_sbf_arena_rewind(transient_mark)) return RI2_REFUSE_ARENA;
     RI2_PHASE(1106);
+    PROF_EXIT(DOOM_SBF_PROF_FIXED_POST, 0);
+    RSR_PROF_EMIT();
     return 0;
 }

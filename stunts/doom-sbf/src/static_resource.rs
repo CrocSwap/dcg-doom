@@ -40,6 +40,17 @@ pub const REFUSE_AUTHORITY: u32 = 306;
 /// refused it: the operation exists to remove a *stale* header, never a good
 /// one.
 pub const REFUSE_HEADER_VALID: u32 = 307;
+/// A RENDER-BUFFERED named a snapshot the buffer's snapshot account is not
+/// holding.  Distinct from `REFUSE_BINDING` on purpose: BINDING says the
+/// accounts are not the ones this instruction is allowed to touch (wrong
+/// buffer, wrong strip, wrong owner), and 308 says the accounts are all
+/// correct and the *time* is wrong.  That is the case the relayer's
+/// send-after-snapshot rule is about -- a strip built for the previous frame
+/// landing after the next frame's SNAPSHOT has already overwritten the buffer.
+/// Before this code the buffered request carried only (buffer, strip_id), so
+/// the program could not see the difference and rendered the newer snapshot
+/// into a transaction the sender had labelled with the older one.
+pub const REFUSE_SNAPSHOT_STALE: u32 = 308;
 
 pub const WAD_HASH: [u8; 32] = [
     0x1d, 0x7d, 0x43, 0xbe, 0x50, 0x1e, 0x67, 0xd9, 0x27, 0xe4, 0x15, 0xe0, 0xb8, 0xf3, 0xe2, 0x9c,
@@ -96,7 +107,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1|render=1:carries-snapshot-hash|refresh-render=5:buffer+strip+snapshot-hash:zero-name-refused-malformed:mismatched-name-refused-308";
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,12 +182,22 @@ impl Request {
         }
     }
 
-    pub const fn render_buffered(buffer: u8, strip_id: u8) -> Self {
+    /// A buffered strip names the snapshot it was rendered for.
+    ///
+    /// The 32 bytes are the snapshot's own hash, which commits its cursor, its
+    /// gametic and its payload, so one field carries the whole identity and the
+    /// sender has exactly one thing to read back off the snapshot account.  It
+    /// replaces a hard zero requirement: with the field pinned at zero the
+    /// program had nothing to compare the account against, so a strip sent
+    /// against a buffer whose snapshot had already moved on would render the
+    /// new frame's pixels and stamp them with the new frame's header while the
+    /// sender believed it had published the old one.
+    pub const fn render_buffered(buffer: u8, strip_id: u8, snapshot_hash: [u8; 32]) -> Self {
         Self {
             operation: OP_RENDER_BUFFERED,
             strip_id,
             cursor: buffer as u32,
-            snapshot_hash: [0; 32],
+            snapshot_hash,
         }
     }
 
@@ -228,8 +249,15 @@ impl Request {
         if request.operation == OP_RENDER_BUFFERED
             && (request.strip_id >= 8
                 || request.cursor >= rsn3::BUFFER_COUNT as u32
-                || request.snapshot_hash != [0; 32])
+                || request.snapshot_hash == [0; 32])
         {
+            // A zero name is not a stale name, it is a missing one: the field
+            // became mandatory with this operation, so a sender that has not
+            // learned to fill it in is refused as malformed rather than being
+            // let through to a comparison it cannot pass anyway.  The two
+            // refusals are worth separating, because they are two different
+            // operator mistakes: 301 is "this relayer is out of date" and 308
+            // is "this frame is late".
             return Err(refuse(REFUSE_MALFORMED));
         }
         if matches!(request.operation, OP_INIT | OP_GROW | OP_REBUILD | OP_CLEAR)
@@ -245,18 +273,60 @@ impl Request {
 mod request_tests {
     use super::*;
 
+    /// A buffered strip carries the snapshot it is rendered for, in the same
+    /// 32 bytes the non-buffered RENDER already used, and the field is
+    /// mandatory: a zero name is malformed rather than a comparison the
+    /// program will fail later.
     #[test]
-    fn buffered_render_request_binds_buffer_without_client_snapshot_fields() {
-        let request = Request::render_buffered(1, 6);
+    fn buffered_render_request_names_its_snapshot() {
+        let snapshot_hash = [0xa5u8; 32];
+        let request = Request::render_buffered(1, 6, snapshot_hash);
         let encoded = request.encode();
         assert_eq!(encoded[12], OP_RENDER_BUFFERED);
         assert_eq!(encoded[13], 6);
         assert_eq!(u32_at(&encoded, 16), 1);
-        assert_eq!(encoded[20..52], [0; 32]);
+        assert_eq!(encoded[20..52], snapshot_hash);
         assert_eq!(Request::decode(&encoded), Ok(request));
-        let mut bad = encoded;
-        bad[20] = 1;
-        assert!(Request::decode(&bad).is_err());
+        // Every one of the 32 bytes is the name: flipping a single bit has to
+        // change the decoded request, or a sender could get away with a
+        // partial name.
+        for byte in 0..32usize {
+            let mut mutated = encoded;
+            mutated[20 + byte] ^= 1;
+            let decoded = Request::decode(&mutated).expect("a mutated name is still well formed");
+            assert_ne!(decoded.snapshot_hash, snapshot_hash, "byte {byte} is not carried");
+        }
+    }
+
+    /// The malformed-input rule for the new field: a buffered strip with no
+    /// snapshot name is refused as malformed, before it can reach a snapshot
+    /// account.  A relayer that has not learned the field is exactly this
+    /// case, and it must be loud rather than quietly rendering whatever the
+    /// buffer happens to hold.
+    ///
+    /// The rule is "not all zero", not "no zero bytes": a name is a SHA-256
+    /// and roughly one in 4.3 billion of them has a zero byte somewhere, so
+    /// refusing those would refuse honest senders.  The test below pins both
+    /// halves of that, because the second half is the one that would be easy to
+    /// tighten by accident.
+    #[test]
+    fn buffered_render_request_without_a_snapshot_name_is_malformed() {
+        let zeroed = Request::render_buffered(0, 0, [0; 32]).encode();
+        assert_eq!(
+            Request::decode(&zeroed),
+            Err(refuse(REFUSE_MALFORMED)),
+            "an all-zero name must be refused as malformed"
+        );
+        for byte in 0..32usize {
+            let mut single = [0u8; 32];
+            single[byte] = 1;
+            let encoded = Request::render_buffered(0, 0, single).encode();
+            assert_eq!(
+                Request::decode(&encoded),
+                Ok(Request::render_buffered(0, 0, single)),
+                "a name whose only set byte is {byte} is still a name"
+            );
+        }
     }
 
     #[test]
@@ -425,6 +495,22 @@ mod layout_tests {
     /// The static account's own length is `ACCOUNT_BYTES`, and a growth beyond
     /// that is refused, so the account can be grown into a new layout but never
     /// shrunk back out of one.
+    ///
+    /// Two values, not one.  A production build keeps 9_734_160, which is what
+    /// the deployed images, the live accounts and the sender scripts were
+    /// built against; only a `diagnostic-profile` build pays patch 0030's 176
+    /// accumulator bytes and reads 9_734_336.  The split is the point of the
+    /// test: a diagnostic measurement must not be a layout change, which is
+    /// what the unconditional declaration in the first version of patch 0030
+    /// was, and what the revert of that merge (30088de1f) was about.
+    #[cfg(feature = "diagnostic-profile")]
+    #[test]
+    fn the_static_account_grows_into_a_layout_and_cannot_shrink_out() {
+        assert_eq!(ACCOUNT_BYTES, 9_734_336);
+        assert!(ACCOUNT_BYTES > 0);
+    }
+
+    #[cfg(not(feature = "diagnostic-profile"))]
     #[test]
     fn the_static_account_grows_into_a_layout_and_cannot_shrink_out() {
         assert_eq!(ACCOUNT_BYTES, 9_734_160);
@@ -1288,6 +1374,17 @@ fn process_render_buffered(
     let snapshot_data = accounts[SNAPSHOT].try_borrow_data()?;
     let snapshot = rsn3::validate_buffered_snapshot_for(&snapshot_data, request.cursor as u8)?;
     crate::diagnostic_phase(1202);
+    // The strip names the snapshot it was rendered for, and this is where that
+    // name is checked against the account's current snapshot.  Everything above
+    // proves the accounts are the right ones; this proves they hold the right
+    // *moment*, which is the part a relayer can get wrong by sending a frame's
+    // strips after the next frame's SNAPSHOT has already overwritten the
+    // buffer.  Read after the borrow so the account's own hash is the only
+    // thing compared: deriving the expected value from the request instead
+    // would make the check vacuous.
+    if snapshot.snapshot_hash != request.snapshot_hash {
+        return Err(refuse(REFUSE_SNAPSHOT_STALE));
+    }
     render_snapshot_to_strip(
         program,
         &accounts[STATIC],
