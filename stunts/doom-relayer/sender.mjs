@@ -721,6 +721,14 @@ export class PipelineSender {
       // `generated_cursor` (the end of the batch it has already published) and
       // is what a page has to aim ahead of. See doom_relayer_server.py.
       producerNextCursor: status.producer_next_cursor ?? null,
+      // The lead the producer resolved from its own measured round trip, and
+      // the round trip it read. The child publishes both in every `status` and
+      // in every input answer, and they were dropped here, so the page could
+      // only re-derive a lead from its own POST latency -- which is a different
+      // quantity, and 16-20 tics where the producer had measured 61. A viewer
+      // that cannot see the producer's own number has to guess it.
+      inputStageLeadTics: status.input_stage_lead_tics ?? null,
+      inputRoundTripSeconds: status.input_round_trip_seconds ?? null,
       // Per-deposit fate for the player's commands, and whether the pipeline can
       // still deliver them at all. Both ride on `status`, which this method
       // already asked for, so neither costs a round trip.

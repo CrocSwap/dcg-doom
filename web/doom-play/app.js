@@ -173,6 +173,12 @@ const state = {
   // (the end of the batch it has already published) and is the only cursor a
   // writer can honestly aim ahead of. See doom_relayer_server.py.
   producerNextCursor: null,
+  // The producer's own staging lead and the round trip it was resolved from.
+  // Shown next to the page's own POST round trip, because they are different
+  // quantities and a lead built from the wrong one is a lead that loses the
+  // keypress it exists to deliver.
+  producerLeadTics: null,
+  producerRoundTripSeconds: null,
   // Whether keystrokes can still reach the engine, and the relayer's per-deposit
   // record of what happened to the ones already sent.
   pipeline: null,
@@ -1064,7 +1070,13 @@ async function pushInput() {
     // the aim has to survive the slow request, not the median one.
     state.roundTripMs = Math.max(...state.latencies.slice(-8));
     const median = [...state.latencies].sort((a, b) => a - b)[Math.floor(state.latencies.length / 2)];
-    setCell(ui.inputLatency, `${median.toFixed(0)} ms · lead ${state.leadTics}`);
+    const producer = state.producerLeadTics === null
+      ? "producer lead n/a"
+      : `producer lead ${state.producerLeadTics}` +
+        (state.producerRoundTripSeconds === null
+          ? ""
+          : ` · ${(state.producerRoundTripSeconds * 1000).toFixed(0)} ms round trip`);
+    setCell(ui.inputLatency, `${median.toFixed(0)} ms · lead ${state.leadTics} · ${producer}`);
     setCell(ui.inputsSent, String(state.inputsSent));
     if (payload.frame?.signature) state.signature = payload.frame.signature;
     clearError("action");
@@ -1184,6 +1196,18 @@ function adoptAccounts(payload) {
   }
   if (payload.pipeline !== undefined && payload.pipeline !== null) state.pipeline = payload.pipeline;
   if (payload.input_fate !== undefined && payload.input_fate !== null) state.inputFate = payload.input_fate;
+  // The producer's own lead and the round trip it was read from. The pipeline
+  // resolves both from a measurement of the delay between producing a tic and
+  // the chain's own input frontier passing it, and publishes them in every
+  // status and every input answer. The node dropped them until 2026-09-26, so
+  // the page could only re-derive a lead from its own POST latency -- 16-20 tics
+  // where the producer had measured 61 -- and nothing on the page said so.
+  if (payload.input_stage_lead_tics !== undefined && payload.input_stage_lead_tics !== null) {
+    state.producerLeadTics = payload.input_stage_lead_tics;
+  }
+  if (payload.input_round_trip_seconds !== undefined && payload.input_round_trip_seconds !== null) {
+    state.producerRoundTripSeconds = payload.input_round_trip_seconds;
+  }
   // Every answer that carries the producer's position is stamped with when it
   // arrived, because the aim carries it forward by its age.
   if (payload.producer_generated_cursor !== undefined) state.producerReadAt = performance.now();

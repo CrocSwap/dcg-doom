@@ -423,6 +423,13 @@ export class Relayer {
       // leads by its round trip measured from a counter that already runs a
       // batch ahead, and the lead is gone before the batch is written.
       producer_next_cursor: slot.producerNextCursor ?? null,
+      // The lead the producer resolved from its own measured round trip, and the
+      // round trip it was read from. The child publishes both; this is where they
+      // stop being the pipeline's private numbers and become the viewer's, which
+      // is the only way a page can aim with the producer's own arithmetic instead
+      // of re-deriving one from its own POST latency.
+      input_stage_lead_tics: slot.inputStageLeadTics ?? null,
+      input_round_trip_seconds: slot.inputRoundTripSeconds ?? null,
       // Per-deposit fate for the player's commands: the bytes the chain was
       // given and the transaction that carried them. It rides on `status`
       // because the status poll already asks the child, so it is free.
