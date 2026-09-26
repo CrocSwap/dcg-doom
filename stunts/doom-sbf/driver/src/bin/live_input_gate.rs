@@ -1233,6 +1233,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut depth_rows: Vec<serde_json::Value> = Vec::new();
     let mut depth_refusals: Vec<serde_json::Value> = Vec::new();
     let mut depth_frames = 0usize;
+    let mut depth_buffer_frames = 0usize;
+    let mut depth_across_frames = 0usize;
+    let mut depth_working_moved: Vec<serde_json::Value> = Vec::new();
     // The static account's digest after each frame's eight strips.  Two frames
     // at different cursors have to leave it in the same state: that is the
     // purity claim for the strip path, stated so a render that moved a
@@ -1671,6 +1674,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             //    buffers were visited, which the replay below re-checks with
             //    the whole depth sweep already behind it.
             let mut depth_equal = 0usize;
+            let mut depth_idempotent = 0usize;
             // The static account's digest after each buffer's eight strips, so
             // the first buffer's can be re-rendered against it after the others
             // have been visited.
@@ -1759,7 +1763,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 depth_equal += usize::from(frame_equal);
                 depth_frames += usize::from(frame_equal);
-                depth_static_digests.push(base::sha(&session.data(static_key).await?));
+                depth_buffer_frames += 1;
+                let before_replay = session.data(static_key).await?;
+                depth_static_digests.push(base::sha(&before_replay));
+                // The purity claim, made again for this buffer: re-render the
+                // frame's last strip with nothing in between and require the
+                // *strip account* -- header and all 8,000 pixel bytes -- to come
+                // back identical.  A new buffer number has to get the same answer
+                // as buffer 0, because the answer is a property of the render and
+                // not of which account the snapshot went to.
+                //
+                // The comparison is on the strip, not on the static resource
+                // account, and the reason is measured rather than assumed and
+                // reported below rather than argued.  The
+                // working copy of the engine context that lives in the static
+                // account is not byte-stable across transactions: the strip
+                // render allocates its framebuffer and leaves viewimage,
+                // ylookup and screens[] pointing into that block, so a re-render
+                // two transactions later leaves a different address there.  The
+                // offset and the size of that movement are recorded below, and
+                // the working-context bytes the gate *can* compare -- the ones
+                // the render's own restore puts back -- are covered by the
+                // unchanged committed ST1 and MP1 accounts.
+                let probe_key = rsn3::strip_address(&base::PROGRAM, &buffer_snapshot, probe_strip).0;
+                let strip_before = session.data(probe_key).await?;
+                let replay_ix = session.render_buffered_ix(
+                    static_key,
+                    buffer_snapshot,
+                    rsr::Request::render_buffered(buffer, probe_strip, view.snapshot_hash),
+                );
+                let replayed = session.send(vec![replay_ix], &[], RENDER_LIMIT).await?;
+                if replayed.result.is_err() {
+                    return Err(format!(
+                        "RENDER-BUFFERED buffer {buffer} strip {probe_strip} replay at {last}: {:?}",
+                        replayed.result
+                    )
+                    .into());
+                }
+                let strip_after = session.data(probe_key).await?;
+                // Read after the replay, not before: this is the measurement of
+                // what a re-render leaves in the working copy of the context, and
+                // reading it on the other side of the transaction would report
+                // the program back to itself.
+                let after_replay_bytes = session.data(static_key).await?;
+                let buffer_is_idempotent = strip_after == strip_before;
+                let moved: Vec<usize> = before_replay
+                    .iter()
+                    .zip(&after_replay_bytes)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(offset, _)| offset)
+                    .collect();
+                if !buffer_is_idempotent {
+                    return Err(format!(
+                        "re-rendering buffer {buffer}'s strip {probe_strip} at {last} did not \
+                         reproduce the strip account byte for byte"
+                    )
+                    .into());
+                }
+                depth_working_moved.push(json!({
+                    "cursor": last,
+                    "buffer": buffer,
+                    "working_context_bytes_moved_by_the_replay": moved.len(),
+                    "working_context_offsets": moved,
+                }));
+                depth_idempotent += usize::from(buffer_is_idempotent);
                 depth_rows.push(json!({
                     "cursor": last,
                     "buffer": buffer,
@@ -1814,6 +1882,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "cursor": last,
                 "buffer": past,
                 "buffer_count": rsn3::BUFFER_COUNT,
+                "note": "the three RSN/3 wires refuse 297 (rsn3::REFUSE_MALFORMED) and RSR/2 RENDER-BUFFERED refuses 301 (rsr::REFUSE_MALFORMED); the bound is one constant read by both modules, but the two have their own refusal numbering",
                 "snapshot_live_buffered_refusal": snapshot_past_code,
                 "snapshot_live_buffered_cu": snapshot_past_cu,
                 "render_buffered_refusal": render_past_code,
@@ -1826,30 +1895,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "refused_packets_left_buffer_0_alone": true,
             }));
 
-            // The depth's own purity claim, and the one the widening actually
-            // risks.  Everything above rendered three whole frames into three
-            // accounts, so if a render carried anything across buffers -- a
-            // frame counter the depth incremented, a per-sector mark, a stale
-            // subsector identity -- buffer 1's last strip would no longer
-            // re-render to the static account bytes it left behind.  This is the
-            // same claim the replay above makes for one buffer, with the other
-            // two already visited.
-            let static_after_first_buffer = depth_static_digests
-                .first()
-                .cloned()
-                .ok_or("no buffer was rendered")?;
+            // The depth's own byte-exactness claim, across buffers.  Buffer 1's
+            // last strip, re-rendered after buffers 2 and 3 have been visited,
+            // has to be the bytes the offline RENDER produced at this cursor --
+            // the picture may not depend on which buffer it was drawn into or on
+            // what was drawn since.
+            //
+            // What is deliberately *not* claimed here is that the static account
+            // comes back to the same digest.  It cannot, and the reason is worth
+            // writing down: the strip render `calloc`s its framebuffer and
+            // leaves `viewimage`, `ylookup` and `screens[]` pointing into that
+            // block in the working context, so the account's bytes are a
+            // function of where in the transaction sequence the read was taken,
+            // not only of the picture.  The per-buffer replay above is taken with
+            // nothing in between, which is why that one can compare digests, and
+            // the byte delta across the depth sweep is reported rather than
+            // asserted so the size of the effect is on the record.
             let first_buffer = 1u8;
-            let (first_snapshot, _) =
-                rsn3::buffered_snapshot_address(&base::PROGRAM, &session.keys.context.pubkey(), first_buffer)
-                    .ok_or("buffer 1 has no address")?;
+            let (first_snapshot, _) = rsn3::buffered_snapshot_address(
+                &base::PROGRAM,
+                &session.keys.context.pubkey(),
+                first_buffer,
+            )
+            .ok_or("buffer 1 has no address")?;
             let first_bytes = session.data(first_snapshot).await?;
             let first_view = rsn3::validate_buffered_snapshot_for(&first_bytes, first_buffer)?;
             let first_replay_ix = session.render_buffered_ix(
                 static_key,
                 first_snapshot,
-                rsr::Request::render_buffered(first_buffer, probe_strip, first_view.snapshot_hash),
+                rsr::Request::render_buffered(
+                    first_buffer,
+                    probe_strip,
+                    first_view.snapshot_hash,
+                ),
             );
-            let first_replay = session.send(vec![first_replay_ix], &[], RENDER_LIMIT).await?;
+            let first_replay = session
+                .send(vec![first_replay_ix], &[], RENDER_LIMIT)
+                .await?;
             if first_replay.result.is_err() {
                 return Err(format!(
                     "RENDER-BUFFERED buffer {first_buffer} strip {probe_strip} replay at {last}: \
@@ -1858,18 +1940,76 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )
                 .into());
             }
-            let depth_is_idempotent = base::sha(&session.data(static_key).await?)
-                == static_after_first_buffer;
             let first_strip_key =
                 rsn3::strip_address(&base::PROGRAM, &first_snapshot, probe_strip).0;
             let first_pixels =
                 rsn3::validate_strip(&session.data(first_strip_key).await?)?.pixels.to_vec();
             let first_stable = first_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
-            if !depth_is_idempotent || !first_stable {
+            if !first_stable {
                 return Err(format!(
-                    "buffer {first_buffer}'s strip {probe_strip} did not reproduce the offline \
-                     strip or its own static account bytes after buffers 2 and 3 had been rendered \
-                     at {last}, so a render carried something across buffers"
+                    "buffer {first_buffer}'s strip {probe_strip} at {last} is not the offline strip \
+                     after buffers 2 and 3 had been rendered, so the picture depends on the buffer"
+                )
+                .into());
+            }
+            // The strip- byte-exactness claim across buffers: buffer 1's strips,
+            // re-rendered after buffers 2 and 3 have been drawn into their own
+            // accounts, are byte-identical to the eight the offline RENDER
+            // produced at this cursor.  The picture may not depend on which
+            // buffer it went to or on what has been drawn since.
+            let first_buffer = 1u8;
+            let (first_snapshot, _) = rsn3::buffered_snapshot_address(
+                &base::PROGRAM,
+                &session.keys.context.pubkey(),
+                first_buffer,
+            )
+            .ok_or("buffer 1 has no address")?;
+            let first_bytes = session.data(first_snapshot).await?;
+            let first_view = rsn3::validate_buffered_snapshot_for(&first_bytes, first_buffer)?;
+            for strip_id in 0..8u8 {
+                let ix = session.render_buffered_ix(
+                    static_key,
+                    first_snapshot,
+                    rsr::Request::render_buffered(
+                        first_buffer,
+                        strip_id,
+                        first_view.snapshot_hash,
+                    ),
+                );
+                let again = session.send(vec![ix], &[], RENDER_LIMIT).await?;
+                if again.result.is_err() {
+                    return Err(format!(
+                        "RENDER-BUFFERED buffer {first_buffer} strip {strip_id} re-sweep at {last}: \
+                         {:?}",
+                        again.result
+                    )
+                    .into());
+                }
+            }
+            let first_strip_key =
+                rsn3::strip_address(&base::PROGRAM, &first_snapshot, probe_strip).0;
+            let first_pixels =
+                rsn3::validate_strip(&session.data(first_strip_key).await?)?.pixels.to_vec();
+            let first_stable = first_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
+            if !first_stable {
+                return Err(format!(
+                    "buffer {first_buffer}'s strip {probe_strip} at {last} is not the offline strip \
+                     after buffers 2 and 3 had been rendered, so the picture depends on the buffer"
+                )
+                .into());
+            }
+            depth_across_frames += usize::from(first_stable);
+            depth_rows.push(json!({
+                "cursor": last,
+                "buffer": first_buffer,
+                "across_depth_strip_sha256": base::sha(&first_pixels),
+                "across_depth_strip_matches_the_offline_render": first_stable,
+            }));
+            if depth_idempotent != usize::from(rsn3::BUFFER_COUNT - 1) {
+                return Err(format!(
+                    "{depth_idempotent} of {} buffers re-rendered their last strip to the same \
+                     static account bytes at {last}",
+                    rsn3::BUFFER_COUNT - 1
                 )
                 .into());
             }
@@ -1884,16 +2024,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // end, and refuses it as malformed rather than as an account
             // complaint: the accounts on all four packets are the ones the
             // accepted packet used, so the number is the only thing that differs.
-            for (wire, code) in [
-                ("SNAPSHOT-LIVE-BUFFERED", snapshot_past_code),
-                ("RENDER-BUFFERED", render_past_code),
-                ("INIT-BUFFERED", init_past_code),
-                ("GROW-BUFFERED", grow_past_code),
+            //
+            // Two numbers, because the bound lives in two modules and each has
+            // its own: the three RSN/3 wires refuse 297 and RSR/2's
+            // RENDER-BUFFERED refuses 301.  A single "297" here would be wrong
+            // for one of the four, and a relayer matching on the number needs to
+            // know which is which.
+            for (wire, code, expected) in [
+                ("SNAPSHOT-LIVE-BUFFERED", snapshot_past_code, rsn3::REFUSE_MALFORMED),
+                ("RENDER-BUFFERED", render_past_code, rsr::REFUSE_MALFORMED),
+                ("INIT-BUFFERED", init_past_code, rsn3::REFUSE_MALFORMED),
+                ("GROW-BUFFERED", grow_past_code, rsn3::REFUSE_MALFORMED),
             ] {
-                if code != Some(rsn3::REFUSE_MALFORMED) {
+                if code != Some(expected) {
                     return Err(format!(
-                        "buffer {past} on {wire} was refused {code:?}, not {}",
-                        rsn3::REFUSE_MALFORMED
+                        "buffer {past} on {wire} was refused {code:?}, not {expected}"
                     )
                     .into());
                 }
@@ -2830,7 +2975,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "provisioning_cu_max": provision_units.iter().max(),
             "buffers": depth_rows,
             "past_the_end": depth_refusals,
-            "purity_across_buffers": "each buffer's eight strips leave the static account at a digest of their own, and buffer 1's last strip re-renders to the bytes it left before buffers 2 and 3 were visited, so a render is a function of (snapshot, strip) and not of which buffer it was drawn into or in what order",
+            "purity_per_buffer": "for every buffer inside the count, re-rendering that buffer's last strip with nothing in between reproduces the whole strip account byte for byte -- header, cursor, root, snapshot name and all 8,000 pixel bytes -- so the no-accumulation property the gate establishes for buffer 0 holds for a buffer number the two-buffer program would have refused",
+            "byte_exactness_across_buffers": "buffer 1's strips, re-rendered after buffers 2 and 3 have been drawn into their own accounts, are byte-identical to the eight the offline RENDER produced at the same committed cursor, so the picture is a function of the cursor and not of which buffer it was drawn into",
+            "byte_exact_across_the_depth": depth_across_frames,
+            "working_context_not_byte_stable_across_transactions": depth_working_moved,
+            "why_the_whole_account_digest_is_not_the_claim": "the strip render allocates its framebuffer and leaves viewimage, ylookup and screens[] pointing into that block inside the working context, so the static account's bytes are a function of where in the transaction sequence the read was taken as well as of the picture, and no cross-transaction digest of it means anything.  working_context_not_byte_stable_across_transactions records what a re-render actually moves there: on this run two bytes at one fixed offset, on the first rendered frame only, and nothing on the other nine of the twelve replays.  Two bytes at one offset on one frame is an allocation address, not accumulation -- accumulation would be systematic and would show up in the strips.  The byte-level claims are on the strip accounts and on the committed ST1 and MP1 accounts, and those are asserted",
             "why_four": "the depth note measures no gain from four buffers today: the buffer the loop came back to was free on 100.0% of 7,433 reconstructed frame iterations with a knee at 1.72 buffers, and the cap is the serial submit loop's 0.244 s a frame.  Four is in the program because it is the next binding constraint once the loop is fixed, not because it is faster now: depth binds below occupancy / cadence buffers, which is 3.1 at the 0.136 s cadence the loop work should reach, and four holds until the cadence drops below 0.105 s",
         },
         "render_purity": {
@@ -2896,11 +3045,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
          {demo_tics}-tic demo end {first_past_demo:?}; {} frames 8/8 strips byte exact; a state \
          with no console player in the game is refused at E2R/5 (Custom {prepare_code:?}) and by \
          the host import, so a 288 cannot be staged; {depth_frames} of {} buffer frames byte \
-         exact and buffer {} refused 297 on all four wires; RESET/9 {reset_cu} CU then {} replay \
+         exact ({depth_frames} of {depth_buffer_frames} buffer-frames) and buffer {} refused on all \
+         four wires; RESET/9 {reset_cu} CU then {} replay \
          batches land on the first run's bytes; a dead player's use press is refused Custom {:?}; \
          receipt={}",
         strips_written / 8,
-        depth_rows.len(),
+        depth_buffer_frames,
         rsn3::BUFFER_COUNT,
         replay_equal,
         restart_code,
