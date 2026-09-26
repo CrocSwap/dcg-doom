@@ -483,6 +483,7 @@ impl Session {
             data: request.encode().to_vec(),
         }
     }
+}
 
 fn system_account(lamports: u64) -> Account {
     Account {
@@ -1256,21 +1257,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // strip built for the previous frame, arriving after this frame's
             // SNAPSHOT-LIVE has already replaced the buffer.
             let probe_strip = 7u8;
-            let positive = session
-                .send(
-                    vec![session.render_buffered_ix(
-                        static_key,
-                        snapshot_key,
-                        rsr::Request::render_buffered(
+            let positive_ix = session.render_buffered_ix(
+                    static_key,
+                    snapshot_key,
+                    rsr::Request::render_buffered(
                             0,
                             probe_strip,
                             snapshot.snapshot_hash,
                         ),
-                    )],
-                    &[],
-                    RENDER_LIMIT,
-                )
-                .await?;
+                );
+                let positive = session.send(vec![positive_ix], &[], RENDER_LIMIT).await?;
             if positive.result.is_err() {
                 return Err(format!(
                     "RENDER-BUFFERED positive control at {last}: {:?}",
@@ -1288,21 +1284,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // R_RenderPlayerView is not a pure read of the committed ST1 -- and
             // section 2b below compares the offline strips against the host.
             // Equal-to-RENDER plus RENDER-equal-to-host is equal-to-host.
-            let probe_pixels = rsn3::validate_strip(&session.data(probe_key).await?)?.pixels;
+            let probe_bytes = session.data(probe_key).await?;
+            let probe_pixels = rsn3::validate_strip(&probe_bytes)?.pixels.to_vec();
             let positive_equal =
                 probe_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
 
-            let zero_name = session
-                .send(
-                    vec![session.render_buffered_ix(
-                        static_key,
-                        snapshot_key,
-                        rsr::Request::render_buffered(0, probe_strip, [0; 32]),
-                    )],
-                    &[],
-                    RENDER_LIMIT,
-                )
-                .await?;
+            let zero_name_ix = session.render_buffered_ix(
+                    static_key,
+                    snapshot_key,
+                    rsr::Request::render_buffered(0, probe_strip, [0; 32]),
+                );
+                let zero_name = session.send(vec![zero_name_ix], &[], RENDER_LIMIT).await?;
             let zero_name_code = custom_code(&zero_name);
 
             // One bit flipped in the name the account is holding: same length,
@@ -1310,34 +1302,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // this snapshot.
             let mut wrong_name = snapshot.snapshot_hash;
             wrong_name[17] ^= 0x40;
-            let stale_name = session
-                .send(
-                    vec![session.render_buffered_ix(
-                        static_key,
-                        snapshot_key,
-                        rsr::Request::render_buffered(0, probe_strip, wrong_name),
-                    )],
-                    &[],
-                    RENDER_LIMIT,
-                )
-                .await?;
+            let stale_name_ix = session.render_buffered_ix(
+                    static_key,
+                    snapshot_key,
+                    rsr::Request::render_buffered(0, probe_strip, wrong_name),
+                );
+                let stale_name = session.send(vec![stale_name_ix], &[], RENDER_LIMIT).await?;
             let stale_name_code = custom_code(&stale_name);
 
             // The relayer's actual failure mode, on chain: last frame's name,
             // this frame's buffer.  Only available from the second frame on,
             // because the first frame has no predecessor to be late against.
             let late_frame = if let Some(previous) = previous_snapshot_hash {
-                let late = session
-                    .send(
-                        vec![session.render_buffered_ix(
-                            static_key,
-                            snapshot_key,
-                            rsr::Request::render_buffered(0, probe_strip, previous),
-                        )],
-                        &[],
-                        RENDER_LIMIT,
-                    )
-                    .await?;
+                let late_ix = session.render_buffered_ix(
+                        static_key,
+                        snapshot_key,
+                        rsr::Request::render_buffered(0, probe_strip, previous),
+                    );
+                    let late = session.send(vec![late_ix], &[], RENDER_LIMIT).await?;
                 custom_code(&late)
             } else {
                 None
@@ -1347,7 +1329,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // that still rewrote its pixels would be worse than one that did
             // not render at all, because the sender would read a frame it
             // believes it just published.
-            let after_refusals = rsn3::validate_strip(&session.data(probe_key).await?)?.pixels;
+            let after_bytes = session.data(probe_key).await?;
+            let after_refusals = rsn3::validate_strip(&after_bytes)?.pixels.to_vec();
             let refusals_left_the_strip_alone = after_refusals == probe_pixels;
 
             buffered_rows.push(json!({
