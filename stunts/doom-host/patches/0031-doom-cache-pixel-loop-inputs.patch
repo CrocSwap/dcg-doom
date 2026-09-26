@@ -1,7 +1,6 @@
-diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
 --- a/linuxdoom-1.10/r_draw.c
 +++ b/linuxdoom-1.10/r_draw.c
-@@ -101,6 +101,11 @@
+@@ -101,8 +101,13 @@
  // 
  void R_DrawColumn (void) 
  { 
@@ -11,8 +10,11 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
 +    int source_length;
 +#endif
      int			count; 
-     byte*		dest; 
+-    byte*		dest; 
++    byte* restrict	dest; 
      fixed_t		frac;
+     fixed_t		fracstep;	 
+     int			source_index;
 @@ -129,6 +134,13 @@
      // Use columnofs LUT for subwindows? 
      dest = ylookup[dc_yl] + columnofs[dc_x];  
@@ -41,7 +43,7 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
  	
  	dest += SCREENWIDTH; 
  #endif
-@@ -543,6 +555,12 @@
+@@ -543,9 +555,15 @@
  // Draws the actual span.
  void R_DrawSpan (void) 
  { 
@@ -53,7 +55,11 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
 +    fixed_t ystep;
      fixed_t		xfrac;
      fixed_t		yfrac; 
-     byte*		dest; 
+-    byte*		dest; 
++    byte* restrict	dest; 
+     int			count;
+     int			spot; 
+ 	int			draw_x1;
 @@ -584,6 +602,14 @@
  		return;
  	}
