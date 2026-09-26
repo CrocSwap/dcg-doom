@@ -56,14 +56,14 @@ index cc4ba2b..0e4b9a1 100644
 +	    draw_start = pl->minx < clip_left ? clip_left : pl->minx;
 +	    draw_stop = stop < clip_right ? stop : clip_right;
 +
-+	    /* A run already open at the strip's first column starts here for this
-+	     * render. Its columns to the left are another strip's responsibility. */
-+	    if (pl->minx < clip_left)
++	    /* Start spans in the first owned column. This avoids reading or closing
++	     * span state from the preceding strip. */
++	    if (draw_start <= pl->maxx)
 +	    {
-+		if (PL_TOP(pl,clip_left) <= PL_BOTTOM(pl,clip_left))
-+		    for (y=PL_TOP(pl,clip_left) ;
-+			y<=PL_BOTTOM(pl,clip_left) && y<viewheight ; y++)
-+			spanstart[y] = clip_left;
++		for (y=PL_TOP(pl,draw_start) ;
++		    y<=PL_BOTTOM(pl,draw_start) && y<viewheight ; y++)
++		    spanstart[y] = draw_start;
++		draw_start++;
 +	    }
 +
 +	    for (x=draw_start ; x<draw_stop ; x++)
