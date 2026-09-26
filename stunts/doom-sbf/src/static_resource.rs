@@ -329,6 +329,28 @@ mod request_tests {
         }
     }
 
+    /// RENDER-BUFFERED carries the buffer number in the cursor field, so the
+    /// decode and the handler bound it by `rsn3::BUFFER_COUNT` and the two move
+    /// together.  This pins the pair: every buffer inside the count reaches the
+    /// handler and the fifth does not, on the decode *and* on the handler's own
+    /// copy of the check, because a wire that let buffer 4 through and a handler
+    /// that refused it would be a refusal the relayer could not see coming.
+    #[test]
+    fn buffered_render_request_is_bounded_by_the_render_buffer_count() {
+        let name = [0xa5u8; 32];
+        for buffer in 0..rsn3::BUFFER_COUNT {
+            let request = Request::render_buffered(buffer, 6, name);
+            assert_eq!(Request::decode(&request.encode()), Ok(request));
+        }
+        for buffer in [rsn3::BUFFER_COUNT, rsn3::BUFFER_COUNT + 1, u8::MAX] {
+            assert_eq!(
+                Request::decode(&Request::render_buffered(buffer, 6, name).encode()),
+                Err(refuse(REFUSE_MALFORMED)),
+                "buffer {buffer} is inside the wire"
+            );
+        }
+    }
+
     #[test]
     fn account_provision_requests_round_trip() {
         for request in [

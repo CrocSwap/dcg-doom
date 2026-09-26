@@ -84,6 +84,12 @@ const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
 const STAGE_CHUNK: usize = 900;
 const RENDER_LIMIT: u32 = 1_400_000;
 const E2R_PHASES: u32 = 8;
+/// The buffer the gate creates through the program's own provisioning
+/// operations rather than asking the bank for it, so the rent a fourth buffer
+/// costs and the `INIT-BUFFERED` / `GROW-BUFFERED` / `INIT-STRIP` wires are
+/// measured rather than assumed.  It is the highest buffer inside the count,
+/// because that is the one the deployed two-buffer program refused outright.
+const PROVISIONED_BUFFER: u8 = 3;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/live_input_gate.rs"
@@ -439,6 +445,82 @@ impl Session {
         }
     }
 
+    /// SNAPSHOT-LIVE-BUFFERED/3: the same six accounts as SNAPSHOT-LIVE with
+    /// the buffer number in `data[13]` instead of a cursor and a state root.
+    /// The relayer sends this once per frame, and the account it names is the
+    /// one its own buffer number derives -- which is the whole of what the
+    /// depth is: four numbers, four accounts, and a program that binds each
+    /// packet to the one its number names.
+    fn snapshot_live_buffered_ix(
+        &self,
+        static_key: Pubkey,
+        snapshot: Pubkey,
+        buffer: u8,
+    ) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.context.pubkey(), false, false),
+                meta(self.keys.meta, false, false),
+                meta(self.keys.state.pubkey(), false, false),
+                meta(self.keys.mirror.pubkey(), false, false),
+                meta(static_key, false, false),
+                meta(snapshot, true, false),
+            ],
+            data: rsn3::BufferedSnapshotRequest { buffer }.encode().to_vec(),
+        }
+    }
+
+    /// INIT-BUFFERED/3: create the buffer's snapshot account, owned by the
+    /// program and rent-exempt at its full size.  Rent is per buffer, so this
+    /// is the operation that decides what a fourth buffer costs.
+    fn init_buffered_ix(&self, snapshot: Pubkey, buffer: u8) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(self.keys.authority.pubkey(), true, true),
+                meta(self.keys.meta, false, false),
+                meta(snapshot, true, false),
+                meta(system_program::id(), false, false),
+            ],
+            data: rsn3::encode_init_buffered(buffer).to_vec(),
+        }
+    }
+
+    /// GROW-BUFFERED/3: the commutative 10,240-byte step, repeated until the
+    /// account reaches `SNAPSHOT_BYTES`.  The account is created at zero
+    /// length and reaches full size the same way the relayer brings one up.
+    fn grow_buffered_ix(&self, snapshot: Pubkey, buffer: u8) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(snapshot, true, false),
+                meta(self.keys.meta, false, false),
+            ],
+            data: rsn3::encode_grow_buffered(buffer).to_vec(),
+        }
+    }
+
+    /// INIT-STRIP/3: one of the eight strip accounts that hang off a buffer's
+    /// snapshot account, so a provisioned buffer is a whole frame's worth of
+    /// accounts and not just a snapshot.
+    fn init_strip_ix(&self, snapshot: Pubkey, strip: u8) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(
+                    rsn3::strip_address(&base::PROGRAM, &snapshot, strip).0,
+                    true,
+                    false,
+                ),
+                meta(self.keys.authority.pubkey(), true, true),
+                meta(snapshot, false, false),
+                meta(system_program::id(), false, false),
+            ],
+            data: rsn3::encode_init_strip(strip).to_vec(),
+        }
+    }
+
     fn render_ix(
         &self,
         static_key: Pubkey,
@@ -552,6 +634,80 @@ async fn grow_buffer(
         return Err("SIM2 input buffer did not reach its declared length".into());
     }
     Ok(())
+}
+
+/// Bring one render buffer up the way a relayer brings one up: the program
+/// creates the account and pays its rent, grows it to its full size in
+/// commutative steps, and creates the eight strip accounts that hang off it.
+///
+/// The rent is reported rather than assumed, because rent is the one cost the
+/// depth is not free of: `minimum_balance(SNAPSHOT_BYTES)` a buffer, paid once
+/// and never recovered, on top of the eight strip accounts either way.  What
+/// this measures is the per-buffer figure for a buffer number that the
+/// two-buffer program would have refused, so it is the number a fourth buffer
+/// actually adds.
+async fn provision_render_buffer(
+    session: &mut Session,
+    buffer: u8,
+    units: &mut Vec<u64>,
+) -> Result<(Pubkey, u64, usize), Box<dyn Error>> {
+    let (snapshot, _) = rsn3::buffered_snapshot_address(
+        &base::PROGRAM,
+        &session.keys.context.pubkey(),
+        buffer,
+    )
+    .ok_or_else(|| format!("buffer {buffer} has no address to provision").into())?;
+    let init = session.init_buffered_ix(snapshot, buffer);
+    let created = session
+        .send(vec![init], &[&session.keys.authority], RENDER_LIMIT)
+        .await?;
+    if created.result.is_err() {
+        return Err(format!("INIT-BUFFERED {buffer}: {:?}", created.result).into());
+    }
+    units.push(base::units(&created)?);
+    let rent = session
+        .ctx
+        .banks_client
+        .get_account(snapshot)
+        .await?
+        .map(|account| account.lamports)
+        .ok_or("INIT-BUFFERED did not create the account")?;
+    let mut len = session.data(snapshot).await?.len();
+    let mut grows = 0usize;
+    while len < rsn3::SNAPSHOT_BYTES {
+        let ix = session.grow_buffered_ix(snapshot, buffer);
+        let grown = session
+            .send(vec![ix], &[], RENDER_LIMIT)
+            .await?;
+        if grown.result.is_err() {
+            return Err(format!("GROW-BUFFERED {buffer} at {len}: {:?}", grown.result).into());
+        }
+        units.push(base::units(&grown)?);
+        grows += 1;
+        let next = session.data(snapshot).await?.len();
+        if next <= len {
+            return Err(format!("GROW-BUFFERED {buffer} stalled at {len}").into());
+        }
+        len = next;
+    }
+    if len != rsn3::SNAPSHOT_BYTES {
+        return Err(format!(
+            "GROW-BUFFERED {buffer} reached {len}, not {}",
+            rsn3::SNAPSHOT_BYTES
+        )
+        .into());
+    }
+    for strip in 0..8u8 {
+        let ix = session.init_strip_ix(snapshot, strip);
+        let created = session
+            .send(vec![ix], &[&session.keys.authority], RENDER_LIMIT)
+            .await?;
+        if created.result.is_err() {
+            return Err(format!("INIT-STRIP {buffer}/{strip}: {:?}", created.result).into());
+        }
+        units.push(base::units(&created)?);
+    }
+    Ok((snapshot, rent, grows))
 }
 
 /// STG/1 + E2R/5 + SIM/2 INIT for one context, from one staged ST1/MP1 pair.
@@ -671,6 +827,29 @@ fn bank_with(
                 rsn3::strip_address(&base::PROGRAM, &snapshot, strip_id).0,
                 base::account(vec![0; rsn3::STRIP_ACCOUNT_BYTES]),
             );
+        }
+        // Every buffer inside the count gets its own snapshot account and its
+        // own eight strips, because the whole point of the depth is that two
+        // frames in flight are writing to two different accounts.  The one
+        // buffer the gate provisions itself is left out here so that the
+        // INIT-BUFFERED / GROW-BUFFERED / INIT-STRIP path is measured on an
+        // account the program created and paid rent for, not on one the bank
+        // handed over already sized.
+        for buffer in 1..rsn3::BUFFER_COUNT {
+            if buffer == PROVISIONED_BUFFER {
+                continue;
+            }
+            let (key, _) = rsn3::buffered_snapshot_address(&base::PROGRAM, &context, buffer)
+                .unwrap_or_else(|| {
+                    panic!("buffer {buffer} is inside BUFFER_COUNT but has no address")
+                });
+            bank.add_account(key, base::account(vec![0; rsn3::SNAPSHOT_BYTES]));
+            for strip_id in 0..8u8 {
+                bank.add_account(
+                    rsn3::strip_address(&base::PROGRAM, &key, strip_id).0,
+                    base::account(vec![0; rsn3::STRIP_ACCOUNT_BYTES]),
+                );
+            }
         }
     }
     bank
@@ -1050,6 +1229,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut build_units: Vec<u64> = Vec::new();
     let mut render_rows: Vec<serde_json::Value> = Vec::new();
     let mut buffered_rows: Vec<serde_json::Value> = Vec::new();
+    // One row per buffer inside the count per rendered cursor, and the refusal
+    // codes for the buffer past the end.
+    let mut depth_rows: Vec<serde_json::Value> = Vec::new();
+    let mut depth_refusals: Vec<serde_json::Value> = Vec::new();
+    let mut depth_frames = 0usize;
     // The static account's digest after each frame's eight strips.  Two frames
     // at different cursors have to leave it in the same state: that is the
     // purity claim for the strip path, stated so a render that moved a
@@ -1084,6 +1268,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut sent = 0usize;
     let started = Instant::now();
     let mut static_built = false;
+    // The buffer the gate provisions through the program's own INIT-BUFFERED /
+    // GROW-BUFFERED / INIT-STRIP operations rather than asking the bank for a
+    // ready-made account.  It is done once, before any frame, because it is a
+    // one-off cost: rent is paid per buffer and never recovered, and the eight
+    // strip accounts are the same eight either way.
+    let mut provision_units: Vec<u64> = Vec::new();
+    let (provisioned_snapshot, provisioned_rent, provision_grows) =
+        provision_render_buffer(&mut session, PROVISIONED_BUFFER, &mut provision_units).await?;
+    let provisioned_snapshot = Some(provisioned_snapshot);
     while cursor < tics {
         let first = cursor;
         let last = (cursor + advance_tics).min(tics);
@@ -1352,7 +1545,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 None
             };
-
             // The refusals must not have touched the strip: a refused strip
             // that still rewrote its pixels would be worse than one that did
             // not render at all, because the sender would read a frame it
@@ -1448,6 +1640,272 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if !refusals_left_the_strip_alone {
                 return Err(format!("a refused buffered strip rewrote its pixels at {last}").into());
             }
+
+
+            // --- the depth: every buffer inside the count, and the one past it
+            //
+            // Four buffers is the arithmetic's answer *before* the serial
+            // submit loop is fixed rather than after: the depth note measures
+            // no gain at all from four today, the knee of
+            // `min(1 / cadence, buffers / occupancy)` is 1.72 buffers on the
+            // `r9s64b` cycle, and halving the loop's own 0.216 s a frame puts
+            // the knee at 3.1 -- so four holds until the cadence drops below
+            // 0.105 s.  What has to be true of the *program* is therefore not
+            // that four is faster.  It is that a number past the end is
+            // refused and a number inside it names its own account, its own
+            // strips and its own picture, and that all of it is the picture the
+            // offline RENDER already drew.
+            //
+            // Three claims per buffer, and each of them is a claim the two
+            // buffers could already make:
+            //
+            //  * the buffered snapshot binds the committed cursor and root and
+            //    carries the ABI identifier its own number selects -- a buffer
+            //    2 snapshot that carried buffer 0's ABI would be a second name
+            //    for buffer 0 with a different address, and the strip that came
+            //    out of it would still be right, which is exactly the shape of
+            //    bug that is invisible until two frames are in flight;
+            //  * all eight strips are byte-identical to the eight the offline
+            //    RENDER produced from the same committed cursor, so the picture
+            //    does not depend on which buffer it was drawn into;
+            //  * the render is a function of the strip and not of the order the
+            //    buffers were visited, which the replay below re-checks with
+            //    the whole depth sweep already behind it.
+            let mut depth_equal = 0usize;
+            // The static account's digest after each buffer's eight strips, so
+            // the first buffer's can be re-rendered against it after the others
+            // have been visited.
+            let mut depth_static_digests: Vec<String> = Vec::new();
+            for buffer in 1..rsn3::BUFFER_COUNT {
+                let buffer_snapshot = if buffer == PROVISIONED_BUFFER {
+                    provisioned_snapshot.ok_or("the provisioned buffer has no address")?
+                } else {
+                    rsn3::buffered_snapshot_address(
+                        &base::PROGRAM,
+                        &session.keys.context.pubkey(),
+                        buffer,
+                    )
+                    .ok_or_else(|| format!("buffer {buffer} has no address").into())?
+                    .0
+                };
+                let snap_ix =
+                    session.snapshot_live_buffered_ix(static_key, buffer_snapshot, buffer);
+                let snap = session.send(vec![snap_ix], &[], RENDER_LIMIT).await?;
+                if snap.result.is_err() {
+                    return Err(format!(
+                        "SNAPSHOT-LIVE-BUFFERED buffer {buffer} at {last}: {:?}",
+                        snap.result
+                    )
+                    .into());
+                }
+                let snapshot_cu = base::units(&snap)?;
+                let buffer_bytes = session.data(buffer_snapshot).await?;
+                let view = rsn3::validate_buffered_snapshot_for(&buffer_bytes, buffer)?;
+                if view.cursor != last || view.state_root != root {
+                    return Err(format!(
+                        "buffer {buffer}'s snapshot binds cursor {} and root {}, not {last} and the \
+                         committed root",
+                        view.cursor,
+                        common::hex(&view.state_root)
+                    )
+                    .into());
+                }
+                let mut frame = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
+                let mut strip_cu: Vec<u64> = Vec::new();
+                let mut well_formed = 0usize;
+                for strip_id in 0..8u8 {
+                    let request =
+                        rsr::Request::render_buffered(buffer, strip_id, view.snapshot_hash);
+                    let ix = session.render_buffered_ix(static_key, buffer_snapshot, request);
+                    let rendered = session.send(vec![ix], &[], RENDER_LIMIT).await?;
+                    if rendered.result.is_err() {
+                        return Err(format!(
+                            "RENDER-BUFFERED buffer {buffer} strip {strip_id} at {last}: {:?}",
+                            rendered.result
+                        )
+                        .into());
+                    }
+                    strip_cu.push(base::units(&rendered)?);
+                    let key = rsn3::strip_address(&base::PROGRAM, &buffer_snapshot, strip_id).0;
+                    let strip_bytes = session.data(key).await?;
+                    let strip = rsn3::validate_strip(&strip_bytes)?;
+                    if strip.cursor != last
+                        || strip.state_root != root
+                        || strip.snapshot_hash != view.snapshot_hash
+                    {
+                        return Err(format!(
+                            "buffer {buffer} strip {strip_id} at {last} does not bind its own \
+                             snapshot"
+                        )
+                        .into());
+                    }
+                    well_formed += usize::from(strip.strip_id == u32::from(strip_id));
+                    for row in 0..200 {
+                        let from = row * 40;
+                        let to = row * 320 + usize::from(strip_id) * 40;
+                        frame[to..to + 40].copy_from_slice(&strip.pixels[from..from + 40]);
+                    }
+                }
+                let frame_equal = frame == reconstructed;
+                let frame_sha = base::sha(&frame);
+                if !frame_equal {
+                    return Err(format!(
+                        "buffer {buffer}'s eight strips at {last} reassemble to a different frame \
+                         than the offline RENDER's ({frame_sha} against {})",
+                        base::sha(&reconstructed)
+                    )
+                    .into());
+                }
+                depth_equal += usize::from(frame_equal);
+                depth_frames += usize::from(frame_equal);
+                depth_static_digests.push(base::sha(&session.data(static_key).await?));
+                depth_rows.push(json!({
+                    "cursor": last,
+                    "buffer": buffer,
+                    "provisioned_by_the_program": buffer == PROVISIONED_BUFFER,
+                    "abi": if buffer == 0 { "DOOM-RSN/3" } else { "buffered" },
+                    "snapshot_sha256": common::hex(&view.snapshot_hash),
+                    "snapshot_cu": snapshot_cu,
+                    "strip_cu": strip_cu.clone(),
+                    "strip_cu_max": strip_cu.iter().max(),
+                    "strips_well_formed": well_formed,
+                    "frame_sha256": frame_sha,
+                    "frame_matches_the_offline_render": frame_equal,
+                    "static_account_sha256_after_this_buffer": depth_static_digests
+                        .last()
+                        .cloned()
+                        .unwrap_or_default(),
+                }));
+            }
+
+            // The fifth buffer, on every wire that carries a buffer number, with
+            // accounts that are otherwise exactly what the accepted packet used.
+            // Each of these is refused by the number alone, before the program
+            // looks at an account, so the refusal is the bound and not a
+            // complaint about the accounts -- which is what makes it a bound the
+            // relayer can rely on rather than a coincidence.
+            let past = rsn3::BUFFER_COUNT;
+            let buffer0_snapshot_before_refusals = base::sha(&session.data(snapshot_key).await?);
+            let snapshot_past_ix =
+                session.snapshot_live_buffered_ix(static_key, snapshot_key, past);
+            let snapshot_past = session.send(vec![snapshot_past_ix], &[], RENDER_LIMIT).await?;
+            let snapshot_past_code = custom_code(&snapshot_past);
+            let snapshot_past_cu = base::units(&snapshot_past).ok();
+            let render_past_ix = session.render_buffered_ix(
+                static_key,
+                snapshot_key,
+                rsr::Request::render_buffered(past, probe_strip, snapshot.snapshot_hash),
+            );
+            let render_past = session.send(vec![render_past_ix], &[], RENDER_LIMIT).await?;
+            let render_past_code = custom_code(&render_past);
+            let render_past_cu = base::units(&render_past).ok();
+            let init_past_ix = session.init_buffered_ix(snapshot_key, past);
+            let init_past = session
+                .send(vec![init_past_ix], &[&session.keys.authority], RENDER_LIMIT)
+                .await?;
+            let init_past_code = custom_code(&init_past);
+            let init_past_cu = base::units(&init_past).ok();
+            let grow_past_ix = session.grow_buffered_ix(snapshot_key, past);
+            let grow_past = session.send(vec![grow_past_ix], &[], RENDER_LIMIT).await?;
+            let grow_past_code = custom_code(&grow_past);
+            let grow_past_cu = base::units(&grow_past).ok();
+            depth_refusals.push(json!({
+                "cursor": last,
+                "buffer": past,
+                "buffer_count": rsn3::BUFFER_COUNT,
+                "snapshot_live_buffered_refusal": snapshot_past_code,
+                "snapshot_live_buffered_cu": snapshot_past_cu,
+                "render_buffered_refusal": render_past_code,
+                "render_buffered_cu": render_past_cu,
+                "init_buffered_refusal": init_past_code,
+                "init_buffered_cu": init_past_cu,
+                "grow_buffered_refusal": grow_past_code,
+                "grow_buffered_cu": grow_past_cu,
+                "buffer_0_snapshot_sha256_before": buffer0_snapshot_before_refusals,
+                "refused_packets_left_buffer_0_alone": true,
+            }));
+
+            // The depth's own purity claim, and the one the widening actually
+            // risks.  Everything above rendered three whole frames into three
+            // accounts, so if a render carried anything across buffers -- a
+            // frame counter the depth incremented, a per-sector mark, a stale
+            // subsector identity -- buffer 1's last strip would no longer
+            // re-render to the static account bytes it left behind.  This is the
+            // same claim the replay above makes for one buffer, with the other
+            // two already visited.
+            let static_after_first_buffer = depth_static_digests
+                .first()
+                .copied()
+                .ok_or("no buffer was rendered")?;
+            let first_buffer = 1u8;
+            let (first_snapshot, _) =
+                rsn3::buffered_snapshot_address(&base::PROGRAM, &session.keys.context.pubkey(), first_buffer)
+                    .ok_or("buffer 1 has no address")?;
+            let first_bytes = session.data(first_snapshot).await?;
+            let first_view = rsn3::validate_buffered_snapshot_for(&first_bytes, first_buffer)?;
+            let first_replay_ix = session.render_buffered_ix(
+                static_key,
+                first_snapshot,
+                rsr::Request::render_buffered(first_buffer, probe_strip, first_view.snapshot_hash),
+            );
+            let first_replay = session.send(vec![first_replay_ix], &[], RENDER_LIMIT).await?;
+            if first_replay.result.is_err() {
+                return Err(format!(
+                    "RENDER-BUFFERED buffer {first_buffer} strip {probe_strip} replay at {last}: \
+                     {:?}",
+                    first_replay.result
+                )
+                .into());
+            }
+            let depth_is_idempotent = base::sha(&session.data(static_key).await?)
+                == static_after_first_buffer;
+            let first_strip_key =
+                rsn3::strip_address(&base::PROGRAM, &first_snapshot, probe_strip).0;
+            let first_pixels =
+                rsn3::validate_strip(&session.data(first_strip_key).await?)?.pixels.to_vec();
+            let first_stable = first_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
+            if !depth_is_idempotent || !first_stable {
+                return Err(format!(
+                    "buffer {first_buffer}'s strip {probe_strip} did not reproduce the offline \
+                     strip or its own static account bytes after buffers 2 and 3 had been rendered \
+                     at {last}, so a render carried something across buffers"
+                )
+                .into());
+            }
+            if depth_equal != usize::from(rsn3::BUFFER_COUNT - 1) {
+                return Err(format!(
+                    "{depth_equal} of {} buffers reproduced the offline frame at {last}",
+                    rsn3::BUFFER_COUNT - 1
+                )
+                .into());
+            }
+            // Every wire that carries a buffer number refuses the one past the
+            // end, and refuses it as malformed rather than as an account
+            // complaint: the accounts on all four packets are the ones the
+            // accepted packet used, so the number is the only thing that differs.
+            for (wire, code) in [
+                ("SNAPSHOT-LIVE-BUFFERED", snapshot_past_code),
+                ("RENDER-BUFFERED", render_past_code),
+                ("INIT-BUFFERED", init_past_code),
+                ("GROW-BUFFERED", grow_past_code),
+            ] {
+                if code != Some(rsn3::REFUSE_MALFORMED) {
+                    return Err(format!(
+                        "buffer {past} on {wire} was refused {code:?}, not {}",
+                        rsn3::REFUSE_MALFORMED
+                    )
+                    .into());
+                }
+            }
+            if buffer0_snapshot_before_refusals
+                != base::sha(&session.data(snapshot_key).await?)
+            {
+                return Err(format!(
+                    "a refused buffer-{past} packet changed buffer 0's snapshot at {last}"
+                )
+                .into());
+            }
+
             let (segment, forward, strafe) = common::r8l_segment(last - 1);
             let (demo_end_cursor, base_state) = if new_game_start {
                 (0u32, baseline_state.clone())
@@ -2362,6 +2820,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "rsr2_build_cu_max": build_units.iter().max(),
         "render": render_rows,
         "buffered_strip_binding": buffered_rows,
+        "render_buffer_depth": {
+            "buffer_count": rsn3::BUFFER_COUNT,
+            "provisioned_buffer": PROVISIONED_BUFFER,
+            "provisioned_by_the_program": "INIT-BUFFERED/3 creates the account and the program pays minimum_balance(SNAPSHOT_BYTES) for it, GROW-BUFFERED/3 brings it to full size in commutative 10,240-byte steps, and eight INIT-STRIP/3 calls create the strips that hang off it.  Rent is per buffer and is not recovered, so this is the recurring cost of the depth and the only part of it that is not free",
+            "provisioned_rent_lamports": provisioned_rent,
+            "provisioned_grow_transactions": provision_grows,
+            "provisioning_cu_max": provision_units.iter().max(),
+            "buffers": depth_rows,
+            "past_the_end": depth_refusals,
+            "purity_across_buffers": "each buffer's eight strips leave the static account at a digest of their own, and buffer 1's last strip re-renders to the bytes it left before buffers 2 and 3 were visited, so a render is a function of (snapshot, strip) and not of which buffer it was drawn into or in what order",
+            "why_four": "the depth note measures no gain from four buffers today: the buffer the loop came back to was free on 100.0% of 7,433 reconstructed frame iterations with a knee at 1.72 buffers, and the cap is the serial submit loop's 0.244 s a frame.  Four is in the program because it is the next binding constraint once the loop is fixed, not because it is faster now: depth binds below occupancy / cadence buffers, which is 3.1 at the 0.136 s cadence the loop work should reach, and four holds until the cadence drops below 0.105 s",
+        },
         "render_purity": {
             "committed_state": "the ST1 state account is the committed game state and is not an account of RSR/2 RENDER or RENDER-BUFFERED; its digest is taken either side of every frame's strips and is unchanged",
             "no_accumulation": "re-rendering the last strip of a frame reproduces the static resource account byte for byte, so no earlier strip's frame counter, per-sector mark, linedef flag or subsector identity survives into a later one.  This is what the image's ri2_render_begin/ri2_render_end restore is for, and it is checked rather than assumed",
@@ -2424,9 +2894,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
          all {equal_sweeps} equal to the host ingress, 0 refusals; first cursor past the \
          {demo_tics}-tic demo end {first_past_demo:?}; {} frames 8/8 strips byte exact; a state \
          with no console player in the game is refused at E2R/5 (Custom {prepare_code:?}) and by \
-         the host import, so a 288 cannot be staged; RESET/9 {reset_cu} CU then {} replay batches \
-         land on the first run's bytes; a dead player's use press is refused Custom {:?}; receipt={}",
+         the host import, so a 288 cannot be staged; {depth_frames} of {} buffer frames byte \
+         exact and buffer {} refused 297 on all four wires; RESET/9 {reset_cu} CU then {} replay \
+         batches land on the first run's bytes; a dead player's use press is refused Custom {:?}; \
+         receipt={}",
         strips_written / 8,
+        depth_rows.len(),
+        rsn3::BUFFER_COUNT,
         replay_equal,
         restart_code,
         receipt.display()
