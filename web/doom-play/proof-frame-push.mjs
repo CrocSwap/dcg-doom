@@ -216,9 +216,12 @@ const SNAPSHOT = `(() => {
     // nextPictureLatencies is keydown to the next painted frame of any kind,
     // which is a much smaller number and not a keypress latency.
     stampLatencies: s.stampLatencies.slice(),
+    stampSamples: (s.stampSamples ?? []).slice(),
     nextPictureLatencies: s.nextPictureLatencies.slice(),
     holdsStarted: s.holdsStarted,
     holdsUnstamped: s.holdsUnstamped,
+    holdsDropped: s.holdsDropped ?? 0,
+    holdsOpen: (s.holds ?? []).length,
     lastStampedTic: s.lastStampedTic ?? null,
     frameSource: s.frameSource,
     stream: stream ? stream.summary() : null,
@@ -330,31 +333,33 @@ const presses = [];
 for (let index = 0; index < PRESSES; index += 1) {
   const spec = KEYS[index % KEYS.length];
   const pictureBefore = await evaluate(`window.doomPlay.state.lastFrame?.gametic ?? null`);
-  // The two meters are rings, so this press's samples are the ones appended
-  // after this point rather than the last entries in the list.
-  const marks = await evaluate(`({
-    stamp: window.doomPlay.state.stampLatencies.length,
-    next: window.doomPlay.state.nextPictureLatencies.length,
-  })`);
+  // The page's per-press log, by count. Attribution is the page's, because the
+  // page knows which key each clock was opened for and when; slicing the two
+  // latency rings after a fixed settle would attribute a slow press's sample to
+  // whichever press happened to read the ring next.
+  const mark = await evaluate(`window.doomPlay.state.stampSamples.length`);
   const at = Date.now();
   await key("keyDown", spec.code, spec.keyName, spec.vk);
   await sleep(HOLD_MS);
   await key("keyUp", spec.code, spec.keyName, spec.vk);
   await sleep(SETTLE_MS);
   const row = await evaluate(SNAPSHOT);
-  const stamps = row.stampLatencies.slice(marks.stamp);
-  const nexts = row.nextPictureLatencies.slice(marks.next);
+  const samples = row.stampSamples.slice(mark).filter((sample) => sample.key === spec.key);
+  const sample = samples.length ? samples[samples.length - 1] : null;
   presses.push({
     key: spec.key,
     index,
     pictureBefore,
     pictureAfter: row.lastGametic,
     pictureMoved: pictureBefore !== row.lastGametic,
-    // Keydown to a frame at or past the tic this press's input was stamped for.
-    keypressMs: stamps.length ? stamps[stamps.length - 1] : null,
+    // Keydown to a frame at or past the tic this press's input was stamped for,
+    // with the pair that makes it checkable.
+    keypressMs: sample ? sample.ms : null,
+    stampedTic: sample ? sample.tic : null,
+    paintedGametic: sample ? sample.gametic : null,
+    leadTics: sample ? sample.lead_tics : null,
     // Keydown to the next frame of any kind. Not a keypress latency.
-    nextPictureMs: nexts.length ? nexts[nexts.length - 1] : null,
-    stampedTic: row.lastStampedTic,
+    nextPictureMs: sample ? sample.next_picture_ms : null,
     wallMs: Date.now() - at,
     painted: row.painted,
     torn: row.torn,
@@ -366,10 +371,39 @@ for (let index = 0; index < PRESSES; index += 1) {
     "keypress", presses.at(-1).keypressMs === null ? "-" : `${presses.at(-1).keypressMs.toFixed(0)} ms`,
     "next pic", presses.at(-1).nextPictureMs === null ? "-" : `${presses.at(-1).nextPictureMs.toFixed(0)} ms`,
     "painted", row.painted,
-    "panel", JSON.stringify(row.panel),
+    "open", row.holdsOpen,
   );
 }
 await shot("proof-keys");
+
+// The presses are done but their pictures are not: a press is 1.2 s of key and
+// the frame carrying it arrives however long the lead is. Wait for the page's
+// open holds to close, so the report counts every press rather than the ones
+// that happened to land inside the last settle window.
+const DRAIN_MS = Number(process.env.PROOF_DRAIN_MS ?? 30_000);
+const drainStart = Date.now();
+let drained = await evaluate(SNAPSHOT);
+while (drained.holdsOpen > 0 && Date.now() - drainStart < DRAIN_MS) {
+  await sleep(1000);
+  drained = await evaluate(SNAPSHOT);
+}
+console.log(`drain: ${drained.holdsOpen} hold(s) still open after ${((Date.now() - drainStart) / 1000).toFixed(1)} s`);
+// Every press's sample, from the page's own log rather than from the per-press
+// rows, so a sample that landed during the drain is counted.
+const allSamples = drained.stampSamples.filter((sample) => sample.key !== null);
+for (const press of presses) {
+  if (press.keypressMs !== null) continue;
+  const late = allSamples.filter((sample) => sample.key === press.key);
+  if (late.length) {
+    const sample = late[late.length - 1];
+    press.keypressMs = sample.ms;
+    press.stampedTic = sample.tic;
+    press.paintedGametic = sample.gametic;
+    press.leadTics = sample.lead_tics;
+    press.nextPictureMs = sample.next_picture_ms;
+    press.late = true;
+  }
+}
 
 const final = await evaluate(SNAPSHOT);
 // The relayer's own view of the same session, so the page's numbers and the
@@ -422,9 +456,15 @@ const result = {
   // answered has no stamped tic and therefore no keypress sample.
   coverage: {
     presses: presses.length,
-    holds_started: after.holdsStarted,
-    holds_unstamped: after.holdsUnstamped,
+    holds_started: final.holdsStarted,
+    holds_unstamped: final.holdsUnstamped,
+    holds_open: final.holdsOpen,
+    holds_dropped: final.holdsDropped,
+    samples: final.stampSamples.length,
   },
+  // Every sample, with the pair that makes each one checkable: the tic the
+  // input was stamped for and the gametic of the frame that ended the wait.
+  samples: final.stampSamples,
   final,
   relayer_health: relayerHealth,
 };

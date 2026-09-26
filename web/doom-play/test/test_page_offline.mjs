@@ -82,9 +82,11 @@ const snapshot = (page) => page.evaluate(`(() => {
     // player feels; nextPictureLatencies is keydown to the next frame of any
     // kind, which is not a keypress latency.
     stampLatencies: s.stampLatencies.slice(),
+    stampSamples: (s.stampSamples ?? []).slice(),
     nextPictureLatencies: s.nextPictureLatencies.slice(),
     holdsStarted: s.holdsStarted,
     holdsUnstamped: s.holdsUnstamped,
+    holdsOpen: (s.holds ?? []).length,
     lastStampedTic: s.lastStampedTic ?? null,
     lastStampSample: s.lastStampSample ?? null,
     keys: Object.entries(s.keys).filter(([, held]) => held).map(([name]) => name),
@@ -421,18 +423,24 @@ if (!chromeAvailable()) {
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
       const before = await snapshot(page);
+      // A tap, not a hold: 300 ms down and then up, which is what a person does.
+      // The clock must not stop at the keyup -- the picture carrying the press
+      // arrives seconds later -- and the live session's first run of this meter
+      // reported zero samples for exactly that reason.
       await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
+      await sleep(300);
+      await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
+      const released = await snapshot(page);
+      assert.equal(released.holdsOpen, 1, "the press stopped being measured at the keyup");
       // Long enough for the stamped tic to be reached: the lead plus the frame
       // cadence, which is the price of a 61-tic lead at 35 tic/s.
-      await sleep(4_000);
-      const held = await snapshot(page);
-      await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
-      await sleep(500);
+      await sleep(6_000);
       const after = await snapshot(page);
 
-      assert.equal(after.holdsStarted, before.holdsStarted + 1, "the hold was not counted");
+      assert.equal(after.holdsStarted, before.holdsStarted + 1, "the press was not counted");
       assert.equal(after.holdsUnstamped, 0, `a press produced no stamped answer: ${JSON.stringify(after)}`);
-      const stamps = after.stampLatencies.slice(before.stampLatencies.length);
+      assert.equal(after.holdsOpen, 0, "the press is still open after its picture arrived");
+      const stamps = after.stampSamples.slice(before.stampSamples.length);
       const nexts = after.nextPictureLatencies.slice(before.nextPictureLatencies.length);
       assert.equal(stamps.length, 1, `the keypress meter recorded ${JSON.stringify(stamps)} samples for one press`);
       assert.ok(nexts.length >= 1, `the next-picture meter recorded nothing: ${JSON.stringify(after)}`);
@@ -446,7 +454,7 @@ if (!chromeAvailable()) {
       );
       // And the two meters are not the same quantity. The next picture is one
       // frame away; the keypress is a whole lead away.
-      const stamp = stamps[0];
+      const stamp = stamps[0].ms;
       const next = nexts[0];
       const leadMs = (relayer.leadTics / relayer.ticsPerSecond) * 1000;
       assert.ok(
@@ -459,7 +467,8 @@ if (!chromeAvailable()) {
         `the next-picture meter (${next.toFixed(0)} ms) is not below the keypress meter (${stamp.toFixed(0)} ms), ` +
           "so one of them is timing the wrong frame",
       );
-      assert.ok(held.painted > before.painted, "the page painted nothing during the hold");
+      assert.ok(after.painted > before.painted, "the page painted nothing during the press");
+      assert.equal(after.holdsOpen, 0, "the press never closed");
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 

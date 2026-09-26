@@ -22,6 +22,10 @@ const SEQ_WINDOW = 240;
 // Batches in flight at once, so the cadence is the interval and not the round
 // trip.
 const MAX_PUSH_IN_FLIGHT = 2;
+// The open keypress holds the page will carry at once. A press lives until the
+// frame carrying it is painted, which at this session's lead is seconds, so the
+// list is bounded rather than open-ended; the overflow is counted.
+const MAX_OPEN_HOLDS = 24;
 // How often the viewer reads a frame. A frame is complete only between one
 // frame's last strip landing and the next frame's first, so a torn read is the
 // expected case at strip rate 64 and is retried at once. This is the direct-read
@@ -199,7 +203,7 @@ const state = {
   // 408 ms "key to picture" was measured on a session whose lead was 2.155 s.
   //
   //   stampLatencies       keydown -> the first painted frame whose gametic is
-  //                        at or past the tic this hold's input was stamped
+  //                        at or past the tic this press's input was stamped
   //                        for. This is the latency a player feels, and the one
   //                        the bar is written against.
   //   nextPictureLatencies keydown -> the first painted frame past the gametic
@@ -211,15 +215,22 @@ const state = {
   // Both are kept, both are on the panel, and the second is never reported under
   // the first's name.
   //
-  // The hold in flight, and the two counters that say how much of it was
-  // measurable at all: a press whose POST never answered contributes no stamp
-  // sample, and a report of "0 ms" from a session where nothing was stamped is
-  // the failure this state exists to make visible.
-  hold: null,
+  // One open hold per *press*, not per hold of the keyboard: a player taps a key
+  // for 300 ms and the picture carrying it arrives four seconds later, so the
+  // clock cannot stop at keyup. Keying the hold to the keyboard hold instead is
+  // what made the first version of this meter report zero samples on a live
+  // session -- every press was closed before its frame arrived.
+  //
+  // `stampSamples` is the per-press log: which key, how long, and the pair that
+  // makes the sample checkable (the tic it was stamped for and the gametic of
+  // the frame that ended the wait).
+  holds: [],
   holdsStarted: 0,
   holdsUnstamped: 0,
+  holdsDropped: 0,
   stampLatencies: [],
   nextPictureLatencies: [],
+  stampSamples: [],
   // Every batch this page has in flight, as {held, firstSeq, at}. An answer
   // carries no batch identity and the page may have MAX_PUSH_IN_FLIGHT open, so
   // the answer is matched to the oldest still-unanswered batch that was signed
@@ -422,55 +433,93 @@ async function paintFrame(frame) {
 // The two keypress meters, and the one place either of them is recorded.
 //
 // `nextPicture`: the first frame past the gametic that was on screen when the
-// key went down. Recorded once per hold, whatever else happens.
+// key went down. Recorded once per press, whatever else happens.
 //
-// `stamp`: the first frame at or past the tic the hold's input was stamped for.
+// `stamp`: the first frame at or past the tic the press's input was stamped for.
 // `stampTic` is null until the relayer answers, so this does nothing until the
 // page knows the tic, and then it fires on the very next qualifying paint -- or,
 // if that paint has already happened, on the paint ring's earliest entry at or
 // past the stamp. Either way the sample is the time from keydown to a frame that
 // contains the keypress.
+//
+// Every open press is offered the frame, not just the newest one: two presses a
+// few hundred milliseconds apart have two stamped tics, and each closes on its
+// own frame.
 function measureKeypress(gametic, at) {
-  const hold = state.hold;
-  if (hold === null) return;
-  if (hold.nextPictureMs === null && typeof gametic === "number" && gametic > hold.gameticAtKeyDown) {
-    hold.nextPictureMs = at - hold.downAt;
-    state.nextPictureLatencies.push(hold.nextPictureMs);
-    if (state.nextPictureLatencies.length > 40) state.nextPictureLatencies.shift();
+  if (!state.holds.length || typeof gametic !== "number") return;
+  const done = [];
+  for (const hold of state.holds) {
+    if (hold.nextPictureMs === null && gametic > hold.gameticAtKeyDown) {
+      hold.nextPictureMs = at - hold.downAt;
+      state.nextPictureLatencies.push(hold.nextPictureMs);
+      if (state.nextPictureLatencies.length > 40) state.nextPictureLatencies.shift();
+    }
+    if (hold.stampTic === null || gametic < hold.stampTic) continue;
+    hold.stampMs = at - hold.downAt;
+    // The stamped tic and the gametic of the frame that ended the wait, together.
+    // They are only comparable as a pair: a held key keeps offering batches and
+    // each one is stamped at a later tic, so the page's *latest* stamped tic
+    // belongs to a later press than the sample this one produced.
+    const sample = {
+      key: hold.key,
+      tic: hold.stampTic,
+      gametic,
+      ms: hold.stampMs,
+      next_picture_ms: hold.nextPictureMs,
+      lead_tics: hold.leadTics,
+    };
+    state.stampSamples.push(sample);
+    if (state.stampSamples.length > 60) state.stampSamples.shift();
+    state.lastStampSample = sample;
+    state.stampLatencies.push(hold.stampMs);
+    if (state.stampLatencies.length > 40) state.stampLatencies.shift();
+    done.push(hold);
   }
-  if (hold.stampTic === null || hold.stampMs !== null) return;
-  if (typeof gametic !== "number" || gametic < hold.stampTic) return;
-  hold.stampMs = at - hold.downAt;
-  // The stamped tic and the gametic of the frame that ended the wait, together.
-  // They are only comparable as a pair: a held key keeps offering batches and
-  // each one is stamped at a later tic, so the page's *latest* stamped tic
-  // belongs to a later press than the sample this one produced.
-  state.lastStampSample = {tic: hold.stampTic, gametic, ms: hold.stampMs};
-  state.stampLatencies.push(hold.stampMs);
-  if (state.stampLatencies.length > 40) state.stampLatencies.shift();
-  state.hold = null;
+  state.holds = state.holds.filter((hold) => !done.includes(hold));
 }
 
-// The relayer has said which tic it stamped this hold's input for. If the frame
-// that tic appears in is already on screen, the paint ring knows when it was
-// painted; if it is not, the next qualifying paint records it.
+// The relayer has said which tic it stamped a batch for. The batch was signed
+// while some press was open, and the press it belongs to is the newest one that
+// does not have a tic yet: presses are seconds apart in anything a person plays,
+// and a held key offers a batch every 100 ms, so the first answer after a
+// keydown is that keydown's.
 function noteStampedTic(tic) {
-  const hold = state.hold;
-  if (hold === null || typeof tic !== "number" || !Number.isFinite(tic)) return;
-  if (hold.stampTic === null) hold.stampTic = tic;
-  if (hold.stampMs !== null) return;
-  const first = state.paintTics.find((row) => row.gametic >= hold.stampTic);
+  if (typeof tic !== "number" || !Number.isFinite(tic)) return;
+  pruneHolds();
+  const hold = [...state.holds].reverse().find((row) => row.stampTic === null);
+  if (hold === undefined) return;
+  hold.stampTic = tic;
+  // If the frame carrying that tic is already on screen the paint ring knows
+  // when it was painted; otherwise the next qualifying paint records it.
+  const first = state.paintTics.find((row) => row.gametic >= tic);
   if (first) measureKeypress(first.gametic, first.at);
 }
 
-// End a hold that will never get a stamp: every key is up and no batch answered.
-// The sample is left out rather than guessed, and counted, so a session whose
-// POSTs all failed reads "0 of 8 presses stamped" rather than "0 ms".
-function closeHold() {
-  const hold = state.hold;
-  if (hold === null) return;
-  state.hold = null;
-  if (hold.stampMs === null) state.holdsUnstamped += 1;
+// A press that will never get a stamp: every key of it is up, nothing has
+// answered for it, and it has been open longer than any picture could take. The
+// sample is left out rather than guessed, and counted, so a session whose POSTs
+// all failed reads "0 of 8 presses stamped" rather than "0 ms".
+const HOLD_STALE_MS = 30_000;
+function pruneHolds() {
+  if (!state.holds.length) return;
+  const now = performance.now();
+  const kept = [];
+  for (const hold of state.holds) {
+    const keysUp = !hold.keys.some((name) => state.keys[name]);
+    if (keysUp && hold.stampTic === null && now - hold.downAt > HOLD_STALE_MS) {
+      state.holdsUnstamped += 1;
+      continue;
+    }
+    // The ring is a bound on the page's own memory, not on the measurement: a
+    // press older than the ring is one the session will not wait for.
+    if (state.holds.length - kept.length >= MAX_OPEN_HOLDS) {
+      state.holdsDropped += 1;
+      state.holdsUnstamped += 1;
+      continue;
+    }
+    kept.push(hold);
+  }
+  state.holds = kept;
 }
 
 // The first unanswered batch that was signed with a key held. An answer does not
@@ -548,12 +597,13 @@ function updateStatus() {
   setCell(ui.statFps, rate === null ? "—" : rate.toFixed(2));
   // Two cells, two quantities, and neither is ever the other's number.
   //
-  //   INPUT->PIC  keydown to the first painted frame at or past the tic this
-  //               hold's input was stamped for. The latency a player feels.
-  //   NEXT PIC    keydown to the next painted frame of any kind. The page's
-  //               drivability, and much the smaller number: on R15 it read
-  //               408 ms while the lead the keypress actually had to wait out
-  //               was 2,155 ms.
+  //   KEY->STAMPED TIC  keydown to the first painted frame at or past the tic
+  //                     this press's input was stamped for. The latency a player
+  //                     feels.
+  //   NEXT PIC          keydown to the next painted frame of any kind. The
+  //                     page's drivability, and much the smaller number: on R15
+  //                     it read 408 ms while the lead the keypress actually had
+  //                     to wait out was 2,155 ms.
   //
   // The stamp cell counts its own coverage, because a session where no POST
   // answered would otherwise read "0 ms" instead of "nothing was measured".
@@ -567,10 +617,12 @@ function updateStatus() {
   if (ui.statPicture) {
     ui.statPicture.title =
       `key press to the first painted frame at or past the stamped tic, median of ${state.stampLatencies.length}; ` +
-      `${state.holdsStarted} press(es) started, ${state.holdsUnstamped} never got a stamped answer` +
-      (state.lastStampedTic === null || state.lastStampedTic === undefined
-        ? ""
-        : `; last stamped tic ${state.lastStampedTic}`);
+      `${state.holdsStarted} press(es) started, ${state.holdsUnstamped} never got a stamped answer, ` +
+      `${state.holds.length} still open, ${state.holdsDropped} dropped at the bound` +
+      (state.lastStampSample
+        ? `; last: ${state.lastStampSample.key} stamped at tic ${state.lastStampSample.tic}, ` +
+          `painted at gametic ${state.lastStampSample.gametic}`
+        : "");
   }
   const next = median(state.nextPictureLatencies);
   setCell(ui.statNextPicture, next === null ? "—" : `${next.toFixed(0)} ms`);
@@ -909,44 +961,49 @@ function keyUp(code) {
   return true;
 }
 
-// Shared by the keyboard and the on-screen pad, because a hold measured from the
-// pad and a hold measured from the keyboard are the same event and the old split
-// -- the pad set `state.keys` itself and never opened the hold -- is how a page
-// driven entirely by mouse could report no keypress latency at all.
+// Shared by the keyboard and the on-screen pad, because a press measured from
+// the pad and a press measured from the keyboard are the same event and the old
+// split -- the pad set `state.keys` itself and never opened a hold -- is how a
+// page driven entirely by mouse could report no keypress latency at all.
 function pressKey(name, label) {
   const first = !state.keys[name];
   state.keys[name] = true;
   if (first) pressRows.set(name, inputLog.press(name, label));
-  // The first key of a hold opens the hold the two meters measure. A held key
-  // does not restart it, or a long hold would report only the last frame's
-  // latency. `gameticAtKeyDown` is the picture the player was looking at, and
-  // `stampTic` stays null until a batch this hold signed comes back stamped.
-  if (state.hold === null) {
-    state.hold = {
-      downAt: performance.now(),
-      gameticAtKeyDown: state.lastFrame ? state.lastFrame.gametic : -1,
-      stampTic: null,
-      nextPictureMs: null,
-      stampMs: null,
-      keys: [name],
-    };
-    state.holdsStarted += 1;
-  } else if (!state.hold.keys.includes(name)) {
-    state.hold.keys.push(name);
-  }
+  // One open hold per *press*. A key repeat (event.repeat, or any second keydown
+  // for a key already down) is not a new press and must not restart the clock; a
+  // key that comes up and goes down again is. The clock does not stop at keyup:
+  // a tap is 300 ms and the picture carrying it arrives seconds later, so the
+  // hold lives until its frame does.
+  if (!first) return;
+  pruneHolds();
+  state.holds.push({
+    key: name,
+    downAt: performance.now(),
+    gameticAtKeyDown: state.lastFrame ? state.lastFrame.gametic : -1,
+    stampTic: null,
+    nextPictureMs: null,
+    stampMs: null,
+    // The lead this press was aimed with, which is the price the press paid. On
+    // the sample, so a report can divide the latency by it rather than guess.
+    leadTics: state.leadTics ?? null,
+    keys: [name],
+  });
+  state.holdsStarted += 1;
 }
 
 function releaseKey(name) {
   state.keys[name] = false;
   inputLog.release(pressRows.get(name));
   pressRows.delete(name);
-  // Every key of the hold is up and the stamp has not landed: this press will
-  // never produce a sample, and saying so is better than a quiet zero.
-  if (state.hold !== null && !Object.values(state.keys).some(Boolean)) closeHold();
+  // Deliberately does not close the hold. The frame carrying this press has not
+  // been painted yet, and closing here is what made a live session report zero
+  // keypress samples: every press was closed before its picture arrived.
+  pruneHolds();
 }
 
 addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
+  if (event.repeat) return;
   if (keyDown(event.code)) {
     event.preventDefault();
     scheduleInputPush();
@@ -964,7 +1021,6 @@ addEventListener("blur", () => {
   for (const name of Object.keys(state.keys)) {
     if (state.keys[name]) releaseKey(name);
   }
-  closeHold();
   syncPad();
 });
 
