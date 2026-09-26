@@ -163,6 +163,18 @@ pub unsafe extern "C" fn doom_sbf_panic() -> ! {
     panic!("doom_sbf_panic");
 }
 
+#[cfg(feature = "ctx-engine")]
+#[no_mangle]
+pub unsafe extern "C" fn doom_sbf_i_error_log(message: *const core::ffi::c_char) {
+    if message.is_null() {
+        return;
+    }
+    let message = core::ffi::CStr::from_ptr(message);
+    if let Ok(message) = core::str::from_utf8(message.to_bytes()) {
+        solana_program::log::sol_log(message);
+    }
+}
+
 #[cfg(not(feature = "sim-transport"))]
 entrypoint!(process_instruction);
 #[cfg(feature = "sim-transport")]
