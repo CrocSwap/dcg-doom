@@ -362,15 +362,16 @@ test("held keys become a per-tic command stream", () => {
 test("turn is contributed on every fourth tic, as vanilla accumulates it", () => {
   assert.equal(TICCMD_HORIZONTAL, 4);
   // A batch starting on tic 0 turns on tic 0 but not on tics 1, 2, 3.
+  // Doom turns counter-clockwise for a positive angleturn: left is +4, right 252.
   const batch = heldToCommands({left: true}, 0, 8);
   const turnByte = (tic) => batch[tic * COMMAND_BYTES + 2];
-  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map(turnByte), [252, 0, 0, 0, 252, 0, 0, 0]);
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map(turnByte), [4, 0, 0, 0, 4, 0, 0, 0]);
 
   // A batch that starts mid-cycle keeps the global tic alignment, so a player
   // holding one key does not get a different turn rate depending on where a
   // batch boundary happened to fall.
   const offset = heldToCommands({right: true}, 3, 4);
-  assert.deepEqual([3, 4, 5, 6].map((tic) => offset[(tic - 3) * COMMAND_BYTES + 2]), [0, 4, 0, 0]);
+  assert.deepEqual([3, 4, 5, 6].map((tic) => offset[(tic - 3) * COMMAND_BYTES + 2]), [0, 252, 0, 0]);
 });
 
 test("heldToCommands never emits BT_SPECIAL", () => {

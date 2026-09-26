@@ -242,7 +242,9 @@ export function heldToCommands(keys, startTic, count) {
   const out = new Uint8Array(count * COMMAND_BYTES);
   for (let i = 0; i < count; i += 1) {
     const tic = startTic + i;
-    const turn = tic % TICCMD_HORIZONTAL === 0 ? (keys.right ? 1 : 0) - (keys.left ? 1 : 0) : 0;
+    // Doom's angleturn is counter-clockwise positive: G_BuildTiccmd subtracts
+    // for key_right and adds for key_left, so left is +1 here.
+    const turn = tic % TICCMD_HORIZONTAL === 0 ? (keys.left ? 1 : 0) - (keys.right ? 1 : 0) : 0;
     const command = ticcmd({
       forward: (keys.forward ? 50 : 0) - (keys.back ? 50 : 0),
       side: (keys.strafeRight ? 50 : 0) - (keys.strafeLeft ? 50 : 0),
