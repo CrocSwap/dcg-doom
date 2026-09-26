@@ -37,6 +37,28 @@ const query = new URLSearchParams(location.search);
 const networkName = query.get("net") ?? DEFAULT_NETWORK;
 const net = requireNetwork(networkName, ["rpcHttp", "doom.program", "doom.context", "doom.strips", "explorer.address"]);
 
+// `?rpc=` points every chain read at another node. Two reasons it exists: a
+// viewer on a network where the public node is slow or unreachable can be aimed
+// at a private one without a rebuild, and the offline page tests need a canned
+// node. It replaces the endpoint and drops the fallback list, because a fallback
+// is a second node the page would silently read from instead -- which is exactly
+// what a test asserting "the page read *this* node" must not allow. Mainnet is
+// still refused: `ChainReader` asks `network.js` and never sees this.
+const rpcOverride = query.get("rpc");
+if (rpcOverride !== null) {
+  let parsed = null;
+  try {
+    parsed = new URL(rpcOverride);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`?rpc=${rpcOverride} is not an http(s) URL`);
+  }
+  net.rpcHttp = parsed.origin + parsed.pathname.replace(/\/+$/, "");
+  net.rpcHttpFallback = [];
+}
+
 // Which frame source a joined page uses. `push` is the relayer's own complete
 // frames; `read` is this page polling the chain, which is the path the R12
 // numbers (16 frames painted in 74 s, 151 torn reads) were measured on and
@@ -1098,7 +1120,13 @@ async function joinSession() {
     base,
     buffer: state.buffer,
     publicKey: state.wallet.publicKeyHex,
-    binding: toHex(session.binding),
+    // The 32 bytes `fromHex` above already decoded, not `session.binding` again.
+    // The relayer sends the binding as 64 characters of hex, and `toHex` takes
+    // bytes, so handing it the string threw a RangeError on the way past -- which
+    // is the line between "the page has a session" and "the page has a session
+    // it polled, that starts its input loop and can find again after a reload".
+    // Measured here on 2026-09-26: a JOIN that painted frames and staged nothing.
+    binding: toHex(binding),
   });
   await pollSessionStatus();
   scheduleInputPush();

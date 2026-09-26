@@ -7,6 +7,7 @@ command. Nothing here touches the network or a key file.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -20,6 +21,11 @@ VIEWER_SUITES = [
     PAGE / "test" / "test_strip.mjs",
     PAGE / "test" / "test_input.mjs",
     PAGE / "test" / "test_palette.mjs",
+    # The frame-push suite was written but never added here, so the page's own
+    # pushed path -- ordering, whole-frame checks, the chain cross-check -- was
+    # not in the default suite at all. It is the suite the R15 painted-path fault
+    # belongs to.
+    PAGE / "test" / "test_push.mjs",
 ]
 RELAYER_SUITES = [RELAYER / "test" / "test_relayer.mjs"]
 
@@ -27,15 +33,19 @@ PAGE_MODULES = ["app.js", "burner.js", "input.js", "network.js", "rpc.js", "stri
 RELAYER_MODULES = ["pool.mjs", "sender.mjs", "server.mjs"]
 
 
-def run_node(*args: str) -> subprocess.CompletedProcess:
+def run_node(*args: str, timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["node", *args],
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=timeout,
         check=False,
     )
+
+
+CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+CHROME_ENV = os.environ.get("PROOF_CHROME", str(CHROME))
 
 
 @pytest.mark.skipif(shutil_which_node := __import__("shutil").which("node") is None, reason="node is not installed")
@@ -60,6 +70,22 @@ class TestDoomPlay:
 
     def test_relayer_suite_passes(self):
         result = run_node("--test", *[str(path) for path in RELAYER_SUITES])
+        assert result.returncode == 0, result.stdout[-6000:] + result.stderr[-2000:]
+
+    @pytest.mark.skipif(
+        not Path(CHROME_ENV).exists(),
+        reason="no Chrome on this machine; set PROOF_CHROME to point at one",
+    )
+    def test_the_page_against_a_fake_relayer_paints_and_sends_input(self):
+        """The painted path, offline.
+
+        Drives the real page in headless Chrome against a fake relayer and a
+        canned node: the SSE stream, the four-frame ring, `since=`, the
+        cross-check, the burner key and the input path, with no chain and no
+        network. It is the suite that separates the two faults the R15 note named
+        without separating, and it is slow because it is a browser.
+        """
+        result = run_node("--test", str(PAGE / "test" / "test_page_offline.mjs"), timeout=900)
         assert result.returncode == 0, result.stdout[-6000:] + result.stderr[-2000:]
 
     def test_the_page_never_sends_a_transaction(self):

@@ -9,6 +9,12 @@ import {isMainnet, requireNetwork} from "./network.js";
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+// How long one read may take before it is treated as a node that is not
+// answering. Long enough for a public node on a bad day, short enough that a
+// page waiting on it keeps painting: a frame interval at one render buffer is
+// 0.5 s, and nothing on a painting path may wait longer than a few of them.
+export const DEFAULT_TIMEOUT_MS = 8000;
+
 export class RpcError extends Error {
   constructor(message, detail = {}) {
     super(message);
@@ -61,7 +67,7 @@ function base64ToBytes(text) {
 }
 
 export class ChainReader {
-  constructor({network, allowMainnet = false, fetchImpl = null} = {}) {
+  constructor({network, allowMainnet = false, fetchImpl = null, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
     this.network = requireNetwork(network, ["rpcHttp"]);
     if (isMainnet(this.network) && !allowMainnet) {
       throw new RpcError("this build refuses mainnet; pass allowMainnet to read it deliberately");
@@ -74,22 +80,34 @@ export class ChainReader {
     this.requestId = 0;
     this.calls = 0;
     this.failures = 0;
+    this.timeouts = 0;
+    this.timeoutMs = timeoutMs;
   }
 
   get paintCommitment() {
     return this.commitment;
   }
 
-  async call(method, params) {
+  // Every call is bounded. This reader used to hand `fetch` an open-ended
+  // request, which is fine for a one-shot script and wrong for a page: the paint
+  // loop, the cross-check and the input push all await a read, and a node that
+  // accepts a request and never answers left every one of them waiting forever.
+  // Measured on the R15 context, 2026-09-26: a page painting 0.02 fps against a
+  // relayer pushing every frame, with the stream's own counter frozen at the
+  // frame the first cross-check fired on.
+  async call(method, params, {timeoutMs = this.timeoutMs} = {}) {
     this.requestId += 1;
     const body = JSON.stringify({jsonrpc: "2.0", id: this.requestId, method, params});
     let lastError = null;
     for (const endpoint of [this.endpoint, ...this.endpoints.filter((value) => value !== this.endpoint)]) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await this.fetch(endpoint, {
           method: "POST",
           headers: {"content-type": "application/json"},
           body,
+          signal: controller.signal,
         });
         if (!response.ok) throw new RpcError(`${endpoint} returned ${response.status} ${response.statusText}`);
         const payload = await response.json();
@@ -104,7 +122,17 @@ export class ChainReader {
         this.failures = 0;
         return payload.result;
       } catch (error) {
+        if (controller.signal.aborted) {
+          this.timeouts += 1;
+          lastError = new RpcError(`${method} to ${endpoint} did not answer within ${timeoutMs}ms`, {
+            method,
+            timeoutMs,
+          });
+          continue;
+        }
         lastError = error;
+      } finally {
+        clearTimeout(timer);
       }
     }
     this.failures += 1;
@@ -117,10 +145,12 @@ export class ChainReader {
   }
 
   // Returns {slot, payloads} where payloads[i] is a Uint8Array or null.
-  async getAccounts(addresses, {dataSlice = null} = {}) {
+  // `timeoutMs` narrows the bound for a read that is on the painting path, where
+  // being late is the same as being wrong.
+  async getAccounts(addresses, {dataSlice = null, timeoutMs = this.timeoutMs} = {}) {
     const config = {encoding: "base64"};
     if (dataSlice) config.dataSlice = dataSlice;
-    const result = await this.call("getMultipleAccounts", [addresses, config]);
+    const result = await this.call("getMultipleAccounts", [addresses, config], {timeoutMs});
     return {
       slot: result.context?.slot ?? null,
       payloads: (result.value ?? []).map((entry) => {
