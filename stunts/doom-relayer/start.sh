@@ -15,12 +15,22 @@
 #
 # The player reaches this through an SSH tunnel; nothing is published.
 #
+#  * strip rate. This is the one number that decides whether frames land at all.
+#    Measured 2026-09-26 on the R12 context: at 64/s every strip transaction
+#    came back `InstructionError: [1, ProgramFailedToComplete]` -- 740,000 CU is
+#    not enough compute for that many strips beside a running sweep, and a
+#    4.10 fps run only survived because the serial submit loop throttled it to
+#    32.8 strips/s by accident. 40/s failed the same way. So the rate is stated
+#    rather than assumed, and the default is 32 strips/s = 4 fps, under the 42-48
+#    strips/s measured as sustainable and over the 4.10 fps this loop used to
+#    reach by being slow. Raise it and the chain, not the sender, will say so.
+#
 # Usage: start.sh [name] [seconds] [strip-rate]
 set -eu
 RD=${RELAYER_DIR:-/home/ec2-user/doom-relayer-20260925}
 NAME=${1:-play-r13}
 SECONDS_LIMIT=${2:-300}
-STRIP_RATE=${3:-64}
+STRIP_RATE=${3:-32}
 REPO=${RELAYER_REPO:-$RD}
 PIN=${PIN:-$REPO/scripts/doom_relayer_deploy.json}
 PY=${PY:-/home/ec2-user/basanos-main/.venv/bin/python}
@@ -49,5 +59,6 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
+  --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   --reset-start-account ${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}

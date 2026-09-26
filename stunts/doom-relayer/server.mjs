@@ -1111,6 +1111,8 @@ if (isMain()) {
     payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
     resetStartAccount: args.get("reset-start-account") ?? undefined,
     frameDeadlineSeconds: args.get("frame-deadline-seconds") ? Number(args.get("frame-deadline-seconds")) : undefined,
+    statusBatch: args.get("status-batch") ? Number(args.get("status-batch")) : undefined,
+    statusMinInterval: args.get("status-min-interval") !== null ? Number(args.get("status-min-interval")) : undefined,
     rpcLagDropSlots: args.get("rpc-lag-drop-slots") ? Number(args.get("rpc-lag-drop-slots")) : undefined,
     rpcLagCheckSeconds: args.get("rpc-lag-check-seconds") ? Number(args.get("rpc-lag-check-seconds")) : undefined,
   });
