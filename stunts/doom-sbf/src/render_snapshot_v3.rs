@@ -26,7 +26,24 @@ pub const OP_SNAPSHOT_LIVE_LATEST: u8 = 6;
 pub const OP_INIT_BUFFERED: u8 = 7;
 pub const OP_SNAPSHOT_LIVE_BUFFERED: u8 = 8;
 pub const OP_GROW_BUFFERED: u8 = 9;
-pub const BUFFER_COUNT: u8 = 2;
+/// The number of render buffers the program will let a relayer cycle through.
+///
+/// The knee of `min(1 / cadence, buffers / occupancy)` is `occupancy / cadence`,
+/// which the measured `r9s64b` cycle put at 1.72 buffers, so the deployed two
+/// were already past it and depth was not what capped the frame rate.  Four is
+/// the next size the arithmetic says to have in the program *before* the serial
+/// submit loop is fixed rather than after: the loop's own 0.216 s a frame is
+/// most of its cadence, and at a 0.136 s cadence the knee is 3.1 buffers, so
+/// four holds until the cadence drops below 0.105 s (0.420 / 4).
+///
+/// Raising this is a pure widening.  Buffers 0 and 1 derive exactly the
+/// addresses they derived at two -- buffer 0 is the unbuffered
+/// `DOOM-RENDER-SNAPSHOT/3` PDA and buffer 1 is
+/// `DOOM-RENDER-SNAPSHOT-BUFFER/1` seeded with the byte 1 -- so an existing
+/// sender's transactions are unchanged and its readback paths keep resolving.
+/// Buffers 2 and 3 take the buffer-1 shape with their own byte, which is what
+/// makes them distinct accounts rather than a second name for buffer 1.
+pub const BUFFER_COUNT: u8 = 4;
 pub const INIT_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 192;
@@ -178,6 +195,24 @@ pub struct BufferedSnapshotRequest {
     pub buffer: u8,
 }
 
+/// The one definition of which buffer numbers the program answers to.
+///
+/// Every buffered wire and every derivation reads its bound here rather than
+/// repeating the comparison, so a buffer is either in the program everywhere or
+/// in none of it: the two used to be the same expression written four times
+/// (`data[13] >= BUFFER_COUNT` at three sites and the `None` arm of
+/// `buffered_snapshot_address`), and a bound that is written four times is a
+/// bound that can be widened three times and forgotten once.
+///
+/// `false` is a refusal, and the number is the enclosing module's:
+/// `REFUSE_MALFORMED` here, which is 297 on SNAPSHOT-LIVE-BUFFERED,
+/// INIT-BUFFERED and GROW-BUFFERED, and 301 for RSR/2's RENDER-BUFFERED, which
+/// bounds itself against this same constant.  One bound, two numbers, and a
+/// relayer matching on the code needs to know which wire it is on.
+fn buffer_in_range(buffer: u8) -> bool {
+    buffer < BUFFER_COUNT
+}
+
 impl BufferedSnapshotRequest {
     pub fn encode(self) -> [u8; REQUEST_BYTES] {
         encode_request(OP_SNAPSHOT_LIVE_BUFFERED, self.buffer, 0, &[0; 32])
@@ -188,7 +223,7 @@ impl BufferedSnapshotRequest {
         if data[14..16] != [0, 0]
             || data[16..20] != [0; 4]
             || data[20..52] != [0; 32]
-            || data[13] >= BUFFER_COUNT
+            || !buffer_in_range(data[13])
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -265,19 +300,29 @@ pub fn snapshot_address(program: &Pubkey, context: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SNAPSHOT_SEED, context.as_ref()], program)
 }
 
+/// The snapshot account a buffer number names.
+///
+/// Buffer 0 is the unbuffered PDA, kept where it was so the first buffer's
+/// address is unchanged by the depth; buffers 1..`BUFFER_COUNT` are the
+/// `DOOM-RENDER-SNAPSHOT-BUFFER/1` PDA seeded with their own number, so each
+/// one is its own account.  A number at or above `BUFFER_COUNT` has no
+/// address, and every caller turns that into `REFUSE_MALFORMED` (297) before
+/// it touches an account -- which is the bound the brief calls refusal 297's.
 pub fn buffered_snapshot_address(
     program: &Pubkey,
     context: &Pubkey,
     buffer: u8,
 ) -> Option<(Pubkey, u8)> {
-    match buffer {
-        0 => Some(snapshot_address(program, context)),
-        1 => Some(Pubkey::find_program_address(
-            &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer]],
-            program,
-        )),
-        _ => None,
+    if !buffer_in_range(buffer) {
+        return None;
     }
+    if buffer == 0 {
+        return Some(snapshot_address(program, context));
+    }
+    Some(Pubkey::find_program_address(
+        &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer]],
+        program,
+    ))
 }
 
 pub fn scratch_address(program: &Pubkey, snapshot: &Pubkey, strip_id: u8) -> (Pubkey, u8) {
@@ -678,7 +723,7 @@ fn process_grow_buffered(
         || &data[..8] != MAGIC
         || u32_at(data, 8) != VERSION
         || data[12] != OP_GROW_BUFFERED
-        || data[13] >= BUFFER_COUNT
+        || !buffer_in_range(data[13])
         || data[14..16] != [0; 2]
     {
         return Err(refuse(REFUSE_MALFORMED));
@@ -716,7 +761,7 @@ fn process_init_buffered(
         || &data[..8] != MAGIC
         || u32_at(data, 8) != VERSION
         || data[12] != OP_INIT_BUFFERED
-        || data[13] >= BUFFER_COUNT
+        || !buffer_in_range(data[13])
         || data[14..16] != [0; 2]
     {
         return Err(refuse(REFUSE_MALFORMED));
@@ -1377,6 +1422,15 @@ mod tests {
         assert!(BufferedSnapshotRequest::decode(&bad).is_err());
     }
 
+    /// Four buffers, four accounts, and the two addresses the deployed
+    /// two-buffer program already gave.
+    ///
+    /// The widening's whole risk in one test: a relayer that is already
+    /// cycling buffers 0 and 1 must not have either account move, and every
+    /// buffer inside the count must be a distinct account rather than a second
+    /// name for buffer 1.  Buffer 0 is pinned to the unbuffered PDA and buffer
+    /// 1 to the buffer seed carrying the byte 1, so a future edit to the
+    /// derivation cannot quietly re-point a live buffer.
     #[test]
     fn buffered_snapshot_addresses_are_distinct() {
         let program = Pubkey::new_from_array([1; 32]);
@@ -1387,7 +1441,61 @@ mod tests {
         assert_eq!(old, first);
         assert_ne!(old, second);
         assert_ne!(first, second);
-        assert!(buffered_snapshot_address(&program, &context, 2).is_none());
+        assert_eq!(
+            second,
+            Pubkey::find_program_address(
+                &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[1u8]],
+                &program
+            )
+            .0
+        );
+        let mut seen = vec![first, second];
+        for buffer in 2..BUFFER_COUNT {
+            let key = buffered_snapshot_address(&program, &context, buffer)
+                .unwrap_or_else(|| panic!("buffer {buffer} has no address"))
+                .0;
+            assert_eq!(
+                key,
+                Pubkey::find_program_address(
+                    &[BUFFERED_SNAPSHOT_SEED, context.as_ref(), &[buffer]],
+                    &program
+                )
+                .0,
+                "buffer {buffer} is not the PDA its own number names"
+            );
+            assert!(!seen.contains(&key), "buffer {buffer} collides");
+            seen.push(key);
+        }
+        assert_eq!(seen.len(), usize::from(BUFFER_COUNT));
+    }
+
+    /// The bound is `BUFFER_COUNT` and it is the same bound on the wire and on
+    /// the derivation, so the fifth buffer is refused rather than unimplemented
+    /// and no buffer inside the count is refused.
+    #[test]
+    fn the_fifth_buffer_is_outside_the_bound_on_every_buffered_wire() {
+        let program = Pubkey::new_from_array([1; 32]);
+        let context = Pubkey::new_from_array([2; 32]);
+        for buffer in 0..BUFFER_COUNT {
+            assert!(buffer_in_range(buffer));
+            assert!(buffered_snapshot_address(&program, &context, buffer).is_some());
+            let request = BufferedSnapshotRequest { buffer }.encode();
+            assert_eq!(
+                BufferedSnapshotRequest::decode(&request).unwrap().buffer,
+                buffer
+            );
+            assert!(buffer_in_range(encode_init_buffered(buffer)[13]));
+            assert!(buffer_in_range(encode_grow_buffered(buffer)[13]));
+        }
+        for buffer in [BUFFER_COUNT, BUFFER_COUNT + 1, u8::MAX] {
+            assert!(!buffer_in_range(buffer));
+            assert!(buffered_snapshot_address(&program, &context, buffer).is_none());
+            assert!(
+                BufferedSnapshotRequest::decode(&BufferedSnapshotRequest { buffer }.encode())
+                    .is_err(),
+                "buffer {buffer} is inside the wire"
+            );
+        }
     }
 
     #[test]
