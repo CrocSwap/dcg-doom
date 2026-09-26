@@ -389,7 +389,14 @@ const after = await evaluate(`({
     leadTics: window.doomPlay.state.leadTics,
     roundTripMs: window.doomPlay.state.roundTripMs,
     ticsPerSecond: window.doomPlay.state.ticsPerSecond,
-    latencies: window.doomPlay.state.pictureLatencies,
+    // The two keypress meters, kept apart: stampLatencies is keydown to the
+    // first painted frame at or past the tic the input was stamped for,
+    // nextPictureLatencies is keydown to the next frame of any kind.
+    stampLatencies: window.doomPlay.state.stampLatencies,
+    nextPictureLatencies: window.doomPlay.state.nextPictureLatencies,
+    holdsStarted: window.doomPlay.state.holdsStarted,
+    holdsUnstamped: window.doomPlay.state.holdsUnstamped,
+    lastStampedTic: window.doomPlay.state.lastStampedTic ?? null,
     producerNextCursor: window.doomPlay.state.producerNextCursor,
     producerGeneratedCursor: window.doomPlay.state.producerGeneratedCursor,
   },
