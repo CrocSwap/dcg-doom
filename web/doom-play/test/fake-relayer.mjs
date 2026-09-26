@@ -57,9 +57,9 @@ const sha256hex = (bytes) => createHash("sha256").update(Buffer.from(bytes)).dig
 // the next, and every strip digest recomputed over the new bytes. Nothing here
 // is a shortcut past `decodePushedFrame`: if the digest is wrong the page
 // refuses the frame, which is what the tests would then see.
-export async function makeFrame(index, {strips: base, meta, startCursor = 6016, ticsPerFrame = 8} = {}) {
+export async function makeFrame(index, {strips: base, meta, startCursor = 6016, ticsPerFrame = 8, cursor: cursorOverride = null} = {}) {
   const source = base ?? fixtureStrips().strips;
-  const cursor = startCursor + index * ticsPerFrame;
+  const cursor = cursorOverride ?? startCursor + index * ticsPerFrame;
   const gametic = cursor;
   const snapshotHash = new Uint8Array(createHash("sha256").update(`snap:${index}`).digest());
   const stateRoot = new Uint8Array(createHash("sha256").update(`root:${index}`).digest());
@@ -202,6 +202,7 @@ export class FakeRelayer {
     publishLead = true,
     streamRetryMs = 1000,
     frames = null,
+    buffers = 1,
   } = {}) {
     const fixture = fixtureStrips();
     this.meta = fixture.meta;
@@ -213,7 +214,25 @@ export class FakeRelayer {
     this.leadTics = leadTics ?? Math.max(12, Math.ceil(INPUT_ROUND_TRIP_SAFETY_FACTOR * MEASURED_INPUT_ROUND_TRIP_SECONDS * ticsPerSecond));
     this.ringLimit = ringLimit;
     this.frameIntervalMs = frameIntervalMs;
+    // How many render buffers are in flight. One is a relayer that renders,
+    // reads back and renders again, and its frames reach the page in submission
+    // order. More than one is what four buffers on a chain actually does, and it
+    // is the shape the page had never been tested against: the frames are
+    // *submitted* in order and *delivered* in completion order, so a frame
+    // submitted second can arrive first.
+    //
+    // Measured on the R15 confirm session, 2026-09-26, from the relayer's own
+    // `frames.jsonl`: 105 of 201 consecutive pushes carried a lower
+    // `frame_index` than the push before them, 113 consecutive pairs carried the
+    // same `gametic` (four buffers rendering one cursor) and 26 went backwards
+    // in `gametic` (a buffer that rendered a slightly older cursor). This fake
+    // reproduces those three numbers rather than a tidier version of them.
+    this.buffers = Math.max(1, buffers);
+    this.bursts = 0;
+    this.pending = [];
+    this.groupTics = Math.max(1, Math.round((ticsPerSecond * frameIntervalMs * this.buffers) / 1000));
     this.chainLagFrames = chainLagFrames;
+
     this.verifySignatures = verifySignatures;
     // Whether to publish the producer's lead on the status at all. Off models a
     // relayer that has not resolved one -- every mock relayer, and a session
@@ -271,6 +290,25 @@ export class FakeRelayer {
 
   // The frames this relayer will push, built once so every caller sees the same
   // bytes the page will.
+  //
+  // The cursor a frame carries is a function of its index and of how many
+  // buffers are in flight, never of the clock: a frame is cached, and a cached
+  // frame that changed its cursor between the chain read and the page's read
+  // would be a fault this fake invented.
+  frameCursor(index) {
+    if (this.buffers === 1) return this.startCursor + index * Math.max(1, Math.round((this.ticsPerSecond * this.frameIntervalMs) / 1000));
+    const group = Math.floor(index / this.buffers);
+    const within = index % this.buffers;
+    const groupCursor = this.startCursor + group * this.groupTics;
+    // One buffer in a group rendered a slightly older cursor, so the frame that
+    // reaches the page *last* in its burst steps the picture backwards: 26 of
+    // 201 pushes on R15 went backwards in `gametic` while 113 repeated one. The
+    // odd groups are the ones delivered reversed, so their first-submitted frame
+    // arrives last, and one group in eight is the 13% R15 measured.
+    if (group % 2 === 1 && within === 0) return groupCursor - 4;
+    return groupCursor;
+  }
+
   async frameAt(index) {
     if (!this.frameCache) {
       this.frameCache = new Map();
@@ -281,6 +319,7 @@ export class FakeRelayer {
         strips: fixture.strips,
         meta: fixture.meta,
         startCursor: this.startCursor,
+        cursor: this.frameCursor(index),
       }));
     }
     return this.frameCache.get(index);
@@ -344,7 +383,7 @@ export class FakeRelayer {
     const frame = await this.frameAt(index);
     const record = {
       frame_index: index,
-      buffer: 0,
+      buffer: this.buffers === 1 ? 0 : index % this.buffers,
       cursor: frame.cursor,
       gametic: frame.gametic,
       frame_sha256: frame.frameSha,
@@ -357,15 +396,39 @@ export class FakeRelayer {
       strip_accounts_b64: frame.strips.map((bytes) => Buffer.from(bytes).toString("base64")),
       at: Date.now(),
     };
-    this.ring.set(index, record);
-    while (this.ring.size > this.ringLimit) this.ring.delete(this.ring.keys().next().value);
     this.pushed += 1;
+    if (this.buffers === 1) {
+      this.deliver(record);
+      return record;
+    }
+    // More than one buffer in flight: the frame is submitted now and delivered
+    // when the buffers ahead of it are done, in completion order rather than
+    // submission order. Alternating the direction of the scramble is what makes
+    // half the consecutive pairs non-monotonic, which is the 105 of 201 R15
+    // measured; a rotation would be 33% and a fixed reverse 100%.
+    this.pending.push(record);
+    if (this.pending.length < this.buffers) return record;
+    const burst = this.bursts % 2 === 1 ? [...this.pending].reverse() : this.pending;
+    this.pending = [];
+    this.bursts += 1;
+    for (const delivered of burst) this.deliver(delivered);
+    return record;
+  }
+
+  // One frame onto the ring and out to every open stream. The ring is filled on
+  // *delivery*, not on submission, which is what the real relayer does
+  // (`server.mjs` `onFrame` is called when the pipeline's frame event arrives):
+  // a ring holding a frame that has not been pushed yet would hand a page that
+  // same frame twice, once on subscribe and once in the burst, and the page
+  // would be right to call the second one a replay.
+  deliver(record) {
+    this.ring.set(record.frame_index, record);
+    while (this.ring.size > this.ringLimit) this.ring.delete(this.ring.keys().next().value);
     for (const subscription of this.subscriptions) {
       for (const listener of subscription.listeners) listener(record);
     }
     return record;
   }
-
   // The same four-frame ring and the same `since` rule as the real relayer: a
   // fresh subscriber is handed the newest frame, and a subscriber that says
   // which frame it last painted is handed every frame the ring still holds that

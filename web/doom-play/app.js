@@ -433,8 +433,13 @@ function updateFrameReadout() {
         `A pushed frame is the relayer's own read of the chain, painted without this page asking. ` +
         `One in ${state.crossCheckEvery || DEFAULT_CROSS_CHECK_EVERY} is read again from the chain and compared.`;
     } else {
+      const stale = summary ? (summary.painted_stale ?? 0) : 0;
+      const skipped = summary ? (summary.skipped ?? 0) : 0;
+      const tail = stale || skipped
+        ? ` ${stale} painted a frame older than the one on screen, ${skipped} were frames this page had already painted.`
+        : "";
       ui.framesHint.textContent = `${check.comparable && !check.match ? "MISMATCH" : "chain check"} ` +
-        `${check.checked}: ${check.reason}`;
+        `${check.checked}: ${check.reason}.${tail}`;
     }
   }
 }
