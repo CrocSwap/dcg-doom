@@ -291,6 +291,8 @@ export class Relayer {
     slot.ticsPerSecond = progress.ticsPerSecond ?? null;
     slot.stagingFrontier = progress.stagingFrontier ?? null;
     slot.producer = progress.producer ?? slot.producer ?? null;
+    slot.writableFrontier = progress.writableFrontier ?? null;
+    slot.writableFloor = progress.writableFloor ?? null;
     slot.frameCounters = progress.frameCounters ?? slot.frameCounters ?? null;
     slot.latestFrame = progress.latestFrame ?? slot.latestFrame ?? null;
     slot.rpcUrls = progress.rpcUrls ?? slot.rpcUrls ?? null;
@@ -328,6 +330,11 @@ export class Relayer {
       producer: slot.producer ?? null,
       producer_stage_limit: slot.producer?.stage_limit ?? null,
       producer_generated_cursor: slot.producer?.generated_cursor ?? null,
+      // The first input slot the chain has not fixed, and the floor a staged
+      // batch is refused below. Named here so a page (and a receipt) can see
+      // which of the two numbers a refusal came from.
+      writable_frontier: slot.writableFrontier ?? null,
+      writable_floor: slot.writableFloor ?? null,
       frame_counters: slot.frameCounters ?? null,
       // Which render buffer holds the newest COMPLETE frame, and that buffer's
       // accounts. The child read the frame back before counting it, so it knows

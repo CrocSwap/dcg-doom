@@ -684,6 +684,13 @@ export class PipelineSender {
       halted: Boolean(status.halt),
       stagingFrontier: status.staging_frontier,
       producer: status.producer ?? null,
+      // The chain's own fixed frontier over the input slots, and the guard the
+      // input path refuses below. The producer's generated cursor is not this
+      // number and cannot stand in for it: on a resumed context it walks over
+      // slots an earlier session already deposited (doom-drive-2).
+      writableFrontier: status.writable_frontier ?? null,
+      writableFloor: status.writable_floor ?? null,
+      frontierProbes: status.frontier_probes ?? null,
       frameCounters: status.frame_counters ?? null,
       rpcUrls: status.rpc_urls ?? null,
       rpcLag: status.rpc_lag ?? null,

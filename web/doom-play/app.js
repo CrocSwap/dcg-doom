@@ -150,7 +150,12 @@ const state = {
   lastFrameBuffer: null,
   paintedFrames: 0,
   paintedAt: 0,
-  frameTimes: [],
+  // When each frame was painted, over a rolling window. The panel's rate is
+  // the rate of THESE, and nothing else: the status tick used to push a
+  // timestamp here every 500 ms and call the result a frame rate, so the
+  // panel read "2.00" on a page that had painted one frame in sixty seconds
+  // (measured, doom-drive-2). A paint is a paint.
+  paintTimes: [],
   signature: null,
   keys: {},
   stopPolling: null,
@@ -272,6 +277,10 @@ async function paintFrame(frame) {
   state.lastFrame = frame;
   state.paintedFrames += 1;
   state.paintedAt = performance.now();
+  state.paintTimes.push(state.paintedAt);
+  while (state.paintTimes.length > 2 && state.paintedAt - state.paintTimes[0] > 4000) {
+    state.paintTimes.shift();
+  }
   // A frame past the tic the picture was on when the key went down is the
   // player's keypress showing up.  Recorded once per hold, and it is the
   // number that says the page is drivable rather than merely connected.
@@ -289,11 +298,14 @@ function median(values) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+// The paint rate over the rolling window in `state.paintTimes`: intervals
+// between consecutive paints, which is the only thing a viewer can see. Two
+// paints are the minimum, because one paint has no rate.
 function fps() {
-  if (state.frameTimes.length < 2) return null;
-  const span = state.frameTimes[state.frameTimes.length - 1] - state.frameTimes[0];
+  if (state.paintTimes.length < 2) return null;
+  const span = state.paintTimes[state.paintTimes.length - 1] - state.paintTimes[0];
   if (span <= 0) return null;
-  return ((state.frameTimes.length - 1) * 1000) / span;
+  return ((state.paintTimes.length - 1) * 1000) / span;
 }
 
 function updateStatus() {
@@ -1034,10 +1046,9 @@ async function boot() {
   }
 
   setInterval(() => void pollSessionStatus(), 2000);
+  // The status tick refreshes the panel and nothing else: the rate on the
+  // panel comes from the paints themselves (see `fps`).
   setInterval(() => {
-    const now = performance.now();
-    state.frameTimes.push(now);
-    while (state.frameTimes.length && now - state.frameTimes[0] > 4000) state.frameTimes.shift();
     if (state.lastFrame) updateStatus();
   }, 500);
   addEventListener("resize", () => {
