@@ -391,3 +391,62 @@ test("a digest match is a pixel match, because the digest covers the pixels", as
     : strip));
   await assert.rejects(() => decodePushedFrame({...pushedRecord(), strip_accounts_b64: tampered.map(toBase64)}));
 });
+
+test("a chain read that is behind is compared against the page's record of that frame", async () => {
+  // The measured shape on R13 at 1.78 fps: the public node is three frames
+  // behind the relayer, so the chain never holds the frame that was just pushed.
+  // The page has the digests of the frames it was already sent, so the chain's
+  // frame is compared against its own record and the answer is exact.
+  const checks = [];
+  const stream = new FrameStream({
+    base: "http://r.invalid",
+    sessionId: "s-behind",
+    onFrame: () => {},
+    onCrossCheck: (value) => checks.push(value),
+    crossCheckEvery: 3,
+    readChain: async () => chainDigestOf(realStrips, 5000),
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  for (let index = 1; index <= 9; index += 1) {
+    await FakeEventSource.last.deliver(pushedRecord({frameIndex: index}));
+  }
+  const summary = stream.summary();
+  assert.equal(summary.cross_checks, 3);
+  // Every pushed frame carries the same fixture's cursor, so every chain read
+  // finds that cursor in the page's own record and compares exactly.
+  assert.equal(summary.cross_check_matches, 3, JSON.stringify(checks.map((c) => c.comparison)));
+  assert.equal(summary.cross_check_mismatches, 0);
+  assert.equal(summary.cross_check_uncomparable, 0);
+  for (const check of checks) {
+    assert.equal(typeof check.comparison.checked_frame_index, "number", "the record it compared against is named");
+    assert.equal(check.comparison.chain_cursor, check.comparison.pushed_cursor, "same frame, so behind_by_tics is 0");
+  }
+});
+
+test("a chain read naming a frame the page never had is uncomparable, not a mismatch", async () => {
+  const checks = [];
+  const elsewhere = chainDigestOf(realStrips, 1);
+  for (const strip of elsewhere.strips) {
+    strip.cursor += 4000;
+    strip.gametic += 4000;
+  }
+  const stream = new FrameStream({
+    base: "http://r.invalid",
+    sessionId: "s-foreign",
+    onFrame: () => {},
+    onCrossCheck: (value) => checks.push(value),
+    crossCheckEvery: 1,
+    readChain: async () => elsewhere,
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 1}));
+  const summary = stream.summary();
+  assert.equal(summary.cross_check_mismatches, 0, "a frame the page never had is not a mismatch");
+  assert.equal(summary.cross_check_uncomparable, 1);
+  assert.match(checks[0].comparison.reason, /which this page was never sent/);
+  assert.equal(checks[0].comparison.behind_by_tics, -4000);
+});

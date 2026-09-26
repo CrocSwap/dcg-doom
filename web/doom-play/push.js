@@ -198,6 +198,14 @@ export class FrameStream {
     this.source = null;
     this.lastFrameIndex = null;
     this.pushed = 0;
+    // Every pushed frame's digests, by cursor, bounded. This is what makes the
+    // cross-check exact rather than approximate: the public node reads three
+    // frames behind the relayer (measured on R13 at 1.78 fps, 2026-09-26: pushed
+    // frame 14892, chain frame 14864), so the chain is not holding the frame
+    // that was just pushed -- it is holding an *older* one, and the page already
+    // has the digests for that one too.
+    this.digestsByCursor = new Map();
+    this.digestsLimit = 60;
     this.skipped = 0;
     this.crossChecks = 0;
     this.crossCheckMismatches = 0;
@@ -278,6 +286,18 @@ export class FrameStream {
     }
     this.pushed += 1;
     if (record.frame_index != null) this.lastFrameIndex = record.frame_index;
+    if (frame.cursor !== null && frame.cursor !== undefined) {
+      this.digestsByCursor.set(frame.cursor, {
+        frameIndex: record.frame_index ?? null,
+        stripHashes: frame.stripHashes,
+        snapshotHash: frame.snapshotHash,
+        stateRoot: frame.stateRoot,
+        pushedAt: Date.now(),
+      });
+      while (this.digestsByCursor.size > this.digestsLimit) {
+        this.digestsByCursor.delete(this.digestsByCursor.keys().next().value);
+      }
+    }
     await this.onFrame(frame, record);
     await this.#maybeCrossCheck(record, frame);
   }
@@ -296,7 +316,40 @@ export class FrameStream {
     let comparison = {comparable: false, match: false, reason: "the chain read did not run"};
     try {
       const chain = await this.readChain(record);
-      comparison = compareDigests(frame, chain);
+      // The chain may be holding an older frame than the one just pushed, and
+      // "older" is not "wrong". The page has the digests of the frames it has
+      // already been sent, so the chain's frame is compared against *its* record
+      // and the answer is exact. When the chain holds the pushed frame, that
+      // record is the frame itself.
+      const cursor = chain?.strips?.[0]?.cursor ?? null;
+      const known = cursor === null ? null : this.digestsByCursor.get(cursor) ?? null;
+      if (known) {
+        comparison = compareDigests(
+          {
+            cursor,
+            gametic: chain.strips[0].gametic,
+            stripHashes: known.stripHashes,
+            snapshotHash: known.snapshotHash,
+            stateRoot: known.stateRoot,
+          },
+          chain,
+        );
+        comparison.checked_frame_index = known.frameIndex;
+        comparison.chain_cursor = cursor;
+        comparison.pushed_cursor = frame.cursor;
+        comparison.behind_by_tics = frame.cursor - cursor;
+      } else {
+        comparison = {
+          comparable: false,
+          match: false,
+          reason: chain === null
+            ? "the chain does not hold eight strip headers yet"
+            : `the chain holds frame ${cursor}, which this page was never sent`,
+          chain_cursor: cursor,
+          pushed_cursor: frame.cursor,
+          behind_by_tics: frame.cursor - (cursor ?? frame.cursor),
+        };
+      }
     } catch (error) {
       comparison = {comparable: false, match: false, reason: `the chain read failed: ${error instanceof Error ? error.message : String(error)}`};
     }
