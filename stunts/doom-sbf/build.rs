@@ -1436,16 +1436,23 @@ fn compile_ctx_engine(target: &str) {
     // profile build with the framebuffer stores removed, so the CU difference
     // between the two images is the pixel-write cost of the drawers.
     let render_count_only = is_sbf && env::var("CARGO_FEATURE_RENDER_COUNT_ONLY").is_ok();
+    // Diagnostic-only: the static RENDER path sets the clip word to zero
+    // instead of mode 1, so one strip prices a full-width pass.  Only the codec
+    // archive needs it, since that is where the strip entry lives.
+    let render_fullwidth = is_sbf && env::var("CARGO_FEATURE_RENDER_PROFILE_FULLWIDTH").is_ok();
     let legacy_5120_buffer = env::var("CARGO_FEATURE_LEGACY_5120_BUFFER").is_ok();
     let out_dir =
         PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
-    let identity_flags: Vec<&str> = if diagnostic_profile || render_count_only {
+    let identity_flags: Vec<&str> = if diagnostic_profile || render_count_only || render_fullwidth {
         let mut flags: Vec<&str> = common.to_vec();
         if diagnostic_profile {
             flags.push("-DDOOM_SBF_PHASE_PROFILE");
         }
         if render_count_only {
             flags.push("-DDOOM_SBF_RENDER_COUNT_ONLY");
+        }
+        if render_fullwidth {
+            flags.push("-DDOOM_SBF_RENDER_FULLWIDTH");
         }
         flags
     } else {
@@ -1495,6 +1502,13 @@ fn compile_ctx_engine(target: &str) {
     }
     if diagnostic_profile {
         platform.define("DOOM_SBF_PHASE_PROFILE", None);
+        // Patch 0030.  DOOM_SBF_PHASE_PROFILE reached only the platform and
+        // codec archives, so every marker the engine sources carry
+        // (R_DRAW_PHASE in r_draw.h, and patch 0030's PROF_ENTER/PROF_EXIT in
+        // r_main.c, r_segs.c, r_things.c and r_plane.c) compiled out: the
+        // guard in r_draw.h was never true for the 41-TU cut.  The render
+        // phase split was therefore never measured, however it was read.
+        engine.define("DOOM_SBF_PHASE_PROFILE", None);
     }
     if render_count_only {
         engine.define("DOOM_SBF_RENDER_COUNT_ONLY", None);
@@ -1929,6 +1943,9 @@ fn compile_ctx_engine(target: &str) {
         codec.file(ri2_source);
         if diagnostic_profile {
             codec.define("DOOM_SBF_PHASE_PROFILE", None);
+        }
+        if render_fullwidth {
+            codec.define("DOOM_SBF_RENDER_FULLWIDTH", None);
         }
         if legacy_5120_buffer {
             codec.define("DOOM_SIM2_LEGACY_DEMO_CAP", None);

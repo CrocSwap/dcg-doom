@@ -1,0 +1,358 @@
+Subject: [PATCH 0030] Aggregate the render phase profile into five log lines
+
+The in-C render phase markers never fired.  DOOM_SBF_PHASE_PROFILE was defined
+on the platform and codec archives and not on the engine archive, so the
+R_DRAW_PHASE guard in r_draw.h was never true for the 41-TU cut and every
+marker in r_main.c, r_segs.c, r_things.c and r_plane.c compiled out.  build.rs
+now defines it on the engine archive too, and this patch replaces the log-per-
+marker scheme with accumulate-then-emit, because even with the markers live a
+flat list needs about fifteen lines for one strip and Solana keeps ten program
+log lines per transaction.  The markers that survive a flat list are the early
+ones, so the render split -- the thing the profile exists to measure -- is
+exactly what gets dropped.  Here each site accumulates its own interval into a
+context cell and the strip driver emits fifteen cells in five sol_log_64 lines.
+
+The cells are the last two members of doom_ctx_t in a diagnostic build
+(eighteen accumulators and four mark registers, 176 bytes), so every field
+offset above them and the zone arena are unchanged.  They live in the context
+account rather than in C or Rust statics because the image must carry zero
+writable static data (M1006 measured the loader refusal for .data and for .bss
+alike).  doom_sbf_prof_cu and doom_sbf_prof_log are Rust shims: the
+freestanding C headers in sbfinc/ declare no syscall interface.
+
+The whole accumulator, the accessor macros and the two struct members are
+inside #ifdef DOOM_SBF_PHASE_PROFILE, so it is compiled only into a
+diagnostic-profile image.  The first version of this patch declared the cells
+unconditionally, which put 176 bytes in EVERY build and moved CTX_MIN_BYTES,
+CTX_STRUCT_BYTES, BOOTSTRAP_OFFSET and ACCOUNT_BYTES with it; the merge of
+7f3cfa7c3 was reverted for that reason (30088de1f).  Making the cells
+conditional is what keeps a production image byte-identical in layout to one
+built without this patch, which is the property deployed images, live context
+accounts and the sender scripts all depend on.  A build that grows the
+context struct is a consensus change, and a diagnostic-only measurement must
+not be one.  The accumulator adds the same two meter reads per interval in a
+phase-profile image and a count-only image, so it cancels in the store-cost
+difference between those two.
+
+Two of the PROF_ENTER sites (R_RenderSegLoop, R_AddSprites) sit after their
+declaration blocks rather than before them: the macro is ((void)0) outside a
+diagnostic build, and a statement ahead of a declaration is not C90.  The
+interval is identical either way.
+
+Slots, in emission order, three per line:
+  0 fixed pre-render   (ctx guard, layout rebind, arena rebind, dynamic state
+                        import, framebuffer allocation, screen and view bases)
+  1 R_SetupFrame       2 R_ClearClipSegs/DrawSegs/Planes/Sprites
+  3 R_RenderBSPNode    4   of which R_RenderSegLoop
+  5   of which R_AddSprites
+  6 R_DrawPlanes       7   of which R_MapPlane's per-column setup
+  8 R_DrawMasked       9   of which R_SortVisSprites
+ 10   of which the vissprite draw loop
+ 11   of which the masked mid-texture seg range loop
+ 12   of which R_DrawPlayerSprites
+ 13 fixed post-render  (strip extraction, free, arena rewind)
+ 14 the 32-root relink and the arena rebind alone, so the dynamic state import
+    beside them can be priced apart (0 minus 14 is the state import and the
+    framebuffer allocation)
+ 15 R_RenderPlayerView as a whole, as a cross-check on 1,2,3,6,8
+ 16 rsn3_apply_dynamic, the dynamic state import
+ 17 the framebuffer allocation, the screen pointers, ylookup and the view bases
+
+Applies on top of 0001-0017 and 0021.
+
+--- a/linuxdoom-1.10/headless/doom_ctx.h
++++ b/linuxdoom-1.10/headless/doom_ctx.h
+@@ -50,6 +50,69 @@
+  * decoder failure threshold. */
+ #define DOOM_SBF_PRIVATE_BYTES 32
+ 
++/* Patch 0030: diagnostic render-phase accumulator.  DOOM_SBF_PROF_SLOTS
++ * unsigned-long cells, declared as the LAST member of doom_ctx_t for the same
++ * reason patch 0017 used doom_sbf_private: every field offset above is
++ * unchanged.
++ *
++ * The cells are compiled ONLY under DOOM_SBF_PHASE_PROFILE.  build.rs defines
++ * that on the platform, engine and codec archives of a `diagnostic-profile`
++ * image and on nothing else, so a production build -- host or SBF, qualifying
++ * or not -- keeps exactly the sizeof(doom_ctx_t) it had before this patch.
++ * That matters beyond tidiness: the static resource header records
++ * CTX_STRUCT_BYTES at offset 20, the deployed images and the live context
++ * accounts are sized from it, and a build that grew the struct by 176 bytes
++ * would have made every one of them wrong at once.  The first version of this
++ * patch declared the cells unconditionally, which put those 176 bytes in
++ * every build; see the revert of this patch (30088de1f) for the incident.
++ *
++ * Eighteen slots fit in six sol_log_64 lines, which is what makes a nested
++ * phase split reportable at all: a flat marker list overruns Solana's
++ * ten-line per-transaction program log and the late markers are the ones that
++ * get dropped. */
++#ifdef DOOM_SBF_PHASE_PROFILE
++#define DOOM_SBF_PROF_SLOTS 18
++
++/* Four mark registers, so a nested split (R_RenderBSPNode with R_RenderSegLoop
++ * and R_AddSprites inside it) does not overwrite its own start reading.  The
++ * depth is passed explicitly at each site instead of tracked in a counter:
++ * the depths in use are 0 for whole-strip phases, 1 for R_RenderPlayerView
++ * and 2 for the BSP interior, and an explicit lvalue keeps the macros usable
++ * in a void expression under -std=gnu89. */
++#define DOOM_SBF_PROF_MARKS 4
++
++/* Slot names.  The numbering is the order the cells are emitted in, three per
++ * sol_log_64 line, and it is recorded in the design note; changing it changes
++ * the reading of a stored profile, so append rather than renumber. */
++#define DOOM_SBF_PROF_FIXED_PRE 0
++#define DOOM_SBF_PROF_SETUP_FRAME 1
++#define DOOM_SBF_PROF_CLEAR_BUFS 2
++#define DOOM_SBF_PROF_BSP 3
++#define DOOM_SBF_PROF_SEG_LOOP 4
++#define DOOM_SBF_PROF_ADD_SPRITES 5
++#define DOOM_SBF_PROF_DRAW_PLANES 6
++#define DOOM_SBF_PROF_PLANE_SETUP 7
++#define DOOM_SBF_PROF_DRAW_MASKED 8
++#define DOOM_SBF_PROF_SORT_VISSPR 9
++#define DOOM_SBF_PROF_VISSPRITES 10
++#define DOOM_SBF_PROF_MASKED_SEGS 11
++#define DOOM_SBF_PROF_PSPRITES 12
++#define DOOM_SBF_PROF_FIXED_POST 13
++/* The 32-root relink and the arena rebind on their own, so the dynamic state
++ * import they sit next to can be priced apart from them.  The prior note read
++ * the 1101-1102 interval as "layout and arena rebind", but that interval also
++ * contains rsn3_apply_dynamic, which re-imports every mobj and re-runs
++ * P_SetThingPosition for each. */
++#define DOOM_SBF_PROF_REBIND 14
++#define DOOM_SBF_PROF_RENDER_TOTAL 15
++/* The two halves of FIXED_PRE apart.  Slot 0 minus slot 14 was the only thing
++ * separating the dynamic state import from the framebuffer set-up, and which of
++ * them the fixed setup mostly is decides whether the fixed setup is worth
++ * attacking before a scene-once pass exists at all. */
++#define DOOM_SBF_PROF_RSN3_APPLY 16
++#define DOOM_SBF_PROF_FRAME_SETUP 17
++#endif /* DOOM_SBF_PHASE_PROFILE */
++
+ typedef struct doom_ctx_s {
+     unsigned long doom_ctx_probe_cell;
+     int	easy;
+@@ -475,6 +538,13 @@
+     /* Last member on purpose: the zone arena and every field offset above are
+      * unchanged, so only sizeof(doom_ctx_t) grows. */
+     unsigned char doom_sbf_private[DOOM_SBF_PRIVATE_BYTES];
++#ifdef DOOM_SBF_PHASE_PROFILE
++    /* Last member on purpose (patch 0030): the zone arena and every field
++     * offset above are unchanged, and a build without the accumulator does
++     * not have them at all, so sizeof(doom_ctx_t) is unchanged too. */
++    unsigned long doom_sbf_prof[DOOM_SBF_PROF_SLOTS];
++    unsigned long doom_sbf_prof_mark[DOOM_SBF_PROF_MARKS];
++#endif
+ } doom_ctx_t;
+ 
+ void doom_ctx_init(void);
+@@ -902,6 +972,31 @@
+ #define doom_sbf_controller_applied ((int *)&DOOM_CTX->doom_sbf_private[8])
+ #define doom_sbf_private_alloc_fail ((long *)&DOOM_CTX->doom_sbf_private[16])
+ #define doom_sbf_private_alloc_calls ((long *)&DOOM_CTX->doom_sbf_private[24])
++#ifdef DOOM_SBF_PHASE_PROFILE
++#define doom_sbf_prof ((unsigned long *)DOOM_CTX->doom_sbf_prof)
++#define doom_sbf_prof_mark ((unsigned long *)DOOM_CTX->doom_sbf_prof_mark)
++#endif
++
++/* Patch 0030 accumulator.  doom_sbf_prof_cu is a Rust shim: the C side has
++ * no declaration for the remaining-CU syscall and the image must not gain
++ * writable static data, so the cells live in the context account and the two
++ * calls are extern.  Each PROF pair costs two meter reads; the reads cost the
++ * same in a phase-profile image and in a count-only image, so they cancel in
++ * the store-cost difference between the two. */
++#ifdef DOOM_SBF_PHASE_PROFILE
++extern unsigned long doom_sbf_prof_cu(void);
++#define PROF_ENTER(slot, depth) \
++    (doom_sbf_prof_mark[(depth)] = doom_sbf_prof_cu())
++/* The meter only ever falls, so the interval is the mark minus the later
++ * reading.  Written the other way round it underflows, which is unsigned
++ * arithmetic doing exactly what it was told. */
++#define PROF_EXIT(slot, depth) \
++    (doom_sbf_prof[(slot)] += \
++     doom_sbf_prof_mark[(depth)] - doom_sbf_prof_cu())
++#else
++#define PROF_ENTER(slot, depth) ((void)0)
++#define PROF_EXIT(slot, depth) ((void)0)
++#endif
+ #define doom_error_latched (DOOM_CTX->doom_error_latched)
+ #define doom_sbf_demo_done (DOOM_CTX->doom_sbf_demo_done)
+ #define doom_render_fuzz_columns (DOOM_CTX->doom_render_fuzz_columns)
+--- a/linuxdoom-1.10/r_draw.h
++++ b/linuxdoom-1.10/r_draw.h
+@@ -41,12 +41,13 @@
+  * store, so the CU difference between a phase-profile image and a count-only
+  * image is the pixel-write cost of the drawers.  Both defines are
+  * diagnostic-only and must never appear in a deployable image. */
+-#ifdef DOOM_SBF_PHASE_PROFILE
+-extern void doom_sbf_phase_marker(unsigned long phase);
+-#define R_DRAW_PHASE(phase) doom_sbf_phase_marker((unsigned long)(phase))
+-#else
++/* Patch 0030: these markers no longer log.  A flat marker list needs fifteen
++ * lines for one strip and Solana keeps ten per transaction, so the markers
++ * that DO get through are the early ones and the render split -- the part the
++ * measurement is for -- is exactly what is dropped.  PROF_ENTER/PROF_EXIT
++ * (doom_ctx.h, force-included into every archive) accumulate instead, and the
++ * strip driver emits all of them in five aggregated lines. */
+ #define R_DRAW_PHASE(phase) ((void)0)
+-#endif
+ 
+ 
+ 
+--- a/linuxdoom-1.10/r_main.c
++++ b/linuxdoom-1.10/r_main.c
+@@ -832,36 +832,48 @@
+ //
+ void R_RenderPlayerView (player_t* player)
+ {	
++    PROF_ENTER(DOOM_SBF_PROF_RENDER_TOTAL, 0);
++    PROF_ENTER(DOOM_SBF_PROF_SETUP_FRAME, 1);
+     R_SetupFrame (player);
+     R_DRAW_PHASE(1201);
++    PROF_EXIT(DOOM_SBF_PROF_SETUP_FRAME, 1);
+ 
+     // Clear buffers.
++    PROF_ENTER(DOOM_SBF_PROF_CLEAR_BUFS, 1);
+     R_ClearClipSegs ();
+     R_ClearDrawSegs ();
+     R_ClearPlanes ();
+     R_ClearSprites ();
+     R_DRAW_PHASE(1202);
+-    
++    PROF_EXIT(DOOM_SBF_PROF_CLEAR_BUFS, 1);
++
+     // check for new console commands.
+     NetUpdate ();
+ 
+     // The head node is the last node output.
++    PROF_ENTER(DOOM_SBF_PROF_BSP, 1);
+     R_RenderBSPNode ((DOOM_CTX->numnodes)-1);
+     R_DRAW_PHASE(1203);
++    PROF_EXIT(DOOM_SBF_PROF_BSP, 1);
+     
+     // Check for new console commands.
+     NetUpdate ();
+     
++    PROF_ENTER(DOOM_SBF_PROF_DRAW_PLANES, 1);
+     R_DrawPlanes ();
+     R_DRAW_PHASE(1204);
++    PROF_EXIT(DOOM_SBF_PROF_DRAW_PLANES, 1);
+     
+     // Check for new console commands.
+     NetUpdate ();
+     
++    PROF_ENTER(DOOM_SBF_PROF_DRAW_MASKED, 1);
+     R_DrawMasked ();
+     R_DRAW_PHASE(1205);
++    PROF_EXIT(DOOM_SBF_PROF_DRAW_MASKED, 1);
+ 
+     // Check for new console commands.
+     NetUpdate ();
+     R_DRAW_PHASE(1206);
++    PROF_EXIT(DOOM_SBF_PROF_RENDER_TOTAL, 0);
+ }
+--- a/linuxdoom-1.10/r_plane.c
++++ b/linuxdoom-1.10/r_plane.c
+@@ -149,6 +149,7 @@
+     angle = (viewangle + xtoviewangle[x1])>>ANGLETOFINESHIFT;
+     ds_xfrac = viewx + FixedMul(finecosine[angle], length);
+     ds_yfrac = -viewy - FixedMul(finesine[angle], length);
++    PROF_ENTER(DOOM_SBF_PROF_PLANE_SETUP, 2);
+ 
+     if (fixedcolormap)
+ 	ds_colormap = fixedcolormap;
+@@ -165,9 +166,16 @@
+     ds_y = y;
+     ds_x1 = x1;
+     ds_x2 = x2;
++
++    /* Patch 0030: everything above the spanfunc() call is the plane pass's
++     * per-column setup, and it is the part that would have to move into a
++     * once-per-frame prepare pass.  Accumulated separately from the drawer so
++     * a count-only image can price the two apart. */
++    PROF_EXIT(DOOM_SBF_PROF_PLANE_SETUP, 2);
+ 
+     // high or low detail
+     spanfunc ();	
++    PROF_ENTER(DOOM_SBF_PROF_PLANE_SETUP, 2);
+ }
+ 
+ 
+--- a/linuxdoom-1.10/r_segs.c
++++ b/linuxdoom-1.10/r_segs.c
+@@ -180,6 +180,11 @@
+     fixed_t		texturecolumn;
+     int			top;
+     int			bottom;
++
++    /* After the declarations, not before them: PROF_ENTER expands to
++     * ((void)0) outside a diagnostic-profile image, and a statement ahead of
++     * a declaration is not C90.  The interval is the same either way. */
++    PROF_ENTER(DOOM_SBF_PROF_SEG_LOOP, 2);
+ 
+     //texturecolumn = 0;				// shut up compiler warning
+ 	
+@@ -328,6 +333,7 @@
+ 	topfrac += topstep;
+ 	bottomfrac += bottomstep;
+     }
++    PROF_EXIT(DOOM_SBF_PROF_SEG_LOOP, 2);
+ }
+ 
+ 
+--- a/linuxdoom-1.10/r_things.c
++++ b/linuxdoom-1.10/r_things.c
+@@ -598,6 +598,10 @@
+ {
+     mobj_t*		thing;
+     int			lightnum;
++
++    /* After the declarations, not before them: see the same note in
++     * r_segs.c.  The interval is the same either way. */
++    PROF_ENTER(DOOM_SBF_PROF_ADD_SPRITES, 2);
+ 
+     // BSP is traversed by subsector.
+     // A sector might have been split into several
+@@ -621,6 +625,7 @@
+     // Handle all things in sector.
+     for (thing = sec->thinglist ; thing ; thing = thing->snext)
+ 	R_ProjectSprite (thing);
++    PROF_EXIT(DOOM_SBF_PROF_ADD_SPRITES, 2);
+ }
+ 
+ 
+@@ -943,8 +948,11 @@
+     vissprite_t*	spr;
+     drawseg_t*		ds;
+ 	
++    PROF_ENTER(DOOM_SBF_PROF_SORT_VISSPR, 2);
+     R_SortVisSprites ();
+     R_DRAW_PHASE(1210);
++    PROF_EXIT(DOOM_SBF_PROF_SORT_VISSPR, 2);
++    PROF_ENTER(DOOM_SBF_PROF_VISSPRITES, 2);
+ 
+     if (vissprite_p > vissprites)
+     {
+@@ -957,17 +965,22 @@
+ 	    R_DrawSprite (spr);
+ 	}
+     }
++    PROF_EXIT(DOOM_SBF_PROF_VISSPRITES, 2);
+     
+     // render any remaining masked mid textures
+     R_DRAW_PHASE(1212);
++    PROF_ENTER(DOOM_SBF_PROF_MASKED_SEGS, 2);
+     for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
+ 	if (ds->maskedtexturecol_m)
+ 	    R_RenderMaskedSegRange (ds, ds->x1, ds->x2);
++    PROF_EXIT(DOOM_SBF_PROF_MASKED_SEGS, 2);
+     
+     // draw the psprites on top of everything
+     R_DRAW_PHASE(1213);
++    PROF_ENTER(DOOM_SBF_PROF_PSPRITES, 2);
+     //  but does not draw on side views
+     if (!viewangleoffset)		
+ 	R_DrawPlayerSprites ();
+     R_DRAW_PHASE(1214);
++    PROF_EXIT(DOOM_SBF_PROF_PSPRITES, 2);
+ }

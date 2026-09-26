@@ -17,6 +17,8 @@ pub mod continuation_split_sbf;
 pub mod ex2;
 #[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
+#[cfg(feature = "diagnostic-profile")]
+pub mod prof;
 #[cfg(feature = "ctx-engine")]
 pub mod render_snapshot;
 #[cfg(feature = "ctx-engine")]
@@ -74,7 +76,26 @@ pub const CTX_GUARD_REFUSED: u32 = 199;
 /// The driver asserts the SBF-side sizeof the probe writes back against its
 /// own copy, so layout drift between the host-measured constant and the SBF
 /// struct fails loudly instead of aliasing engine state.
-#[cfg(feature = "ctx-engine")]
+///
+/// The constant has to be exact, not merely large enough: the static resource
+/// header records CTX_STRUCT_BYTES at offset 20 and the C rebind compares it
+/// against its own sizeof(doom_ctx_t), so an eight-byte drift here is a
+/// Custom(302) at the first RENDER with nothing in the log to explain it.
+///
+/// Patch 0030's diagnostic render-phase accumulator is eighteen CU cells plus
+/// four mark registers, 176 bytes, as the last member of doom_ctx_t. Those
+/// members are inside `#ifdef DOOM_SBF_PHASE_PROFILE` in doom_ctx.h, which
+/// build.rs defines for a `diagnostic-profile` image and nothing else, so the
+/// 176 bytes exist in that image and in no other. Hence the two constants:
+/// a production build must read exactly what it read before patch 0030, and
+/// the first version of the patch, which added the 176 bytes everywhere,
+/// moved BOOTSTRAP_OFFSET and ACCOUNT_BYTES with it and had to be reverted
+/// (30088de1f). A production build's context layout is a consensus input to
+/// the deployed images, the live accounts and the sender scripts; a
+/// measurement-only patch has no business changing it.
+#[cfg(all(feature = "ctx-engine", feature = "diagnostic-profile"))]
+pub const CTX_MIN_BYTES: usize = 3_440_952 + 176 + 24;
+#[cfg(all(feature = "ctx-engine", not(feature = "diagnostic-profile")))]
 pub const CTX_MIN_BYTES: usize = 3_440_952 + 24;
 
 /// Numeric phase-log magic used only by the bounded diagnostic SBF image.

@@ -44,6 +44,13 @@ capacity-extension = []
 # Diagnostic-only v3 instruction used to measure clipped 40-column rendering.
 # Never enable this feature in a deployable image.
 render-clip-measurement = ["ctx-engine"]
+# Diagnostic-only: render the strip with no clip at all, so one strip prices a
+# full 320-column pass.  The extraction still takes this strip's 40 columns, so
+# the 8-of-8 native pixel gate still holds and the per-strip CU becomes the
+# whole frame's render cost divided by nothing.  Never enable this in a
+# deployable image; it exists so the scene-once estimate can be measured
+# instead of extrapolated.
+render-profile-fullwidth = ["ctx-engine"]
 # Diagnostic-only: run every BSP traversal, column and span setup and every
 # per-pixel texture computation, but drop the framebuffer store.  The CU
 # difference against a diagnostic-profile image is the pixel-write cost of the
