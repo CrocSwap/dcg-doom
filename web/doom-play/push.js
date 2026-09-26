@@ -108,6 +108,14 @@ export async function readChainDigest(reader, record) {
   return {slot, strips};
 }
 
+// Two pushed records for one cursor are the same frame when their digests are.
+function sameFrame(a, b) {
+  if (a.stripHashes.length !== b.stripHashes.length) return false;
+  return a.stripHashes.every((digest, index) => digest === b.stripHashes[index])
+    && a.snapshotHash === b.snapshotHash
+    && a.stateRoot === b.stateRoot;
+}
+
 function u32le(bytes, offset) {
   return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
 }
@@ -187,7 +195,7 @@ export function compareFrames(pushed, read) {
 // if the page is too slow to keep up, the queue grows and the page says so, and
 // it is the operator who has to decide that a slow viewer wants skipping.
 export class FrameStream {
-  constructor({base, sessionId, onFrame, onCrossCheck, crossCheck, crossCheckEvery = DEFAULT_CROSS_CHECK_EVERY, EventSourceImpl = null, readChain = null} = {}) {
+  constructor({base, sessionId, onFrame, onCrossCheck, crossCheck, crossCheckEvery = DEFAULT_CROSS_CHECK_EVERY, EventSourceImpl = null, readChain = null, retryDelayMs = 500} = {}) {
     this.base = base;
     this.sessionId = sessionId;
     this.onFrame = onFrame;
@@ -206,10 +214,21 @@ export class FrameStream {
     // has the digests for that one too.
     this.digestsByCursor = new Map();
     this.digestsLimit = 60;
+    // The newest frame_index pushed for each cursor, kept apart from the digest
+    // list because identical digests are stored once and a re-render that
+    // produced the same picture must not make every later frame look superseded.
+    this.newestForCursor = new Map();
     this.skipped = 0;
     this.crossChecks = 0;
+    this.crossCheckMatches = 0;
     this.crossCheckMismatches = 0;
     this.crossCheckUncomparable = 0;
+    this.crossCheckRetries = 0;
+    this.superseded = 0;
+    // Wait this long before reading the chain a second time after a
+    // disagreement. Long enough for a re-render to be announced, short enough
+    // that a check does not hold the stream up.
+    this.retryDelayMs = retryDelayMs;
     this.stopped = false;
     this.queue = [];
     this.draining = false;
@@ -287,13 +306,21 @@ export class FrameStream {
     this.pushed += 1;
     if (record.frame_index != null) this.lastFrameIndex = record.frame_index;
     if (frame.cursor !== null && frame.cursor !== undefined) {
-      this.digestsByCursor.set(frame.cursor, {
+      // A *list* per cursor. The loop re-renders an unchanged cursor, so a cursor
+      // can have more than one frame, and "cursor -> digests" is not a key.
+      // Identical digests are stored once: a re-render that produced the same
+      // picture is not a second frame.
+      const entry = {
         frameIndex: record.frame_index ?? null,
         stripHashes: frame.stripHashes,
         snapshotHash: frame.snapshotHash,
         stateRoot: frame.stateRoot,
         pushedAt: Date.now(),
-      });
+      };
+      const existing = this.digestsByCursor.get(frame.cursor) ?? [];
+      if (!existing.some((candidate) => sameFrame(candidate, entry))) existing.push(entry);
+      this.digestsByCursor.set(frame.cursor, existing);
+      this.newestForCursor.set(frame.cursor, record.frame_index ?? null);
       while (this.digestsByCursor.size > this.digestsLimit) {
         this.digestsByCursor.delete(this.digestsByCursor.keys().next().value);
       }
@@ -309,52 +336,55 @@ export class FrameStream {
   // 1,728 bytes rather than 1,072,384 so that it finishes inside a frame
   // interval -- see `readChainDigest` for why the first version never compared
   // anything.
+  // Every Nth frame, read the same accounts' headers from the chain and compare
+  // the digests. The pushed frame has already been painted: the cross-check is
+  // an audit of the path, not a gate on the picture.
+  //
+  // It reads 1,728 bytes rather than 1,072,384 so it finishes inside a frame
+  // interval, and it compares the chain's frame against the page's own record
+  // of that frame rather than only against the frame just pushed, because the
+  // public node is about three frames behind the relayer.
+  //
+  // And a disagreement is read again before it is believed. Measured on R13,
+  // 2026-09-26: the loop re-renders an unchanged cursor, the page's stream is
+  // serial so it is not told about the second render, and the chain holds the
+  // newer one -- so a check firing on the older frame compares two pictures of
+  // one cursor and called it a mismatch. Four of eight live checks did that. A
+  // mismatch raises the page's banner, so a false one is worse than none: the
+  // second read brackets a window, and a disagreement is only a disagreement if
+  // it persists across it and the relayer has not announced a second frame for
+  // that cursor in the meantime.
   async #maybeCrossCheck(record, frame) {
     if (!this.readChain || this.crossCheckEvery <= 0) return;
     if (this.pushed % this.crossCheckEvery !== 0) return;
     this.crossChecks += 1;
-    let comparison = {comparable: false, match: false, reason: "the chain read did not run"};
+    let comparison;
     try {
-      const chain = await this.readChain(record);
-      // The chain may be holding an older frame than the one just pushed, and
-      // "older" is not "wrong". The page has the digests of the frames it has
-      // already been sent, so the chain's frame is compared against *its* record
-      // and the answer is exact. When the chain holds the pushed frame, that
-      // record is the frame itself.
-      const cursor = chain?.strips?.[0]?.cursor ?? null;
-      const known = cursor === null ? null : this.digestsByCursor.get(cursor) ?? null;
-      if (known) {
-        comparison = compareDigests(
-          {
-            cursor,
-            gametic: chain.strips[0].gametic,
-            stripHashes: known.stripHashes,
-            snapshotHash: known.snapshotHash,
-            stateRoot: known.stateRoot,
-          },
-          chain,
-        );
-        comparison.checked_frame_index = known.frameIndex;
-        comparison.chain_cursor = cursor;
-        comparison.pushed_cursor = frame.cursor;
-        comparison.behind_by_tics = frame.cursor - cursor;
-      } else {
-        comparison = {
-          comparable: false,
-          match: false,
-          reason: chain === null
-            ? "the chain does not hold eight strip headers yet"
-            : `the chain holds frame ${cursor}, which this page was never sent`,
-          chain_cursor: cursor,
-          pushed_cursor: frame.cursor,
-          behind_by_tics: frame.cursor - (cursor ?? frame.cursor),
-        };
+      comparison = this.#compare(await this.readChain(record), frame, record);
+      if (comparison.comparable && !comparison.match) {
+        // A disagreement is not yet a fact. Wait, and look again.
+        await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
+        if (this.#newestFor(frame.cursor) > (record.frame_index ?? 0)) {
+          // The relayer re-rendered this cursor while the read was open. There
+          // is nothing to report: the frame the chain holds is one this page has
+          // not been sent yet.
+          this.superseded += 1;
+          this.crossChecks -= 1;
+          return;
+        }
+        const again = this.#compare(await this.readChain(record), frame, record);
+        comparison = {...again, retried: true};
+        if (again.comparable && !again.match) this.crossCheckRetries += 1;
       }
     } catch (error) {
-      comparison = {comparable: false, match: false, reason: `the chain read failed: ${error instanceof Error ? error.message : String(error)}`};
+      comparison = {
+        comparable: false,
+        match: false,
+        reason: `the chain read failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
     if (comparison.match) {
-      this.crossCheckMatches = (this.crossCheckMatches ?? 0) + 1;
+      this.crossCheckMatches += 1;
     } else if (comparison.comparable) {
       this.crossCheckMismatches += 1;
     } else {
@@ -363,10 +393,61 @@ export class FrameStream {
     this.onCrossCheck({frame, comparison, checked: this.crossChecks});
   }
 
+  // The newest frame_index the relayer has pushed for a cursor, -1 for none.
+  #newestFor(cursor) {
+    const value = this.newestForCursor.get(cursor);
+    return value === undefined || value === null ? -1 : value;
+  }
+
+  // Compare one chain read against the page's records. Every record for the
+  // cursor the chain names is tried, because a cursor can have more than one
+  // frame; the first match wins, and a cursor the page has no record of is
+  // "uncomparable" rather than a mismatch.
+  #compare(chain, frame, record) {
+    const cursor = chain?.strips?.[0]?.cursor ?? null;
+    const base = {
+      chain_cursor: cursor,
+      pushed_cursor: frame.cursor,
+      behind_by_tics: frame.cursor - (cursor ?? frame.cursor),
+    };
+    if (chain === null) {
+      return {...base, comparable: false, match: false, reason: "the chain does not hold eight strip headers yet"};
+    }
+    const candidates = this.digestsByCursor.get(cursor) ?? [];
+    if (candidates.length === 0) {
+      return {...base, comparable: false, match: false, reason: `the chain holds frame ${cursor}, which this page was never sent`, candidates: 0};
+    }
+    const attempts = candidates.map((known) => ({
+      known,
+      result: compareDigests(
+        {
+          cursor,
+          gametic: chain.strips[0].gametic,
+          stripHashes: known.stripHashes,
+          snapshotHash: known.snapshotHash,
+          stateRoot: known.stateRoot,
+        },
+        chain,
+      ),
+    }));
+    const hit = attempts.find((attempt) => attempt.result.match) ?? attempts[0];
+    const comparison = {
+      ...hit.result,
+      checked_frame_index: hit.known.frameIndex,
+      candidates: candidates.length,
+      ...base,
+    };
+    if (comparison.match && candidates.length > 1) {
+      comparison.rerendered = true;
+      comparison.reason = `${comparison.reason} (frame ${hit.known.frameIndex} of ${candidates.length} pushed for this cursor)`;
+    }
+    return comparison;
+  }
+
   // Resolve once the queue has been drained. Painting is asynchronous (every
-  // frame runs eight digest checks), so "the stream has taken this frame" and
-  // "the frame is on the canvas" are different moments, and a caller that cares
-  // about the second asks for this.
+  // frame runs eight digest checks, and a cross-check reads the chain), so "the
+  // stream has taken this frame" and "the frame is on the canvas" are different
+  // moments, and a caller that cares about the second asks for this.
   async idle() {
     while (this.draining || this.queue.length > 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -387,6 +468,13 @@ export class FrameStream {
       cross_check_matches: this.crossCheckMatches ?? 0,
       cross_check_mismatches: this.crossCheckMismatches,
       cross_check_uncomparable: this.crossCheckUncomparable,
+      // Disagreements that survived a second read. This is the only bucket that
+      // means the push path is wrong.
+      cross_check_retries: this.crossCheckRetries,
+      // Disagreements that went away because the relayer re-rendered the cursor
+      // while the read was open. Counted, so the rate of re-renders is visible
+      // rather than looking like a rate of lies.
+      cross_check_superseded: this.superseded,
       last_error: this.lastError ?? null,
     };
   }

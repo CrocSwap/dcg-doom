@@ -450,3 +450,156 @@ test("a chain read naming a frame the page never had is uncomparable, not a mism
   assert.match(checks[0].comparison.reason, /which this page was never sent/);
   assert.equal(checks[0].comparison.behind_by_tics, -4000);
 });
+
+// -- the disagreement is read twice ------------------------------------------
+//
+// Measured on R13, 2026-09-26: the loop re-renders an unchanged cursor, the
+// page's stream is serial so it is not told about the second render, and the
+// chain holds the newer one. A check firing on the older frame compared two
+// pictures of one cursor and called it a mismatch -- four of eight live checks.
+// A mismatch raises the page's banner, so a false one is worse than a false
+// negative: the player is told the picture cannot be trusted when it can.
+
+function chainWith(stripId, digest) {
+  const chain = chainDigestOf(realStrips, 42);
+  chain.strips[stripId] = {...chain.strips[stripId], digest};
+  return chain;
+}
+
+test("a disagreement that goes away on the second read is not a mismatch", async () => {
+  let calls = 0;
+  const checks = [];
+  const stream = new FrameStream({
+    base: "http://r.invalid", sessionId: "s-transient",
+    onFrame: () => {},
+    onCrossCheck: (value) => checks.push(value),
+    crossCheckEvery: 1,
+    retryDelayMs: 1,
+    readChain: async () => {
+      calls += 1;
+      // The first read catches the chain mid-re-render; the second does not.
+      return calls === 1 ? chainWith(3, "ab".repeat(32)) : chainDigestOf(realStrips, 43);
+    },
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 1}));
+  const summary = stream.summary();
+  assert.equal(calls, 2, "a disagreement is read again");
+  assert.equal(summary.cross_check_matches, 1, JSON.stringify(checks.map((c) => c.comparison)));
+  assert.equal(summary.cross_check_mismatches, 0, "a disagreement that went away is not a mismatch");
+  assert.equal(summary.cross_check_retries, 0, "and the retry is not counted as a retry either");
+  assert.equal(checks[0].comparison.retried, true, "the panel says the answer came from a second read");
+});
+
+test("a disagreement that survives the second read is a mismatch", async () => {
+  let calls = 0;
+  const checks = [];
+  const stream = new FrameStream({
+    base: "http://r.invalid", sessionId: "s-real",
+    onFrame: () => {},
+    onCrossCheck: (value) => checks.push(value),
+    crossCheckEvery: 1,
+    retryDelayMs: 1,
+    readChain: async () => {
+      calls += 1;
+      return chainWith(3, "ab".repeat(32));
+    },
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 1}));
+  const summary = stream.summary();
+  assert.equal(calls, 2, "it was read twice");
+  assert.equal(summary.cross_check_mismatches, 1, "and it still disagrees, so it is a mismatch");
+  assert.equal(summary.cross_check_retries, 1, "counted as a disagreement that survived the retry");
+  assert.match(checks[0].comparison.reason, /strip 3 digest differs/);
+});
+
+test("a disagreement that the relayer re-rendered away is not a result at all", async () => {
+  // The live case: the chain read is open, the relayer announces a second frame
+  // for the same cursor, and there is nothing to say about the older one.
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let calls = 0;
+  const checks = [];
+  const stream = new FrameStream({
+    base: "http://r.invalid", sessionId: "s-rerendered-away",
+    onFrame: () => {},
+    onCrossCheck: (value) => checks.push(value),
+    crossCheckEvery: 1,
+    retryDelayMs: 1,
+    readChain: async () => {
+      calls += 1;
+      if (calls === 1) {
+        await gate;
+        return chainWith(3, "ab".repeat(32));
+      }
+      return chainDigestOf(realStrips, 44);
+    },
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  FakeEventSource.last.fire("frame", {data: JSON.stringify(pushedRecord({frameIndex: 1}))});
+  // Wait for the push to be registered, and for its check to be parked in the
+  // gated read.
+  while (stream.pushed < 1 || calls < 1) await new Promise((resolve) => setImmediate(resolve));
+  // The relayer announces a second frame for the same cursor while the first
+  // read is still open. The stream is serial, so this one waits its turn -- which
+  // is exactly why the supersession has to be judged after the read, not before
+  // it.
+  stream.newestForCursor.set(pushedRecord().cursor, 2);
+  release();
+  await stream.idle();
+  const summary = stream.summary();
+  assert.equal(checks.length, 0, `nothing is reported: ${JSON.stringify(checks.map((c) => c.comparison))} superseded=${summary.cross_check_superseded} checks=${summary.cross_checks} calls=${calls}`);
+  assert.equal(summary.cross_check_superseded, 1);
+  assert.equal(summary.cross_check_mismatches, 0);
+  assert.equal(summary.cross_checks, 0, "and it does not count as a check either");
+});
+
+test("a cursor with two genuinely different frames keeps both, and either can match", async () => {
+  // "cursor -> digests" is not a key: the loop re-renders an unchanged cursor and
+  // the two renders can differ. The check tries every record for the cursor.
+  const checks = [];
+  const cursor = meta.cursor ?? 6016;
+  const first = await decodePushedFrame(pushedRecord({frameIndex: 7}));
+  const stream = new FrameStream({
+    base: "http://r.invalid", sessionId: "s-two",
+    onFrame: () => {},
+    onCrossCheck: (value) => checks.push(value),
+    crossCheckEvery: 1,
+    retryDelayMs: 1,
+    readChain: async () => chainDigestOf(realStrips, 42),
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  stream.digestsByCursor.set(cursor, [
+    {frameIndex: 7, stripHashes: first.stripHashes, snapshotHash: first.snapshotHash, stateRoot: first.stateRoot, pushedAt: 1},
+    {frameIndex: 9, stripHashes: first.stripHashes.map((d, i) => (i === 3 ? "00".repeat(32) : d)), snapshotHash: first.snapshotHash, stateRoot: first.stateRoot, pushedAt: 2},
+  ]);
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 11}));
+  assert.equal(checks.length, 1);
+  const comparison = checks[0].comparison;
+  assert.equal(comparison.match, true, JSON.stringify(comparison));
+  assert.equal(comparison.checked_frame_index, 7, "the frame the chain actually holds");
+  assert.equal(comparison.candidates, 2);
+  assert.equal(comparison.rerendered, true);
+  assert.match(comparison.reason, /of 2 pushed for this cursor/);
+});
+
+test("two pushes of the same frame for one cursor are stored once", async () => {
+  const stream = new FrameStream({base: "http://r.invalid", sessionId: "s-same", onFrame: () => {}, EventSourceImpl: FakeEventSource});
+  stream.start();
+  FakeEventSource.stream = stream;
+  const cursor = meta.cursor ?? 6016;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 1}));
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 2}));
+  assert.equal(stream.digestsByCursor.get(cursor).length, 1, "identical digests, one record");
+});
