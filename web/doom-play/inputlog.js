@@ -5,7 +5,7 @@
 // `input_tics_staged: 7076`, `input_tics_deposited: 3436` and
 // `input_command_tics_deposited: 215`, so 80% of what the player pressed never
 // reached a DEPOSIT and the page said nothing. This module is the answer to
-// that: it keeps one row per key press, resolves every tic the press aimed at
+// that: it keeps one row per key press, resolves the relayer-assigned tic
 // against what the producer actually deposited, and names the fate.
 //
 // The fates, and where each comes from:
@@ -140,8 +140,8 @@ export class InputLog {
     return this.presses.filter((record) => record.upAt === null);
   }
 
-  // A batch the page signed and offered. `commands` is what it aimed at, so the
-  // panel can compare it byte for byte against what the chain was given.
+  // An explicit-sequence batch. `commands` is what it aimed at, so the panel
+  // can compare it byte for byte against what the chain was given.
   noteBatch({firstSeq, count, commands, accepted = count, acceptedFrom = firstSeq, trimmedFromSeq = null, queuedAboveStageLimit = null, refused = null, reason = null, at = performance.now()}) {
     for (const record of this.open()) {
       for (let i = 0; i < count; i += 1) {
@@ -174,6 +174,20 @@ export class InputLog {
       while (record.offered.size > MAX_OFFERED_PER_PRESS) {
         record.offered.delete(record.offered.keys().next().value);
       }
+    }
+    this.dirty = true;
+  }
+
+  // V2 does not choose a sequence or encode ticcmd bytes in the page. Once
+  // the relayer assigns this press its tic, retain the one command the signed
+  // key state means there so the normal fate ledger can check the eventual
+  // atomic DEPOSIT against it.
+  noteStampedState(record, tic, commands) {
+    if (!record || typeof tic !== "number" || !(commands instanceof Uint8Array) || commands.length !== 4) return;
+    record.offered.set(tic, Uint8Array.from(commands));
+    record.tics.set(tic, {fate: PENDING, reason: null});
+    while (record.offered.size > MAX_OFFERED_PER_PRESS) {
+      record.offered.delete(record.offered.keys().next().value);
     }
     this.dirty = true;
   }
@@ -416,7 +430,7 @@ export class InputLog {
         list.dataset.empty = "1";
         const empty = document.createElement("li");
         empty.className = "inputlog-empty";
-        empty.textContent = "Press a key. Every press appears here with the tics it aimed at, whether they reached a DEPOSIT, and the transaction that carried them.";
+        empty.textContent = "Press a key. The relayer assigns it to the next free tic and reports whether it reached a DEPOSIT.";
         list.replaceChildren(empty);
       }
       return;

@@ -13,6 +13,7 @@ import {webcrypto} from "node:crypto";
 import {
   INPUT_MAGIC,
   INPUT_VERSION,
+  INPUT_VERSION_EXPLICIT_TICS,
   INPUT_SIGN_DOMAIN,
   INPUT_HEADER_BYTES,
   COMMAND_BYTES,
@@ -31,6 +32,7 @@ import {
   OFF_COMMANDS,
   InputError,
   encodeInput,
+  encodeKeyState,
   decodeInput,
   signingPayload,
   signInput,
@@ -70,6 +72,17 @@ function sample(overrides = {}) {
     slot: 3,
     firstSeq: 128,
     commands: commands(4),
+    clientSeq: 9,
+    issuedAt: NOW,
+    binding: BINDING,
+    ...overrides,
+  });
+}
+
+function sampleKeyState(overrides = {}) {
+  return encodeInput({
+    slot: 3,
+    keys: {forward: true, attack: true},
     clientSeq: 9,
     issuedAt: NOW,
     binding: BINDING,
@@ -124,7 +137,7 @@ test("every field lands at its documented offset, little-endian", () => {
   const message = sample();
   const view = new DataView(message.buffer);
   assert.equal(new TextDecoder().decode(message.subarray(0, 8)), INPUT_MAGIC);
-  assert.equal(view.getUint16(8, true), INPUT_VERSION);
+  assert.equal(view.getUint16(8, true), INPUT_VERSION_EXPLICIT_TICS);
   assert.equal(view.getUint16(10, true), 4);
   assert.equal(view.getUint32(OFF_SLOT, true), 3);
   assert.equal(view.getUint32(OFF_FIRST_SEQ, true), 128);
@@ -150,8 +163,8 @@ test("decode refuses a malformed message", () => {
   assert.throws(() => decodeInput(badMagic), /magic/);
 
   const badVersion = sample();
-  new DataView(badVersion.buffer).setUint16(8, 2, true);
-  assert.throws(() => decodeInput(badVersion), /version 2/);
+  new DataView(badVersion.buffer).setUint16(8, 7, true);
+  assert.throws(() => decodeInput(badVersion), /version 7/);
 
   // A count that disagrees with the declared payload length.
   const badCount = sample();
@@ -178,7 +191,7 @@ test("decode refuses a malformed message", () => {
   const tooMany = new Uint8Array(INPUT_HEADER_BYTES + 65 * COMMAND_BYTES);
   tooMany.set(new TextEncoder().encode(INPUT_MAGIC), 0);
   const tooManyView = new DataView(tooMany.buffer);
-  tooManyView.setUint16(8, INPUT_VERSION, true);
+  tooManyView.setUint16(8, INPUT_VERSION_EXPLICIT_TICS, true);
   tooManyView.setUint16(10, 65, true);
   tooManyView.setUint32(OFF_PAYLOAD_BYTES, 65 * COMMAND_BYTES, true);
   tooManyView.setUint32(OFF_ISSUED_AT, NOW, true);
@@ -202,11 +215,23 @@ test("a key made with WebCrypto signs, and node verifies the signature", async (
 });
 
 test("the signing payload is the domain tag followed by the message", () => {
-  const message = sample();
+  const message = sampleKeyState();
   const payload = signingPayload(message);
   assert.equal(payload.length, INPUT_SIGN_DOMAIN.length + message.length);
   assert.equal(new TextDecoder().decode(payload.subarray(0, INPUT_SIGN_DOMAIN.length)), INPUT_SIGN_DOMAIN);
   assert.deepEqual(Array.from(payload.subarray(INPUT_SIGN_DOMAIN.length)), Array.from(message));
+});
+
+test("version 2 signs a sequence-free key state and bypasses page-side cursor windows", () => {
+  const message = sampleKeyState();
+  const parsed = decodeInput(message);
+  assert.equal(new DataView(message.buffer).getUint16(8, true), INPUT_VERSION);
+  assert.equal(parsed.sequenceMode, "now");
+  assert.equal(parsed.firstSeq, 0);
+  assert.equal(parsed.count, 1);
+  assert.deepEqual(parsed.keys, {forward: true, back: false, left: false, right: false, strafeLeft: false, strafeRight: false, attack: true, use: false, run: false});
+  assert.equal(validateInput(parsed, {expectedSlot: 3, expectedBinding: BINDING, nowSeconds: NOW, nextSeq: 50000, window: 1}).ok, true);
+  assert.deepEqual(Array.from(encodeKeyState({forward: true, attack: true})), Array.from(parsed.commands));
 });
 
 test("a signature does not transfer to another message, another key, or another tag", async () => {

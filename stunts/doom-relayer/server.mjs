@@ -560,6 +560,7 @@ export class Relayer {
   // The core path: verify the player's signature, check the batch against the
   // slot's rules, then deposit and advance on chain.
   async postInput(sessionId, {message, signature, publicKey}) {
+    const postReceivedAtMs = Date.now();
     const session = this.getSession(sessionId);
     if (session.state !== "playing") {
       const error = new Error(`session is ${session.state}`);
@@ -568,12 +569,6 @@ export class Relayer {
       throw error;
     }
     const slot = session.slot;
-    // Read the cursor before judging the batch, not after staging it. The page's
-    // own next_seq is only as fresh as its last answer, and the engine runs at
-    // about 35 tics/s, so between two player batches the chain can consume
-    // hundreds of tics the page still believes it owns.
-    await this.refreshSlot(slot);
-
     let decoded;
     try {
       decoded = decodeInput(message);
@@ -608,6 +603,69 @@ export class Relayer {
       error.code = "wrong_player";
       throw error;
     }
+
+    // V2 carries a full key state, not an absolute sequence. The pipeline owns
+    // the frontier and stamps it at its next free tic, so do not spend an RPC
+    // read refreshing a cursor the browser has no reason to know.
+    if (decoded.sequenceMode === "now") {
+      if (session.clientSeq !== 0 && decoded.clientSeq <= session.clientSeq) {
+        this.stats.inputsRejected += 1;
+        const error = new Error(`client_seq ${decoded.clientSeq} is not ahead of ${session.clientSeq}`);
+        error.status = 409;
+        error.code = "stale_client_seq";
+        throw error;
+      }
+      session.clientSeq = decoded.clientSeq;
+      const binding = await this.bindingForSlot(slot);
+      const verdict = validateInput(decoded, {
+        expectedSlot: slot.slot,
+        expectedBinding: binding,
+        nowSeconds: Math.floor(Date.now() / 1000),
+        maxSkewSeconds: this.maxSkewSeconds,
+      });
+      if (!verdict.ok) {
+        this.stats.inputsRejected += 1;
+        const error = new Error(verdict.reason);
+        error.status = 409;
+        error.code = "batch_refused";
+        throw error;
+      }
+      let result;
+      try {
+        result = await this.sender.keyState({slot: slot.label, keyMask: decoded.keyMask});
+      } catch (error) {
+        this.stats.inputsRejected += 1;
+        throw error;
+      }
+      slot.cursor = result.cursor ?? slot.cursor;
+      slot.gametic = result.gametic ?? slot.gametic;
+      slot.producerNextCursor = result.producerNextCursor ?? slot.producerNextCursor;
+      slot.pipeline = result.pipeline ?? slot.pipeline;
+      this.stats.inputsAccepted += 1;
+      return {
+        ok: true,
+        accepted: 1,
+        offered: 1,
+        first_seq: 0,
+        accepted_from: result.acceptedFrom,
+        stamp_tic: result.acceptedFrom,
+        stamp_gametic: result.stampGametic ?? result.acceptedFrom,
+        next_seq: result.acceptedFrom + 1,
+        cursor: slot.cursor,
+        gametic: slot.gametic,
+        key_mask: decoded.keyMask,
+        post_received_at_ms: postReceivedAtMs,
+        tic_assigned_at_ms: result.ticAssignedAtMs ?? null,
+        key_state: result.keyStateEvent ?? null,
+        producer_next_cursor: result.producerNextCursor ?? null,
+        pipeline: result.pipeline ?? slot.pipeline ?? null,
+        latest_frame: slot.latestFrame ?? null,
+      };
+    }
+
+    // V1 still carries an explicit range. Read the cursor before validating it;
+    // its sequence can have gone stale while the page was signing or sending.
+    await this.refreshSlot(slot);
 
     // Replay within one session: client_seq must strictly increase.
     if (decoded.clientSeq <= session.clientSeq && session.clientSeq !== 0) {
@@ -1093,7 +1151,7 @@ const CHAIN_FLAGS = new Set([
 // the first to the *text* of the second and then skip it, so the second would
 // never reach the pipeline and the session would quietly run the serial path
 // while the runbook said otherwise.
-const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot"]);
+const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot", "atomic-live-inputs"]);
 
 export function parseArgs(argv) {
   const args = new Map();
@@ -1151,6 +1209,7 @@ if (isMain()) {
     spendCapFogo: args.get("spend-cap-fogo") ? Number(args.get("spend-cap-fogo")) : undefined,
     payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
     resetStartAccount: args.get("reset-start-account") ?? undefined,
+    atomicLiveInputs: args.get("atomic-live-inputs") != null,
     frameDeadlineSeconds: args.get("frame-deadline-seconds") ? Number(args.get("frame-deadline-seconds")) : undefined,
     minCursorStepTics: args.get("min-cursor-step-tics") ? Number(args.get("min-cursor-step-tics")) : undefined,
     renderPoolWorkers: args.get("render-pool-workers") != null ? Number(args.get("render-pool-workers")) : undefined,
