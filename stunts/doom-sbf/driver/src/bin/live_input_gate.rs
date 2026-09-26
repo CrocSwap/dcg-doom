@@ -656,11 +656,12 @@ async fn provision_render_buffer(
         &session.keys.context.pubkey(),
         buffer,
     )
-    .ok_or_else(|| format!("buffer {buffer} has no address to provision").into())?;
+    .ok_or_else(|| -> Box<dyn Error> {
+        format!("buffer {buffer} has no address to provision").into()
+    })?;
+    let authority = session.keys.authority.insecure_clone();
     let init = session.init_buffered_ix(snapshot, buffer);
-    let created = session
-        .send(vec![init], &[&session.keys.authority], RENDER_LIMIT)
-        .await?;
+    let created = session.send(vec![init], &[&authority], RENDER_LIMIT).await?;
     if created.result.is_err() {
         return Err(format!("INIT-BUFFERED {buffer}: {:?}", created.result).into());
     }
@@ -699,9 +700,7 @@ async fn provision_render_buffer(
     }
     for strip in 0..8u8 {
         let ix = session.init_strip_ix(snapshot, strip);
-        let created = session
-            .send(vec![ix], &[&session.keys.authority], RENDER_LIMIT)
-            .await?;
+        let created = session.send(vec![ix], &[&authority], RENDER_LIMIT).await?;
         if created.result.is_err() {
             return Err(format!("INIT-STRIP {buffer}/{strip}: {:?}", created.result).into());
         }
@@ -1685,7 +1684,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &session.keys.context.pubkey(),
                         buffer,
                     )
-                    .ok_or_else(|| format!("buffer {buffer} has no address").into())?
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        format!("buffer {buffer} has no address").into()
+                    })?
                     .0
                 };
                 let snap_ix =
@@ -1801,7 +1802,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let render_past_cu = base::units(&render_past).ok();
             let init_past_ix = session.init_buffered_ix(snapshot_key, past);
             let init_past = session
-                .send(vec![init_past_ix], &[&session.keys.authority], RENDER_LIMIT)
+                .send(vec![init_past_ix], &[&authority], RENDER_LIMIT)
                 .await?;
             let init_past_code = custom_code(&init_past);
             let init_past_cu = base::units(&init_past).ok();
@@ -1835,7 +1836,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // two already visited.
             let static_after_first_buffer = depth_static_digests
                 .first()
-                .copied()
+                .cloned()
                 .ok_or("no buffer was rendered")?;
             let first_buffer = 1u8;
             let (first_snapshot, _) =
