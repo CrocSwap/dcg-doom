@@ -15,7 +15,7 @@ import {readFileSync} from "node:fs";
 import {fileURLToPath} from "node:url";
 import {dirname, join} from "node:path";
 
-import {STRIP_COUNT, STRIP_ACCOUNT_BYTES, STRIP_HASH_DOMAIN, decodeFrame} from "../strip.js";
+import {STRIP_COUNT, STRIP_ACCOUNT_BYTES, STRIP_HEADER_BYTES, STRIP_HASH_DOMAIN, decodeFrame, stripDigest} from "../strip.js";
 import {
   FrameStream,
   compareDigests,
@@ -68,6 +68,32 @@ function decodeFrameSync(strips) {
     }
   }
   return {pixels};
+}
+
+// The fixture's eight strips at a cursor *behind* the one on screen, with every
+// strip digest recomputed, so it is a frame the page would accept from the
+// relayer and not a malformed record. That is the whole point: a stale frame is
+// valid, and refusing to paint it is a policy.
+async function olderStrips(ticsBehind = 4) {
+  const out = [];
+  for (let stripId = 0; stripId < STRIP_COUNT; stripId += 1) {
+    const source = realStrips[stripId];
+    const account = new Uint8Array(source);
+    const view = new DataView(account.buffer);
+    const cursor = view.getUint32(20, true) - ticsBehind;
+    view.setUint32(20, cursor, true);
+    view.setUint32(24, view.getUint32(24, true) - ticsBehind, true);
+    const pixels = account.subarray(STRIP_HEADER_BYTES);
+    account.set(await stripDigest({
+      stripId,
+      cursor,
+      gametic: view.getUint32(24, true),
+      snapshotHash: account.subarray(32, 64),
+      pixels,
+    }), 96);
+    out.push(account);
+  }
+  return out;
 }
 
 // A minimal EventSource, so the stream can be driven without a browser.
@@ -201,6 +227,89 @@ test("the stream asks for frames after the last one it painted", () => {
   const stream = new FrameStream({base: "http://r.invalid", sessionId: "a b", EventSourceImpl: FakeEventSource});
   stream.lastFrameIndex = 41;
   assert.equal(stream.url, "http://r.invalid/v1/sessions/a%20b/frames?since=41");
+});
+
+// The paint gap, in one test, from the shape the chain actually produces.
+//
+// `frame_index` is the relayer's *submission* counter. With more than one render
+// buffer in flight the frames are submitted in order and completed in
+// completion order, so a frame submitted second arrives first. The rule that
+// dropped it -- `frame_index <= lastFrameIndex` -- called that a frame already
+// painted, and threw away frames the page had never seen. Measured on the R15
+// confirm session, 2026-09-26, from the relayer's own `frames.jsonl`: 105 of 201
+// consecutive pushes carried a lower `frame_index` than the push before them,
+// and replaying that push order through the old rule paints 79 and drops 123.
+test("a frame the page has never painted is painted, whatever its index is behind", async () => {
+  const painted = [];
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-order",
+    onFrame: (frame) => painted.push(frame.frameIndex),
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  // Four buffers in flight, two bursts: the first group completes in submission
+  // order, the second in reverse. Every one of the eight is a frame the page has
+  // never seen, and the second burst is entirely behind the first.
+  for (const index of [1, 2, 3, 4, 8, 7, 6, 5]) {
+    await FakeEventSource.last.deliver(pushedRecord({frameIndex: index}));
+  }
+  assert.deepEqual(painted, [1, 2, 3, 4, 8, 7, 6, 5], "every frame the relayer sent reached the canvas, in arrival order");
+  const summary = stream.summary();
+  assert.equal(summary.skipped, 0, "nothing this page had not painted was called a replay");
+  assert.equal(summary.pushed, 8);
+  assert.equal(summary.received, 8, "delivery was complete: the loss was never on the wire");
+  // The picture is on the newest frame it has shown, not the last one it was
+  // handed, so a reconnect asks for what it missed rather than everything again.
+  assert.equal(summary.last_frame_index, 8, `the reconnect cursor went backwards to ${summary.last_frame_index}`);
+  assert.match(stream.url, /since=8$/);
+  stream.stop();
+});
+
+test("a replay is still dropped, and a stale frame is painted and counted", async () => {
+  const painted = [];
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-stale",
+    onFrame: (frame) => painted.push(frame.frameIndex),
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 7}));
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 7}));
+  assert.equal(stream.summary().skipped, 1, "the frame the relayer handed back was re-painted");
+  // A frame older than the picture on screen. It is a real render of a real
+  // state the chain committed, so it is painted and counted, and the count is
+  // what makes the choice visible rather than silent.
+  const older = pushedRecord({frameIndex: 6, strips: await olderStrips()});
+  await FakeEventSource.last.deliver(older);
+  const summary = stream.summary();
+  assert.equal(summary.painted_stale, 1, JSON.stringify(summary));
+  assert.equal(summary.stale_dropped, 0);
+  assert.equal(summary.pushed, 2, "the stale frame was painted, so the page is at the chain's rate");
+  stream.stop();
+});
+
+test("the old rule is available: a viewer can refuse to go backwards", async () => {
+  const painted = [];
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-monotone",
+    dropStaleFrames: true,
+    onFrame: (frame) => painted.push(frame.frameIndex),
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 7}));
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 6, strips: await olderStrips()}));
+  const summary = stream.summary();
+  assert.equal(summary.stale_dropped, 1, "a frame older than the picture was painted anyway");
+  assert.equal(summary.pushed, 1);
+  assert.deepEqual(painted, [7]);
+  stream.stop();
 });
 
 test("a dropped stream is opened again asking for what it missed", async () => {

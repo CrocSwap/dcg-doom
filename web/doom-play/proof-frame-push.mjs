@@ -21,7 +21,7 @@
 
 import {spawn} from "node:child_process";
 import {createHash} from "node:crypto";
-import {mkdirSync, writeFileSync} from "node:fs";
+import {mkdirSync, rmSync, writeFileSync} from "node:fs";
 import {createConnection} from "node:net";
 import {setTimeout as sleep} from "node:timers/promises";
 
@@ -98,6 +98,11 @@ function wsConnect(url) {
 
 // -- the browser ------------------------------------------------------------
 
+// The profile goes with the browser. On macOS it carries the `code_sign_clone`
+// directory Chrome writes into it, which is megabytes per run, and a proof that
+// leaves one behind on every session is a proof that fills the disk. `PROOF_CLEAN`
+// =0 keeps it, for a run that wants to look at the profile.
+const PROFILE = process.env.PROOF_PROFILE ?? "/tmp/doom-push-proof-profile";
 const chrome = spawn(CHROME, [
   "--headless=new",
   `--remote-debugging-port=${PORT}`,
@@ -106,10 +111,47 @@ const chrome = spawn(CHROME, [
   "--no-default-browser-check",
   "--disable-gpu",
   "--window-size=1600,1200",
-  `--user-data-dir=${process.env.PROOF_PROFILE ?? "/tmp/doom-push-proof-profile"}`,
+  `--user-data-dir=${PROFILE}`,
   "about:blank",
 ], {stdio: ["ignore", "ignore", "pipe"]});
 chrome.stderr.on("data", () => {});
+
+// One exit path for every way this file ends, including the join failure below.
+let closed = false;
+function closeChrome() {
+  if (closed) return;
+  closed = true;
+  try {
+    chrome.kill();
+  } catch {
+    /* already gone */
+  }
+  if (process.env.PROOF_CLEAN === "0") return;
+  const sweep = () => {
+    try {
+      rmSync(PROFILE, {recursive: true, force: true});
+    } catch {
+      /* the profile is already gone */
+    }
+  };
+  chrome.once("exit", sweep);
+  const timer = setTimeout(() => {
+    try {
+      chrome.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    sweep();
+  }, 2_000);
+  timer.unref?.();
+}
+process.on("exit", closeChrome);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    closeChrome();
+    process.exit(1);
+  });
+}
 
 async function target() {
   for (let attempt = 0; attempt < 80; attempt += 1) {
@@ -220,7 +262,7 @@ if (typeof joined !== "string" || !/^[0-9a-f]{8,}$/.test(joined)) {
   writeFileSync(`${OUT}/proof.json`, JSON.stringify({page: PAGE, joined, ok: false}, null, 2));
   await shot("proof-join-failed");
   console.log("JOIN FAILED; the page says:", await evaluate(`document.getElementById("error")?.textContent ?? ""`));
-  chrome.kill();
+  closeChrome();
   process.exit(1);
 }
 
@@ -343,4 +385,4 @@ console.log("panel:", JSON.stringify(final.panel));
 console.log("relayer frame_push:", JSON.stringify(relayerHealth?.frame_push));
 console.log("error:", final.error, "banner:", final.banner);
 ws.close();
-chrome.kill();
+closeChrome();
