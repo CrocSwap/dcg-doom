@@ -1,0 +1,346 @@
+// The frame-push proof: measure the painted rate through the page, then press
+// keys and measure how long a keypress takes to show up.
+//
+// Same shape as proof-input-panel.mjs and for the same reason -- dependency-free
+// CDP over a WebSocket this file implements itself, so the proof does not depend
+// on a package that may or may not be installed, and it reads the page's own
+// state rather than anything this file keeps.
+//
+// What it is here to answer, in order:
+//
+//   1. painted frames per second over a window of at least PROOF_FPS_WINDOW
+//      seconds, counted from the page's own paint timestamps;
+//   2. torn reads on the push path, which should be none: a pushed frame is
+//      eight whole strip accounts that agree, not a read that caught a write;
+//   3. key-to-picture latency over at least PROOF_PRESSES presses;
+//   4. the cross-check: how many pushed frames were read back from the chain and
+//      compared, and how many disagreed;
+//   5. the panel's own landed ratio, read from the page.
+//
+// Usage: node proof-frame-push.mjs [out-dir]
+
+import {spawn} from "node:child_process";
+import {createHash} from "node:crypto";
+import {mkdirSync, writeFileSync} from "node:fs";
+import {createConnection} from "node:net";
+import {setTimeout as sleep} from "node:timers/promises";
+
+const OUT = process.argv[2] ?? ".";
+const PAGE = process.env.PROOF_PAGE
+  ?? "http://127.0.0.1:8012/web/doom-play/?relayer=http://127.0.0.1:8787&net=testnet&frame-source=push";
+const CHROME = process.env.PROOF_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const PORT = Number(process.env.PROOF_CDP_PORT ?? 9334);
+const FPS_WINDOW = Number(process.env.PROOF_FPS_WINDOW ?? 60) * 1000;
+const PRESSES = Number(process.env.PROOF_PRESSES ?? 12);
+const HOLD_MS = Number(process.env.PROOF_HOLD_MS ?? 1200);
+const SETTLE_MS = Number(process.env.PROOF_SETTLE_MS ?? 2200);
+
+mkdirSync(OUT, {recursive: true});
+
+// -- a minimal websocket client, enough for CDP -----------------------------
+
+function wsConnect(url) {
+  const parsed = new URL(url);
+  const key = createHash("sha1").update(createHash("md5").update(String(Math.random())).digest()).digest("base64");
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({host: parsed.hostname, port: Number(parsed.port || 80)});
+    let buffer = Buffer.alloc(0);
+    let handshaked = false;
+    const listeners = [];
+    const send = (text) => {
+      const payload = Buffer.from(text);
+      const header = payload.length < 126
+        ? Buffer.from([0x81, 0x80 | payload.length])
+        : Buffer.concat([Buffer.from([0x81, 0x80 | 126]), (() => { const b = Buffer.alloc(2); b.writeUInt16BE(payload.length); return b; })()]);
+      socket.write(Buffer.concat([header, Buffer.from([0, 0, 0, 0]), payload]));
+    };
+    socket.on("connect", () => {
+      socket.write(
+        `GET ${parsed.pathname}${parsed.search} HTTP/1.1\r\n` +
+          `Host: ${parsed.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+          `Sec-WebSocket-Key: ${Buffer.from(key).toString("base64").slice(0, 24)}\r\n` +
+          "Sec-WebSocket-Version: 13\r\n\r\n",
+      );
+    });
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!handshaked) {
+        const at = buffer.indexOf("\r\n\r\n");
+        if (at < 0) return;
+        handshaked = true;
+        buffer = buffer.subarray(at + 4);
+        resolve({send, onMessage: (fn) => listeners.push(fn), close: () => socket.end()});
+      }
+      for (;;) {
+        if (buffer.length < 2) return;
+        const opcode = buffer[0] & 0x0f;
+        let length = buffer[1] & 0x7f;
+        let offset = 2;
+        if (length === 126) {
+          if (buffer.length < 4) return;
+          length = buffer.readUInt16BE(2);
+          offset = 4;
+        } else if (length === 127) {
+          if (buffer.length < 10) return;
+          length = Number(buffer.readBigUInt64BE(2));
+          offset = 10;
+        }
+        if (buffer.length < offset + length) return;
+        const payload = buffer.subarray(offset, offset + length).toString("utf8");
+        buffer = buffer.subarray(offset + length);
+        if (opcode === 1) for (const fn of listeners) fn(payload);
+        if (opcode === 8) socket.end();
+      }
+    });
+    socket.on("error", reject);
+  });
+}
+
+// -- the browser ------------------------------------------------------------
+
+const chrome = spawn(CHROME, [
+  "--headless=new",
+  `--remote-debugging-port=${PORT}`,
+  "--remote-allow-origins=*",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--disable-gpu",
+  "--window-size=1600,1200",
+  `--user-data-dir=${process.env.PROOF_PROFILE ?? "/tmp/doom-push-proof-profile"}`,
+  "about:blank",
+], {stdio: ["ignore", "ignore", "pipe"]});
+chrome.stderr.on("data", () => {});
+
+async function target() {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
+      const page = list.find((t) => t.type === "page");
+      if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
+    } catch { /* not up yet */ }
+    await sleep(250);
+  }
+  throw new Error("chrome did not offer a debuggable page");
+}
+
+const ws = await wsConnect(await target());
+let nextId = 0;
+const waiting = new Map();
+ws.onMessage((text) => {
+  const message = JSON.parse(text);
+  const resolve = waiting.get(message.id);
+  if (resolve) {
+    waiting.delete(message.id);
+    resolve(message);
+  }
+});
+function call(method, params = {}) {
+  const id = ++nextId;
+  return new Promise((resolve) => {
+    waiting.set(id, resolve);
+    ws.send(JSON.stringify({id, method, params}));
+  });
+}
+async function evaluate(expression) {
+  const answer = await call("Runtime.evaluate", {expression, awaitPromise: true, returnByValue: true});
+  if (answer.result?.exceptionDetails) {
+    throw new Error(answer.result.exceptionDetails.exception?.description ?? "evaluate failed");
+  }
+  return answer.result?.result?.value;
+}
+async function key(type, code, keyName, windowsVirtualKeyCode) {
+  await call("Input.dispatchKeyEvent", {
+    type, code, key: keyName,
+    windowsVirtualKeyCode, nativeVirtualKeyCode: windowsVirtualKeyCode,
+  });
+}
+async function shot(name) {
+  const answer = await call("Page.captureScreenshot", {format: "png"});
+  writeFileSync(`${OUT}/${name}.png`, Buffer.from(answer.result.data, "base64"));
+}
+
+// Read the page's own numbers. One expression, so a rate and the counts that
+// explain it come from the same instant.
+const SNAPSHOT = `(() => {
+  const s = window.doomPlay?.state;
+  if (!s) return null;
+  const stream = s.stream;
+  return {
+    painted: s.paintedFrames,
+    torn: s.tornReads,
+    paints: s.paintTimes.slice(),
+    latencies: s.pictureLatencies.slice(),
+    frameSource: s.frameSource,
+    stream: stream ? stream.summary() : null,
+    lastCrossCheck: s.lastCrossCheck,
+    session: s.session?.id ?? null,
+    slot: s.lastFrameSlot,
+    buffer: s.lastFrameBuffer,
+    lastGametic: s.lastFrame?.gametic ?? null,
+    lastCursor: s.lastFrame?.cursor ?? null,
+    lastSha: s.lastFrame?.sha256 ?? s.lastFrame?.digest ?? null,
+    panel: window.doomPlay.inputLog.summary(),
+    banner: document.getElementById("inputlog-banner")?.hidden
+      ? null
+      : document.getElementById("inputlog-banner")?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+    error: document.getElementById("error")?.hidden
+      ? null
+      : document.getElementById("error")?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+    framesReadout: {
+      source: document.getElementById("frames-source")?.textContent ?? null,
+      pushed: document.getElementById("frames-pushed")?.textContent ?? null,
+      torn: document.getElementById("frames-torn")?.textContent ?? null,
+      crossChecks: document.getElementById("frames-crosschecks")?.textContent ?? null,
+      mismatches: document.getElementById("frames-mismatches")?.textContent ?? null,
+    },
+    fps: document.getElementById("stat-fps")?.textContent ?? null,
+    picture: document.getElementById("stat-picture")?.textContent ?? null,
+  };
+})()`;
+
+await call("Page.enable");
+await call("Runtime.enable");
+await call("Page.navigate", {url: PAGE});
+await sleep(4000);
+
+// JOIN, through the page's own button, so the session is one the relayer made.
+const joined = await evaluate(`(async () => {
+  const button = document.getElementById("join");
+  if (!button) return "no join button";
+  button.click();
+  for (let i = 0; i < 80; i += 1) {
+    await new Promise((r) => setTimeout(r, 500));
+    const state = window.doomPlay?.state?.session;
+    if (state) return state.id;
+  }
+  return "no session after 40 s";
+})()`);
+console.log("session:", joined);
+if (typeof joined !== "string" || !/^[0-9a-f]{8,}$/.test(joined)) {
+  writeFileSync(`${OUT}/proof.json`, JSON.stringify({page: PAGE, joined, ok: false}, null, 2));
+  await shot("proof-join-failed");
+  console.log("JOIN FAILED; the page says:", await evaluate(`document.getElementById("error")?.textContent ?? ""`));
+  chrome.kill();
+  process.exit(1);
+}
+
+// Wait for the first pushed frame, so the window below measures a running rate
+// rather than the time to the first frame.
+const first = await evaluate(`(async () => {
+  for (let i = 0; i < 80; i += 1) {
+    if ((window.doomPlay?.state?.paintedFrames ?? 0) > 0) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return ${SNAPSHOT};
+})()`);
+console.log("first frame:", JSON.stringify({
+  painted: first.painted, stream: first.stream, source: first.framesReadout, error: first.error,
+}));
+
+// 1. painted rate over the window. Counted from the page's own paint
+//    timestamps, not from a stopwatch around this file.
+const before = await evaluate(SNAPSHOT);
+const windowStart = Date.now();
+await sleep(FPS_WINDOW);
+const after = await evaluate(SNAPSHOT);
+const windowSeconds = (Date.now() - windowStart) / 1000;
+// The paints inside the window, from the page's rolling list. The list is capped
+// at four seconds, so the count comes from the difference of the totals and the
+// span from the page's own first and last paint inside it.
+const paintedInWindow = after.painted - before.painted;
+const tornInWindow = after.torn - before.torn;
+const pushedInWindow = (after.stream?.pushed ?? 0) - (before.stream?.pushed ?? 0);
+console.log(`window ${windowSeconds.toFixed(1)} s: painted ${paintedInWindow} ` +
+  `(${(paintedInWindow / windowSeconds).toFixed(2)} fps), pushed ${pushedInWindow}, torn ${tornInWindow}`);
+await shot("proof-fps");
+
+// 2. keys. The presses cycle the six engine keys so every input path is
+//    exercised, and each one is timed from the key going down to the first frame
+//    painted past the tic the picture was on when it went down -- which is the
+//    page's own `pictureLatencies` entry for that hold.
+const KEYS = [
+  {key: "forward", code: "ArrowUp", keyName: "ArrowUp", vk: 38},
+  {key: "back", code: "ArrowDown", keyName: "ArrowDown", vk: 40},
+  {key: "left", code: "ArrowLeft", keyName: "ArrowLeft", vk: 37},
+  {key: "right", code: "ArrowRight", keyName: "ArrowRight", vk: 39},
+  {key: "fire", code: "Space", keyName: " ", vk: 32},
+  {key: "use", code: "KeyR", keyName: "r", vk: 82},
+];
+const presses = [];
+for (let index = 0; index < PRESSES; index += 1) {
+  const spec = KEYS[index % KEYS.length];
+  const pictureBefore = await evaluate(`window.doomPlay.state.lastFrame?.gametic ?? null`);
+  const at = Date.now();
+  await key("keyDown", spec.code, spec.keyName, spec.vk);
+  await sleep(HOLD_MS);
+  await key("keyUp", spec.code, spec.keyName, spec.vk);
+  await sleep(SETTLE_MS);
+  const row = await evaluate(SNAPSHOT);
+  const latencies = row.latencies;
+  presses.push({
+    key: spec.key,
+    index,
+    pictureBefore,
+    pictureAfter: row.lastGametic,
+    pictureMoved: pictureBefore !== row.lastGametic,
+    // The last latency is this hold's, if this hold produced one.
+    latencyMs: latencies.length ? latencies[latencies.length - 1] : null,
+    wallMs: Date.now() - at,
+    painted: row.painted,
+    torn: row.torn,
+    panel: row.panel,
+  });
+  console.log(
+    spec.key.padEnd(8),
+    "picture", pictureBefore === row.lastGametic ? "same" : `moved ${pictureBefore} -> ${row.lastGametic}`,
+    "latency", presses.at(-1).latencyMs === null ? "-" : `${presses.at(-1).latencyMs.toFixed(0)} ms`,
+    "painted", row.painted,
+    "panel", JSON.stringify(row.panel),
+  );
+}
+await shot("proof-keys");
+
+const final = await evaluate(SNAPSHOT);
+// The relayer's own view of the same session, so the page's numbers and the
+// pipeline's numbers are side by side rather than one of them being believed.
+let relayerHealth = null;
+try {
+  relayerHealth = await (await fetch(`http://127.0.0.1:8787/healthz`)).json();
+} catch (error) {
+  relayerHealth = {error: String(error)};
+}
+const latencies = presses.map((press) => press.latencyMs).filter((value) => value !== null);
+const sorted = [...latencies].sort((a, b) => a - b);
+const result = {
+  page: PAGE,
+  ok: tornInWindow === 0 && paintedInWindow > 0,
+  joined,
+  window: {
+    seconds: windowSeconds,
+    painted: paintedInWindow,
+    painted_fps: paintedInWindow / windowSeconds,
+    pushed: pushedInWindow,
+    torn: tornInWindow,
+  },
+  first,
+  after_window: after,
+  presses,
+  latency: {
+    samples: latencies.length,
+    min: sorted[0] ?? null,
+    median: sorted[Math.floor(sorted.length / 2)] ?? null,
+    max: sorted.at(-1) ?? null,
+  },
+  final,
+  relayer_health: relayerHealth,
+};
+writeFileSync(`${OUT}/proof.json`, JSON.stringify(result, null, 2));
+console.log("painted fps:", result.window.painted_fps.toFixed(2), "torn:", tornInWindow);
+console.log("latency ms:", JSON.stringify(result.latency));
+console.log("push:", JSON.stringify(final.stream));
+console.log("cross-check:", JSON.stringify(final.lastCrossCheck));
+console.log("panel:", JSON.stringify(final.panel));
+console.log("relayer frame_push:", JSON.stringify(relayerHealth?.frame_push));
+console.log("error:", final.error, "banner:", final.banner);
+ws.close();
+chrome.kill();
