@@ -385,6 +385,15 @@ export class Relayer {
     slot.writableFrontier = progress.writableFrontier ?? null;
     slot.writableFloor = progress.writableFloor ?? null;
     slot.producerNextCursor = progress.producerNextCursor ?? null;
+    // The lead the producer resolved, and the round trip it was read from.
+    // `readProgress` has asked the child for both since 2026-09-26 and this is
+    // where they were dropped on the floor: fourteen fields were copied onto the
+    // slot and these two were not, so `status` published `null` for the lead and
+    // a page that aims with the producer's own number never saw it. Measured on
+    // R15, 2026-09-26, at a live page still aiming its own 17 tics while the
+    // child was publishing 61 in the very same answer, one field down.
+    slot.inputStageLeadTics = progress.inputStageLeadTics ?? null;
+    slot.inputRoundTripSeconds = progress.inputRoundTripSeconds ?? null;
     slot.inputFate = progress.inputFate ?? slot.inputFate ?? null;
     slot.pipeline = progress.pipeline ?? slot.pipeline ?? null;
     slot.ticsPerSecondCap = progress.ticsPerSecondCap ?? slot.ticsPerSecondCap ?? null;

@@ -389,11 +389,36 @@ function backgroundSender({frontier, cursor = 0}) {
       return {cursor, gametic: cursor, signature: "chain-frame-1", strips: null};
     },
     async readProgress() {
-      return {cursor, gametic: cursor, capacity: 6016, halted: false};
+      return {
+        cursor,
+        gametic: cursor,
+        capacity: 6016,
+        halted: false,
+        // The child publishes both of these in every status; see `refreshSlot`.
+        inputStageLeadTics: 61,
+        inputRoundTripSeconds: 1.89,
+      };
     },
     async close() {},
   };
 }
+
+test("the status a page reads carries the lead the child published", async () => {
+  // `readProgress` has asked the child for the producer's lead since
+  // 2026-09-26. `refreshSlot` copied fourteen fields onto the slot and left
+  // these two off, so every `status` a page read published `null` for the lead
+  // and the page aimed its own 17 tics while the child was publishing 61 in the
+  // same answer, one field down. Measured live on R15, 2026-09-26.
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  await relayer.init();
+  const slot = relayer.pool.slots[0];
+  await relayer.refreshSlot(slot);
+  assert.equal(slot.inputStageLeadTics, 61);
+  assert.equal(slot.inputRoundTripSeconds, 1.89);
+  const answer = relayer.status(slot);
+  assert.equal(answer.input_stage_lead_tics, 61, JSON.stringify(answer).slice(0, 200));
+  assert.equal(answer.input_round_trip_seconds, 1.89);
+});
 
 test("chain mode stages a signed batch, and refuses input past the staging frontier", async () => {
   const sender = backgroundSender({frontier: 20});
