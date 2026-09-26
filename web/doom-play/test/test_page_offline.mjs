@@ -313,22 +313,30 @@ if (!chromeAvailable()) {
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
-  test("the page aims its own hop past the producer, and does not add the producer's lead", {timeout: 180_000}, async () => {
-    // The producer publishes a lead of its own: 45-48 tics on R15, which is
-    // 1.77 s, the time a DEPOSIT takes to become visible plus the sweep that then
-    // consumes it. That is the producer's distance -- its staged tic to the
-    // chain's committed cursor -- and the producer is already that far ahead of
-    // the chain.
+  test("the page aims at the producer's published lead, and that lead is most of the latency", {timeout: 180_000}, async () => {
+    // The producer resolves a lead of its own from how long a staged tic takes to
+    // reach the chain -- 45-48 tics on R15, which is 1.77 s -- and this page
+    // takes the larger of that and its own hop. On the 2026-09-26 baseline that
+    // put the stamped tic 90 tics past the chain's cursor, and the measured
+    // keypress-to-picture median was 4,270 ms against 90/22.2 tic/s = 4.05 s of
+    // arithmetic: the page pays the delivery lead twice, once inside the
+    // producer's position and once in its own aim.
     //
-    // The page used to aim at `producerNext + publishedLead`, which put its batch
-    // a whole producer lead beyond the producer and made every press wait the
-    // delivery out twice: 45 + 45 = 90 tics at 22.2 tic/s is 4.05 s, against a
-    // measured keypress-to-picture median of 4,270 ms. This test fails on a page
-    // that takes the maximum of its own hop and the published lead.
+    // The obvious fix -- aim the page's own hop alone -- was measured twice on
+    // R15 and broke both sessions: input refusals went from 1 in a 110 s session
+    // to 100 and then 176, no command tics were deposited, the producer stopped,
+    // the chain's cursor stuck at 45,890 and `tic-sender-result.json` was never
+    // written. The chain was fine -- the meta read afterwards at `M_HALT 0`,
+    // `M_CURSOR 45890`, `M_LAST_SWEEP_TICS 4` -- so that is a client-side
+    // producer hang and it is not diagnosed. A 16-tic aim is inside the race the
+    // 2026-09-26 input round measured, and mostly-zeros becomes a refusal flood
+    // rather than a cheaper keypress. The comment on `aimLead` carries the
+    // numbers; this test is here so the behaviour is pinned and the next attempt
+    // starts from the measurement rather than from the idea.
     //
-    // What the page's own lead still has to do is win the race against the
-    // producer's snapshot of the same tic, and that is asserted here from the
-    // relayer's side: the batch the page staged, and tics the engine consumed.
+    // What it asserts is the two halves: the page reads the published lead, and
+    // its aim is the producer's next tic plus that lead. It fails on a page that
+    // ignores the published lead.
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
       const producerNext = await page.evaluate("window.doomPlay.state.producerNextCursor");
@@ -346,30 +354,23 @@ if (!chromeAvailable()) {
       const published = await page.evaluate("window.doomPlay.state.producerLeadTics");
       assert.equal(published, relayer.leadTics, `the page never read the producer's lead (${JSON.stringify(published)})`);
       assert.ok(relayer.leadTics > 16, `this relayer published ${relayer.leadTics}, which is not above the 16 the page used to aim`);
-      // The lead the page actually used is its own hop, and it is below the
-      // producer's delivery lead rather than equal to it.
-      assert.ok(
-        held.leadTics < relayer.leadTics,
-        `the page aimed ${JSON.stringify(held.leadTics)} tics, which is the producer's published ` +
-          `${relayer.leadTics}: the delivery lead is being paid twice`,
+      assert.equal(
+        held.leadTics,
+        relayer.leadTics,
+        `the page aimed ${JSON.stringify(held.leadTics)} tics ahead of the producer's next tic ` +
+          `where the producer published ${relayer.leadTics}`,
       );
-      assert.ok(
-        held.leadTics >= 16,
-        `with round trip ${JSON.stringify(held.roundTripMs)} ms the page aimed ${JSON.stringify(held.leadTics)} tics, under the floor of 16`,
-      );
-      // And the aim is the producer's next tic plus the page's own hop, not plus
-      // the published lead. `producerNext` was read before the keydown and the
-      // fake's producer advances 2 tics every 60 ms, so the measured hop also
-      // carries the page's push cadence; the bound that matters is that it stays
-      // under the delivery lead, which the previous page exceeded.
+      // And the aim really is the producer's next tic plus the published lead.
+      // `producerNext` was read before the keydown and the fake's producer
+      // advances 2 tics every 60 ms, so the measured hop also carries the page's
+      // push cadence.
       const hop = batch.firstSeq - producerNext;
       assert.ok(
-        hop >= 16 && hop < relayer.leadTics,
-        `the batch started ${hop} tics past the producer's next tic, where the page's own hop was ` +
-          `${held.leadTics} and the published lead was ${relayer.leadTics}: the aim is the delivery lead again`,
+        hop >= relayer.leadTics && hop <= relayer.leadTics + 40,
+        `the batch started ${hop} tics past the producer's next tic, where the published lead was ${relayer.leadTics}`,
       );
-      // And the aim is inside the relayer's own window, so a shorter lead did not
-      // turn a deposit race into a batch_refused.
+      // And the aim is inside the relayer's own window, so the lead did not turn
+      // a deposit race into a batch_refused.
       assert.equal(held.refusals, 0, "the aim was refused");
       assert.ok(relayer.acceptedBatches > 0, "the relayer accepted nothing");
       assert.ok(relayer.landedTics > 0, `the engine consumed none of the ${relayer.stagedTics} tics staged in 3.5 s`);
@@ -480,16 +481,14 @@ if (!chromeAvailable()) {
         `the wait ended on gametic ${after.lastStampSample.gametic} against a stamped tic of ${after.lastStampSample.tic}`,
       );
       // And the two meters are not the same quantity. The next picture is one
-      // frame away; the keypress is at least the page's own hop away, which is
-      // the lead the sample was aimed with -- not the producer's published
-      // delivery lead, which the page does not pay (see the aim test).
+      // frame away; the keypress is a whole lead away.
       const stamp = stamps[0].ms;
       const next = nexts[0];
-      const hopMs = (stamps[0].lead_tics / relayer.ticsPerSecond) * 1000;
+      const leadMs = (relayer.leadTics / relayer.ticsPerSecond) * 1000;
       assert.ok(
-        stamp >= 0.5 * hopMs,
-        `the keypress meter read ${stamp.toFixed(0)} ms against the page's own hop of ${hopMs.toFixed(0)} ms ` +
-          `(stamped tic ${stamps[0].tic}), so it timed a frame rather than the keypress`,
+        stamp >= 0.5 * leadMs,
+        `the keypress meter read ${stamp.toFixed(0)} ms against a lead of ${leadMs.toFixed(0)} ms ` +
+          `(stamped tic ${after.lastStampedTic}), so it timed a frame rather than the keypress`,
       );
       assert.ok(
         next < stamp,

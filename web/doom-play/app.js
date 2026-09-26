@@ -1143,47 +1143,64 @@ function predictedNext() {
 // The lead, in tics: the producer's own, when it publishes one, and otherwise
 // the push cadence plus the measured round trip plus the producer's batch.
 //
-// The producer is the side that holds the window open, and it resolves a lead of
-// its own from a measurement of how long a staged tic takes to reach the chain:
-// `Server.lead_tics` in `scripts/doom_relayer_server.py`, published as
-// `input_stage_lead_tics` on every status and every input answer. On R15 that is
-// 45-48 tics, which is 1.77 s: the time a DEPOSIT takes to become visible plus
-// the sweep that then has to consume it.
+// The producer is the side that holds the window open, and it resolves this
+// quantity from a measurement of how long a staged tic takes to reach the
+// chain: `Server.lead_tics` in `scripts/doom_relayer_server.py`, published as
+// `input_stage_lead_tics` on every status and every input answer. On R15 that
+// is 61 tics (35 tic/s configured, 2 x the 0.86 s round trip), where this page
+// was building 16 out of its own POST latency -- which is only the page's share
+// of the same delivery, and the smaller half of it.
 //
-// **That lead is not this page's to pay.** It measures the producer's distance --
-// its staged tic to the chain's committed cursor -- and the producer is already
-// that far ahead of the chain. Aiming at `producerNext + publishedLead` put the
-// page's batch a whole producer lead beyond the producer, so every press waited
-// the delivery out twice: 45 + 45 = 90 tics at this session's 22.2 tic/s is
-// 4.05 s, and the measured keypress-to-picture median was 4,270 ms with the
-// frame that ended the wait landing 0-15 tics past the stamped tic. The two
-// numbers are the same number twice.
+// The price is latency, and it is a real one: 61 tics at the 23 tic/s R15
+// actually ran is 2.6 s from keypress to the engine reading the tic, against
+// 310 ms measured with the 16-tic aim. What that buys is the ratio: with the
+// 16-tic aim, 201 of 510 staged tics (39.4%) reached a DEPOSIT carrying a key
+// and the other 309 were deposited as zeros, because the producer snapshotted
+// those tics before this page's write arrived. A lead inside the race is not a
+// cheaper lead, it is a lost keystroke.
 //
-// So the aim is the page's own hop and nothing else: the POST round trip, the
-// push cadence, and the producer's batch. The published lead is still shown on
-// the panel -- it is the producer's number about the producer's distance, and it
-// is the right thing to read when asking why a key was lost -- but it no longer
-// decides how far this page writes.
+// The local arithmetic stays as the floor rather than being replaced, for a
+// relayer that publishes nothing and for a published number that is stale
+// because the rate it was resolved from is not this session's rate. The larger
+// of the two is used, so neither source can quietly aim short.
 //
-// What the page's own lead buys is the ratio, and the measurement that fixed the
-// ratio is why this is not simply the 16 the page used to aim: with a 16-tic aim,
-// 201 of 510 staged tics (39.4%) reached a DEPOSIT carrying a key and the other
-// 309 were deposited as zeros, because the producer snapshotted those tics before
-// this page's write arrived. A lead inside the race is not a cheaper lead, it is
-// a lost keystroke. The hop is measured, not assumed: `roundTripMs` is the worst
-// of the last eight round trips, and a 409 that says the producer has already
-// passed the aim grows the lead by the shortfall (see `pushInput`).
+// **MEASURED 2026-09-26: this maximum is most of the keypress latency, and
+// removing it does not work.** The honest keypress meter (the one that waits for
+// a frame at or past the stamped tic) put the baseline median at 4,270 ms on
+// R15, and the arithmetic says why: the producer's published lead is 45 tics,
+// which is 1.77 s and is the producer's own distance from its staged tic to the
+// chain's committed cursor, so the batch below sits 45 + 45 = 90 tics past the
+// chain's cursor and 90/22.2 tic/s is 4.05 s. The page pays the delivery lead
+// twice, once inside the producer's position and once in its own aim.
+//
+// So the aim was changed to the page's own hop alone -- the POST round trip, the
+// push cadence and the producer's batch, about 16 tics -- and measured twice on
+// R15. Both sessions were worse and both broke: input refusals went from 1 in a
+// 110 s session to 100 and then 176, `input_command_tics_deposited` went to 0,
+// the producer stopped depositing, the chain's cursor stopped at 45,890, and
+// `tic-sender-result.json` was never written. The chain itself was fine -- the
+// meta read afterwards at `M_HALT 0`, `M_CURSOR 45890`, `M_LAST_SWEEP_TICS 4` --
+// so this is a client-side producer hang and not a chain fault, and it is not
+// diagnosed.
+//
+// The reading is that a 16-tic aim is inside the race the 2026-09-26 input round
+// measured (201 of 510 staged tics reached a DEPOSIT carrying a key at a 16-tic
+// aim, against 0.98 at the published lead), and "mostly zeros" turns into a
+// refusal flood rather than into a cheaper keypress. The lead has to come down
+// by making the *delivery* shorter, not by aiming closer to the producer: one
+// transaction carrying both the input and the advance that consumes it takes the
+// delivery from a round trip plus a sweep to a single round trip, and that is
+// the change to make. Until it exists, this maximum stays.
 function aimLead() {
   const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
   const tripTics = Math.ceil(((state.roundTripMs ?? 0) / 1000) * rate);
   const cadenceTics = Math.ceil((PUSH_INTERVAL_MS / 1000) * rate);
-  // The producer's own lead used to be a floor here. It is a different
-  // distance -- a staged tic to the chain's cursor, not this page to the
-  // producer -- and using it as a floor is what made every press pay for it
-  // twice. The producer's position is still a floor on the aim, in `pushInput`:
-  // the batch may not name a tic at or below the producer's next one.
   const derived = Math.max(MIN_LEAD_TICS, tripTics + cadenceTics + PRODUCER_BATCH_TICS);
-  return Math.min(MAX_LEAD_TICS, derived);
+  const published = state.producerLeadTics;
+  const usable = typeof published === "number" && Number.isFinite(published) && published > 0
+    ? Math.round(published)
+    : 0;
+  return Math.min(MAX_LEAD_TICS, Math.max(derived, usable));
 }
 
 async function pushInput() {
