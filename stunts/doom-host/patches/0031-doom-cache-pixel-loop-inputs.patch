@@ -1,0 +1,87 @@
+diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -101,6 +101,11 @@
+ // 
+ void R_DrawColumn (void) 
+ { 
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
++    const byte *source_base;
++    const byte *colormap_base;
++    int source_length;
++#endif
+     int			count; 
+     byte*		dest; 
+     fixed_t		frac;
+@@ -129,6 +134,13 @@
+     // Use columnofs LUT for subwindows? 
+     dest = ylookup[dc_yl] + columnofs[dc_x];  
+ 
++    /* Cache stable texture inputs outside the per-pixel loop. */
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
++    source_base = dc_source;
++    colormap_base = dc_colormap;
++    source_length = dc_source_length;
++#endif
++
+     // Determine scaling,
+     //  which is the only mapping to be done.
+     fracstep = dc_iscale; 
+@@ -144,10 +156,10 @@
+ 	// pixel centers; sampling past it is transparent, not a WAD over-read.
+ 	source_index = (frac>>FRACBITS)&127;
+ #ifndef DOOM_SBF_RENDER_COUNT_ONLY
+-	if (dc_source_length && source_index >= dc_source_length)
+-	    *dest = dc_colormap[0];
++	if (source_length && source_index >= source_length)
++	    *dest = colormap_base[0];
+ 	else
+-	    *dest = dc_colormap[dc_source[source_index]];
++	    *dest = colormap_base[source_base[source_index]];
+ 	
+ 	dest += SCREENWIDTH; 
+ #endif
+@@ -543,6 +555,12 @@
+ // Draws the actual span.
+ void R_DrawSpan (void) 
+ { 
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
++    const byte *source_base;
++    const byte *colormap_base;
++#endif
++    fixed_t xstep;
++    fixed_t ystep;
+     fixed_t		xfrac;
+     fixed_t		yfrac; 
+     byte*		dest; 
+@@ -584,6 +602,14 @@
+ 		return;
+ 	}
+ 	 
++    /* Cache the stable flat and mapping inputs for the pixel loop. */
++#ifndef DOOM_SBF_RENDER_COUNT_ONLY
++    source_base = ds_source;
++    colormap_base = ds_colormap;
++#endif
++    xstep = ds_xstep;
++    ystep = ds_ystep;
++
+     dest = ylookup[ds_y] + columnofs[draw_x1];
+ 
+     // We do not check for zero spans here?
+@@ -597,12 +623,12 @@
+ 	// Lookup pixel from flat texture tile,
+ 	//  re-index using light/colormap.
+ #ifndef DOOM_SBF_RENDER_COUNT_ONLY
+-	*dest++ = ds_colormap[ds_source[spot]];
++	*dest++ = colormap_base[source_base[spot]];
+ #endif
+ 
+ 	// Next step in u,v.
+-	xfrac += ds_xstep; 
+-	yfrac += ds_ystep;
++	xfrac += xstep; 
++	yfrac += ystep;
+ 	
+     } while (count--); 
+ } 
