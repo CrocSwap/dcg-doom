@@ -1429,3 +1429,26 @@ test("the flags this round added are built, with their defaults intact", () => {
     assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
   }
 });
+
+test("a third node and a send rate reach the pipeline's argv", () => {
+  // The frame's own send cost is 8 / (rate x endpoints) seconds, and both halves
+  // were unreachable: `argv()` is the only place a chain-mode flag becomes a
+  // process argument, and a flag that is not built here is a flag the pipeline
+  // has never seen. That is the same trap `--status-batch` fell into.
+  const argv = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    rpcA: "http://a:8899", rpcB: "https://b", rpcC: "http://third:8899", sendPacerRate: 40,
+  }).argv();
+  assert.equal(argv[argv.indexOf("--rpc-c") + 1], "http://third:8899");
+  assert.equal(argv[argv.indexOf("--send-pacer-rate") + 1], "40");
+  // The two named endpoints are still pushed when they are set, so naming a
+  // third cannot displace either of them.
+  assert.equal(argv[argv.indexOf("--rpc-a") + 1], "http://a:8899");
+  assert.equal(argv[argv.indexOf("--rpc-b") + 1], "https://b");
+  // Absent by default, so a session that names neither runs the two-node 30/s
+  // configuration the last measured run used.
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  for (const flag of ["--rpc-c", "--send-pacer-rate"]) {
+    assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
+  }
+});

@@ -47,6 +47,16 @@
 #    Buffers 0 and 1 are the accounts a two-buffer session already used, so
 #    raising the count is a widening and not a move.
 #
+#  * the send pacer. SEND_RATE is transactions per second per endpoint, and
+#    RPC_C names a third healthy node if one is wanted; the two together are the
+#    frame's own send cost, 8 / (SEND_RATE x endpoints) seconds for the strips.
+#    At the default 30 over two endpoints that is 0.133 s, and 0.135 s is what
+#    the eight sends measured on R15 at one buffer. This is a pacing choice on
+#    our side, not a protocol bound, and a node that will not answer at the rate
+#    answers 429 -- so `rpc_lag.throttled` in the receipt, not the rate, is what
+#    says whether it was sustainable. `64.130.44.172` stays out of every list:
+#    R9b measured it 14,336 slots behind `.173`.
+#
 #  * the one-buffer read path. At BUFFERS=1 the buffer is held from the moment a
 #    submission starts until the readback has copied 1,113,792 bytes out of it,
 #    and that is the whole reason one buffer rendered at 1.8 fps while four did
@@ -105,6 +115,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --script "$RD/scripts/doom_relayer_server.py" \
   --run-dir "$RD/out/$NAME" \
   --rpc-a http://64.130.44.173:8899 --rpc-b https://testnet.fogo.io \
+  ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-30} \
   --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
   --image-bytes 916496 \
   --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-2} \

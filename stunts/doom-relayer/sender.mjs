@@ -399,6 +399,14 @@ export class PipelineSender {
     ];
     if (options.rpcA) argv.push("--rpc-a", options.rpcA);
     if (options.rpcB) argv.push("--rpc-b", options.rpcB);
+    // A third node, and the send rate, are the two levers on the frame's
+    // own send cost: eight strip sends take 8 / (rate x endpoints) seconds.
+    // Both are pushed only when set, so an unnamed session is the two-node
+    // 30/s default the last measured run used.
+    if (options.rpcC) argv.push("--rpc-c", options.rpcC);
+    if (options.sendPacerRate !== undefined && options.sendPacerRate !== null) {
+      argv.push("--send-pacer-rate", String(options.sendPacerRate));
+    }
     if (options.imageSha256) argv.push("--image-sha256", options.imageSha256);
     if (options.imageBytes) argv.push("--image-bytes", String(options.imageBytes));
     if (options.seconds) argv.push("--seconds", String(options.seconds));
