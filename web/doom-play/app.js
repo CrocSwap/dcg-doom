@@ -10,6 +10,7 @@ import {ChainReader, WadImageReader, readPlaypal, base58ToBytes, bytesToBase58} 
 import {decodeFrame, frameToRgba, parseSnapshot, frameReadAddresses, toHex, StripError, FRAME_WIDTH, FRAME_HEIGHT} from "./strip.js";
 import {loadOrCreateBurner, forgetSession, recallSession, rememberSession, ed25519Available} from "./burner.js";
 import {encodeInput, heldToCommands} from "./input.js";
+import {InputLog} from "./inputlog.js";
 
 // The engine rate to assume before the relayer has reported one. Measured at
 // 23.8-26.3 tics/s across two drive sessions at strip rate 64, so 25 is the
@@ -70,6 +71,11 @@ const ui = {
   chainCapacity: el("chain-capacity"),
   stripGrid: el("strip-grid"),
   stripSummary: el("strip-summary"),
+  inputlogList: el("inputlog-list"),
+  inputlogSummary: el("inputlog-summary"),
+  inputlogBanner: el("inputlog-banner"),
+  inputlogLead: el("inputlog-lead"),
+  inputlogTorn: el("inputlog-torn"),
   hintCapacity: el("hint-capacity"),
   spectatorHint: el("spectator-hint"),
   error: el("error"),
@@ -117,6 +123,14 @@ const state = {
   // has, so a batch aimed between them is read rather than dropped.
   producerStageLimit: null,
   producerGeneratedCursor: null,
+  // The producer's NEXT tic to generate, which is not `producerGeneratedCursor`
+  // (the end of the batch it has already published) and is the only cursor a
+  // writer can honestly aim ahead of. See doom_relayer_server.py.
+  producerNextCursor: null,
+  // Whether keystrokes can still reach the engine, and the relayer's per-deposit
+  // record of what happened to the ones already sent.
+  pipeline: null,
+  inputFate: null,
   // When the two producer numbers above were read, and the engine rate they are
   // read against. The page's aim is a prediction, and a prediction needs the
   // age of its input.
@@ -160,7 +174,29 @@ const state = {
   keys: {},
   stopPolling: null,
   lastError: null,
+  // A torn read is the expected case at strip rate 64, not a fault: the strips
+  // of a frame land in eight transactions and a read catches them mid-write.
+  // It was raised as an error and shown in the error bar, which is how a page
+  // that was working fine came to look broken. Counted, not shown.
+  tornReads: 0,
 };
+
+// One row per key press, with the fate of every tic it aimed at.
+const inputLog = new InputLog({
+  link: (signature) => {
+    const anchor = document.createElement("a");
+    anchor.href = explorerTransaction(net, signature);
+    anchor.textContent = "↗";
+    anchor.target = "_blank";
+    anchor.rel = "noopener";
+    return anchor;
+  },
+});
+
+function renderInputLog() {
+  inputLog.setLead(state.leadTics, state.ticsPerSecond);
+  inputLog.render(ui.inputlogList, ui.inputlogSummary, ui.inputlogLead, ui.inputlogTorn, state.tornReads);
+}
 
 const keys = () => state.keys;
 
@@ -484,13 +520,23 @@ function startPolling() {
   let timer = null;
   const loop = async () => {
     if (stopped) return;
+    let torn = false;
     try {
       await readOnce();
     } catch (error) {
-      // A torn frame is expected while a new frame is landing. Report the
-      // first distinct reason and keep the last good frame on screen.
-      if (error instanceof StripError) setCell(ui.railState, "TORN");
-      showError(error);
+      // A torn frame is the expected case while a new frame is landing, and it
+      // is not a fault the player can do anything about. It used to be raised
+      // into the error bar, so a page that was working perfectly looked broken
+      // and the error bar covered the panel; it is counted and shown as a
+      // number instead, and the last good frame stays on screen.
+      if (error instanceof StripError) {
+        state.tornReads += 1;
+        torn = true;
+        setCell(ui.railState, "TORN");
+        renderInputLog();
+      } else {
+        showError(error);
+      }
     }
     if (stopped) return;
     // Frames land at 1-2/s at strip rate 16 and faster at 64, and a frame is
@@ -499,7 +545,7 @@ function startPolling() {
     // a fault: it is retried at the next poll with no backoff, because backing
     // off is what held the painted rate at one frame a minute. Other failures
     // are a node or a relayer having a bad time, and those do back off.
-    const delay = state.lastError && !state.lastError.startsWith("StripError") ? 3000 : POLL_MS;
+    const delay = torn || !state.lastError ? POLL_MS : 3000;
     timer = setTimeout(loop, delay);
   };
   loop();
@@ -530,10 +576,24 @@ const KEY_MAP = {
   ShiftRight: "run",
 };
 
+// What the panel calls a key, so a row reads "FORWARD" rather than "KeyW".
+const KEY_LABEL = {
+  ArrowUp: "FORWARD", KeyW: "FORWARD",
+  ArrowDown: "BACK", KeyS: "BACK",
+  ArrowLeft: "LEFT", KeyA: "LEFT",
+  ArrowRight: "RIGHT", KeyD: "RIGHT",
+  KeyQ: "STRAFE LEFT", KeyE: "STRAFE RIGHT",
+  Space: "FIRE", KeyF: "FIRE", KeyR: "USE", ShiftLeft: "RUN", ShiftRight: "RUN",
+};
+
+const pressRows = new Map();
+
 function keyDown(code) {
   const name = KEY_MAP[code];
   if (!name) return false;
+  const first = !state.keys[name];
   state.keys[name] = true;
+  if (first) pressRows.set(name, inputLog.press(name, KEY_LABEL[code] ?? name.toUpperCase()));
   // The first key of a hold starts the clock for input-to-picture: the tic it
   // is aimed at is the relayer's frontier, and the latency is the time until a
   // frame painted that is past the tic the picture was on when the key went
@@ -550,6 +610,8 @@ function keyUp(code) {
   const name = KEY_MAP[code];
   if (!name) return false;
   state.keys[name] = false;
+  inputLog.release(pressRows.get(name));
+  pressRows.delete(name);
   return true;
 }
 
@@ -569,7 +631,11 @@ addEventListener("keyup", (event) => {
 });
 
 addEventListener("blur", () => {
-  for (const name of Object.keys(state.keys)) state.keys[name] = false;
+  for (const name of Object.keys(state.keys)) {
+    state.keys[name] = false;
+    inputLog.release(pressRows.get(name));
+    pressRows.delete(name);
+  }
   syncPad();
 });
 
@@ -577,6 +643,7 @@ for (const button of document.querySelectorAll(".pad button")) {
   const name = button.dataset.key;
   const press = (event) => {
     event.preventDefault();
+    if (!state.keys[name]) pressRows.set(name, inputLog.press(name, name.toUpperCase()));
     state.keys[name] = true;
     syncPad();
     scheduleInputPush();
@@ -584,6 +651,8 @@ for (const button of document.querySelectorAll(".pad button")) {
   const release = (event) => {
     event.preventDefault();
     state.keys[name] = false;
+    inputLog.release(pressRows.get(name));
+    pressRows.delete(name);
     syncPad();
     scheduleInputPush();
   };
@@ -619,11 +688,23 @@ function syncPad() {
 // signed, which is the input-to-picture latency this design implies.
 const PUSH_TICS = 16;
 const PUSH_INTERVAL_MS = 100;
-// Two round trips of lead, and never less than twelve tics: the first number
-// covers the trip, the second covers a trip the page has not measured yet.
-const LEAD_ROUND_TRIPS = 2;
-const MIN_LEAD_TICS = 12;
-const MAX_LEAD_TICS = 96;
+// The lead, in tics, above the producer's NEXT tic to generate.
+//
+// It has to cover three distances, and the first version of this page covered
+// none of them properly:
+//   * the push interval, because the producer reads a reading at most one
+//     cadence old;
+//   * the POST round trip, because the producer keeps generating while the
+//     request is in the air;
+//   * the producer's own batch, `round(35 * 0.1)` = 4 tics, because it
+//     snapshots a whole batch at once and a write that arrives inside that
+//     window is a coin flip.
+// Measured on the 2026-09-26 play session: the aim had a median of 12 tics over
+// `producer_generated_cursor`, which is itself four tics ahead of the producer's
+// real position, and 93.7% of the tics the chain deposited carried no key.
+const PRODUCER_BATCH_TICS = 4;
+const MIN_LEAD_TICS = 16;
+const MAX_LEAD_TICS = 64;
 // Stay this far inside the relayer's own 240-tic sequence window, so a
 // mispredicted aim is a refusal the page can read a resume point from rather
 // than a batch_refused for being too far ahead.
@@ -655,23 +736,29 @@ function scheduleInputPush() {
   });
 }
 
-// Where the producer's generated cursor will be when our POST reaches it. The
-// number the relayer last reported is as old as that answer, and the producer
-// does not stop, so the page carries it forward by its own age.
-function predictedGenerated() {
-  const observed = state.producerGeneratedCursor;
+// Where the producer's next tic to generate will be when our POST reaches it.
+// The number the relayer last reported is as old as that answer, and the
+// producer does not stop, so the page carries it forward by its own age.
+function predictedNext() {
+  const observed = state.producerNextCursor ?? state.producerGeneratedCursor;
   if (observed === null || observed === undefined) return null;
   const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
   const ageSeconds = Math.max(0, performance.now() - state.producerReadAt) / 1000;
-  return observed + Math.floor(ageSeconds * rate);
+  // `producerGeneratedCursor` is the END of the batch the producer has already
+  // published, so when that is all there is, the next tic is a batch lower.
+  const base = state.producerNextCursor === null || state.producerNextCursor === undefined
+    ? observed - PRODUCER_BATCH_TICS
+    : observed;
+  return base + Math.floor(ageSeconds * rate);
 }
 
-// The lead, in tics, the page aims ahead of the producer by: the measured round
-// trip twice over, never less than twelve tics.
+// The lead, in tics: the push cadence, the measured round trip and the
+// producer's own batch, and never less than MIN_LEAD_TICS.
 function aimLead() {
   const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
   const tripTics = Math.ceil(((state.roundTripMs ?? 0) / 1000) * rate);
-  return Math.max(MIN_LEAD_TICS, Math.min(MAX_LEAD_TICS, LEAD_ROUND_TRIPS * tripTics));
+  const cadenceTics = Math.ceil((PUSH_INTERVAL_MS / 1000) * rate);
+  return Math.max(MIN_LEAD_TICS, Math.min(MAX_LEAD_TICS, tripTics + cadenceTics + PRODUCER_BATCH_TICS));
 }
 
 async function pushInput() {
@@ -682,17 +769,17 @@ async function pushInput() {
     // one the session was opened with is as old as the join.
     await readWindow();
   }
-  const generated = predictedGenerated();
-  // The floor is one past the producer's generated cursor: a write at or below
-  // it names tics DEPOSIT has already fixed, so it can never be read by the
-  // game. The chain cursor is a second floor, because a tic the engine has read
-  // is gone whatever the producer says. The page's own last batch is
-  // deliberately not a floor: the batches overlap and repeat the same keys, so
-  // a floor there would walk the aim up faster than the engine runs and build
-  // the backlog the relayer's lead bound exists to prevent.
+  const next = predictedNext();
+  // The floor is the producer's next tic to generate: a write at or below it
+  // names tics the producer is about to snapshot, so its command is either
+  // ignored or a coin flip. The chain cursor is a second floor, because a tic
+  // the engine has read is gone whatever the producer says. The page's own last
+  // batch is deliberately not a floor: the batches overlap and repeat the same
+  // keys, so a floor there would walk the aim up faster than the engine runs
+  // and build the backlog the relayer's lead bound exists to prevent.
   const floor = Math.max(
     state.cursor,
-    generated === null ? 0 : generated + 1,
+    next === null ? 0 : next,
   );
   if (!held || floor <= 0) {
     // No keys, or nothing has been read yet: the next frame offers again.
@@ -732,15 +819,32 @@ async function pushInput() {
     if (!response.ok) {
       // A refusal that names a resume point is not a failure to show, it is the
       // relayer saying where the chain is. Take its word for the sequence and
-      // offer again.
+      // offer again. The panel still records it: a keystroke the relayer would
+      // not take is a fate the player is entitled to see.
       state.refusals += 1;
+      inputLog.noteBatch({
+        firstSeq,
+        count,
+        commands,
+        refused: true,
+        reason: payload.error ?? payload.detail?.reason ?? `relayer returned ${response.status}`,
+        at: sentAt,
+      });
+      renderInputLog();
       if (payload.detail?.next_seq !== undefined) {
         if (payload.detail.cursor !== undefined) state.cursor = payload.detail.cursor;
         if (payload.detail.staging_frontier !== undefined) state.stagingFrontier = payload.detail.staging_frontier;
         if (payload.detail.input_window !== undefined) state.inputWindow = payload.detail.input_window;
         if (payload.detail.producer_generated_cursor !== undefined) {
           state.producerGeneratedCursor = payload.detail.producer_generated_cursor;
-          state.producerReadAt = performance.now();
+          // Only stamp the reading as fresh when the answer also carried the
+          // next cursor the aim is built from. Stamping it without that left the
+          // prediction frozen at an old cursor while claiming to be current, so
+          // the aim walked backwards into tics the producer had already read.
+          if (payload.detail.producer_next_cursor !== undefined && payload.detail.producer_next_cursor !== null) {
+            state.producerNextCursor = payload.detail.producer_next_cursor;
+            state.producerReadAt = performance.now();
+          }
         }
         if (payload.detail.producer_stage_limit !== undefined) {
           state.producerStageLimit = payload.detail.producer_stage_limit;
@@ -763,6 +867,17 @@ async function pushInput() {
       throw new Error(payload.error ?? `relayer returned ${response.status}`);
     }
     adoptAccounts(payload);
+    inputLog.noteBatch({
+      firstSeq,
+      count,
+      commands,
+      accepted: payload.accepted ?? count,
+      acceptedFrom: payload.accepted_from ?? firstSeq,
+      trimmedFromSeq: payload.trimmed_from_seq ?? null,
+      queuedAboveStageLimit: payload.queued_above_stage_limit ?? null,
+      at: sentAt,
+    });
+    renderInputLog();
     // The batch's own end, so the next one overlaps it rather than leaving a
     // hole. It is not a floor: the aim is the producer's position plus the
     // lead, and this is only here to say how much of the window is written.
@@ -866,9 +981,14 @@ function adoptAccounts(payload) {
   if (payload.producer_generated_cursor !== undefined) {
     state.producerGeneratedCursor = payload.producer_generated_cursor;
   }
+  if (payload.producer_next_cursor !== undefined && payload.producer_next_cursor !== null) {
+    state.producerNextCursor = payload.producer_next_cursor;
+  }
   if (payload.producer_stage_limit !== undefined) {
     state.producerStageLimit = payload.producer_stage_limit;
   }
+  if (payload.pipeline !== undefined && payload.pipeline !== null) state.pipeline = payload.pipeline;
+  if (payload.input_fate !== undefined && payload.input_fate !== null) state.inputFate = payload.input_fate;
   // Every answer that carries the producer's position is stamped with when it
   // arrived, because the aim carries it forward by its age.
   if (payload.producer_generated_cursor !== undefined) state.producerReadAt = performance.now();
@@ -915,9 +1035,18 @@ async function pollSessionStatus() {
     if (status.frame?.signature) state.signature = status.frame.signature;
     if (status.state && status.state !== "playing") {
       setCell(ui.sessionState, status.state.toUpperCase(), "warn");
+      inputLog.close(`the session is ${status.state}`);
     }
+    // Everything the panel needs, on a poll that was already happening.
+    inputLog.observe(status);
+    renderInputLog();
     clearError();
   } catch (error) {
+    // The relayer is not answering. That is the loudest thing that can happen to
+    // a page whose job is to show whether keys are landing, so the panel says so
+    // rather than leaving a frozen picture and a silent keyboard.
+    inputLog.close(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+    renderInputLog();
     showError(error, "action");
   }
 }
@@ -930,6 +1059,8 @@ async function leaveSession() {
     showError(error, "action");
   }
   state.session = null;
+  inputLog.reset();
+  renderInputLog();
   forgetSession(localStorage);
   setCell(ui.sessionState, "SPECTATING", "warn");
   setCell(ui.slotCell, "—");
@@ -1057,6 +1188,6 @@ async function boot() {
 }
 
 // Exposed for the offline tests and for poking at a live page from a console.
-globalThis.doomPlay = {state, net, readOnce, paintFrame, base58ToBytes, bytesToBase58};
+globalThis.doomPlay = {state, net, readOnce, paintFrame, base58ToBytes, bytesToBase58, inputLog, renderInputLog};
 
 void boot().catch((error) => showError(error));

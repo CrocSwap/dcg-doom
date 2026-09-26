@@ -118,6 +118,46 @@ batches as that player. That is deliberate: the key signs inputs only, the
 relayer pays every fee, and the amounts are tiny. Do not put anything of value
 behind it.
 
+## The input panel
+
+The panel under the chain readout is the answer to "I pressed a key and nothing
+happened". It keeps one row per key press, newest first: the key, when it went
+down and up, the tic range it aimed at, and the fate of every one of those tics.
+A fate is named, not summarised, and a landed tic links the transaction that
+carried it on the Fogo explorer.
+
+The fates and where each comes from are in `inputlog.js`. Two of them are worth
+knowing about:
+
+* **missed the slot** — the producer deposited that tic *before* this write
+  reached it, so the chain ran it with no keys in it. This is the input drop, and
+  it is measured rather than inferred from a picture that did not change.
+* **queued, never deposited** — offered above the producer's staging limit, and
+  the pipeline stopped before the chain reached it.
+
+The one-line summary above the list is pressed / landed / failed, the landed
+ratio over resolved tics, and the current input lead in tics and milliseconds.
+
+When the context is spent, the pipeline has stopped, or the session is gone, a
+red banner replaces the numbers. A page whose job is to say whether keys are
+landing cannot also be the page that quietly swallows them.
+
+### What the relayer has to expose for it
+
+Two fields on the session status, both of which ride on an answer the relayer
+was already fetching, so neither costs a round trip:
+
+| field | what it is |
+|---|---|
+| `input_fate.runs[]` | one row per DEPOSIT that carried a non-zero command: `seq`, `count`, the exact `commands` bytes, and the transaction `signature`. Only command-bearing runs are listed, and the list is bounded. |
+| `input_fate.zero_deposited_through` | every sequence below this is deposited. One number instead of a run of zeros, and it is what turns a tic with no run into "missed the slot" rather than "queued". |
+
+Plus `producer_next_cursor`, which is not the same number as
+`producer_generated_cursor` and is the one a writer can honestly aim ahead of:
+`generated_cursor` is the *end* of the batch the producer has already published,
+so it runs `round(35 * 0.1)` = 4 tics ahead of the producer's real position.
+And `pipeline`, which says whether keystrokes can still reach the engine at all.
+
 ## The input message
 
 64-byte header plus four bytes per command. See `input.js` for the field

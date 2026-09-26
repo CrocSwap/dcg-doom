@@ -633,7 +633,16 @@ export class PipelineSender {
       signature: null,
       cursor: reply.cursor,
       producerGeneratedCursor: reply.producer_generated_cursor,
+      producerNextCursor: reply.producer_next_cursor ?? null,
       producerStageLimit: reply.producer_stage_limit,
+      // Whether the batch was written into a window the producer will reach at
+      // all. A batch above the stage limit is queued, which is normal for a
+      // page that leads by its round trip; a batch whose write landed after the
+      // producer read those tics is the input drop, and the pipeline's own
+      // numbers in `pipeline` are how a page tells the two apart.
+      queuedAboveStageLimit: reply.queued_above_stage_limit ?? null,
+      trimmedFromSeq: reply.trimmed_from_seq ?? null,
+      pipeline: reply.pipeline ?? null,
     };
   }
 
@@ -691,6 +700,16 @@ export class PipelineSender {
       writableFrontier: status.writable_frontier ?? null,
       writableFloor: status.writable_floor ?? null,
       frontierProbes: status.frontier_probes ?? null,
+      // The producer's NEXT tic to generate, which is not the same number as
+      // `generated_cursor` (the end of the batch it has already published) and
+      // is what a page has to aim ahead of. See doom_relayer_server.py.
+      producerNextCursor: status.producer_next_cursor ?? null,
+      // Per-deposit fate for the player's commands, and whether the pipeline can
+      // still deliver them at all. Both ride on `status`, which this method
+      // already asked for, so neither costs a round trip.
+      inputFate: status.input_fate ?? null,
+      pipeline: status.pipeline ?? null,
+      ticsPerSecondCap: status.input_tics_per_second_cap ?? null,
       frameCounters: status.frame_counters ?? null,
       rpcUrls: status.rpc_urls ?? null,
       rpcLag: status.rpc_lag ?? null,

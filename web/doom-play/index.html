@@ -95,6 +95,7 @@
       </div>
     </section>
 
+    <div class="rail-col">
     <aside class="panel rail" aria-labelledby="rail-title">
       <header class="panel-heading">
         <div><span>03</span><h2 id="rail-title">ON CHAIN</h2></div>
@@ -118,6 +119,24 @@
         holding a fresh context.
       </p>
     </aside>
+
+    <section class="panel inputlog" aria-labelledby="inputlog-title">
+      <header class="panel-heading">
+        <div><span>04</span><h2 id="inputlog-title">INPUT</h2></div>
+        <strong id="inputlog-summary">no keys pressed</strong>
+      </header>
+      <div class="inputlog-banner" id="inputlog-banner" role="alert" hidden></div>
+      <p class="inputlog-lead">
+        <span>INPUT LEAD</span>
+        <strong id="inputlog-lead">&mdash;</strong>
+        <span class="inputlog-torn">TORN READS <strong id="inputlog-torn">0</strong></span>
+      </p>
+      <ol class="inputlog-list" id="inputlog-list" aria-label="Key presses, newest first">
+        <li class="inputlog-empty">Press a key. Every press appears here with the tics it
+          aimed at, whether they reached a DEPOSIT, and the transaction that carried them.</li>
+      </ol>
+    </section>
+    </div>
   </main>
 
   <div id="error" class="error" role="alert" hidden></div>

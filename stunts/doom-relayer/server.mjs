@@ -293,6 +293,10 @@ export class Relayer {
     slot.producer = progress.producer ?? slot.producer ?? null;
     slot.writableFrontier = progress.writableFrontier ?? null;
     slot.writableFloor = progress.writableFloor ?? null;
+    slot.producerNextCursor = progress.producerNextCursor ?? null;
+    slot.inputFate = progress.inputFate ?? slot.inputFate ?? null;
+    slot.pipeline = progress.pipeline ?? slot.pipeline ?? null;
+    slot.ticsPerSecondCap = progress.ticsPerSecondCap ?? slot.ticsPerSecondCap ?? null;
     slot.frameCounters = progress.frameCounters ?? slot.frameCounters ?? null;
     slot.latestFrame = progress.latestFrame ?? slot.latestFrame ?? null;
     slot.rpcUrls = progress.rpcUrls ?? slot.rpcUrls ?? null;
@@ -335,6 +339,20 @@ export class Relayer {
       // which of the two numbers a refusal came from.
       writable_frontier: slot.writableFrontier ?? null,
       writable_floor: slot.writableFloor ?? null,
+      // The producer's next tic to generate: the aim point a page needs and the
+      // one number that is not `producer_generated_cursor`. Without it a page
+      // leads by its round trip measured from a counter that already runs a
+      // batch ahead, and the lead is gone before the batch is written.
+      producer_next_cursor: slot.producerNextCursor ?? null,
+      // Per-deposit fate for the player's commands: the bytes the chain was
+      // given and the transaction that carried them. It rides on `status`
+      // because the status poll already asks the child, so it is free.
+      input_fate: slot.inputFate ?? null,
+      // Whether keystrokes can still reach the engine, and how long the chain's
+      // cursor has stood still. A page that cannot see this shows a frozen
+      // picture and takes keys anyway.
+      pipeline: slot.pipeline ?? null,
+      tics_per_second_cap: slot.ticsPerSecondCap ?? null,
       frame_counters: slot.frameCounters ?? null,
       // Which render buffer holds the newest COMPLETE frame, and that buffer's
       // accounts. The child read the frame back before counting it, so it knows
@@ -645,15 +663,28 @@ export class Relayer {
       }
     }
 
+    slot.producerNextCursor = result.producerNextCursor ?? slot.producerNextCursor ?? null;
+    slot.pipeline = result.pipeline ?? slot.pipeline ?? null;
+
     return {
       ok: true,
       accepted,
       offered: decoded.count,
       first_seq: decoded.firstSeq,
+      // The first sequence the producer actually took, which is not the one
+      // offered when the head of the batch was already on chain. The page aims
+      // its next batch from this.
+      accepted_from: result.firstSeq,
       next_seq: slot.nextSeq,
       cursor: slot.cursor,
       gametic: slot.gametic,
       staging_frontier: frontier,
+      producer_generated_cursor: result.producerGeneratedCursor ?? null,
+      producer_next_cursor: result.producerNextCursor ?? null,
+      producer_stage_limit: result.producerStageLimit ?? null,
+      queued_above_stage_limit: result.queuedAboveStageLimit ?? null,
+      trimmed_from_seq: result.trimmedFromSeq ?? null,
+      pipeline: result.pipeline ?? slot.pipeline ?? null,
       tics: advanced.tics,
       deposit_signature: result.signature,
       advance_signature: advanced.signature,
