@@ -1773,18 +1773,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // as buffer 0, because the answer is a property of the render and
                 // not of which account the snapshot went to.
                 //
-                // The comparison is on the strip, not on the static resource
-                // account, and the reason is measured rather than assumed and
-                // reported below rather than argued.  The
-                // working copy of the engine context that lives in the static
-                // account is not byte-stable across transactions: the strip
-                // render allocates its framebuffer and leaves viewimage,
+                // The comparison is on the strip rather than on the static
+                // resource account, and the reason is measured rather than
+                // assumed.  The working copy of the engine context inside the
+                // static account is not byte-stable across transactions: the
+                // strip render allocates its framebuffer and leaves viewimage,
                 // ylookup and screens[] pointing into that block, so a re-render
-                // two transactions later leaves a different address there.  The
-                // offset and the size of that movement are recorded below, and
-                // the working-context bytes the gate *can* compare -- the ones
-                // the render's own restore puts back -- are covered by the
-                // unchanged committed ST1 and MP1 accounts.
+                // two transactions later leaves a different address there.  How
+                // much moves, and at which offsets, is recorded below rather
+                // than argued.  The bytes the gate can compare across the depth
+                // are the strips and the committed ST1 and MP1 accounts.
                 let probe_key = rsn3::strip_address(&base::PROGRAM, &buffer_snapshot, probe_strip).0;
                 let strip_before = session.data(probe_key).await?;
                 let replay_ix = session.render_buffered_ix(
