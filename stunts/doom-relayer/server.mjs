@@ -281,6 +281,9 @@ export class Relayer {
     slot.gametic = progress.gametic;
     slot.ticsPerSecond = progress.ticsPerSecond ?? null;
     slot.stagingFrontier = progress.stagingFrontier ?? null;
+    slot.producer = progress.producer ?? slot.producer ?? null;
+    slot.frameCounters = progress.frameCounters ?? slot.frameCounters ?? null;
+    slot.rpcUrls = progress.rpcUrls ?? slot.rpcUrls ?? null;
     slot.nextSeq = Math.max(slot.nextSeq, slot.cursor);
     return slot;
   }
@@ -308,6 +311,15 @@ export class Relayer {
       tics_per_second: slot.ticsPerSecond ?? null,
       staging_frontier: slot.stagingFrontier ?? null,
       input_window: this.inputWindow(slot),
+      // The producer's own two cursors. `producer_stage_limit` is the sequence
+      // it will deposit next and `producer_generated_cursor` the last one it
+      // has, so the page can aim at a window that is still writable instead of
+      // guessing from a cursor the producer does not use.
+      producer: slot.producer ?? null,
+      producer_stage_limit: slot.producer?.stage_limit ?? null,
+      producer_generated_cursor: slot.producer?.generated_cursor ?? null,
+      frame_counters: slot.frameCounters ?? null,
+      rpc_urls: slot.rpcUrls ?? null,
       input_capacity: slot.inputCapacity,
       tics_landed: slot.ticsLanded,
       frames_landed: slot.framesLanded,
@@ -530,7 +542,38 @@ export class Relayer {
       }
     }
 
-    const result = await this.sender.deposit({slot: slot.label, firstSeq: decoded.firstSeq, commands});
+    let result;
+    try {
+      result = await this.sender.deposit({slot: slot.label, firstSeq: decoded.firstSeq, commands});
+      // The producer's own bound is the last word on how much of the batch is
+      // still writable, and it can be tighter than the frontier this method
+      // trimmed against: the producer is the side that reads the command
+      // stream, so its staging limit is where a tic stops being the page's to
+      // choose. Trim again rather than let a short deposit throw.
+      accepted = result.accepted;
+      commands = decoded.commands.subarray(0, accepted * COMMAND_BYTES);
+    } catch (error) {
+      // A refusal from the pipeline is a resume point, not a server fault: it
+      // names the sequence to write next. Without the 409 and the detail the
+      // page sees a 500 and can only retry the same batch, which is the
+      // accepted-and-dropped input path all over again.
+      this.stats.inputsRejected += 1;
+      const refusal = new Error(error.message);
+      refusal.status = 409;
+      refusal.code = error.code === "pipeline_refused" ? "input_stale" : (error.code ?? "batch_refused");
+      // The pipeline's refusal detail: where to resume, and the producer's own
+      // two cursors, which are the numbers a page aims with.
+      const resume = error.detail ?? {};
+      refusal.detail = {
+        first_seq: decoded.firstSeq,
+        next_seq: resume.next_seq ?? slot.nextSeq,
+        cursor: resume.cursor ?? slot.cursor,
+        staging_frontier: resume.staging_frontier ?? slot.stagingFrontier ?? null,
+        producer_generated_cursor: resume.producer_generated_cursor ?? null,
+        producer_stage_limit: resume.producer_stage_limit ?? null,
+      };
+      throw refusal;
+    }
     // A background sender is already advancing and rendering on its own
     // schedule, so a batch does not drive either. It reports where the chain
     // has got to, which is what the page's status line wants.
@@ -803,7 +846,8 @@ const CHAIN_FLAGS = new Set([
   "image-sha256", "image-bytes", "seconds", "strip-rate", "render-buffers",
   "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
-  "render",
+  "render", "reset-start-account", "frame-deadline-seconds", "rpc-lag-drop-slots",
+  "rpc-lag-check-seconds",
 ]);
 
 function parseArgs(argv) {
@@ -857,6 +901,10 @@ if (isMain()) {
     startCursor: args.get("start-cursor") ? Number(args.get("start-cursor")) : undefined,
     spendCapFogo: args.get("spend-cap-fogo") ? Number(args.get("spend-cap-fogo")) : undefined,
     payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
+    resetStartAccount: args.get("reset-start-account") ?? undefined,
+    frameDeadlineSeconds: args.get("frame-deadline-seconds") ? Number(args.get("frame-deadline-seconds")) : undefined,
+    rpcLagDropSlots: args.get("rpc-lag-drop-slots") ? Number(args.get("rpc-lag-drop-slots")) : undefined,
+    rpcLagCheckSeconds: args.get("rpc-lag-check-seconds") ? Number(args.get("rpc-lag-check-seconds")) : undefined,
   });
   const relayer = createRelayer({
     network,

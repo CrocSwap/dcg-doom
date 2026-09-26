@@ -40,6 +40,8 @@ const ui = {
   canvas: el("doom-canvas"),
   statTic: el("stat-tic"),
   statFps: el("stat-fps"),
+  statPicture: el("stat-picture"),
+  statStalls: el("stat-stalls"),
   statSlot: el("stat-slot"),
   statCommitment: el("stat-commitment"),
   statExplorer: el("stat-explorer"),
@@ -95,6 +97,18 @@ const state = {
   cursor: 0,
   stagingFrontier: null,
   inputWindow: null,
+  // The tic producer's own two cursors, as the relayer reports them. This is
+  // the other end of the input rendezvous: `producerStageLimit` is the
+  // sequence it will deposit next and `producerGeneratedCursor` the last one it
+  // has, so a batch aimed between them is read rather than dropped.
+  producerStageLimit: null,
+  producerGeneratedCursor: null,
+  frameCounters: null,
+  // A key going down, and the first frame painted after it. That pair is the
+  // input-to-picture latency a player feels, and it is the only one of the
+  // page's numbers that says whether the game is responding.
+  keysDownAt: null,
+  pictureLatencies: [],
   clientSeq: 0,
   inputsSent: 0,
   latencies: [],
@@ -224,7 +238,21 @@ async function paintFrame(frame) {
   state.lastFrame = frame;
   state.paintedFrames += 1;
   state.paintedAt = performance.now();
+  // A frame past the tic the picture was on when the key went down is the
+  // player's keypress showing up.  Recorded once per hold, and it is the
+  // number that says the page is drivable rather than merely connected.
+  if (state.keysDownAt !== null && frame.gametic > (state.gameticAtKeyDown ?? -1)) {
+    state.pictureLatencies.push(performance.now() - state.keysDownAt);
+    if (state.pictureLatencies.length > 40) state.pictureLatencies.shift();
+    state.keysDownAt = null;
+  }
   updateStatus();
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
 }
 
 function fps() {
@@ -240,6 +268,17 @@ function updateStatus() {
   setCell(ui.statTic, String(frame.gametic));
   const rate = fps();
   setCell(ui.statFps, rate === null ? "—" : rate.toFixed(2));
+  const picture = median(state.pictureLatencies);
+  setCell(ui.statPicture, picture === null ? "—" : `${picture.toFixed(0)} ms`);
+  const counters = state.frameCounters;
+  setCell(
+    ui.statStalls,
+    counters ? `${(counters.frame_stalls_per_minute ?? 0).toFixed(1)} / ${(counters.frame_skips ?? 0)}` : "—",
+  );
+  ui.statStalls.title = counters
+    ? `frame deadline ${counters.frame_deadline_seconds ?? "?"} s · ${counters.frames_submitted ?? 0} submitted · ` +
+      `${counters.frame_retries ?? 0} retried`
+    : "the relayer has not reported frame counters yet";
   setCell(ui.statSlot, state.lastFrameSlot === null ? "—" : String(state.lastFrameSlot));
   setCell(ui.statCommitment, state.reader?.paintCommitment ?? net.commitment.paint, "good");
 
@@ -420,6 +459,15 @@ function keyDown(code) {
   const name = KEY_MAP[code];
   if (!name) return false;
   state.keys[name] = true;
+  // The first key of a hold starts the clock for input-to-picture: the tic it
+  // is aimed at is the relayer's frontier, and the latency is the time until a
+  // frame painted that is past the tic the picture was on when the key went
+  // down.  A held key does not restart it, or a long hold would report only
+  // the last frame's latency.
+  if (state.keysDownAt === null) {
+    state.keysDownAt = performance.now();
+    state.gameticAtKeyDown = state.lastFrame ? state.lastFrame.gametic : -1;
+  }
   return true;
 }
 
@@ -564,6 +612,12 @@ async function pushInput() {
         if (payload.detail.cursor !== undefined) state.cursor = payload.detail.cursor;
         if (payload.detail.staging_frontier !== undefined) state.stagingFrontier = payload.detail.staging_frontier;
         if (payload.detail.input_window !== undefined) state.inputWindow = payload.detail.input_window;
+        if (payload.detail.producer_generated_cursor !== undefined) {
+          state.producerGeneratedCursor = payload.detail.producer_generated_cursor;
+        }
+        if (payload.detail.producer_stage_limit !== undefined) {
+          state.producerStageLimit = payload.detail.producer_stage_limit;
+        }
         state.nextSeq = state.cursor;
         if (held) scheduleInputPush();
         return;
@@ -667,6 +721,13 @@ function adoptAccounts(payload) {
   if (payload.cursor !== undefined) state.cursor = payload.cursor;
   if (payload.staging_frontier !== undefined) state.stagingFrontier = payload.staging_frontier;
   if (payload.input_window !== undefined && payload.input_window !== null) state.inputWindow = payload.input_window;
+  if (payload.producer_generated_cursor !== undefined) {
+    state.producerGeneratedCursor = payload.producer_generated_cursor;
+  }
+  if (payload.producer_stage_limit !== undefined) {
+    state.producerStageLimit = payload.producer_stage_limit;
+  }
+  if (payload.frame_counters) state.frameCounters = payload.frame_counters;
 }
 
 // A fresh cursor and staging frontier. The relayer reads the chain for this, so

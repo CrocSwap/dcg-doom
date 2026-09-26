@@ -899,3 +899,141 @@ test("a batch behind the cursor is refused with a resume point, not deposited", 
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test("every flag start.sh passes reaches the child, including the reset account", () => {
+  // `argv()` is the only place a chain-mode flag becomes a process argument. A
+  // flag that is not built here is a flag the pipeline has never seen, and
+  // `start.sh` had been passing `--reset-start-account` for a dispatch: the
+  // whole RESET/9 path was unreachable from the operator's own start command.
+  const sender = createSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    resetStartAccount: "9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1",
+    frameDeadlineSeconds: 2,
+    rpcLagDropSlots: 512,
+    rpcLagCheckSeconds: 10,
+  });
+  const argv = sender.argv();
+  assert.ok(argv.includes("--reset-start-account"));
+  assert.equal(argv[argv.indexOf("--reset-start-account") + 1], "9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1");
+  assert.equal(argv[argv.indexOf("--frame-deadline-seconds") + 1], "2");
+  assert.equal(argv[argv.indexOf("--rpc-lag-drop-slots") + 1], "512");
+  assert.equal(argv[argv.indexOf("--rpc-lag-check-seconds") + 1], "10");
+});
+
+test("a producer-trimmed batch is a partial accept, not a server fault", async () => {
+  // The producer's own staging limit is the last word on which tics are still
+  // writable, and it can be tighter than the frontier the relayer trimmed
+  // against. "One tic less than offered" has to come back as a 200 the page can
+  // carry on from; a 500 would leave it retrying the same batch forever, which
+  // is the accepted-and-dropped input path with a different status code.
+  const deposits = [];
+  const producer = {generated_cursor: 0, stage_limit: 0};
+  const inner = backgroundSender({frontier: 1020, cursor: 1000});
+  const sender = {
+    ...inner,
+    async readProgress() {
+      return {...(await inner.readProgress()), stagingFrontier: 1020, ticsPerSecond: 35};
+    },
+    async provisionSlot() {
+      const slot = await inner.provisionSlot();
+      producer.generated_cursor = 1016;
+      // Tighter than the four tics the page offers, so the producer has to trim.
+      producer.stage_limit = 1018;
+      return slot;
+    },
+    async deposit({firstSeq, commands}) {
+      const offered = commands.length / 4;
+      const accepted = Math.max(1, Math.min(offered, producer.stage_limit - firstSeq));
+      producer.generated_cursor = firstSeq + accepted;
+      deposits.push({firstSeq, tics: accepted});
+      return {accepted, firstSeq, cursor: 1016, producer_stage_limit: producer.stage_limit};
+    },
+  };
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const window = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    const width = window.input_window || 4;
+    const aimed = await batch(wallet, relayer, created, {
+      firstSeq: window.staging_frontier - width,
+      count: width,
+      clientSeq: 1,
+    });
+    const {status, body} = await call("POST", `/v1/sessions/${created.id}/input`, aimed);
+    assert.equal(status, 200, `a short accept is a 200: ${JSON.stringify(body)}`);
+    assert.ok(body.accepted >= 1 && body.accepted < width, `short accept: ${body.accepted} of ${width}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a pipeline refusal reaches the page as a resume point, not a 500", async () => {
+  // A refusal from the pipeline names the sequence to write next. Carrying it
+  // as a 409 with its detail is what lets the page re-aim in one frame instead
+  // of showing an error and leaving the player's keys unheld.
+  const relayer = createRelayer({
+    mode: "chain",
+    network: "testnet",
+    sender: {
+      ...backgroundSender({frontier: 1020, cursor: 1000}),
+      async readProgress() {
+        return {...(await backgroundSender({frontier: 1020, cursor: 1000}).readProgress()),
+          stagingFrontier: 1020, ticsPerSecond: 35};
+      },
+      async deposit() {
+        throw new SenderError(
+          "first_seq 100 .. 104 is at or below the producer's generated cursor 104: those tics are " +
+            "already on chain and cannot be rewritten; resume at 104",
+          "pipeline_refused",
+          {detail: {next_seq: 104, cursor: 96, staging_frontier: 120, producer_generated_cursor: 104}},
+        );
+      },
+    },
+  });
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const window = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    const width = window.input_window || 4;
+    const aimed = await batch(wallet, relayer, created, {
+      firstSeq: window.staging_frontier - width,
+      count: width,
+      clientSeq: 1,
+    });
+    const {status, body} = await call("POST", `/v1/sessions/${created.id}/input`, aimed);
+    assert.equal(status, 409, `a stale sequence is a 409: ${JSON.stringify(body)}`);
+    assert.equal(body.code, "input_stale");
+    assert.equal(body.detail.next_seq, 104);
+    assert.equal(body.detail.producer_generated_cursor, 104);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

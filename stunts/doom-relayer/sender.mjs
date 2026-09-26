@@ -411,6 +411,21 @@ export class PipelineSender {
     argv.push("--input-tics-per-second", String(options.inputTicsPerSecond ?? 35));
     if (options.inputStageLeadTics) argv.push("--input-stage-lead-tics", String(options.inputStageLeadTics));
     if (options.waitForAdvance === false) argv.push("--no-wait-for-advance");
+    // These three were in start.sh and never reached the child: `argv()` is the
+    // only place a chain-mode flag becomes a process argument, and a flag that
+    // is not built here is a flag the pipeline has never seen.  The
+    // reset-start-account one is the whole RESET/9 path, so its absence meant
+    // a dead player's use press ended the session instead of restarting it.
+    if (options.resetStartAccount) argv.push("--reset-start-account", options.resetStartAccount);
+    if (options.frameDeadlineSeconds !== undefined && options.frameDeadlineSeconds !== null) {
+      argv.push("--frame-deadline-seconds", String(options.frameDeadlineSeconds));
+    }
+    if (options.rpcLagDropSlots !== undefined && options.rpcLagDropSlots !== null) {
+      argv.push("--rpc-lag-drop-slots", String(options.rpcLagDropSlots));
+    }
+    if (options.rpcLagCheckSeconds !== undefined && options.rpcLagCheckSeconds !== null) {
+      argv.push("--rpc-lag-check-seconds", String(options.rpcLagCheckSeconds));
+    }
     if (options.startCursor !== undefined && options.startCursor !== null) {
       argv.push("--start-cursor", String(options.startCursor));
     }
@@ -573,6 +588,9 @@ export class PipelineSender {
       // holds.
       nextSeq: hello.staged_frontier ?? hello.start_cursor,
       stagedFrontier: hello.staging_frontier,
+      producer: hello.producer ?? null,
+      frameCounters: hello.frame_counters ?? null,
+      rpcUrls: hello.rpc_urls ?? null,
     };
   }
 
@@ -586,14 +604,32 @@ export class PipelineSender {
       first_seq: firstSeq,
       commands: Buffer.from(commands).toString("base64"),
     });
-    if (reply.accepted !== commands.length / 4) {
+    const offered = commands.length / 4;
+    if (reply.accepted < 1) {
       throw new SenderError(
-        `the pipeline accepted ${reply.accepted} of ${commands.length / 4} tics at ${firstSeq}`,
+        `the pipeline accepted none of ${offered} tics at ${firstSeq}`,
         "short_deposit",
         reply,
       );
     }
-    return {accepted: reply.accepted, firstSeq, signature: null, cursor: reply.cursor};
+    // A short accept is normal now, not a fault: the producer's own staging
+    // limit is the last word on which tics are still the writer's, and it can
+    // be tighter than the frontier the relayer trimmed against.  Throwing here
+    // would turn "one tic less than offered" into a 500 the page cannot act on.
+    if (reply.accepted !== offered) {
+      this.log(
+        `the pipeline accepted ${reply.accepted} of ${offered} tics at ${firstSeq} ` +
+          `(first_seq ${reply.first_seq}, stage limit ${reply.producer_stage_limit})`,
+      );
+    }
+    return {
+      accepted: reply.accepted,
+      firstSeq: reply.first_seq ?? firstSeq,
+      signature: null,
+      cursor: reply.cursor,
+      producerGeneratedCursor: reply.producer_generated_cursor,
+      producerStageLimit: reply.producer_stage_limit,
+    };
   }
 
   // The advance is not this method's job any more: the child runs the
@@ -631,6 +667,11 @@ export class PipelineSender {
       capacity: status.capacity,
       halted: Boolean(status.halt),
       stagingFrontier: status.staging_frontier,
+      producer: status.producer ?? null,
+      frameCounters: status.frame_counters ?? null,
+      rpcUrls: status.rpc_urls ?? null,
+      rpcLag: status.rpc_lag ?? null,
+      inputRefusals: status.input_refusals ?? null,
       ticsPerSecond: status.tics_per_second,
       framesCompleted: status.frames_completed,
       framesPerSecond: status.frames_per_second,
