@@ -51,6 +51,8 @@ real keyboard would.
 | `rpc.js` | Read-only JSON-RPC client, plus the WAD reader that pulls PLAYPAL out of the WAD accounts by offset. |
 | `input.js` | The signed input message. Imported by the relayer too, so the two cannot drift. |
 | `burner.js` | The throwaway ed25519 keypair, in the tab, in localStorage. |
+| `push.js` | The frame stream: SSE subscription, in-order painting, the chain cross-check. |
+| `proof-frame-push.mjs` | The proof driver: painted rate, torn reads, per-press latency, over CDP. |
 | `app.js` | Page wiring: the read loop, the canvas, the input loop, the session. |
 | `test/` | Offline tests, plus one live cross-check that is not part of the default run. |
 
@@ -58,7 +60,7 @@ real keyboard would.
 
 ```sh
 cd web/doom-play
-node --test test/test_strip.mjs test/test_input.mjs test/test_palette.mjs
+node --test test/test_strip.mjs test/test_input.mjs test/test_palette.mjs test/test_push.mjs
 ```
 
 `test/fixtures/frame-cursor-6016.bin.gz` holds eight real strip accounts read
@@ -117,6 +119,33 @@ Anyone can read that key out of localStorage, and anyone who has it can sign
 batches as that player. That is deliberate: the key signs inputs only, the
 relayer pays every fee, and the amounts are tiny. Do not put anything of value
 behind it.
+
+## Where the frames come from
+
+A page with a relayer to push from is sent each complete frame and never looks
+for one. `?frame-source=push` (the default) subscribes to
+`GET /v1/sessions/:id/frames`, which is server-sent events: the relayer already
+read every frame's eight strip accounts and checked every digest, and it forwards
+those exact bytes. `?frame-source=read` is the old path, this page polling the
+chain itself, and it is still the default for a page with no session.
+
+The push is not a shortcut past the checks. A pushed frame goes through the same
+`decodeFrame` as a chain read: each strip's SHA-256 over its header and pixels is
+recomputed, and the eight are required to agree on cursor, gametic, snapshot hash
+and state root. Every twentieth frame the page also reads the same accounts from
+the chain and compares, and a disagreement is raised rather than counted — the
+one way this path can be wrong is quietly, so the check is not optional. It
+reads the eight 128-byte strip headers rather than the whole accounts, because
+the digests cover the pixels and 1,728 bytes finishes inside a frame interval
+where 1,072,384 bytes does not; and it compares the chain's frame against the
+page's own record of that frame, because the public node the page reads is about
+three frames behind the relayer.
+
+Measured through this page on 2026-09-26 (see
+`docs/experiments/doom-frame-push-2026-09-26.md`): **1.78 frames/s painted over
+60 s with 0 torn reads**, key-to-picture median **390 ms** over 12 presses with
+the picture moving on all 12, and 9 of 9 chain cross-checks matching. The direct
+read on the same page over the same period: 0.22 fps and 151 torn reads.
 
 ## The input panel
 
