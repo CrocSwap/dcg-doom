@@ -17,7 +17,10 @@ export const NETWORKS = {
     cluster: "testnet",
     // Reads only. The page never signs a transaction of its own.
     rpcHttp: "https://testnet.fogo.io",
-    rpcHttpFallback: ["http://64.130.44.172:8899", "http://64.130.44.173:8899"],
+    // `64.130.44.172` was here first until 2026-09-26: R9b measured it 14,336
+    // slots behind `.173`, and a readback that takes the lower finalized slot
+    // as its floor waits for it. `.173` is the only direct fallback.
+    rpcHttpFallback: ["http://64.130.44.173:8899"],
     // Empty means "poll"; the viewer does not require a websocket socket.
     rpcWs: UNSET,
     genesis: "9GGSFo95raqzZxWqKM5tGYvJp5iv4Dm565S4r8h5PEu9",

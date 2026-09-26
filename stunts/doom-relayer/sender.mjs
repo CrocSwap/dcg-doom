@@ -411,6 +411,21 @@ export class PipelineSender {
     argv.push("--input-tics-per-second", String(options.inputTicsPerSecond ?? 35));
     if (options.inputStageLeadTics) argv.push("--input-stage-lead-tics", String(options.inputStageLeadTics));
     if (options.waitForAdvance === false) argv.push("--no-wait-for-advance");
+    // These three were in start.sh and never reached the child: `argv()` is the
+    // only place a chain-mode flag becomes a process argument, and a flag that
+    // is not built here is a flag the pipeline has never seen.  The
+    // reset-start-account one is the whole RESET/9 path, so its absence meant
+    // a dead player's use press ended the session instead of restarting it.
+    if (options.resetStartAccount) argv.push("--reset-start-account", options.resetStartAccount);
+    if (options.frameDeadlineSeconds !== undefined && options.frameDeadlineSeconds !== null) {
+      argv.push("--frame-deadline-seconds", String(options.frameDeadlineSeconds));
+    }
+    if (options.rpcLagDropSlots !== undefined && options.rpcLagDropSlots !== null) {
+      argv.push("--rpc-lag-drop-slots", String(options.rpcLagDropSlots));
+    }
+    if (options.rpcLagCheckSeconds !== undefined && options.rpcLagCheckSeconds !== null) {
+      argv.push("--rpc-lag-check-seconds", String(options.rpcLagCheckSeconds));
+    }
     if (options.startCursor !== undefined && options.startCursor !== null) {
       argv.push("--start-cursor", String(options.startCursor));
     }
@@ -573,6 +588,14 @@ export class PipelineSender {
       // holds.
       nextSeq: hello.staged_frontier ?? hello.start_cursor,
       stagedFrontier: hello.staging_frontier,
+      producer: hello.producer ?? null,
+      frameCounters: hello.frame_counters ?? null,
+      rpcUrls: hello.rpc_urls ?? null,
+      // Which buffer holds the newest COMPLETE frame, and that buffer's
+      // accounts. The child reads each frame back before counting it, so it
+      // knows; the viewer, reading eight strip accounts that land in eight
+      // transactions, cannot.
+      latestFrame: hello.latest_frame ?? null,
     };
   }
 
@@ -586,14 +609,32 @@ export class PipelineSender {
       first_seq: firstSeq,
       commands: Buffer.from(commands).toString("base64"),
     });
-    if (reply.accepted !== commands.length / 4) {
+    const offered = commands.length / 4;
+    if (reply.accepted < 1) {
       throw new SenderError(
-        `the pipeline accepted ${reply.accepted} of ${commands.length / 4} tics at ${firstSeq}`,
+        `the pipeline accepted none of ${offered} tics at ${firstSeq}`,
         "short_deposit",
         reply,
       );
     }
-    return {accepted: reply.accepted, firstSeq, signature: null, cursor: reply.cursor};
+    // A short accept is normal now, not a fault: the producer's own staging
+    // limit is the last word on which tics are still the writer's, and it can
+    // be tighter than the frontier the relayer trimmed against.  Throwing here
+    // would turn "one tic less than offered" into a 500 the page cannot act on.
+    if (reply.accepted !== offered) {
+      this.log(
+        `the pipeline accepted ${reply.accepted} of ${offered} tics at ${firstSeq} ` +
+          `(first_seq ${reply.first_seq}, stage limit ${reply.producer_stage_limit})`,
+      );
+    }
+    return {
+      accepted: reply.accepted,
+      firstSeq: reply.first_seq ?? firstSeq,
+      signature: null,
+      cursor: reply.cursor,
+      producerGeneratedCursor: reply.producer_generated_cursor,
+      producerStageLimit: reply.producer_stage_limit,
+    };
   }
 
   // The advance is not this method's job any more: the child runs the
@@ -608,15 +649,26 @@ export class PipelineSender {
   // viewer reads the strip accounts off the chain itself. This reports the
   // newest frame the child knows landed.
   async renderFrame() {
-    const status = await this.readProgress();
-    const frame = status.last_frame;
+    await this.readProgress();
+    // readProgress returns a fresh object literal, so `last_frame` was read off
+    // an object that never had it and this always threw `no_frame` -- which is
+    // why the page's rendered-on-chain cell never left the snapshot account
+    // link in chain mode. The raw answer is on `this.status`.
+    const frame = this.status?.latest_frame ?? this.status?.last_frame ?? null;
     if (!frame) throw new SenderError("no frame has landed yet", "no_frame");
+    // The child's own keys first, so this is the same object the status answer
+    // carries and a page cannot tell the two apart; the camelCase aliases are
+    // for the fields this class has always returned by that name.
     return {
+      ...frame,
+      buffer: frame.buffer ?? null,
       cursor: frame.cursor,
       gametic: frame.gametic,
       snapshotHash: frame.snapshot_hash,
       stateRoot: frame.state_root,
       signature: frame.signature,
+      snapshotAccount: frame.snapshot_account ?? null,
+      stripAccounts: frame.strip_accounts ?? null,
       strips: null,
       background: true,
     };
@@ -631,9 +683,15 @@ export class PipelineSender {
       capacity: status.capacity,
       halted: Boolean(status.halt),
       stagingFrontier: status.staging_frontier,
+      producer: status.producer ?? null,
+      frameCounters: status.frame_counters ?? null,
+      rpcUrls: status.rpc_urls ?? null,
+      rpcLag: status.rpc_lag ?? null,
+      inputRefusals: status.input_refusals ?? null,
       ticsPerSecond: status.tics_per_second,
       framesCompleted: status.frames_completed,
       framesPerSecond: status.frames_per_second,
+      latestFrame: status.latest_frame ?? null,
       spendFogo: status.spend_fogo,
     };
   }
@@ -642,10 +700,22 @@ export class PipelineSender {
   // a batch beyond it rather than queueing input the chain will not run for
   // another second, which is what made R8l5's input latency drift upward
   // through a session.
+  //
+  // Asked of the child every time, never served from `this.status`. The bound
+  // used to be the cursor plus a constant, so a cached copy was merely a little
+  // stale and the page's own floor was stale by the same amount; it is now the
+  // tic producer's own staging limit, an absolute sequence, while the page's
+  // floor is a cursor read a moment later. Caching it then aims a batch at a
+  // sequence the engine has already read -- which is refused, every push, and
+  // is the accepted-and-dropped input path with a 409 on it. One pipe round
+  // trip is a cheap price for the bound and the floor being from the same
+  // instant.
   async stagingFrontier() {
-    const status = this.status ?? (await this.request({op: "status"}, {timeoutMs: 10_000}));
+    const status = await this.request({op: "status"}, {timeoutMs: 10_000});
+    this.status = status;
     return status.staging_frontier;
   }
+
 
   // The viewer reads the chain in chain mode, so the relayer has no bytes to
   // hand it. Saying so beats returning eight empty accounts.

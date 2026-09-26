@@ -11,7 +11,7 @@ import {webcrypto} from "node:crypto";
 import {encodeInput, heldToCommands, MAX_COMMANDS_PER_BATCH, BT_ATTACK, BT_SPECIAL} from "../../../web/doom-play/input.js";
 import {createRelayer, createServer, API_VERSION} from "../server.mjs";
 import {SlotPool, makeSlot, SLOT_STATE, PoolError} from "../pool.mjs";
-import {MockSender, createSender, SenderError, PIPELINE_REQUIREMENTS} from "../sender.mjs";
+import {MockSender, createSender, SenderError, PipelineSender, PIPELINE_REQUIREMENTS} from "../sender.mjs";
 
 const subtle = webcrypto.subtle;
 
@@ -434,10 +434,13 @@ test("chain mode stages a signed batch, and refuses input past the staging front
     // force a frame; the newest one it knows about is reported instead.
     assert.equal(first.body.frame.signature, "chain-frame-1");
 
-    // A batch that runs past the frontier is accepted as far as it goes, and
-    // the page re-offers the rest. Each sequence is written exactly once. The
-    // frontier is 20 and the cursor is not moving, so the third batch is the
-    // first one with nowhere left to put its tics.
+    // A batch that runs past the frontier is queued, not trimmed and not
+    // refused. The producer reads the command stream by absolute sequence and
+    // reaches those tics as its in-flight packets land, and a page that leads
+    // the window by its own round trip -- 0.3-0.4 s measured, 7-11 tics at the
+    // measured 23.8-26.3 tics/s, against a four-tic window -- puts every batch
+    // above the frontier on purpose. Refusing there is the R10 input drop:
+    // 19 POSTs, 0 accepted, all 409 `input_stale`, 0 command tics deposited.
     const second = await call(
       "POST",
       `/v1/sessions/${created.id}/input`,
@@ -455,14 +458,16 @@ test("chain mode stages a signed batch, and refuses input past the staging front
       await batch(wallet, relayer, created, {firstSeq: 16, count: 8, clientSeq: 3}),
     );
     assert.equal(third.status, 200);
-    assert.equal(third.body.accepted, 4);
-    assert.equal(third.body.next_seq, 20);
-    assert.deepEqual(sender.deposits[2], {firstSeq: 16, tics: 4});
+    assert.equal(third.body.accepted, 8);
+    assert.deepEqual(sender.deposits[2], {firstSeq: 16, tics: 8});
 
+    // What is still refused is a batch so far past the frontier that it is a
+    // backlog rather than a keystroke: the R8l5 failure this bound was written
+    // for, one lead further out. The frontier is 20 and the lead is 96 tics.
     const fourth = await call(
       "POST",
       `/v1/sessions/${created.id}/input`,
-      await batch(wallet, relayer, created, {firstSeq: 20, count: 8, clientSeq: 4}),
+      await batch(wallet, relayer, created, {firstSeq: 116, count: 8, clientSeq: 4}),
     );
     assert.equal(fourth.status, 409);
     assert.equal(fourth.body.code, "input_window_full");
@@ -470,6 +475,17 @@ test("chain mode stages a signed batch, and refuses input past the staging front
     // Nothing was staged, so the page's next_seq has not moved and the same
     // batch is still valid to re-offer.
     assert.equal(sender.deposits.length, 3);
+
+    // And just inside the lead it is accepted whole, which is the whole point:
+    // a page aiming two round trips ahead is not refused for being early.
+    const fifth = await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 108, count: 8, clientSeq: 5}),
+    );
+    assert.equal(fifth.status, 200, JSON.stringify(fifth.body));
+    assert.equal(fifth.body.accepted, 8);
+    assert.deepEqual(sender.deposits[3], {firstSeq: 108, tics: 8});
 
     // And the frame-bytes endpoint says why it has none, rather than handing
     // back eight empty strip accounts.
@@ -898,4 +914,233 @@ test("a batch behind the cursor is refused with a resume point, not deposited", 
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("every flag start.sh passes reaches the child, including the reset account", () => {
+  // `argv()` is the only place a chain-mode flag becomes a process argument. A
+  // flag that is not built here is a flag the pipeline has never seen, and
+  // `start.sh` had been passing `--reset-start-account` for a dispatch: the
+  // whole RESET/9 path was unreachable from the operator's own start command.
+  const sender = createSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    resetStartAccount: "9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1",
+    frameDeadlineSeconds: 2,
+    rpcLagDropSlots: 512,
+    rpcLagCheckSeconds: 10,
+  });
+  const argv = sender.argv();
+  assert.ok(argv.includes("--reset-start-account"));
+  assert.equal(argv[argv.indexOf("--reset-start-account") + 1], "9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1");
+  assert.equal(argv[argv.indexOf("--frame-deadline-seconds") + 1], "2");
+  assert.equal(argv[argv.indexOf("--rpc-lag-drop-slots") + 1], "512");
+  assert.equal(argv[argv.indexOf("--rpc-lag-check-seconds") + 1], "10");
+});
+
+test("the session answer names the buffer holding the latest complete frame", async () => {
+  // The child reads a frame back before it counts it, so it knows which buffer
+  // is whole; the viewer reads eight strip accounts that land in eight
+  // transactions and cannot. The pointer has to reach the page together with
+  // that buffer's accounts, or the page reads the buffer being written -- which
+  // at strip rate 64 is most reads, and was 1 frame painted in 60 s.
+  const pointer = {
+    buffer: 1,
+    cursor: 51140,
+    gametic: 51140,
+    snapshot_hash: "ab".repeat(32),
+    state_root: "cd".repeat(32),
+    signature: "chain-frame-7",
+    snapshot_account: "snap-1",
+    strip_accounts: Array.from({length: 8}, (_, i) => `strip-1-${i}`),
+  };
+  const inner = backgroundSender({frontier: 20, cursor: 0});
+  const sender = {
+    ...inner,
+    async readProgress() {
+      return {...(await inner.readProgress()), latestFrame: pointer};
+    },
+    async renderFrame() {
+      return {...pointer, strips: null, background: true};
+    },
+  };
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const status = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    assert.equal(status.latest_frame.buffer, 1);
+    assert.equal(status.latest_frame.snapshot_account, "snap-1");
+    assert.deepEqual(status.latest_frame.strip_accounts, pointer.strip_accounts);
+    // And it rides on the input answer too, so a held key does not have to wait
+    // for the status poll to learn which buffer to read.
+    const posted = (await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 0, count: 8, clientSeq: 1}),
+    )).body;
+    assert.equal(posted.latest_frame.buffer, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a producer-trimmed batch is a partial accept, not a server fault", async () => {
+  // The producer's own staging limit is the last word on which tics are still
+  // writable, and it can be tighter than the frontier the relayer trimmed
+  // against. "One tic less than offered" has to come back as a 200 the page can
+  // carry on from; a 500 would leave it retrying the same batch forever, which
+  // is the accepted-and-dropped input path with a different status code.
+  const deposits = [];
+  const producer = {generated_cursor: 0, stage_limit: 0};
+  const inner = backgroundSender({frontier: 1020, cursor: 1000});
+  const sender = {
+    ...inner,
+    async readProgress() {
+      return {...(await inner.readProgress()), stagingFrontier: 1020, ticsPerSecond: 35};
+    },
+    async provisionSlot() {
+      const slot = await inner.provisionSlot();
+      producer.generated_cursor = 1016;
+      // Tighter than the four tics the page offers, so the producer has to trim.
+      producer.stage_limit = 1018;
+      return slot;
+    },
+    async deposit({firstSeq, commands}) {
+      const offered = commands.length / 4;
+      const accepted = Math.max(1, Math.min(offered, producer.stage_limit - firstSeq));
+      producer.generated_cursor = firstSeq + accepted;
+      deposits.push({firstSeq, tics: accepted});
+      return {accepted, firstSeq, cursor: 1016, producer_stage_limit: producer.stage_limit};
+    },
+  };
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const window = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    const width = window.input_window || 4;
+    const aimed = await batch(wallet, relayer, created, {
+      firstSeq: window.staging_frontier - width,
+      count: width,
+      clientSeq: 1,
+    });
+    const {status, body} = await call("POST", `/v1/sessions/${created.id}/input`, aimed);
+    assert.equal(status, 200, `a short accept is a 200: ${JSON.stringify(body)}`);
+    assert.ok(body.accepted >= 1 && body.accepted < width, `short accept: ${body.accepted} of ${width}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a pipeline refusal reaches the page as a resume point, not a 500", async () => {
+  // A refusal from the pipeline names the sequence to write next. Carrying it
+  // as a 409 with its detail is what lets the page re-aim in one frame instead
+  // of showing an error and leaving the player's keys unheld.
+  const relayer = createRelayer({
+    mode: "chain",
+    network: "testnet",
+    sender: {
+      ...backgroundSender({frontier: 1020, cursor: 1000}),
+      async readProgress() {
+        return {...(await backgroundSender({frontier: 1020, cursor: 1000}).readProgress()),
+          stagingFrontier: 1020, ticsPerSecond: 35};
+      },
+      async deposit() {
+        throw new SenderError(
+          "first_seq 100 .. 104 is at or below the producer's generated cursor 104: those tics are " +
+            "already on chain and cannot be rewritten; resume at 104",
+          "pipeline_refused",
+          {detail: {next_seq: 104, cursor: 96, staging_frontier: 120, producer_generated_cursor: 104}},
+        );
+      },
+    },
+  });
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const window = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    const width = window.input_window || 4;
+    const aimed = await batch(wallet, relayer, created, {
+      firstSeq: window.staging_frontier - width,
+      count: width,
+      clientSeq: 1,
+    });
+    const {status, body} = await call("POST", `/v1/sessions/${created.id}/input`, aimed);
+    assert.equal(status, 409, `a stale sequence is a 409: ${JSON.stringify(body)}`);
+    assert.equal(body.code, "input_stale");
+    assert.equal(body.detail.next_seq, 104);
+    assert.equal(body.detail.producer_generated_cursor, 104);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("the input bound is asked of the child, never served from a cached status", async () => {
+  // The bound used to be the cursor plus a constant, so a cached copy was stale
+  // by the same amount as the page's own floor and the two cancelled. It is now
+  // the tic producer's staging limit -- an absolute sequence -- while the
+  // page's floor is a cursor read moments later. Serving the bound from
+  // `this.status`, which a 5 s progress event also writes, aims every batch at
+  // a sequence the engine has already read: refused, on every push, forever.
+  const sender = new PipelineSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    runDir: "/run",
+  });
+  sender.closed = false;
+  let asked = 0;
+  sender.request = async (payload) => {
+    if (payload.op === "status") {
+      asked += 1;
+      return {ok: true, cursor: 1000 + asked * 10, staging_frontier: 1036 + asked * 10};
+    }
+    throw new Error(`unexpected op ${payload.op}`);
+  };
+  // A stale status in hand, exactly as a progress event would leave.
+  sender.status = {ok: true, cursor: 1000, staging_frontier: 1036};
+  const first = await sender.stagingFrontier();
+  assert.equal(first, 1046, "the bound is a fresh answer, not the cached 1036");
+  const second = await sender.stagingFrontier();
+  assert.equal(second, 1056);
+  assert.equal(asked, 2, "one ask per bound, not one per session");
 });

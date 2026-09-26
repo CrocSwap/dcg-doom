@@ -133,6 +133,7 @@ export class Relayer {
     seqWindow = 240,
     ticsPerFrame = 16,
     advanceTics = 4,
+    inputLeadTics = 96,
   } = {}) {
     this.networkName = network;
     this.network = NETWORKS[network];
@@ -145,6 +146,14 @@ export class Relayer {
     this.ticsPerFrame = ticsPerFrame;
     // How wide the live input window is: one advance packet's worth of tics.
     this.advanceTics = advanceTics;
+    // How far past the staging frontier a page may aim, in tics. A page that
+    // aims at the frontier is aiming below the producer by the time its batch
+    // lands: the round trip to this process is 0.3-0.4 s measured, which is
+    // 7-11 tics at the measured 23.8-26.3 tics/s, and the frontier is about
+    // four tics wide. So the page leads the window by its own round trip and
+    // its batches arrive above the frontier, and this is the bound that keeps
+    // "ahead by one round trip" from becoming a backlog.
+    this.inputLeadTics = inputLeadTics;
     this.sender = sender ?? createSender({mode});
     this.pool = pool ?? new SlotPool({slots: []});
     this.sessions = new Map();
@@ -281,6 +290,10 @@ export class Relayer {
     slot.gametic = progress.gametic;
     slot.ticsPerSecond = progress.ticsPerSecond ?? null;
     slot.stagingFrontier = progress.stagingFrontier ?? null;
+    slot.producer = progress.producer ?? slot.producer ?? null;
+    slot.frameCounters = progress.frameCounters ?? slot.frameCounters ?? null;
+    slot.latestFrame = progress.latestFrame ?? slot.latestFrame ?? null;
+    slot.rpcUrls = progress.rpcUrls ?? slot.rpcUrls ?? null;
     slot.nextSeq = Math.max(slot.nextSeq, slot.cursor);
     return slot;
   }
@@ -308,6 +321,20 @@ export class Relayer {
       tics_per_second: slot.ticsPerSecond ?? null,
       staging_frontier: slot.stagingFrontier ?? null,
       input_window: this.inputWindow(slot),
+      // The producer's own two cursors. `producer_stage_limit` is the sequence
+      // it will deposit next and `producer_generated_cursor` the last one it
+      // has, so the page can aim at a window that is still writable instead of
+      // guessing from a cursor the producer does not use.
+      producer: slot.producer ?? null,
+      producer_stage_limit: slot.producer?.stage_limit ?? null,
+      producer_generated_cursor: slot.producer?.generated_cursor ?? null,
+      frame_counters: slot.frameCounters ?? null,
+      // Which render buffer holds the newest COMPLETE frame, and that buffer's
+      // accounts. The child read the frame back before counting it, so it knows
+      // which buffer is whole; the viewer does not, and reading the buffer being
+      // written is what made it refuse to paint at strip rate 64.
+      latest_frame: slot.latestFrame ?? null,
+      rpc_urls: slot.rpcUrls ?? null,
       input_capacity: slot.inputCapacity,
       tics_landed: slot.ticsLanded,
       frames_landed: slot.framesLanded,
@@ -506,12 +533,19 @@ export class Relayer {
     let frontier = null;
     if (this.sender.background) {
       frontier = await this.sender.stagingFrontier();
-      const room = frontier - decoded.firstSeq;
+      // A page aims ahead of the producer by its own round trip, so a batch
+      // routinely lands above the frontier: the producer reads the command
+      // stream by absolute sequence and reaches those tics as its in-flight
+      // packets land. What is refused is a batch so far ahead that it is a
+      // backlog rather than a keystroke, which is the R8l5 failure this check
+      // was written for and still is, one lead further out.
+      const ceiling = frontier + this.inputLeadTics;
+      const room = ceiling - decoded.firstSeq;
       if (room <= 0) {
         this.stats.inputsRejected += 1;
         const error = new Error(
-          `input window is full: ${decoded.firstSeq} is ${decoded.firstSeq - frontier} tics past the ` +
-            `staging frontier ${frontier}`,
+          `input window is full: ${decoded.firstSeq} is ${decoded.firstSeq - ceiling} tics past the ` +
+            `staging frontier ${frontier} plus the ${this.inputLeadTics}-tic lead`,
         );
         error.status = 409;
         error.code = "input_window_full";
@@ -530,7 +564,38 @@ export class Relayer {
       }
     }
 
-    const result = await this.sender.deposit({slot: slot.label, firstSeq: decoded.firstSeq, commands});
+    let result;
+    try {
+      result = await this.sender.deposit({slot: slot.label, firstSeq: decoded.firstSeq, commands});
+      // The producer's own bound is the last word on how much of the batch is
+      // still writable, and it can be tighter than the frontier this method
+      // trimmed against: the producer is the side that reads the command
+      // stream, so its staging limit is where a tic stops being the page's to
+      // choose. Trim again rather than let a short deposit throw.
+      accepted = result.accepted;
+      commands = decoded.commands.subarray(0, accepted * COMMAND_BYTES);
+    } catch (error) {
+      // A refusal from the pipeline is a resume point, not a server fault: it
+      // names the sequence to write next. Without the 409 and the detail the
+      // page sees a 500 and can only retry the same batch, which is the
+      // accepted-and-dropped input path all over again.
+      this.stats.inputsRejected += 1;
+      const refusal = new Error(error.message);
+      refusal.status = 409;
+      refusal.code = error.code === "pipeline_refused" ? "input_stale" : (error.code ?? "batch_refused");
+      // The pipeline's refusal detail: where to resume, and the producer's own
+      // two cursors, which are the numbers a page aims with.
+      const resume = error.detail ?? {};
+      refusal.detail = {
+        first_seq: decoded.firstSeq,
+        next_seq: resume.next_seq ?? slot.nextSeq,
+        cursor: resume.cursor ?? slot.cursor,
+        staging_frontier: resume.staging_frontier ?? slot.stagingFrontier ?? null,
+        producer_generated_cursor: resume.producer_generated_cursor ?? null,
+        producer_stage_limit: resume.producer_stage_limit ?? null,
+      };
+      throw refusal;
+    }
     // A background sender is already advancing and rendering on its own
     // schedule, so a batch does not drive either. It reports where the chain
     // has got to, which is what the page's status line wants.
@@ -553,6 +618,7 @@ export class Relayer {
     if (this.sender.background) {
       try {
         const frame = await this.sender.renderFrame({slot: slot.label, bufferId: 0});
+        if (frame.buffer !== undefined) slot.latestFrame = frame;
         if (frame.signature && frame.signature !== slot.lastFrameSignature) {
           slot.lastFrameSignature = frame.signature;
           slot.framesLanded += 1;
@@ -584,6 +650,10 @@ export class Relayer {
       tics: advanced.tics,
       deposit_signature: result.signature,
       advance_signature: advanced.signature,
+      // The frame pointer rides on the input answer too: a held key is the
+      // moment the page most wants to be reading the buffer that is not being
+      // written, and the status poll is up to two seconds behind.
+      latest_frame: slot.latestFrame ?? null,
       frame: {
         cursor: slot.cursor,
         gametic: slot.gametic,
@@ -803,7 +873,8 @@ const CHAIN_FLAGS = new Set([
   "image-sha256", "image-bytes", "seconds", "strip-rate", "render-buffers",
   "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
-  "render",
+  "render", "reset-start-account", "frame-deadline-seconds", "rpc-lag-drop-slots",
+  "rpc-lag-check-seconds",
 ]);
 
 function parseArgs(argv) {
@@ -857,6 +928,10 @@ if (isMain()) {
     startCursor: args.get("start-cursor") ? Number(args.get("start-cursor")) : undefined,
     spendCapFogo: args.get("spend-cap-fogo") ? Number(args.get("spend-cap-fogo")) : undefined,
     payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
+    resetStartAccount: args.get("reset-start-account") ?? undefined,
+    frameDeadlineSeconds: args.get("frame-deadline-seconds") ? Number(args.get("frame-deadline-seconds")) : undefined,
+    rpcLagDropSlots: args.get("rpc-lag-drop-slots") ? Number(args.get("rpc-lag-drop-slots")) : undefined,
+    rpcLagCheckSeconds: args.get("rpc-lag-check-seconds") ? Number(args.get("rpc-lag-check-seconds")) : undefined,
   });
   const relayer = createRelayer({
     network,
@@ -865,6 +940,7 @@ if (isMain()) {
     logger,
     sender,
     advanceTics: args.get("advance-tics") ? Number(args.get("advance-tics")) : 4,
+    inputLeadTics: args.get("input-lead-tics") ? Number(args.get("input-lead-tics")) : 96,
   });
   const corsOrigin = args.get("cors-origin") ?? "*";
   const server = createServer(relayer, {onLog: (line) => logger(line), corsOrigin});
