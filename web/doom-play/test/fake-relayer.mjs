@@ -32,7 +32,7 @@ import {
   STRIP_WIDTH,
 } from "../strip.js";
 import {stripDigest} from "../strip.js";
-import {decodeInput, signingPayload, validateInput} from "../input.js";
+import {decodeInput, decodeKeyState, heldToCommands, signingPayload, validateInput} from "../input.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const PAGE_ROOT = join(here, "..");
@@ -264,6 +264,8 @@ export class FakeRelayer {
     this.ring = new Map();
     this.frameIndex = 0;
     this.cursor = startCursor;
+    this.liveNextCursor = startCursor;
+    this.keyStateEvents = [];
     this.producerNextCursor = startCursor;
     this.producerGeneratedCursor = startCursor - 4;
     this.staged = new Map();
@@ -368,6 +370,16 @@ export class FakeRelayer {
     this.producerNextCursor += step;
     this.producerGeneratedCursor = this.producerNextCursor - 4;
     this.cursor += step;
+    for (const event of this.keyStateEvents) {
+      if (event.deposit_submitted_at_ms === undefined) {
+        event.deposit_submitted_at_ms = Date.now();
+        event.deposit_signature = `fake-atomic-${event.seq}`;
+      }
+      if (event.seq < this.cursor && event.cursor_reached_at_ms === undefined) {
+        event.cursor_reached_at_ms = Date.now();
+        this.landedTics += 1;
+      }
+    }
     for (const [seq, tic] of this.staged) {
       if (tic < this.cursor - this.leadTics) {
         this.landedTics += 1;
@@ -490,7 +502,7 @@ export class FakeRelayer {
       producer_next_cursor: this.producerNextCursor,
       writable_frontier: generated + 64,
       writable_floor: this.cursor,
-      input_fate: {deposited: this.stagedTics, landed: this.landedTics},
+      input_fate: {deposited: this.stagedTics, landed: this.landedTics, key_states: this.keyStateEvents},
       pipeline: {state: "running", cursor_stalled_seconds: 0},
       // The producer's own lead, under the names the real relayer publishes it
       // under (`server.mjs` `status()`, from the child's `input_stage_lead_tics`).
@@ -571,6 +583,56 @@ export class FakeRelayer {
       error2.code = "bad_batch";
       throw error2;
     }
+    if (batch.sequenceMode === "now") {
+      if (batch.clientSeq <= session.clientSeq && session.clientSeq !== 0) {
+        const error = new Error(`client_seq ${batch.clientSeq} is not ahead of ${session.clientSeq}`);
+        error.status = 409;
+        error.code = "stale_client_seq";
+        throw error;
+      }
+      session.clientSeq = batch.clientSeq;
+      const seq = Math.max(this.liveNextCursor, this.cursor);
+      this.liveNextCursor = seq + 1;
+      const assignedAt = Date.now();
+      const postReceivedAt = assignedAt;
+      const event = {seq, key_mask: batch.keyMask, assigned_at_ms: assignedAt};
+      this.keyStateEvents.push(event);
+      const commands = heldToCommands(decodeKeyState(batch.keyMask), seq, 1);
+      const view = new DataView(commands.buffer, commands.byteOffset, commands.byteLength);
+      const command = {
+        clientSeq: batch.clientSeq,
+        sequenceMode: "now",
+        firstSeq: seq,
+        count: 1,
+        keyMask: batch.keyMask,
+        forward: view.getUint8(0),
+        side: view.getUint8(1),
+        turns: view.getUint8(2) ? [view.getUint8(2)] : [],
+        buttons: view.getUint8(3),
+      };
+      this.batches.push(command);
+      this.lastBatch = command;
+      this.acceptedBatches += 1;
+      this.stagedTics += 1;
+      return {
+        accepted: 1,
+        accepted_from: seq,
+        stamp_tic: seq,
+        stamp_gametic: seq,
+        next_seq: seq + 1,
+        post_received_at_ms: postReceivedAt,
+        tic_assigned_at_ms: assignedAt,
+        client_seq: batch.clientSeq,
+        ...this.status(session),
+      };
+    }
+    if (batch.clientSeq <= session.clientSeq && session.clientSeq !== 0) {
+      const error = new Error(`client_seq ${batch.clientSeq} is not ahead of ${session.clientSeq}`);
+      error.status = 409;
+      error.code = "stale_client_seq";
+      throw error;
+    }
+    session.clientSeq = batch.clientSeq;
     // The relayer's own rules, the ones `validateInput` is the reference for, so
     // a page that aims badly is refused for the reason it would be refused live.
     // The floor is the chain cursor, not a count of what this relayer has

@@ -217,6 +217,7 @@ const SNAPSHOT = `(() => {
     // which is a much smaller number and not a keypress latency.
     stampLatencies: s.stampLatencies.slice(),
     stampSamples: (s.stampSamples ?? []).slice(),
+    keyTimingBreakdown: (s.keyTimingBreakdown ?? []).slice(),
     nextPictureLatencies: s.nextPictureLatencies.slice(),
     holdsStarted: s.holdsStarted,
     holdsUnstamped: s.holdsUnstamped,
@@ -357,7 +358,6 @@ for (let index = 0; index < PRESSES; index += 1) {
     keypressMs: sample ? sample.ms : null,
     stampedTic: sample ? sample.tic : null,
     paintedGametic: sample ? sample.gametic : null,
-    leadTics: sample ? sample.lead_tics : null,
     // Keydown to the next frame of any kind. Not a keypress latency.
     nextPictureMs: sample ? sample.next_picture_ms : null,
     wallMs: Date.now() - at,
@@ -399,7 +399,6 @@ for (const press of presses) {
     press.keypressMs = sample.ms;
     press.stampedTic = sample.tic;
     press.paintedGametic = sample.gametic;
-    press.leadTics = sample.lead_tics;
     press.nextPictureMs = sample.next_picture_ms;
     press.late = true;
   }
@@ -465,6 +464,18 @@ const result = {
   // Every sample, with the pair that makes each one checkable: the tic the
   // input was stamped for and the gametic of the frame that ended the wait.
   samples: final.stampSamples,
+  timing_breakdown: final.keyTimingBreakdown,
+  timing_breakdown_summary: Object.fromEntries([
+    "page_to_post_ms_estimated",
+    "wait_to_deposit_ms_measured",
+    "cursor_to_tic_ms_measured",
+    "render_and_paint_ms_residual",
+  ].map((name) => {
+    const values = final.keyTimingBreakdown
+      .map((row) => row[name])
+      .filter((value) => Number.isFinite(value));
+    return [name, summarize(values)];
+  })),
   final,
   relayer_health: relayerHealth,
 };

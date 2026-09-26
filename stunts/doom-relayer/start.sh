@@ -168,6 +168,8 @@ mkdir -p "$RD/out/$NAME"
 
 export PYTHONPATH=/home/ec2-user/basanos-main/src
 cd "$RD"
+# RESET/9 answers the program's dead-player use refusal (295). The start
+# account is sealed from the E1M1 image; keep recovery enabled by default.
 exec node "$RD/stunts/doom-relayer/server.mjs" \
   --mode chain --port 8787 --host 127.0.0.1 \
   --keys-dir ${KEYS_DIR:?KEYS_DIR must name the context keys directory} \
@@ -187,7 +189,8 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --render-pool-workers ${RENDER_POOL_WORKERS:-0} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
+  --atomic-live-inputs \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   ${readback_flags[@]+"${readback_flags[@]}"} \
   ${STRIPS_BEHIND_SNAPSHOT:+--strips-behind-snapshot} \
-  ${RESET_START_ACCOUNT:+--reset-start-account "$RESET_START_ACCOUNT"}
+  --reset-start-account "${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}"
