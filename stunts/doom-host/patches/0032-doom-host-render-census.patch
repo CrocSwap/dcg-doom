@@ -1,7 +1,8 @@
 diff --git a/linuxdoom-1.10/headless/doom_ctx.h b/linuxdoom-1.10/headless/doom_ctx.h
+index 90fb8ac..8bd606d 100644
 --- a/linuxdoom-1.10/headless/doom_ctx.h
 +++ b/linuxdoom-1.10/headless/doom_ctx.h
-@@ -1002,4 +1002,31 @@
+@@ -1002,4 +1002,30 @@ extern unsigned long doom_sbf_prof_cu(void);
  #define doom_render_fuzz_columns (DOOM_CTX->doom_render_fuzz_columns)
  #endif
  
@@ -31,12 +32,12 @@ diff --git a/linuxdoom-1.10/headless/doom_ctx.h b/linuxdoom-1.10/headless/doom_c
 +#define DOOM_HOST_CENSUS_CLIP_STEP() ((void)0)
 +#define DOOM_HOST_CENSUS_VIEW(x, y, angle, floorpic) ((void)0)
 +#endif
-+
  #endif /* DOOM_CTX_H */
 diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
+index cd4c321..c5f8413 100644
 --- a/linuxdoom-1.10/r_draw.c
 +++ b/linuxdoom-1.10/r_draw.c
-@@ -116,6 +116,9 @@
+@@ -121,6 +121,9 @@ void R_DrawColumn (void)
      // Zero length, column does not exceed a pixel.
      if (count < 0) 
  	return; 
@@ -46,7 +47,7 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
  				 
  #ifdef RANGECHECK 
      if ((unsigned)dc_x >= SCREENWIDTH
-@@ -230,6 +233,9 @@
+@@ -242,6 +245,9 @@ void R_DrawColumnLow (void)
      // Zero length.
      if (count < 0) 
  	return; 
@@ -56,7 +57,7 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
  				 
  #ifdef RANGECHECK 
      if ((unsigned)dc_x >= SCREENWIDTH
-@@ -311,6 +317,9 @@
+@@ -323,6 +329,9 @@ void R_DrawFuzzColumn (void)
      // Zero length.
      if (count < 0) 
  	return; 
@@ -66,7 +67,7 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
  
      if (DOOM_RENDER_CLIP_MODE &&
  	(dc_x < (int)DOOM_RENDER_CLIP_LEFT || dc_x >= (int)DOOM_RENDER_CLIP_RIGHT))
-@@ -425,6 +434,9 @@
+@@ -437,6 +446,9 @@ void R_DrawTranslatedColumn (void)
      count = dc_yh - dc_yl; 
      if (count < 0) 
  	return; 
@@ -76,17 +77,17 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
  				 
  #ifdef RANGECHECK 
      if ((unsigned)dc_x >= SCREENWIDTH
-@@ -584,6 +596,9 @@
+@@ -602,6 +614,9 @@ void R_DrawSpan (void)
  		return;
  	}
  	 
 +#ifdef DOOM_HOST_RENDER_CENSUS
 +    DOOM_HOST_CENSUS_SPAN((unsigned long)(draw_x2 - draw_x1 + 1), ds_y, draw_x1, draw_x2);
 +#endif
-     dest = ylookup[ds_y] + columnofs[draw_x1];
- 
-     // We do not check for zero spans here?
-@@ -707,6 +722,9 @@
+     /* Cache the stable flat and mapping inputs for the pixel loop. */
+ #ifndef DOOM_SBF_RENDER_COUNT_ONLY
+     source_base = ds_source;
+@@ -733,6 +748,9 @@ void R_DrawSpanLow (void)
  	 
      xfrac = ds_xfrac; 
      yfrac = ds_yfrac; 
@@ -97,13 +98,13 @@ diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
      // Blocky mode, need to multiply by 2.
      ds_x1 <<= 1;
 diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
+index 4be0f0e..9912bfd 100644
 --- a/linuxdoom-1.10/r_main.c
 +++ b/linuxdoom-1.10/r_main.c
-@@ -40,6 +40,106 @@
- 
+@@ -41,6 +41,106 @@ static const char rcsid[] = "$Id: r_main.c,v 1.5 1997/02/03 22:45:12 b1 Exp $";
  #include "r_local.h"
  #include "r_sky.h"
-+
+ 
 +#ifdef DOOM_HOST_RENDER_CENSUS
 +#define DOOM_HOST_CENSUS_VALUES 56
 +static long long doom_host_census_values[DOOM_HOST_CENSUS_VALUES];
@@ -203,10 +204,11 @@ diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
 +    doom_host_census_values[15] = (long long)floorpic;
 +}
 +#endif
++
  
  
  
-@@ -835,6 +935,10 @@
+@@ -835,6 +935,10 @@ void R_RenderPlayerView (player_t* player)
      PROF_ENTER(DOOM_SBF_PROF_RENDER_TOTAL, 0);
      PROF_ENTER(DOOM_SBF_PROF_SETUP_FRAME, 1);
      R_SetupFrame (player);
@@ -217,7 +219,7 @@ diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
      R_DRAW_PHASE(1201);
      PROF_EXIT(DOOM_SBF_PROF_SETUP_FRAME, 1);
  
-@@ -851,14 +955,19 @@
+@@ -851,14 +955,19 @@ void R_RenderPlayerView (player_t* player)
      NetUpdate ();
  
      // The head node is the last node output.
@@ -237,7 +239,7 @@ diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
      PROF_ENTER(DOOM_SBF_PROF_DRAW_PLANES, 1);
      R_DrawPlanes ();
      R_DRAW_PHASE(1204);
-@@ -867,6 +976,7 @@
+@@ -867,6 +976,7 @@ void R_RenderPlayerView (player_t* player)
      // Check for new console commands.
      NetUpdate ();
      
@@ -245,7 +247,7 @@ diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
      PROF_ENTER(DOOM_SBF_PROF_DRAW_MASKED, 1);
      R_DrawMasked ();
      R_DRAW_PHASE(1205);
-@@ -875,5 +985,6 @@
+@@ -875,5 +985,6 @@ void R_RenderPlayerView (player_t* player)
      // Check for new console commands.
      NetUpdate ();
      R_DRAW_PHASE(1206);
@@ -253,23 +255,27 @@ diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
      PROF_EXIT(DOOM_SBF_PROF_RENDER_TOTAL, 0);
  }
 diff --git a/linuxdoom-1.10/r_plane.c b/linuxdoom-1.10/r_plane.c
+index cc4ba2b..bcc087f 100644
 --- a/linuxdoom-1.10/r_plane.c
 +++ b/linuxdoom-1.10/r_plane.c
-@@ -413,8 +413,10 @@
+@@ -413,8 +413,10 @@ void R_DrawPlanes (void)
  		{
  		    angle = (viewangle + xtoviewangle[x])>>ANGLETOSKYSHIFT;
  		    dc_x = x;
+-		    dc_source = R_GetColumn(skytexture, angle);
+-		    colfunc ();
 +		    DOOM_HOST_CENSUS_PHASE(4);
- 		    dc_source = R_GetColumn(skytexture, angle);
- 		    colfunc ();
-+		    DOOM_HOST_CENSUS_PHASE(2);
++			dc_source = R_GetColumn(skytexture, angle);
++			colfunc ();
++			DOOM_HOST_CENSUS_PHASE(2);
  		}
  	    }
  	    continue;
 diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
+index 12044e5..82ed8fd 100644
 --- a/linuxdoom-1.10/r_segs.c
 +++ b/linuxdoom-1.10/r_segs.c
-@@ -148,7 +148,9 @@
+@@ -148,7 +148,9 @@ R_RenderMaskedSegRange
  	    col = (column_t *)( 
  		(byte *)R_GetColumn(texnum,maskedtexturecol[dc_x]) -3);
  			
@@ -280,9 +286,10 @@ diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
  	}
  	spryscale += rw_scalestep;
 diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
+index c84bd3e..a959271 100644
 --- a/linuxdoom-1.10/r_things.c
 +++ b/linuxdoom-1.10/r_things.c
-@@ -677,6 +677,9 @@
+@@ -677,6 +677,9 @@ void R_DrawPSprite (pspdef_t* psp)
      // off the left side
      if (x2 < 0)
  	return;
@@ -292,7 +299,7 @@ diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
      
      // store information in a vissprite
      vis = &avis;
-@@ -839,6 +842,7 @@
+@@ -839,6 +842,7 @@ void R_DrawSprite (vissprite_t* spr)
      fixed_t		lowscale;
      int			silhouette;
  		
@@ -300,7 +307,7 @@ diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
      for (x = spr->x1 ; x<=spr->x2 ; x++)
  	clipbot[x] = cliptop[x] = -2;
      
-@@ -847,6 +851,7 @@
+@@ -847,6 +851,7 @@ void R_DrawSprite (vissprite_t* spr)
      //  is the clip seg.
      for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
      {
@@ -308,4 +315,3 @@ diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
  	// determine if the drawseg obscures the sprite
  	if (ds->x1 > spr->x2
  	    || ds->x2 < spr->x1
-

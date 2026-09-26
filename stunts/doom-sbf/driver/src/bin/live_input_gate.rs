@@ -1899,6 +1899,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .iter()
                     .zip(&strip_after)
                     .position(|(before, after)| before != after);
+                let pixels_before = &strip_before[rsn3::STRIP_HEADER_BYTES..];
+                let pixels_after = &strip_after[rsn3::STRIP_HEADER_BYTES..];
+                let first_pixel_difference = pixels_before
+                    .iter()
+                    .zip(pixels_after)
+                    .position(|(before, after)| before != after);
+                let pixels_equal = pixels_before.len() == pixels_after.len()
+                    && first_pixel_difference.is_none();
                 let moved: Vec<usize> = before_replay
                     .iter()
                     .zip(&after_replay_bytes)
@@ -1906,10 +1914,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .filter(|(_, (a, b))| a != b)
                     .map(|(offset, _)| offset)
                     .collect();
-                if !buffer_is_idempotent && !worst_view_benchmark {
+                if !buffer_is_idempotent {
+                    let cause = if pixels_equal {
+                        "strip header or digest changed while pixel bytes stayed equal".to_owned()
+                    } else {
+                        format!(
+                            "strip pixel bytes changed first at offset {first_pixel_difference:?}"
+                        )
+                    };
                     return Err(format!(
-                        "re-rendering buffer {buffer}'s strip {probe_strip} at {last} did not \
-                         reproduce the strip account byte for byte"
+                        "re-rendering buffer {buffer}'s strip {probe_strip} at {last} changed the \
+                         strip account at byte {first_strip_difference:?}: {cause}"
                     )
                     .into());
                 }
