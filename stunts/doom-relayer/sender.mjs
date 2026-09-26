@@ -683,10 +683,22 @@ export class PipelineSender {
   // a batch beyond it rather than queueing input the chain will not run for
   // another second, which is what made R8l5's input latency drift upward
   // through a session.
+  //
+  // Asked of the child every time, never served from `this.status`. The bound
+  // used to be the cursor plus a constant, so a cached copy was merely a little
+  // stale and the page's own floor was stale by the same amount; it is now the
+  // tic producer's own staging limit, an absolute sequence, while the page's
+  // floor is a cursor read a moment later. Caching it then aims a batch at a
+  // sequence the engine has already read -- which is refused, every push, and
+  // is the accepted-and-dropped input path with a 409 on it. One pipe round
+  // trip is a cheap price for the bound and the floor being from the same
+  // instant.
   async stagingFrontier() {
-    const status = this.status ?? (await this.request({op: "status"}, {timeoutMs: 10_000}));
+    const status = await this.request({op: "status"}, {timeoutMs: 10_000});
+    this.status = status;
     return status.staging_frontier;
   }
+
 
   // The viewer reads the chain in chain mode, so the relayer has no bytes to
   // hand it. Saying so beats returning eight empty accounts.

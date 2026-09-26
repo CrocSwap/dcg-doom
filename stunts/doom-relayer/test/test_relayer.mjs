@@ -11,7 +11,7 @@ import {webcrypto} from "node:crypto";
 import {encodeInput, heldToCommands, MAX_COMMANDS_PER_BATCH, BT_ATTACK, BT_SPECIAL} from "../../../web/doom-play/input.js";
 import {createRelayer, createServer, API_VERSION} from "../server.mjs";
 import {SlotPool, makeSlot, SLOT_STATE, PoolError} from "../pool.mjs";
-import {MockSender, createSender, SenderError, PIPELINE_REQUIREMENTS} from "../sender.mjs";
+import {MockSender, createSender, SenderError, PipelineSender, PIPELINE_REQUIREMENTS} from "../sender.mjs";
 
 const subtle = webcrypto.subtle;
 
@@ -1036,4 +1036,36 @@ test("a pipeline refusal reaches the page as a resume point, not a 500", async (
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("the input bound is asked of the child, never served from a cached status", async () => {
+  // The bound used to be the cursor plus a constant, so a cached copy was stale
+  // by the same amount as the page's own floor and the two cancelled. It is now
+  // the tic producer's staging limit -- an absolute sequence -- while the
+  // page's floor is a cursor read moments later. Serving the bound from
+  // `this.status`, which a 5 s progress event also writes, aims every batch at
+  // a sequence the engine has already read: refused, on every push, forever.
+  const sender = new PipelineSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    runDir: "/run",
+  });
+  sender.closed = false;
+  let asked = 0;
+  sender.request = async (payload) => {
+    if (payload.op === "status") {
+      asked += 1;
+      return {ok: true, cursor: 1000 + asked * 10, staging_frontier: 1036 + asked * 10};
+    }
+    throw new Error(`unexpected op ${payload.op}`);
+  };
+  // A stale status in hand, exactly as a progress event would leave.
+  sender.status = {ok: true, cursor: 1000, staging_frontier: 1036};
+  const first = await sender.stagingFrontier();
+  assert.equal(first, 1046, "the bound is a fresh answer, not the cached 1036");
+  const second = await sender.stagingFrontier();
+  assert.equal(second, 1056);
+  assert.equal(asked, 2, "one ask per bound, not one per session");
 });
