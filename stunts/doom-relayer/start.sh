@@ -47,6 +47,22 @@
 #    Buffers 0 and 1 are the accounts a two-buffer session already used, so
 #    raising the count is a widening and not a move.
 #
+#  * the one-buffer read path. At BUFFERS=1 the buffer is held from the moment a
+#    submission starts until the readback has copied 1,113,792 bytes out of it,
+#    and that is the whole reason one buffer rendered at 1.8 fps while four did
+#    not: nothing else can be submitted meanwhile. READBACK=overlap hands the
+#    buffer back as soon as the frame's strips have *executed* -- the point after
+#    which the next frame's snapshot is safe to send, because a strip binds to
+#    whatever snapshot is in the account when it executes and the program refuses
+#    one naming a different snapshot (308) -- and reads the pixels in the shadow
+#    of the next submission. The next frame's strip send waits for the previous
+#    readback, so a slow readback delays a frame and cannot tear one.
+#    READBACK=overlap also implies PRE_READ=1, which is what makes it safe: the
+#    readback then reads the eight strip accounts only, and the snapshot account
+#    -- the one account a snapshot transaction writes, and nothing else -- is out
+#    of its bank view. The payload's hash is still recomputed and still has to
+#    match the name the strips are sent with. Default is the old serial path.
+#
 # Usage: start.sh [name] [seconds] [strip-rate]
 set -eu
 RD=${RELAYER_DIR:-/home/ec2-user/doom-relayer-20260925}
@@ -56,6 +72,20 @@ STRIP_RATE=${3:-32}
 REPO=${RELAYER_REPO:-$RD}
 PIN=${PIN:-$REPO/scripts/doom_relayer_deploy.json}
 PY=${PY:-/home/ec2-user/basanos-main/.venv/bin/python}
+# `overlap` is the one value that is not a boolean, because the overlap is only
+# defined against the strips-only readback and asking for one without the other
+# is asking for a flag that cannot work.
+case "${READBACK:-serial}" in
+  serial) readback_flags=() ;;
+  overlap) readback_flags=(--pre-read-snapshot --overlap-readback) ;;
+  pre-read) readback_flags=(--pre-read-snapshot) ;;
+  *) echo "READBACK must be serial, pre-read or overlap" >&2; exit 2 ;;
+esac
+if [ -n "${PRE_READ:-}" ] && [ "${PRE_READ}" != "0" ] \
+   && [ "${#readback_flags[@]}" -eq 0 ]; then
+  readback_flags=(--pre-read-snapshot)
+fi
+
 mkdir -p "$RD/out/$NAME"
 
 # Every on-chain step in this repository goes through stage_cap.sh at 90 s
@@ -84,4 +114,5 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-0} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
+  ${readback_flags[@]+"${readback_flags[@]}"} \
   ${RESET_START_ACCOUNT:+--reset-start-account "$RESET_START_ACCOUNT"}

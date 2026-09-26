@@ -446,6 +446,13 @@ export class PipelineSender {
     if (options.stripCuLimit !== undefined && options.stripCuLimit !== null) {
       argv.push("--strip-cu-limit", String(options.stripCuLimit));
     }
+    // The one-buffer read path. `--pre-read-snapshot` is what makes
+    // `--overlap-readback` safe rather than merely fast: it takes the snapshot
+    // account out of the readback's bank view, and the snapshot account is the
+    // one account a snapshot transaction writes. Both are switches, so they are
+    // pushed without a value and are absent unless asked for.
+    if (options.preReadSnapshot) argv.push("--pre-read-snapshot");
+    if (options.overlapReadback) argv.push("--overlap-readback");
     argv.push("--spend-cap-fogo", String(options.spendCapFogo ?? 10));
     return argv;
   }

@@ -1086,13 +1086,23 @@ const CHAIN_FLAGS = new Set([
   "rpc-lag-check-seconds",
 ]);
 
+// Chain-mode flags that are switches rather than values. They are listed rather
+// than left to the generic branch, because the generic branch consumes the token
+// after the flag as its value: `--pre-read-snapshot --overlap-readback` would set
+// the first to the *text* of the second and then skip it, so the second would
+// never reach the pipeline and the session would quietly run the serial path
+// while the runbook said otherwise.
+const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback"]);
+
 function parseArgs(argv) {
   const args = new Map();
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
     if (!token.startsWith("--")) continue;
     const name = token.slice(2);
-    if (CHAIN_FLAGS.has(name)) {
+    if (BOOLEAN_CHAIN_FLAGS.has(name)) {
+      args.set(name, "1");
+    } else if (CHAIN_FLAGS.has(name)) {
       const value = argv[i + 1];
       if (value === undefined || value.startsWith("--")) {
         throw new Error(`--${name} needs a value`);
@@ -1144,6 +1154,8 @@ if (isMain()) {
     statusMinInterval: args.get("status-min-interval") !== null ? Number(args.get("status-min-interval")) : undefined,
     rpcLagDropSlots: args.get("rpc-lag-drop-slots") ? Number(args.get("rpc-lag-drop-slots")) : undefined,
     rpcLagCheckSeconds: args.get("rpc-lag-check-seconds") ? Number(args.get("rpc-lag-check-seconds")) : undefined,
+    preReadSnapshot: args.get("pre-read-snapshot") != null,
+    overlapReadback: args.get("overlap-readback") != null,
   });
   const relayer = createRelayer({
     network,
