@@ -141,6 +141,14 @@ if [ -n "${PRE_READ:-}" ] && [ "${PRE_READ}" != "0" ] \
   readback_flags=(--pre-read-snapshot)
 fi
 
+# The two RPC endpoints, and the switch that runs a session on one of them.
+# `RPC_B` is *always* passed, empty or not, because `--rpc-b` has the public
+# endpoint as its own default: a session that wants one node has to say so by
+# name, or it gets two and the receipt says two.
+rpc_a=${RPC_A:-http://64.130.44.173:8899}
+rpc_b=${RPC_B-}
+case "$rpc_b" in none|off|NONE|OFF) rpc_b="" ;; esac
+
 mkdir -p "$RD/out/$NAME"
 
 # Every on-chain step in this repository goes through stage_cap.sh at 90 s
@@ -159,7 +167,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --python "$PY" \
   --script "$RD/scripts/doom_relayer_server.py" \
   --run-dir "$RD/out/$NAME" \
-  --rpc-a ${RPC_A:-http://64.130.44.173:8899} ${RPC_B+--rpc-b "$RPC_B"} \
+  --rpc-a "$rpc_a" --rpc-b "$rpc_b" \
   ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-45} \
   --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
   --image-bytes 916496 \
@@ -168,6 +176,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
   --min-cursor-step-tics ${MIN_CURSOR_STEP:-1} \
+  --render-pool-workers ${RENDER_POOL_WORKERS:-0} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \

@@ -435,6 +435,9 @@ export class PipelineSender {
     if (options.minCursorStepTics !== undefined && options.minCursorStepTics !== null) {
       argv.push("--min-cursor-step-tics", String(options.minCursorStepTics));
     }
+    if (options.renderPoolWorkers !== undefined && options.renderPoolWorkers !== null) {
+      argv.push("--render-pool-workers", String(options.renderPoolWorkers));
+    }
     if (options.rpcLagDropSlots !== undefined && options.rpcLagDropSlots !== null) {
       argv.push("--rpc-lag-drop-slots", String(options.rpcLagDropSlots));
     }

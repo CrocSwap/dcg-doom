@@ -1084,7 +1084,7 @@ const CHAIN_FLAGS = new Set([
   "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
   "render", "reset-start-account", "frame-deadline-seconds", "rpc-lag-drop-slots",
-  "rpc-lag-check-seconds", "min-cursor-step-tics",
+  "rpc-lag-check-seconds", "min-cursor-step-tics", "render-pool-workers",
 ]);
 
 // Chain-mode flags that are switches rather than values. They are listed rather
@@ -1153,6 +1153,7 @@ if (isMain()) {
     resetStartAccount: args.get("reset-start-account") ?? undefined,
     frameDeadlineSeconds: args.get("frame-deadline-seconds") ? Number(args.get("frame-deadline-seconds")) : undefined,
     minCursorStepTics: args.get("min-cursor-step-tics") ? Number(args.get("min-cursor-step-tics")) : undefined,
+    renderPoolWorkers: args.get("render-pool-workers") != null ? Number(args.get("render-pool-workers")) : undefined,
     stripCuLimit: args.get("strip-cu-limit") ? Number(args.get("strip-cu-limit")) : undefined,
     statusBatch: args.get("status-batch") ? Number(args.get("status-batch")) : undefined,
     statusMinInterval: args.get("status-min-interval") !== null ? Number(args.get("status-min-interval")) : undefined,
