@@ -76,6 +76,40 @@
 #    receipt's `errors` and `config.send_pacer_rate_per_endpoint`, not the rate
 #    itself, are what say whether a rate was sustainable.
 #
+#  * RPC_B. The second node, and `RPC_B=none` runs the session on one.
+#    Measured 2026-09-26 on R15 at four buffers, 60 s, the two-node session froze
+#    the *whole process* -- the engine's sweeps and the render together -- three
+#    times for 10.2, 10.2 and 10.7 s, which is 31 s of a 60 s session, and the
+#    render's own `sendTransaction` on the public node went from 0.13 s to
+#    1.2 s inside those windows while the fast node answered in 4.6 ms. The
+#    relayer's own error list has two `getSlot ... HTTP 429` from
+#    `testnet.fogo.io` in the same 60 s, six lag checks. So the two-node pool
+#    spends 52% of a session waiting on one rate-limited public endpoint, and
+#    the switch is here to measure the alternative rather than argue about it.
+#    One node makes the sender's dual-RPC agreement vacuous (see
+#    `apply_rpc_health`) and leaves no fallback, so the default is still two.
+#
+#  * MIN_CURSOR_STEP, the smallest cursor step between two rendered frames, in
+#    tics, default 1. A frame is only worth block space if it is a game state
+#    nobody has rendered, and the renderer now gates on the highest cursor it has
+#    already handed to a submission or got back from one -- not, as before, on the
+#    last frame that *finished*, which let all four buffers take the same cursor
+#    before any of them came back. Measured 2026-09-26 on R15 at four buffers,
+#    60 s: 204 frames of 85 distinct cursors, so 3.37 fps was 1.4 new pictures/s
+#    and about 58% of the render compute was spent re-rendering states the chain
+#    had already published.
+#
+#    The default is 8, not 1, and the measurement says why. Against
+#    ADV_TICS=4 sweeps, 1 renders every sweep and 8 renders every other one --
+#    which sounds like a straight trade of pictures for engine tics, and is not:
+#    measured 60 s each on R15, 1 gave 1.60 new cursors/s and 1.52 new pictures/s
+#    at 17.5 engine tics/s with key-to-picture at 993 ms, and 8 gave 2.30 and
+#    2.16 at 22.2 tics/s with key-to-picture at 408 ms. The renderer was not the
+#    compute-bound term; the chain's release queue was (`await_strips` at a
+#    0.50-0.60 s median, 7 blocks at 13 blocks/s). The compute it stops asking
+#    for goes to the sweeps, the sweeps publish cursors faster, and there are
+#    then more cursors to render than the renderer can use. 16 is not measured.
+#
 #  * the one-buffer read path. At BUFFERS=1 the buffer is held from the moment a
 #    submission starts until the readback has copied 1,113,792 bytes out of it,
 #    and that is the whole reason one buffer rendered at 1.8 fps while four did
@@ -115,6 +149,14 @@ if [ -n "${PRE_READ:-}" ] && [ "${PRE_READ}" != "0" ] \
   readback_flags=(--pre-read-snapshot)
 fi
 
+# The two RPC endpoints, and the switch that runs a session on one of them.
+# `RPC_B` is *always* passed, empty or not, because `--rpc-b` has the public
+# endpoint as its own default: a session that wants one node has to say so by
+# name, or it gets two and the receipt says two.
+rpc_a=${RPC_A:-http://64.130.44.173:8899}
+rpc_b=${RPC_B-}
+case "$rpc_b" in none|off|NONE|OFF) rpc_b="" ;; esac
+
 mkdir -p "$RD/out/$NAME"
 
 # Every on-chain step in this repository goes through stage_cap.sh at 90 s
@@ -133,7 +175,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --python "$PY" \
   --script "$RD/scripts/doom_relayer_server.py" \
   --run-dir "$RD/out/$NAME" \
-  --rpc-a http://64.130.44.173:8899 --rpc-b https://testnet.fogo.io \
+  --rpc-a "$rpc_a" --rpc-b "$rpc_b" \
   ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-45} \
   --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
   --image-bytes 916496 \
@@ -141,6 +183,8 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
+  --min-cursor-step-tics ${MIN_CURSOR_STEP:-8} \
+  --render-pool-workers ${RENDER_POOL_WORKERS:-0} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
