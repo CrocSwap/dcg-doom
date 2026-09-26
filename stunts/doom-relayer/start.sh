@@ -25,6 +25,14 @@
 #    strips/s measured as sustainable and over the 4.10 fps this loop used to
 #    reach by being slow. Raise it and the chain, not the sender, will say so.
 #
+#  * the strip CU limit. 740,000 is three strips to a block, and it was measured
+#    on a cheap view. Render cost is a property of the picture, so a context that
+#    has moved into a busier view needs more than the limit allows and every
+#    strip comes back `ProgramFailedToComplete` at exactly 740,000 -- measured on
+#    the R12 context from cursor 20,572 up, at every rate tried. STRIP_CU_LIMIT
+#    raises it; the chain's own per-transaction ceiling is the only upper bound
+#    this side knows about.
+#
 # Usage: start.sh [name] [seconds] [strip-rate]
 set -eu
 RD=${RELAYER_DIR:-/home/ec2-user/doom-relayer-20260925}
@@ -60,5 +68,6 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
+  --strip-cu-limit ${STRIP_CU_LIMIT:-0} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   --reset-start-account ${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}
