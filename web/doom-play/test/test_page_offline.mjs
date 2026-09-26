@@ -313,16 +313,25 @@ if (!chromeAvailable()) {
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
-  test("the page aims at the producer's published lead, not at its own round trip", {timeout: 180_000}, async () => {
-    // The producer resolves the lead from how long a staged tic takes to reach
-    // the chain and publishes it; the page used to build its own out of the
-    // latency of its own POST, which is only the page's share of that delivery.
-    // On R15 that was 16 tics where the producer had 61, and 201 of 510 staged
-    // tics reached a DEPOSIT carrying a key: the rest were deposited as zeros
-    // because the producer had already snapshotted them. This test fails on the
-    // page that aims at 16.
+  test("the page aims its own hop past the producer, and does not add the producer's lead", {timeout: 180_000}, async () => {
+    // The producer publishes a lead of its own: 45-48 tics on R15, which is
+    // 1.77 s, the time a DEPOSIT takes to become visible plus the sweep that then
+    // consumes it. That is the producer's distance -- its staged tic to the
+    // chain's committed cursor -- and the producer is already that far ahead of
+    // the chain.
+    //
+    // The page used to aim at `producerNext + publishedLead`, which put its batch
+    // a whole producer lead beyond the producer and made every press wait the
+    // delivery out twice: 45 + 45 = 90 tics at 22.2 tic/s is 4.05 s, against a
+    // measured keypress-to-picture median of 4,270 ms. This test fails on a page
+    // that takes the maximum of its own hop and the published lead.
+    //
+    // What the page's own lead still has to do is win the race against the
+    // producer's snapshot of the same tic, and that is asserted here from the
+    // relayer's side: the batch the page staged, and tics the engine consumed.
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
+      const producerNext = await page.evaluate("window.doomPlay.state.producerNextCursor");
       await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
       // Long enough for the aim to be consumed: the fake marks a staged tic
       // landed once the chain cursor is a whole lead past the producer's
@@ -332,18 +341,36 @@ if (!chromeAvailable()) {
       await sleep(3_500);
       const held = await snapshot(page);
       await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
+      const batch = relayer.batches[0] ?? null;
+      assert.ok(batch, "the page staged no batch");
       const published = await page.evaluate("window.doomPlay.state.producerLeadTics");
       assert.equal(published, relayer.leadTics, `the page never read the producer's lead (${JSON.stringify(published)})`);
-      assert.equal(
-        held.leadTics,
-        relayer.leadTics,
-        `the page aimed ${JSON.stringify(held.leadTics)} tics ahead of the producer's next tic ` +
-          `where the producer published ${relayer.leadTics}`,
-      );
       assert.ok(relayer.leadTics > 16, `this relayer published ${relayer.leadTics}, which is not above the 16 the page used to aim`);
-      // And the aim is inside the relayer's own window, so the lead did not turn
-      // a deposit race into a batch_refused.
-      assert.equal(held.refusals, 0, `aiming ${relayer.leadTics} tics ahead was refused: ${JSON.stringify(relayer.refusals.slice(0, 2))}`);
+      // The lead the page actually used is its own hop, and it is below the
+      // producer's delivery lead rather than equal to it.
+      assert.ok(
+        held.leadTics < relayer.leadTics,
+        `the page aimed ${JSON.stringify(held.leadTics)} tics, which is the producer's published ` +
+          `${relayer.leadTics}: the delivery lead is being paid twice`,
+      );
+      assert.ok(
+        held.leadTics >= 16,
+        `with round trip ${JSON.stringify(held.roundTripMs)} ms the page aimed ${JSON.stringify(held.leadTics)} tics, under the floor of 16`,
+      );
+      // And the aim is the producer's next tic plus the page's own hop, not plus
+      // the published lead. `producerNext` was read before the keydown and the
+      // fake's producer advances 2 tics every 60 ms, so the measured hop also
+      // carries the page's push cadence; the bound that matters is that it stays
+      // under the delivery lead, which the previous page exceeded.
+      const hop = batch.firstSeq - producerNext;
+      assert.ok(
+        hop >= 16 && hop < relayer.leadTics,
+        `the batch started ${hop} tics past the producer's next tic, where the page's own hop was ` +
+          `${held.leadTics} and the published lead was ${relayer.leadTics}: the aim is the delivery lead again`,
+      );
+      // And the aim is inside the relayer's own window, so a shorter lead did not
+      // turn a deposit race into a batch_refused.
+      assert.equal(held.refusals, 0, "the aim was refused");
       assert.ok(relayer.acceptedBatches > 0, "the relayer accepted nothing");
       assert.ok(relayer.landedTics > 0, `the engine consumed none of the ${relayer.stagedTics} tics staged in 3.5 s`);
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
@@ -453,14 +480,16 @@ if (!chromeAvailable()) {
         `the wait ended on gametic ${after.lastStampSample.gametic} against a stamped tic of ${after.lastStampSample.tic}`,
       );
       // And the two meters are not the same quantity. The next picture is one
-      // frame away; the keypress is a whole lead away.
+      // frame away; the keypress is at least the page's own hop away, which is
+      // the lead the sample was aimed with -- not the producer's published
+      // delivery lead, which the page does not pay (see the aim test).
       const stamp = stamps[0].ms;
       const next = nexts[0];
-      const leadMs = (relayer.leadTics / relayer.ticsPerSecond) * 1000;
+      const hopMs = (stamps[0].lead_tics / relayer.ticsPerSecond) * 1000;
       assert.ok(
-        stamp >= 0.5 * leadMs,
-        `the keypress meter read ${stamp.toFixed(0)} ms against a lead of ${leadMs.toFixed(0)} ms ` +
-          `(stamped tic ${after.lastStampedTic}), so it timed a frame rather than the keypress`,
+        stamp >= 0.5 * hopMs,
+        `the keypress meter read ${stamp.toFixed(0)} ms against the page's own hop of ${hopMs.toFixed(0)} ms ` +
+          `(stamped tic ${stamps[0].tic}), so it timed a frame rather than the keypress`,
       );
       assert.ok(
         next < stamp,
