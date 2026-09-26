@@ -222,7 +222,7 @@ impl Session {
                 .send(
                     vec![Self::stage_ix(target.pubkey(), offset, chunk)],
                     &[target],
-                    base::NORMAL_LIMIT,
+                    cu_limit(),
                 )
                 .await?;
             if result.result.is_err() {
@@ -239,7 +239,7 @@ impl Session {
             .send(
                 vec![Self::stage_ix(target.pubkey(), offset, chunk)],
                 &[target],
-                base::NORMAL_LIMIT,
+                cu_limit(),
             )
             .await?;
         if result.result.is_err() {
@@ -622,7 +622,7 @@ async fn grow_buffer(
     while len < total {
         let ix = session.grow_ix(capacity, len as u32);
         let grown = session
-            .send(vec![ix], &[buffer], base::NORMAL_LIMIT)
+            .send(vec![ix], &[buffer], cu_limit())
             .await?;
         if grown.result.is_err() {
             return Err(format!("SIM2 GROW-BUFFER at {len}: {:?}", grown.result).into());
@@ -751,7 +751,7 @@ async fn reconstruct(
         } else {
             vec![&authority]
         };
-        let result = session.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        let result = session.send(vec![ix], &signers, cu_limit()).await?;
         if result.result.is_err() {
             return Err(format!("E2R/5 phase {cursor}: {:?}", result.result).into());
         }
@@ -772,7 +772,7 @@ async fn reconstruct(
         solana_program::hash::hash(&vec![0u8; resource_sbf::RI2_FRAME_BYTES]).to_bytes(),
     );
     let init = session
-        .send(vec![ix], &[&authority], base::NORMAL_LIMIT)
+        .send(vec![ix], &[&authority], cu_limit())
         .await?;
     if init.result.is_err() {
         return Err(format!("SIM2 INIT {:?}", init.result).into());
@@ -791,6 +791,64 @@ async fn reconstruct(
     Ok((phases, init_cu))
 }
 
+/// The per-transaction compute limit this gate asks for.
+///
+/// 1,400,000 is the deployed image's `STRIP_CU_LIMIT` and the value every
+/// retained strip CU in this tree was measured under, so it is the default and
+/// changing it changes what the numbers mean. It is overridable for one
+/// reason: a diagnostic-only image that renders a strip at full width, or at
+/// full detail with every phase marker live, costs more than any strip a
+/// deployable image costs, and `ProgramFailedToComplete` at the default limit
+/// says nothing except that it did not fit. Raise it to price such an image.
+/// The value used is recorded in the receipt.
+fn cu_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        env::var("DOOM_GATE_CU_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(base::NORMAL_LIMIT)
+    })
+}
+
+/// The account layout the image under test expects.
+///
+/// A `diagnostic-profile` image carries patch 0030's 176-byte phase
+/// accumulator inside `doom_ctx_t`, so both the context account and the
+/// static resource account it derives its offset from are that much longer.
+/// The runner is built with `ctx-engine` only, so it cannot read its own
+/// feature set as the answer: the layout has to come from the image's
+/// manifest, which is the image's own record of what it was built with.
+struct Layout {
+    context_bytes: usize,
+    static_bytes: usize,
+    diagnostic: bool,
+}
+
+impl Layout {
+    fn from_manifest(manifest: &serde_json::Value) -> Result<Self, Box<dyn Error>> {
+        let features = manifest["enabled_cargo_features"]
+            .as_array()
+            .ok_or("image manifest has no enabled_cargo_features")?;
+        let diagnostic = features
+            .iter()
+            .any(|f| f.as_str() == Some("diagnostic-profile"));
+        Ok(if diagnostic {
+            Layout {
+                context_bytes: resource_sbf::CONTEXT_BYTES_DIAGNOSTIC,
+                static_bytes: resource_sbf::CONTEXT_BYTES_DIAGNOSTIC,
+                diagnostic: true,
+            }
+        } else {
+            Layout {
+                context_bytes: resource_sbf::CONTEXT_BYTES,
+                static_bytes: rsr::ACCOUNT_BYTES,
+                diagnostic: false,
+            }
+        })
+    }
+}
+
 fn bank_with(
     capture: &Capture,
     context: Pubkey,
@@ -799,12 +857,13 @@ fn bank_with(
     controller: Pubkey,
     authority: Pubkey,
     render_accounts: Option<(Pubkey, Pubkey)>,
+    layout: &Layout,
 ) -> ProgramTest {
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
-    bank.set_compute_max_units(u64::from(base::NORMAL_LIMIT));
+    bank.set_compute_max_units(u64::from(cu_limit()));
     bank.add_program("doom_sbf", base::PROGRAM, None);
-    bank.add_account(context, base::account(vec![0; resource_sbf::CONTEXT_BYTES]));
+    bank.add_account(context, base::account(vec![0; layout.context_bytes]));
     bank.add_account(RESOURCE, base::account(capture.resource.clone()));
     for (ordinal, bytes) in capture.wad.iter().enumerate() {
         bank.add_account(wad_key(ordinal), base::account(bytes.clone()));
@@ -819,7 +878,7 @@ fn bank_with(
     bank.add_account(FRAME, base::account(vec![0; resource_sbf::RI2_FRAME_BYTES]));
     bank.add_account(authority, system_account(100_000_000_000));
     if let Some((static_key, snapshot)) = render_accounts {
-        bank.add_account(static_key, base::account(vec![0; rsr::ACCOUNT_BYTES]));
+        bank.add_account(static_key, base::account(vec![0; layout.static_bytes]));
         bank.add_account(snapshot, base::account(vec![0; rsn3::SNAPSHOT_BYTES]));
         for strip_id in 0..8u8 {
             bank.add_account(
@@ -1109,10 +1168,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("image manifest does not carry the live render path".into());
     }
-    if !manifest_json["resource_ri2_sbf_abi_descriptor"]
-        .as_str()
-        .unwrap_or_default()
-        .contains(&format!("context={}", resource_sbf::CONTEXT_BYTES))
+    let layout = Layout::from_manifest(&manifest_json)?;
+    // The pinned E2R/2 descriptor names a context size that is a literal in
+    // both build.rs and the library, and it is deliberately *not* the
+    // diagnostic layout: it is the same string in a diagnostic image and in a
+    // production one, which is why the ABI id the snapshot header binds does
+    // not move. So the descriptor still checks the runner against the image's
+    // pinned ABI, and the account sizes come from `Layout` instead.
+    if manifest_json["resource_ri2_sbf_abi_descriptor"]
+        != resource_sbf::RESOURCE_RI2_SBF_ABI_DESCRIPTOR
     {
         return Err("image manifest context size is not the driver's".into());
     }
@@ -1193,6 +1257,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         keys.controller.pubkey(),
         keys.authority.pubkey(),
         Some((static_key, snapshot_key)),
+        &layout,
     );
     let ctx = bank.start_with_context().await;
     let mut session = Session {
@@ -1285,7 +1350,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let count = (last - first) as usize;
         let deposit = session.deposit_ix(first, &commands[first as usize * 4..last as usize * 4]);
         let deposited = session
-            .send(vec![deposit], &[&authority], base::NORMAL_LIMIT)
+            .send(vec![deposit], &[&authority], cu_limit())
             .await?;
         if deposited.result.is_err() {
             return Err(format!("deposit {first}+{count}: {:?}", deposited.result).into());
@@ -1294,7 +1359,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         session.cursor_before = first;
         let advance = session.advance_ix(sim2::ADVANCE_STARVED, count as u32);
         let result = session
-            .send(vec![advance], &[&authority], base::NORMAL_LIMIT)
+            .send(vec![advance], &[&authority], cu_limit())
             .await?;
         if result.result.is_err() {
             return Err(format!(
@@ -2234,6 +2299,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         starve_keys.controller.pubkey(),
         starve_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let starve_state_signer = starve_keys.state.pubkey();
     let starve_ctx = starve_bank.start_with_context().await;
@@ -2291,7 +2357,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } else {
             vec![&starve_authority]
         };
-        let result = starve.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        let result = starve.send(vec![ix], &signers, cu_limit()).await?;
         starve_phase_cu.push(base::units(&result)?);
         if result.result.is_err() {
             starve_refusal = Some((cursor, format!("{:?}", result.result)));
@@ -2319,6 +2385,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         good_keys.controller.pubkey(),
         good_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let good_state_signer = good_keys.state.pubkey();
     let good_ctx = good_bank.start_with_context().await;
@@ -2347,7 +2414,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .send(
             vec![good.deposit_ix(0, good_batch)],
             &[&good_authority],
-            base::NORMAL_LIMIT,
+            cu_limit(),
         )
         .await?;
     if good_deposit.result.is_err() {
@@ -2358,7 +2425,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .send(
             vec![good.advance_ix(sim2::ADVANCE_STARVED, advance_tics)],
             &[&good_authority],
-            base::NORMAL_LIMIT,
+            cu_limit(),
         )
         .await?;
     if good_advance.result.is_err() {
@@ -2434,7 +2501,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             sim2::REFUSE_STATE_ROOT,
         ),
     ] {
-        let result = session.send(vec![ix], &signers, base::NORMAL_LIMIT).await?;
+        let result = session.send(vec![ix], &signers, cu_limit()).await?;
         let code = custom_code(&result);
         if result.result.is_err() {
             let units = base::units(&result)?;
@@ -2458,7 +2525,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let reset_ix = session.reset_ix(start_key.pubkey(), sim2::RESET_START_STATE, false);
     let reset = session
-        .send(vec![reset_ix], &[&authority], base::NORMAL_LIMIT)
+        .send(vec![reset_ix], &[&authority], cu_limit())
         .await?;
     if reset.result.is_err() {
         return Err(format!("RESET/9 {:?}", reset.result).into());
@@ -2506,7 +2573,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // cursor and root is accepted, so the refusal is the binding and not the
     // packet.
     let stale = session.snapshot_ix(final_cursor, &final_root);
-    let stale_result = session.send(vec![stale], &[], base::NORMAL_LIMIT).await?;
+    let stale_result = session.send(vec![stale], &[], cu_limit()).await?;
     let stale_code = custom_code(&stale_result);
     if stale_result.result.is_err() {
         if stale_code != Some(sim2::REFUSE_SNAPSHOT) {
@@ -2516,7 +2583,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("a frame from before the reset still passed the snapshot check".into());
     }
     let fresh = session.snapshot_ix(0, &start_root);
-    let fresh_result = session.send(vec![fresh], &[], base::NORMAL_LIMIT).await?;
+    let fresh_result = session.send(vec![fresh], &[], cu_limit()).await?;
     if fresh_result.result.is_err() {
         return Err(format!(
             "the reset slot refused its own snapshot: {:?}",
@@ -2542,7 +2609,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let last = (cursor + advance_tics).min(tics);
         let deposit = session.deposit_ix(first, &commands[first as usize * 4..last as usize * 4]);
         let deposited = session
-            .send(vec![deposit], &[&authority], base::NORMAL_LIMIT)
+            .send(vec![deposit], &[&authority], cu_limit())
             .await?;
         if deposited.result.is_err() {
             return Err(format!("replay deposit {first}: {:?}", deposited.result).into());
@@ -2550,7 +2617,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         session.cursor_before = first;
         let advance = session.advance_ix(sim2::ADVANCE_STARVED, last - first);
         let result = session
-            .send(vec![advance], &[&authority], base::NORMAL_LIMIT)
+            .send(vec![advance], &[&authority], cu_limit())
             .await?;
         if result.result.is_err() {
             return Err(format!("replay ADVANCE/5 at {first}: {:?}", result.result).into());
@@ -2616,7 +2683,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let use_batch = vec![use_command; 1].concat();
     let use_deposit = session.deposit_ix(cursor, &use_batch);
     let deposited = session
-        .send(vec![use_deposit], &[&authority], base::NORMAL_LIMIT)
+        .send(vec![use_deposit], &[&authority], cu_limit())
         .await?;
     if deposited.result.is_err() {
         return Err(format!("live-use deposit: {:?}", deposited.result).into());
@@ -2624,7 +2691,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     session.cursor_before = cursor;
     let use_advance = session.advance_ix(sim2::ADVANCE_STARVED, 1);
     let used = session
-        .send(vec![use_advance], &[&authority], base::NORMAL_LIMIT)
+        .send(vec![use_advance], &[&authority], cu_limit())
         .await?;
     if used.result.is_err() {
         return Err(format!("a live player's use command was refused: {:?}", used.result).into());
@@ -2654,6 +2721,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dead_keys.controller.pubkey(),
         dead_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let dead_ctx = dead_bank.start_with_context().await;
     let mut dead = Session {
@@ -2682,7 +2750,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let move_batch = vec![[16u8, 0, 0, 0]; 4].concat();
     let deposit = dead.deposit_ix(0, &move_batch);
     let deposited = dead
-        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![deposit], &[&dead_authority], cu_limit())
         .await?;
     if deposited.result.is_err() {
         return Err(format!("dead-slot deposit: {:?}", deposited.result).into());
@@ -2690,7 +2758,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dead.cursor_before = 0;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 4);
     let moved = dead
-        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![advance], &[&dead_authority], cu_limit())
         .await?;
     if moved.result.is_err() {
         return Err(format!("a dead player could not tic: {:?}", moved.result).into());
@@ -2706,7 +2774,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let press = [0u8, 0, 0, 0x01];
     let deposit = dead.deposit_ix(4, &press);
     let deposited = dead
-        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![deposit], &[&dead_authority], cu_limit())
         .await?;
     if deposited.result.is_err() {
         return Err(format!("dead-slot use deposit: {:?}", deposited.result).into());
@@ -2714,7 +2782,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dead.cursor_before = 4;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
     let refused = dead
-        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![advance], &[&dead_authority], cu_limit())
         .await?;
     let restart_code = custom_code(&refused);
     if refused.result.is_err() {
@@ -2738,7 +2806,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // state, and the slot runs again.
     let reset_ix = dead.reset_ix(dead_start_key.pubkey(), sim2::RESET_START_STATE, false);
     let reset = dead
-        .send(vec![reset_ix], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![reset_ix], &[&dead_authority], cu_limit())
         .await?;
     if reset.result.is_err() {
         return Err(format!("dead-slot RESET/9: {:?}", reset.result).into());
@@ -2761,7 +2829,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // non-use command is what has to commit here.
     let deposit = dead.deposit_ix(0, &[16u8, 0, 0, 0]);
     let deposited = dead
-        .send(vec![deposit], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![deposit], &[&dead_authority], cu_limit())
         .await?;
     if deposited.result.is_err() {
         return Err(format!("restarted-slot deposit: {:?}", deposited.result).into());
@@ -2769,7 +2837,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dead.cursor_before = 0;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
     let restarted = dead
-        .send(vec![advance], &[&dead_authority], base::NORMAL_LIMIT)
+        .send(vec![advance], &[&dead_authority], cu_limit())
         .await?;
     if restarted.result.is_err() {
         return Err(format!(
@@ -2817,6 +2885,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         halt_keys.controller.pubkey(),
         halt_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let halt_ctx = halt_bank.start_with_context().await;
     let mut halt = Session {
@@ -2841,7 +2910,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let halt_start_key = stage_start_account(&mut halt, &halt_state).await?;
     let deposit = halt.deposit_ix(0, &[0u8, 0, 0, 0]);
     let deposited = halt
-        .send(vec![deposit], &[&halt_authority], base::NORMAL_LIMIT)
+        .send(vec![deposit], &[&halt_authority], cu_limit())
         .await?;
     if deposited.result.is_err() {
         return Err(format!("halt-slot deposit: {:?}", deposited.result).into());
@@ -2849,7 +2918,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     halt.cursor_before = 0;
     let advance = halt.advance_ix(sim2::ADVANCE_STARVED, 1);
     let halted = halt
-        .send(vec![advance], &[&halt_authority], base::NORMAL_LIMIT)
+        .send(vec![advance], &[&halt_authority], cu_limit())
         .await?;
     if halted.result.is_err() {
         return Err(format!("the halt control did not latch: {:?}", halted.result).into());
@@ -2867,7 +2936,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .send(
             vec![halt.reset_ix(halt_start_key.pubkey(), sim2::RESET_START_STATE, false)],
             &[&halt_authority],
-            base::NORMAL_LIMIT,
+            cu_limit(),
         )
         .await?;
     let halted_code = custom_code(&refused);
@@ -2885,7 +2954,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .send(
             vec![halt.reset_ix(halt_start_key.pubkey(), sim2::RESET_START_STATE, true)],
             &[&halt_authority],
-            base::NORMAL_LIMIT,
+            cu_limit(),
         )
         .await?;
     if forced.result.is_err() {
@@ -2931,6 +3000,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "manifest_sha256": base::sha(&manifest_bytes),
         "manifest_source_commit": manifest_json["compile_source_commit"],
         "manifest_source_tree": manifest_json["compile_source_tree"],
+        "context_account_bytes": layout.context_bytes,
+        "static_resource_account_bytes": layout.static_bytes,
+        "diagnostic_profile_image": layout.diagnostic,
+        "compute_unit_limit": cu_limit(),
         "driver_source_sha256": base::sha(DRIVER_SOURCE),
         "capture": capture_dir.display().to_string(),
         "resource_sha256": base::sha(&capture_data.resource),
