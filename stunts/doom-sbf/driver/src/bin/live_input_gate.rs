@@ -460,7 +460,29 @@ impl Session {
             data: request.encode().to_vec(),
         }
     }
-}
+
+    /// The instruction the live relayer actually sends: RSR/2 RENDER-BUFFERED/5,
+    /// which names its buffer and its strip and -- new in this image -- the
+    /// snapshot it believes it is rendering.  The account list is the
+    /// relayer's, and it is four accounts where the offline RENDER takes
+    /// three, because the buffered path binds the context as well as the
+    /// static account.
+    fn render_buffered_ix(&self, static_key: Pubkey, snapshot: Pubkey, request: rsr::Request) -> Instruction {
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts: vec![
+                meta(static_key, true, false),
+                meta(self.keys.context.pubkey(), false, false),
+                meta(snapshot, false, false),
+                meta(
+                    rsn3::strip_address(&base::PROGRAM, &snapshot, request.strip_id).0,
+                    true,
+                    false,
+                ),
+            ],
+            data: request.encode().to_vec(),
+        }
+    }
 
 fn system_account(lamports: u64) -> Account {
     Account {
@@ -1026,6 +1048,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut deposit_units: Vec<u64> = Vec::new();
     let mut build_units: Vec<u64> = Vec::new();
     let mut render_rows: Vec<serde_json::Value> = Vec::new();
+    let mut buffered_rows: Vec<serde_json::Value> = Vec::new();
+    // The name the previous frame's strips carried, so a frame that is late
+    // can be recognised as late on chain rather than only in the relayer's log.
+    let mut previous_snapshot_hash: Option<[u8; 32]> = None;
     let mut position_rows: Vec<serde_json::Value> = Vec::new();
     let mut st1_at_demo_end: Option<(u32, Vec<u8>)> = None;
     // With a new-game start state the demo end is not in this run, so the
@@ -1217,6 +1243,155 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 strips_written += 1;
             }
             fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
+
+            // --- the strip names its snapshot --------------------------------
+            //
+            // Four RENDER-BUFFERED/5 packets against the accounts the relayer
+            // uses, in the order a relayer meets them.  The first is the
+            // positive control: the same strip, named correctly, has to render
+            // and has to be byte-identical to the offline RENDER's strip 7, so
+            // the buffered path is not being waved through on a weaker check
+            // than the gate above applies to it.  The next two are the
+            // malformed and stale shapes.  The fourth is the real thing: a
+            // strip built for the previous frame, arriving after this frame's
+            // SNAPSHOT-LIVE has already replaced the buffer.
+            let probe_strip = 7u8;
+            let positive = session
+                .send(
+                    vec![session.render_buffered_ix(
+                        static_key,
+                        snapshot_key,
+                        rsr::Request::render_buffered(
+                            0,
+                            probe_strip,
+                            snapshot.snapshot_hash,
+                        ),
+                    )],
+                    &[],
+                    RENDER_LIMIT,
+                )
+                .await?;
+            if positive.result.is_err() {
+                return Err(format!(
+                    "RENDER-BUFFERED positive control at {last}: {:?}",
+                    positive.result
+                )
+                .into());
+            }
+            let buffered_units = base::units(&positive)?;
+            let probe_key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, probe_strip).0;
+            // `reconstructed` is the frame RENDER/1 just assembled, and
+            // slice_frame pulls one strip's 40 columns out of a 320-wide
+            // frame, so this compares the buffered strip against the offline
+            // strip of the same snapshot.  The host frame is not in scope here
+            // -- it is taken in its own session after the sweep, because
+            // R_RenderPlayerView is not a pure read of the committed ST1 -- and
+            // section 2b below compares the offline strips against the host.
+            // Equal-to-RENDER plus RENDER-equal-to-host is equal-to-host.
+            let probe_pixels = rsn3::validate_strip(&session.data(probe_key).await?)?.pixels;
+            let positive_equal =
+                probe_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
+
+            let zero_name = session
+                .send(
+                    vec![session.render_buffered_ix(
+                        static_key,
+                        snapshot_key,
+                        rsr::Request::render_buffered(0, probe_strip, [0; 32]),
+                    )],
+                    &[],
+                    RENDER_LIMIT,
+                )
+                .await?;
+            let zero_name_code = custom_code(&zero_name);
+
+            // One bit flipped in the name the account is holding: same length,
+            // same accounts, same owner, same everything except that it is not
+            // this snapshot.
+            let mut wrong_name = snapshot.snapshot_hash;
+            wrong_name[17] ^= 0x40;
+            let stale_name = session
+                .send(
+                    vec![session.render_buffered_ix(
+                        static_key,
+                        snapshot_key,
+                        rsr::Request::render_buffered(0, probe_strip, wrong_name),
+                    )],
+                    &[],
+                    RENDER_LIMIT,
+                )
+                .await?;
+            let stale_name_code = custom_code(&stale_name);
+
+            // The relayer's actual failure mode, on chain: last frame's name,
+            // this frame's buffer.  Only available from the second frame on,
+            // because the first frame has no predecessor to be late against.
+            let late_frame = if let Some(previous) = previous_snapshot_hash {
+                let late = session
+                    .send(
+                        vec![session.render_buffered_ix(
+                            static_key,
+                            snapshot_key,
+                            rsr::Request::render_buffered(0, probe_strip, previous),
+                        )],
+                        &[],
+                        RENDER_LIMIT,
+                    )
+                    .await?;
+                custom_code(&late)
+            } else {
+                None
+            };
+
+            // The refusals must not have touched the strip: a refused strip
+            // that still rewrote its pixels would be worse than one that did
+            // not render at all, because the sender would read a frame it
+            // believes it just published.
+            let after_refusals = rsn3::validate_strip(&session.data(probe_key).await?)?.pixels;
+            let refusals_left_the_strip_alone = after_refusals == probe_pixels;
+
+            buffered_rows.push(json!({
+                "cursor": last,
+                "positive_control_rendered": true,
+                "positive_control_pixels_match_offline_render": positive_equal,
+                "buffered_strip_cu": buffered_units,
+                "zero_name_refusal": zero_name_code,
+                "one_bit_wrong_name_refusal": stale_name_code,
+                "previous_frame_name_refusal": late_frame,
+                "refusals_left_the_strip_account_alone": refusals_left_the_strip_alone,
+            }));
+            previous_snapshot_hash = Some(snapshot.snapshot_hash);
+
+            if !positive_equal {
+                return Err(format!(
+                    "RENDER-BUFFERED positive control at {last} does not match the native strip"
+                )
+                .into());
+            }
+            if zero_name_code != Some(rsr::REFUSE_MALFORMED) {
+                return Err(format!(
+                    "a buffered strip with no snapshot name was refused {zero_name_code:?}, not {}",
+                    rsr::REFUSE_MALFORMED
+                )
+                .into());
+            }
+            if stale_name_code != Some(rsr::REFUSE_SNAPSHOT_STALE) {
+                return Err(format!(
+                    "a buffered strip naming the wrong snapshot was refused {stale_name_code:?}, not {}",
+                    rsr::REFUSE_SNAPSHOT_STALE
+                )
+                .into());
+            }
+            if late_frame.is_some() && late_frame != Some(rsr::REFUSE_SNAPSHOT_STALE) {
+                return Err(format!(
+                    "a late frame's buffered strip was refused {late_frame:?}, not {}",
+                    rsr::REFUSE_SNAPSHOT_STALE
+                )
+                .into());
+            }
+            if !refusals_left_the_strip_alone {
+                return Err(format!("a refused buffered strip rewrote its pixels at {last}").into());
+            }
             let (segment, forward, strafe) = common::r8l_segment(last - 1);
             let (demo_end_cursor, base_state) = if new_game_start {
                 (0u32, baseline_state.clone())
@@ -2130,6 +2305,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "rsr2_build_transactions": build_units.len(),
         "rsr2_build_cu_max": build_units.iter().max(),
         "render": render_rows,
+        "buffered_strip_binding": buffered_rows,
         "strips_written": strips_written,
         "new_game_start": new_game_start,
         "reset9": {

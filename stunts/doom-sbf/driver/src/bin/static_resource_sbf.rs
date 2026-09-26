@@ -670,7 +670,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut render_units_total = 0u64;
     for strip_id in 0..8u8 {
         let request = if buffered {
-            rsr::Request::render_buffered(0, strip_id).encode()
+            // The buffered path names the snapshot it is rendering for; the
+            // field became mandatory in this image and a zero name is
+            // REFUSE_MALFORMED rather than a comparison that fails later.
+            rsr::Request::render_buffered(0, strip_id, snapshot.snapshot_hash).encode()
         } else {
             rsr::Request::render(strip_id, snapshot.cursor, snapshot.snapshot_hash).encode()
         };
