@@ -948,6 +948,18 @@ fn run_phase(
         if at != wad_end {
             return Err(ProgramError::InvalidAccountData);
         }
+        let first_wad_word = u64::from(u32::from_le_bytes(
+            context[wad_start..wad_start + 4]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        ));
+        crate::doom_sbf_debug_values(
+            0,
+            context.as_ptr() as u64,
+            wad_start as u64,
+            wad_end as u64,
+            first_wad_word,
+        );
         crate::diagnostic_phase(709);
         let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
         unsafe {
