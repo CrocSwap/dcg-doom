@@ -415,8 +415,10 @@ export class PipelineSender {
       "--keys-dir", this.keysDir,
       "--payer-key", this.payerKey,
     ];
-    if (options.rpcA) argv.push("--rpc-a", options.rpcA);
-    if (options.rpcB) argv.push("--rpc-b", options.rpcB);
+    if (options.rpcA !== undefined && options.rpcA !== null) argv.push("--rpc-a", options.rpcA);
+    // Empty RPC_B is an intentional single-node configuration. It must reach
+    // argparse as an empty value or Python restores its public-node default.
+    if (options.rpcB !== undefined && options.rpcB !== null) argv.push("--rpc-b", options.rpcB);
     // A third node, and the send rate, are the two levers on the frame's
     // own send cost: eight strip sends take 8 / (rate x endpoints) seconds.
     // Both are pushed only when set, so an unnamed session is the two-node

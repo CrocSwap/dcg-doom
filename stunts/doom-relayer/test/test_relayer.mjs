@@ -1504,4 +1504,9 @@ test("a third node and a send rate reach the pipeline's argv", () => {
   for (const flag of ["--rpc-c", "--send-pacer-rate"]) {
     assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
   }
+  const singleNode = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    rpcA: "http://fast:8899", rpcB: "",
+  }).argv();
+  assert.equal(singleNode[singleNode.indexOf("--rpc-b") + 1], "");
 });
