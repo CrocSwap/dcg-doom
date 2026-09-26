@@ -182,7 +182,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
   --image-bytes 916496 \
   --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-4} \
-  --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
+  --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth ${ADV_PIPELINE_DEPTH:-4} --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
   --min-cursor-step-tics ${MIN_CURSOR_STEP:-8} \
