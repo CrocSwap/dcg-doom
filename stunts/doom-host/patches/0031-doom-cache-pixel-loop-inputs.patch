@@ -11,7 +11,7 @@
 +#endif
      int			count; 
 -    byte*		dest; 
-+    byte* restrict	dest; 
++    byte* __restrict	dest; 
      fixed_t		frac;
      fixed_t		fracstep;	 
      int			source_index;
@@ -56,7 +56,7 @@
      fixed_t		xfrac;
      fixed_t		yfrac; 
 -    byte*		dest; 
-+    byte* restrict	dest; 
++    byte* __restrict	dest; 
      int			count;
      int			spot; 
  	int			draw_x1;
