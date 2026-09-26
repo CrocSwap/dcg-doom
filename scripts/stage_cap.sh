@@ -10,8 +10,22 @@ rc=$?
 end=$(python3 -c 'import time;print(time.time())')
 wall=$(python3 -c "print(round($end-$start,2))")
 verdict=pass; [ $rc -ne 0 ] && verdict=fail; [ $rc -eq 124 -o $rc -eq 137 ] && verdict=killed_at_cap
-cmd_string="$*"
-printf '{"stage":"%s","cap_s":%s,"wall_s":%s,"exit":%s,"verdict":"%s","started_unix":%s,"cmd":"%s"}\n' \
-  "$stage" "$cap" "$wall" "$rc" "$verdict" "$start" "$cmd_string" >> "$ledger"
+python3 - "$ledger" "$stage" "$cap" "$wall" "$rc" "$verdict" "$start" "$*" <<'PY'
+import json
+import sys
+
+ledger_path, stage_name, cap_seconds, wall_seconds, exit_code, verdict, started_unix, command = sys.argv[1:]
+row = {
+    "stage": stage_name,
+    "cap_s": int(cap_seconds),
+    "wall_s": float(wall_seconds),
+    "exit": int(exit_code),
+    "verdict": verdict,
+    "started_unix": float(started_unix),
+    "cmd": command,
+}
+with open(ledger_path, "a", encoding="utf-8") as ledger_file:
+    ledger_file.write(json.dumps(row, separators=(",", ":")) + "\n")
+PY
 echo "stage_cap: $stage $verdict wall=${wall}s cap=${cap}s exit=$rc" >&2
 exit $rc
