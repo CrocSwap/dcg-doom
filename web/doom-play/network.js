@@ -32,8 +32,10 @@ export const NETWORKS = {
       reconcile: "confirmed",
     },
     explorer: {
-      address: "https://explorer.fogo.io/address/{address}",
-      transaction: "https://explorer.fogo.io/tx/{signature}",
+      // {cluster} is filled from this entry's `cluster`, so the explorer opens
+      // the network the page is on; without it the explorer defaults to mainnet.
+      address: "https://explorer.fogo.io/address/{address}?cluster={cluster}",
+      transaction: "https://explorer.fogo.io/tx/{signature}?cluster={cluster}",
     },
     doom: {
       program: "57kJfNC3U4gZ6VBDpbYRmwA14WYDXhiS75aaj6PwA9kT",
@@ -157,11 +159,11 @@ export function requireNetwork(name, fields = []) {
 export function explorerAddress(net, address) {
   const template = net.explorer.address;
   if (!template) return null;
-  return template.replace("{address}", address);
+  return template.replace("{address}", address).replace("{cluster}", net.cluster);
 }
 
 export function explorerTransaction(net, signature) {
   const template = net.explorer.transaction;
   if (!template || !signature) return null;
-  return template.replace("{signature}", signature);
+  return template.replace("{signature}", signature).replace("{cluster}", net.cluster);
 }
