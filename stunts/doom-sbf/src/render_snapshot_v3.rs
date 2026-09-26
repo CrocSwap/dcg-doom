@@ -202,9 +202,13 @@ pub struct BufferedSnapshotRequest {
 /// in none of it: the two used to be the same expression written four times
 /// (`data[13] >= BUFFER_COUNT` at three sites and the `None` arm of
 /// `buffered_snapshot_address`), and a bound that is written four times is a
-/// bound that can be widened three times and forgotten once.  `false` is the
-/// refusal 297 on the two buffered requests and INIT/GROW-BUFFERED, and the
-/// missing address the three callers turn into the same 297.
+/// bound that can be widened three times and forgotten once.
+///
+/// `false` is a refusal, and the number is the enclosing module's:
+/// `REFUSE_MALFORMED` here, which is 297 on SNAPSHOT-LIVE-BUFFERED,
+/// INIT-BUFFERED and GROW-BUFFERED, and 301 for RSR/2's RENDER-BUFFERED, which
+/// bounds itself against this same constant.  One bound, two numbers, and a
+/// relayer matching on the code needs to know which wire it is on.
 fn buffer_in_range(buffer: u8) -> bool {
     buffer < BUFFER_COUNT
 }
