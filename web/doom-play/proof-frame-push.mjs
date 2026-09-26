@@ -211,6 +211,8 @@ const SNAPSHOT = `(() => {
     painted: s.paintedFrames,
     torn: s.tornReads,
     paints: s.paintTimes.slice(),
+    paintTics: (s.paintTics ?? []).slice(),
+    ticsPerSecond: s.ticsPerSecond ?? null,
     // The two keypress meters, kept apart. stampLatencies is keydown to the
     // first painted frame at or past the tic the input was stamped for;
     // nextPictureLatencies is keydown to the next painted frame of any kind,
@@ -304,12 +306,16 @@ const windowSeconds = (Date.now() - windowStart) / 1000;
 const paintedInWindow = after.painted - before.painted;
 const tornInWindow = after.torn - before.torn;
 const pushedInWindow = (after.stream?.pushed ?? 0) - (before.stream?.pushed ?? 0);
+const oldGametics = new Set(before.paintTics.map((row) => row.gametic).filter(Number.isFinite));
+const newGametics = new Set(after.paintTics.map((row) => row.gametic).filter(Number.isFinite));
+const newPicturesInWindow = [...newGametics].filter((gametic) => !oldGametics.has(gametic)).length;
 console.log(`window ${windowSeconds.toFixed(1)} s: painted ${paintedInWindow} ` +
-  `(${(paintedInWindow / windowSeconds).toFixed(2)} fps), pushed ${pushedInWindow}, torn ${tornInWindow}`);
+  `(${(paintedInWindow / windowSeconds).toFixed(2)} fps), new ${newPicturesInWindow} ` +
+  `(${(newPicturesInWindow / windowSeconds).toFixed(2)} pictures/s), pushed ${pushedInWindow}, torn ${tornInWindow}`);
 await shot("proof-fps");
 
-// 2. keys. The presses cycle the six engine keys so every input path is
-//    exercised. Two numbers come out of each press and they are different
+// 2. keys. The presses cycle movement and fire states without triggering the
+//    dead-player use/reset path. Two numbers come out of each press and they are different
 //    quantities:
 //
 //      keypress  keydown to the first painted frame whose gametic is at or past
@@ -328,7 +334,6 @@ const KEYS = [
   {key: "left", code: "ArrowLeft", keyName: "ArrowLeft", vk: 37},
   {key: "right", code: "ArrowRight", keyName: "ArrowRight", vk: 39},
   {key: "fire", code: "Space", keyName: " ", vk: 32},
-  {key: "use", code: "KeyR", keyName: "r", vk: 82},
 ];
 const presses = [];
 for (let index = 0; index < PRESSES; index += 1) {
@@ -383,11 +388,23 @@ await shot("proof-keys");
 const DRAIN_MS = Number(process.env.PROOF_DRAIN_MS ?? 30_000);
 const drainStart = Date.now();
 let drained = await evaluate(SNAPSHOT);
-while (drained.holdsOpen > 0 && Date.now() - drainStart < DRAIN_MS) {
+const completeTiming = (press, snapshot) => {
+  if (!Number.isFinite(press.stampedTic)) return true;
+  const row = snapshot.keyTimingBreakdown.find((item) => item.tic === press.stampedTic);
+  return row && [
+    row.page_to_post_ms_estimated,
+    row.wait_to_deposit_ms_measured,
+    row.cursor_to_tic_ms_measured,
+    row.render_and_paint_ms_residual,
+  ].every(Number.isFinite);
+};
+const pendingTiming = (snapshot) => presses.filter((press) => !completeTiming(press, snapshot)).length;
+while ((drained.holdsOpen > 0 || pendingTiming(drained) > 0) && Date.now() - drainStart < DRAIN_MS) {
   await sleep(1000);
   drained = await evaluate(SNAPSHOT);
 }
-console.log(`drain: ${drained.holdsOpen} hold(s) still open after ${((Date.now() - drainStart) / 1000).toFixed(1)} s`);
+console.log(`drain: ${drained.holdsOpen} hold(s), ${pendingTiming(drained)} timing row(s) pending after ` +
+  `${((Date.now() - drainStart) / 1000).toFixed(1)} s`);
 // Every press's sample, from the page's own log rather than from the per-press
 // rows, so a sample that landed during the drain is counted.
 const allSamples = drained.stampSamples.filter((sample) => sample.key !== null);
@@ -440,6 +457,8 @@ const result = {
     seconds: windowSeconds,
     painted: paintedInWindow,
     painted_fps: paintedInWindow / windowSeconds,
+    new_pictures: newPicturesInWindow,
+    new_pictures_per_second: newPicturesInWindow / windowSeconds,
     pushed: pushedInWindow,
     torn: tornInWindow,
   },
@@ -465,6 +484,11 @@ const result = {
   // input was stamped for and the gametic of the frame that ended the wait.
   samples: final.stampSamples,
   timing_breakdown: final.keyTimingBreakdown,
+  timing_breakdown_coverage: {
+    required: presses.filter((press) => Number.isFinite(press.stampedTic)).length,
+    complete: presses.filter((press) => completeTiming(press, final)).length,
+    pending: pendingTiming(final),
+  },
   timing_breakdown_summary: Object.fromEntries([
     "page_to_post_ms_estimated",
     "wait_to_deposit_ms_measured",
@@ -476,6 +500,7 @@ const result = {
       .filter((value) => Number.isFinite(value));
     return [name, summarize(values)];
   })),
+  engine_tics_per_second: final.ticsPerSecond,
   final,
   relayer_health: relayerHealth,
 };

@@ -656,6 +656,7 @@ export class Relayer {
         key_mask: decoded.keyMask,
         post_received_at_ms: postReceivedAtMs,
         tic_assigned_at_ms: result.ticAssignedAtMs ?? null,
+        key_state: result.keyStateEvent ?? null,
         producer_next_cursor: result.producerNextCursor ?? null,
         pipeline: result.pipeline ?? slot.pipeline ?? null,
         latest_frame: slot.latestFrame ?? null,

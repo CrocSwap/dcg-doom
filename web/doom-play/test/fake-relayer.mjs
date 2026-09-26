@@ -622,6 +622,7 @@ export class FakeRelayer {
         next_seq: seq + 1,
         post_received_at_ms: postReceivedAt,
         tic_assigned_at_ms: assignedAt,
+        key_state: event,
         client_seq: batch.clientSeq,
         ...this.status(session),
       };

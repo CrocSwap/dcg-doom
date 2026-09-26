@@ -370,6 +370,8 @@ test("a signed key-state transition is stamped by the relayer without an explici
     assert.equal(up.body.stamp_tic, 8);
     assert.equal(down.body.stamp_gametic, 0);
     assert.equal(up.body.stamp_gametic, 8);
+    assert.equal(down.body.key_state.seq, 0);
+    assert.equal(up.body.key_state.seq, 8);
     assert.equal(down.body.accepted, 1);
     assert.equal(relayer.sender.calls.filter((row) => row.op === "deposit").length, 2);
     assert.equal(relayer.stats.inputsRejected, 0);

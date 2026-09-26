@@ -203,7 +203,15 @@ export class MockSender {
     const commands = heldToCommands(decodeKeyState(keyMask), firstSeq, this.ticsPerAdvance);
     const deposit = await this.deposit({slot, firstSeq, commands});
     const advanced = await this.advance({slot, maxTics: this.ticsPerAdvance, expectedCursor: firstSeq});
-    return {accepted: 1, acceptedFrom: firstSeq, cursor: advanced.cursor, gametic: advanced.gametic, deposit, advanced};
+    return {
+      accepted: 1,
+      acceptedFrom: firstSeq,
+      cursor: advanced.cursor,
+      gametic: advanced.gametic,
+      keyStateEvent: {seq: firstSeq, mask: keyMask, assigned_at_ms: Date.now()},
+      deposit,
+      advanced,
+    };
   }
 
   async advance({slot, maxTics = 0, expectedCursor = null}) {
@@ -715,6 +723,7 @@ export class PipelineSender {
       cursor: reply.cursor,
       gametic: reply.gametic,
       ticAssignedAtMs: reply.tic_assigned_at_ms ?? null,
+      keyStateEvent: reply.key_state ?? null,
       producerNextCursor: reply.producer_next_cursor,
       pipeline: reply.pipeline ?? null,
     };

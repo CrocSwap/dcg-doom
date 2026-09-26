@@ -416,6 +416,21 @@ if (!chromeAvailable()) {
       const nexts = after.nextPictureLatencies.slice(before.nextPictureLatencies.length);
       assert.equal(stamps.length, 1, `the keypress meter recorded ${JSON.stringify(stamps)} samples for one press`);
       assert.ok(nexts.length >= 1, `the next-picture meter recorded nothing: ${JSON.stringify(after)}`);
+      const timing = after.keyTimingBreakdown.find((row) => row.tic === stamps[0].tic);
+      assert.ok(timing, `the stamped press has no timing breakdown: ${JSON.stringify(after.keyTimingBreakdown)}`);
+      assert.ok(Number.isFinite(timing.page_to_post_ms_estimated));
+      let completedTiming = timing;
+      for (let attempt = 0; attempt < 25; attempt += 1) {
+        if (Number.isFinite(completedTiming.wait_to_deposit_ms_measured)
+          && Number.isFinite(completedTiming.cursor_to_tic_ms_measured)) break;
+        await sleep(100);
+        const refreshed = await snapshot(page);
+        completedTiming = refreshed.keyTimingBreakdown.find((row) => row.tic === stamps[0].tic) ?? completedTiming;
+      }
+      assert.ok(Number.isFinite(completedTiming.wait_to_deposit_ms_measured));
+      assert.ok(Number.isFinite(completedTiming.cursor_to_tic_ms_measured));
+      assert.ok(Number.isFinite(completedTiming.render_and_paint_ms_residual));
+      assert.ok(Number.isFinite(completedTiming.browser_to_relayer_clock_offset_ms_estimated));
 
       // The definitional check: this frame's cursor is past the input sequence.
       assert.ok(after.lastStampSample !== null, "no sample recorded the pair it waited on");

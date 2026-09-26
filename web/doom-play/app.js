@@ -423,6 +423,7 @@ function measureKeypress(gametic, at) {
     };
     state.stampSamples.push(sample);
     if (state.stampSamples.length > 60) state.stampSamples.shift();
+    refreshKeyTimingBreakdown();
     state.lastStampSample = sample;
     state.stampLatencies.push(hold.stampMs);
     if (state.stampLatencies.length > 40) state.stampLatencies.shift();
@@ -437,8 +438,19 @@ function refreshKeyTimingBreakdown() {
     const event = state.keyStateEvents.find((row) => row.seq === sample.tic);
     const post = state.keyPostSamples?.find((row) => row.tic === sample.tic);
     if (!event || !post) continue;
-    const pageToPost = Number.isFinite(post.post_received_at_ms) && Number.isFinite(post.page_down_wall_ms)
-      ? Number(post.post_received_at_ms) - Number(post.page_down_wall_ms)
+    const hasClockBridge = Number.isFinite(post.post_received_at_ms)
+      && Number.isFinite(post.sent_wall_ms)
+      && Number.isFinite(post.post_rtt_ms)
+      && Number.isFinite(post.page_down_wall_ms);
+    // The browser and Tokyo do not share a wall clock. Estimate their offset
+    // from this request's midpoint (symmetric network delay), then use the
+    // relayer's receipt time for keydown -> POST. The remaining server-side
+    // intervals below use the relayer's clock on both ends.
+    const clockOffsetMs = hasClockBridge
+      ? Number(post.post_received_at_ms) - Number(post.sent_wall_ms) - Number(post.post_rtt_ms) / 2
+      : null;
+    const pageToPost = hasClockBridge
+      ? Number(post.post_received_at_ms) - Number(post.page_down_wall_ms) - clockOffsetMs
       : null;
     const waitToDeposit = Number.isFinite(event.deposit_submitted_at_ms) && Number.isFinite(post.post_received_at_ms)
       ? Number(event.deposit_submitted_at_ms) - Number(post.post_received_at_ms)
@@ -453,6 +465,7 @@ function refreshKeyTimingBreakdown() {
       key: sample.key,
       keydown_to_picture_ms: sample.ms,
       page_to_post_ms_estimated: pageToPost,
+      browser_to_relayer_clock_offset_ms_estimated: clockOffsetMs,
       wait_to_deposit_ms_measured: waitToDeposit,
       cursor_to_tic_ms_measured: cursorToTic,
       render_and_paint_ms_residual: known.length === 3
@@ -1099,6 +1112,11 @@ async function pushQueuedInput() {
     if (!response.ok) {
       state.refusals += 1;
       throw new Error(payload.error ?? `relayer returned ${response.status}`);
+    }
+    if (payload.key_state && Number.isFinite(payload.key_state.seq)) {
+      const existing = state.keyStateEvents.findIndex((row) => row.seq === payload.key_state.seq);
+      if (existing < 0) state.keyStateEvents.push(payload.key_state);
+      else state.keyStateEvents[existing] = {...state.keyStateEvents[existing], ...payload.key_state};
     }
     const responseAt = performance.now();
     const postRttMs = responseAt - sentAt;
