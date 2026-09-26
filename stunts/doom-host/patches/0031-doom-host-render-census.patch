@@ -1,0 +1,311 @@
+diff --git a/linuxdoom-1.10/headless/doom_ctx.h b/linuxdoom-1.10/headless/doom_ctx.h
+--- a/linuxdoom-1.10/headless/doom_ctx.h
++++ b/linuxdoom-1.10/headless/doom_ctx.h
+@@ -1002,4 +1002,31 @@
+ #define doom_render_fuzz_columns (DOOM_CTX->doom_render_fuzz_columns)
+ #endif
+ 
++#ifdef DOOM_HOST_RENDER_CENSUS
++extern void doom_host_render_census_reset(void);
++extern void doom_host_render_census_values(long long *out);
++extern void doom_host_render_census_phase(unsigned long phase);
++extern void doom_host_render_census_column(unsigned long pixels, unsigned long columns, int x);
++extern void doom_host_render_census_span(unsigned long pixels, int row, int x1, int x2);
++extern void doom_host_render_census_scene(unsigned long drawseg_count, unsigned long visplane_count);
++extern void doom_host_render_census_sprite(void);
++extern void doom_host_render_census_clip_step(void);
++extern void doom_host_render_census_view(int x, int y, unsigned long angle, unsigned long floorpic);
++#define DOOM_HOST_CENSUS_PHASE(value) doom_host_render_census_phase((unsigned long)(value))
++#define DOOM_HOST_CENSUS_COLUMN(pixels, columns, x) doom_host_render_census_column((unsigned long)(pixels), (unsigned long)(columns), (x))
++#define DOOM_HOST_CENSUS_SPAN(pixels, row, x1, x2) doom_host_render_census_span((unsigned long)(pixels), (row), (x1), (x2))
++#define DOOM_HOST_CENSUS_SCENE(drawsegs, visplanes) doom_host_render_census_scene((unsigned long)(drawsegs), (unsigned long)(visplanes))
++#define DOOM_HOST_CENSUS_SPRITE() doom_host_render_census_sprite()
++#define DOOM_HOST_CENSUS_CLIP_STEP() doom_host_render_census_clip_step()
++#define DOOM_HOST_CENSUS_VIEW(x, y, angle, floorpic) doom_host_render_census_view((x), (y), (unsigned long)(angle), (unsigned long)(floorpic))
++#else
++#define DOOM_HOST_CENSUS_PHASE(value) ((void)0)
++#define DOOM_HOST_CENSUS_COLUMN(pixels, columns, x) ((void)0)
++#define DOOM_HOST_CENSUS_SPAN(pixels, row, x1, x2) ((void)0)
++#define DOOM_HOST_CENSUS_SCENE(drawsegs, visplanes) ((void)0)
++#define DOOM_HOST_CENSUS_SPRITE() ((void)0)
++#define DOOM_HOST_CENSUS_CLIP_STEP() ((void)0)
++#define DOOM_HOST_CENSUS_VIEW(x, y, angle, floorpic) ((void)0)
++#endif
++
+ #endif /* DOOM_CTX_H */
+diff --git a/linuxdoom-1.10/r_draw.c b/linuxdoom-1.10/r_draw.c
+--- a/linuxdoom-1.10/r_draw.c
++++ b/linuxdoom-1.10/r_draw.c
+@@ -116,6 +116,9 @@
+     // Zero length, column does not exceed a pixel.
+     if (count < 0) 
+ 	return; 
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_COLUMN((unsigned long)(count + 1), 1, dc_x);
++#endif
+ 				 
+ #ifdef RANGECHECK 
+     if ((unsigned)dc_x >= SCREENWIDTH
+@@ -230,6 +233,9 @@
+     // Zero length.
+     if (count < 0) 
+ 	return; 
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_COLUMN((unsigned long)(count + 1) * 2UL, 2, dc_x * 2);
++#endif
+ 				 
+ #ifdef RANGECHECK 
+     if ((unsigned)dc_x >= SCREENWIDTH
+@@ -311,6 +317,9 @@
+     // Zero length.
+     if (count < 0) 
+ 	return; 
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_COLUMN((unsigned long)(count + 1), 1, dc_x);
++#endif
+ 
+     if (DOOM_RENDER_CLIP_MODE &&
+ 	(dc_x < (int)DOOM_RENDER_CLIP_LEFT || dc_x >= (int)DOOM_RENDER_CLIP_RIGHT))
+@@ -425,6 +434,9 @@
+     count = dc_yh - dc_yl; 
+     if (count < 0) 
+ 	return; 
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_COLUMN((unsigned long)(count + 1), 1, dc_x);
++#endif
+ 				 
+ #ifdef RANGECHECK 
+     if ((unsigned)dc_x >= SCREENWIDTH
+@@ -584,6 +596,9 @@
+ 		return;
+ 	}
+ 	 
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_SPAN((unsigned long)(draw_x2 - draw_x1 + 1), ds_y, draw_x1, draw_x2);
++#endif
+     dest = ylookup[ds_y] + columnofs[draw_x1];
+ 
+     // We do not check for zero spans here?
+@@ -707,6 +722,9 @@
+ 	 
+     xfrac = ds_xfrac; 
+     yfrac = ds_yfrac; 
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_SPAN((unsigned long)(ds_x2 - ds_x1 + 1) * 2UL, ds_y, ds_x1 * 2, ds_x2 * 2 + 1);
++#endif
+ 
+     // Blocky mode, need to multiply by 2.
+     ds_x1 <<= 1;
+diff --git a/linuxdoom-1.10/r_main.c b/linuxdoom-1.10/r_main.c
+--- a/linuxdoom-1.10/r_main.c
++++ b/linuxdoom-1.10/r_main.c
+@@ -40,6 +40,106 @@
+ 
+ #include "r_local.h"
+ #include "r_sky.h"
++
++#ifdef DOOM_HOST_RENDER_CENSUS
++#define DOOM_HOST_CENSUS_VALUES 56
++static long long doom_host_census_values[DOOM_HOST_CENSUS_VALUES];
++static unsigned char doom_host_census_rows[200];
++static unsigned long doom_host_census_current_phase;
++
++void doom_host_render_census_reset(void)
++{
++    int i;
++    for (i = 0; i < DOOM_HOST_CENSUS_VALUES; ++i)
++        doom_host_census_values[i] = 0;
++    for (i = 0; i < 200; ++i)
++        doom_host_census_rows[i] = 0;
++    doom_host_census_current_phase = 0;
++}
++
++void doom_host_render_census_values(long long *out)
++{
++    int i;
++    unsigned long rows = 0;
++    for (i = 0; i < DOOM_HOST_CENSUS_VALUES; ++i)
++        out[i] = doom_host_census_values[i];
++    for (i = 0; i < 200; ++i)
++        rows += doom_host_census_rows[i] != 0;
++    out[4] = (long long)rows;
++}
++
++void doom_host_render_census_phase(unsigned long phase)
++{
++    doom_host_census_current_phase = phase;
++}
++
++void doom_host_render_census_column(unsigned long pixels, unsigned long columns, int x)
++{
++    int strip = x / 40;
++    if (strip < 0) strip = 0;
++    if (strip > 7) strip = 7;
++    if (doom_host_census_current_phase == 1)
++    {
++        doom_host_census_values[0] += pixels;
++        doom_host_census_values[1] += columns;
++        doom_host_census_values[16 + strip] += pixels;
++    }
++    else if (doom_host_census_current_phase == 4)
++    {
++        doom_host_census_values[5] += pixels;
++        doom_host_census_values[32 + strip] += pixels;
++    }
++    else if (doom_host_census_current_phase == 3 || doom_host_census_current_phase == 5)
++    {
++        doom_host_census_values[6] += pixels;
++        doom_host_census_values[40 + strip] += pixels;
++        if (doom_host_census_current_phase == 5)
++        {
++            doom_host_census_values[11] += pixels;
++            doom_host_census_values[48 + strip] += pixels;
++        }
++    }
++}
++
++void doom_host_render_census_span(unsigned long pixels, int row, int x1, int x2)
++{
++    int x;
++    doom_host_census_values[2] += pixels;
++    doom_host_census_values[3] += 1;
++    if (row >= 0 && row < 200)
++        doom_host_census_rows[row] = 1;
++    for (x = x1; x <= x2; ++x)
++    {
++        int strip = x / 40;
++        if (strip >= 0 && strip < 8)
++            doom_host_census_values[24 + strip] += 1;
++    }
++}
++
++void doom_host_render_census_scene(unsigned long drawseg_count, unsigned long visplane_count)
++{
++    doom_host_census_values[8] = drawseg_count;
++    doom_host_census_values[10] = visplane_count;
++}
++
++void doom_host_render_census_sprite(void)
++{
++    doom_host_census_values[7] += 1;
++}
++
++void doom_host_render_census_clip_step(void)
++{
++    doom_host_census_values[9] += 1;
++}
++
++void doom_host_render_census_view(int x, int y, unsigned long angle, unsigned long floorpic)
++{
++    doom_host_census_values[12] = x;
++    doom_host_census_values[13] = y;
++    doom_host_census_values[14] = (long long)angle;
++    doom_host_census_values[15] = (long long)floorpic;
++}
++#endif
+ 
+ 
+ 
+@@ -835,6 +935,10 @@
+     PROF_ENTER(DOOM_SBF_PROF_RENDER_TOTAL, 0);
+     PROF_ENTER(DOOM_SBF_PROF_SETUP_FRAME, 1);
+     R_SetupFrame (player);
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_VIEW(player->mo->x, player->mo->y, viewangle,
++                          player->mo->subsector->sector->floorpic);
++#endif
+     R_DRAW_PHASE(1201);
+     PROF_EXIT(DOOM_SBF_PROF_SETUP_FRAME, 1);
+ 
+@@ -851,14 +955,19 @@
+     NetUpdate ();
+ 
+     // The head node is the last node output.
++    DOOM_HOST_CENSUS_PHASE(1);
+     PROF_ENTER(DOOM_SBF_PROF_BSP, 1);
+     R_RenderBSPNode ((DOOM_CTX->numnodes)-1);
+     R_DRAW_PHASE(1203);
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_SCENE(ds_p - drawsegs, lastvisplane - visplanes);
++#endif
+     PROF_EXIT(DOOM_SBF_PROF_BSP, 1);
+     
+     // Check for new console commands.
+     NetUpdate ();
+     
++    DOOM_HOST_CENSUS_PHASE(2);
+     PROF_ENTER(DOOM_SBF_PROF_DRAW_PLANES, 1);
+     R_DrawPlanes ();
+     R_DRAW_PHASE(1204);
+@@ -867,6 +976,7 @@
+     // Check for new console commands.
+     NetUpdate ();
+     
++    DOOM_HOST_CENSUS_PHASE(3);
+     PROF_ENTER(DOOM_SBF_PROF_DRAW_MASKED, 1);
+     R_DrawMasked ();
+     R_DRAW_PHASE(1205);
+@@ -875,5 +985,6 @@
+     // Check for new console commands.
+     NetUpdate ();
+     R_DRAW_PHASE(1206);
++    DOOM_HOST_CENSUS_PHASE(0);
+     PROF_EXIT(DOOM_SBF_PROF_RENDER_TOTAL, 0);
+ }
+diff --git a/linuxdoom-1.10/r_plane.c b/linuxdoom-1.10/r_plane.c
+--- a/linuxdoom-1.10/r_plane.c
++++ b/linuxdoom-1.10/r_plane.c
+@@ -413,8 +413,10 @@
+ 		{
+ 		    angle = (viewangle + xtoviewangle[x])>>ANGLETOSKYSHIFT;
+ 		    dc_x = x;
++		    DOOM_HOST_CENSUS_PHASE(4);
+ 		    dc_source = R_GetColumn(skytexture, angle);
+ 		    colfunc ();
++		    DOOM_HOST_CENSUS_PHASE(2);
+ 		}
+ 	    }
+ 	    continue;
+diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
+--- a/linuxdoom-1.10/r_segs.c
++++ b/linuxdoom-1.10/r_segs.c
+@@ -148,7 +148,9 @@
+ 	    col = (column_t *)( 
+ 		(byte *)R_GetColumn(texnum,maskedtexturecol[dc_x]) -3);
+ 			
++	    DOOM_HOST_CENSUS_PHASE(5);
+ 	    R_DrawMaskedColumn (col);
++	    DOOM_HOST_CENSUS_PHASE(3);
+ 	    maskedtexturecol[dc_x] = MAXSHORT;
+ 	}
+ 	spryscale += rw_scalestep;
+diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
+--- a/linuxdoom-1.10/r_things.c
++++ b/linuxdoom-1.10/r_things.c
+@@ -677,6 +677,9 @@
+     // off the left side
+     if (x2 < 0)
+ 	return;
++#ifdef DOOM_HOST_RENDER_CENSUS
++    DOOM_HOST_CENSUS_SPRITE();
++#endif
+     
+     // store information in a vissprite
+     vis = &avis;
+@@ -839,6 +842,7 @@
+     fixed_t		lowscale;
+     int			silhouette;
+ 		
++    DOOM_HOST_CENSUS_SPRITE();
+     for (x = spr->x1 ; x<=spr->x2 ; x++)
+ 	clipbot[x] = cliptop[x] = -2;
+     
+@@ -847,6 +851,7 @@
+     //  is the clip seg.
+     for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
+     {
++	DOOM_HOST_CENSUS_CLIP_STEP();
+ 	// determine if the drawseg obscures the sprite
+ 	if (ds->x1 > spr->x2
+ 	    || ds->x2 < spr->x1
+
