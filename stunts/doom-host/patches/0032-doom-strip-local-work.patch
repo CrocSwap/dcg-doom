@@ -46,7 +46,7 @@ index cc4ba2b..0e4b9a1 100644
  	    {
  		dc_yl = PL_TOP(pl,x);
  		dc_yh = PL_BOTTOM(pl,x);
-@@ -441,12 +461,55 @@ void R_DrawPlanes (void)
+@@ -441,12 +461,56 @@ void R_DrawPlanes (void)
  		
  	stop = pl->maxx + 1;
  
@@ -87,8 +87,9 @@ index cc4ba2b..0e4b9a1 100644
 +		/* Close spans at the right edge without reading or building columns
 +		 * owned by the next strip. */
 +		x = clip_right - 1;
-+		for (y=PL_TOP(pl,x) ; y<=PL_BOTTOM(pl,x) ; y++)
-+		    R_MapPlane(y,spanstart[y],x);
++		for (y=PL_TOP(pl,x) ; y<=PL_BOTTOM(pl,x) && y<viewheight ; y++)
++		    if (spanstart[y] <= x)
++			R_MapPlane(y,spanstart[y],x);
 +	    }
 +	}
 +	else
