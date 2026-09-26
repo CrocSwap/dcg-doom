@@ -96,7 +96,7 @@ const H_BUILD_NEXT: usize = 288;
 const H_BUILD_WAD_USED: usize = 292;
 const H_BUILD_RESOURCE_HASH: usize = 296;
 const H_BUILD_BASE: usize = 328;
-const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-valid|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
+const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1";
 const MAX_ACCOUNT_GROWTH: usize = 10_240;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -484,8 +484,12 @@ mod clear_tests {
         assert!(account[header.clone()].iter().all(|byte| *byte == 0));
     }
 
-    /// The gate is the whole safety argument: a resource that passes
-    /// `validate_header` is the good one, and it is never cleared.
+    /// The gate is the whole safety argument: anything that starts with the
+    /// static header's magic and version is a header, and a header is never
+    /// cleared.  `validate_header` passing is a strictly stronger test than
+    /// CLEAR/6 needs and a strictly weaker guarantee: a header this image
+    /// cannot fully validate is still a header, and zeroing it would destroy a
+    /// resource that a later build or a later image could complete.
     #[test]
     fn refuses_on_a_valid_built_header_and_leaves_it_untouched() {
         let program = program();
@@ -503,19 +507,76 @@ mod clear_tests {
             Err(refuse(REFUSE_HEADER_VALID))
         );
         assert_eq!(account, before, "a refused clear must not write a byte");
+    }
 
-        // A header one field short of valid is clearable, which is the other
-        // half of the gate: the operation refuses a *good* resource, not any
-        // resource that starts with the magic.
-        let mut partial = account;
+    /// The rest of the gate: a header one field short of valid is still a
+    /// header.  It used to be clearable, which meant a single wrong field
+    /// turned CLEAR/6 into a header destroyer -- and a layout move is exactly
+    /// that kind of wrong field.
+    #[test]
+    fn refuses_on_a_header_this_image_cannot_fully_validate() {
+        let program = program();
+        let key = static_address(&program).0;
+        let mut account = vec![0u8; ACCOUNT_BYTES];
+        account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES]
+            .copy_from_slice(&built_header(0x4_0000_0060));
         // Header field offsets are relative to the header, so the account write
         // has to land at HEADER_OFFSET + H_BUILD_NEXT, not at H_BUILD_NEXT.
-        put_u32(&mut partial, HEADER_OFFSET + H_BUILD_NEXT, 3);
-        assert!(validate_header(&partial).is_err());
-        assert_eq!(
-            clear_static_header(&key, &program, &program, &mut partial),
-            Ok(())
+        put_u32(&mut account, HEADER_OFFSET + H_BUILD_NEXT, 3);
+        assert!(
+            validate_header(&account).is_err(),
+            "precondition: this header is not one this image would accept"
         );
+        let before = account.clone();
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut account),
+            Err(refuse(REFUSE_HEADER_VALID))
+        );
+        assert_eq!(account, before, "a refused clear must not write a byte");
+    }
+
+    /// A header that is nothing but the magic and the version, with every
+    /// other field zero, is the shape a half-written or truncated BUILD
+    /// leaves.  CLEAR/6 must not zero it either.
+    #[test]
+    fn refuses_on_the_magic_and_version_alone() {
+        let program = program();
+        let key = static_address(&program).0;
+        let mut account = vec![0u8; ACCOUNT_BYTES];
+        account[HEADER_OFFSET..HEADER_OFFSET + 8].copy_from_slice(MAGIC);
+        put_u32(&mut account, HEADER_OFFSET + 8, VERSION);
+        assert!(validate_header(&account).is_err());
+        let before = account.clone();
+        assert_eq!(
+            clear_static_header(&key, &program, &program, &mut account),
+            Err(refuse(REFUSE_HEADER_VALID))
+        );
+        assert_eq!(account, before, "a refused clear must not write a byte");
+    }
+
+    /// The other side: bytes that are not a header are cleared, and the check
+    /// is the magic and version, not the whole header shape.  A region with
+    /// any other content, including a version this image does not speak, is
+    /// garbage as far as this image is concerned.
+    #[test]
+    fn clears_bytes_that_do_not_start_with_the_magic_and_version() {
+        let program = program();
+        let key = static_address(&program).0;
+        let fillers: [[u8; 8]; 2] = [*b"DOOM-RSX", *b"DOOM-ST1"];
+        for filler in [MAGIC, &fillers[0], &fillers[1]] {
+            let mut account = vec![0u8; ACCOUNT_BYTES];
+            account[HEADER_OFFSET..HEADER_OFFSET + 8].copy_from_slice(filler);
+            account[HEADER_OFFSET + 8..HEADER_OFFSET + 12]
+                .copy_from_slice(&7u32.to_le_bytes());
+            assert_eq!(
+                clear_static_header(&key, &program, &program, &mut account),
+                Ok(()),
+                "filler {filler:?} is not this ABI's header"
+            );
+            assert!(account[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
     }
 
     #[test]
@@ -743,17 +804,33 @@ fn process_rebuild(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
 ///   image, the context and the bootstrap carrier ahead of it are rewritten
 ///   by the rebuild itself (phase 0 memsets the context and rebinds the arena
 ///   cursor to zero), so none of them is part of the contract;
-/// * a *valid* built header is refused, so a good resource can never be
-///   wiped by this or by a caller who reaches the account first;
+/// * anything that starts with this ABI's magic and version is refused, so a
+///   good resource can never be wiped by this or by a caller who reaches the
+///   account first -- and neither can one this image cannot fully validate,
+///   such as a half-written `BUILD` or a header a layout move left behind;
 /// * the account must still be this program's static PDA, program-owned, and
 ///   exactly `ACCOUNT_BYTES` long, so it cannot be pointed at another
 ///   account, at a shorter one, or at a layout this image does not write.
 ///
-/// The price of that narrowness is that a *partially* built header (cursor 1
-/// through 10, which is not a valid header) is clearable by anyone who can
-/// name the PDA. That is a restart of work that is reproducible from the
-/// pinned WAD and resource accounts, not a loss of state: unlike
-/// `REBUILD/4`, this writes nothing that cannot be rebuilt from public input.
+/// The price of that narrowness is that a region carrying bytes from some
+/// other ABI, or garbage that happens not to begin with this ABI's header, is
+/// still clearable by anyone who can name the PDA. That is a restart of work
+/// that is reproducible from the pinned WAD and resource accounts, not a loss
+/// of state: unlike `REBUILD/4`, this writes nothing that cannot be rebuilt
+/// from public input.
+///
+/// Ported from fadeno/doom-lowdetail-3. The gate used to be
+/// `validate_header(data).is_ok()`, which is a strictly stronger test than
+/// CLEAR/6 needs and a strictly weaker guarantee: a header one field short of
+/// valid used to be clearable, so a single wrong field turned this operation
+/// into a header destroyer.
+fn starts_with_header_magic_and_version(data: &[u8]) -> bool {
+    let end = HEADER_OFFSET + 12;
+    data.len() >= end
+        && &data[HEADER_OFFSET..HEADER_OFFSET + 8] == MAGIC
+        && u32_at(data, HEADER_OFFSET + 8) == VERSION
+}
+
 fn clear_static_header(
     key: &Pubkey,
     program: &Pubkey,
@@ -764,7 +841,7 @@ fn clear_static_header(
     if key != &expected || owner != program || data.len() != ACCOUNT_BYTES {
         return Err(refuse(REFUSE_ACCOUNT));
     }
-    if validate_header(data).is_ok() {
+    if starts_with_header_magic_and_version(data) {
         return Err(refuse(REFUSE_HEADER_VALID));
     }
     data[HEADER_OFFSET..HEADER_OFFSET + HEADER_BYTES].fill(0);
