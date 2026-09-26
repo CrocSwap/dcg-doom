@@ -15,23 +15,18 @@
 #
 # The player reaches this through an SSH tunnel; nothing is published.
 #
-#  * strip rate. This is the one number that decides whether frames land at all.
-#    Measured 2026-09-26 on the R12 context: at 64/s every strip transaction
-#    came back `InstructionError: [1, ProgramFailedToComplete]` -- 740,000 CU is
-#    not enough compute for that many strips beside a running sweep, and a
-#    4.10 fps run only survived because the serial submit loop throttled it to
-#    32.8 strips/s by accident. 40/s failed the same way. So the rate is stated
-#    rather than assumed, and the default is 32 strips/s = 4 fps, under the 42-48
-#    strips/s measured as sustainable and over the 4.10 fps this loop used to
-#    reach by being slow. Raise it and the chain, not the sender, will say so.
-#
-#  * the strip CU limit. 740,000 is three strips to a block, and it was measured
-#    on a cheap view. Render cost is a property of the picture, so a context that
-#    has moved into a busier view needs more than the limit allows and every
-#    strip comes back `ProgramFailedToComplete` at exactly 740,000 -- measured on
-#    the R12 context from cursor 20,572 up, at every rate tried. STRIP_CU_LIMIT
-#    raises it; the chain's own per-transaction ceiling is the only upper bound
-#    this side knows about.
+#  * strip rate, and the strip CU limit, together. They are one decision.
+#    The 32 strips/s default existed because 40 and 64 strips/s came back
+#    `InstructionError: [1, ProgramFailedToComplete]` on R12. **That was the CU
+#    limit, not the rate.** A strip on this context measures 960,055-1,003,200 CU
+#    and the old limit was 740,000, so a strip could not complete at *any* rate
+#    once the view got expensive; the rate was blamed for a per-transaction
+#    bound. Re-measured 2026-09-26 on R15 at STRIP_CU_LIMIT=1400000, two buffers,
+#    60 s each: 32/s 2.85 fps, 40/s 2.86, 48/s 2.82, 64/s 2.84 -- zero
+#    ProgramFailedToComplete, and `strip_rate_cap.binding` false at 48 and 64.
+#    So the default is 64 strips/s, a 0.125 s floor on the frame interval that
+#    nothing reaches, and STRIP_CU_LIMIT defaults to 1,400,000 with it. Setting
+#    one without the other is the trap: 64/s at 740,000 CU loses every strip.
 #
 #  * the image. 2026-09-26 06:2x UTC the program was upgraded to the four-buffer
 #    image (out/runs/doom-4-buffers-20260926/, sha 4bb632e2..., 916,496 B) and
@@ -45,7 +40,41 @@
 #
 #  * the render buffer count. BUFFERS is 1..4, the program's own `BUFFER_COUNT`.
 #    Buffers 0 and 1 are the accounts a two-buffer session already used, so
-#    raising the count is a widening and not a move.
+#    raising the count is a widening and not a move. All four are provisioned on
+#    R15 as of 2026-09-26 (23.280030720 FOGO of rent for buffers 1..3 and their
+#    24 strips), and the default is 4 because that is where the frame rate stops
+#    improving: measured 60 s each on R15, one buffer 2.01 fps and 2 buffers
+#    2.85, 3 buffers 3.14, 4 buffers 3.28. Two is the worst of the three above
+#    one buffer, because at two the buffer is still held for the strips'
+#    `await_strips` and the two round trips are serial, while at four the
+#    release wait overlaps the next three submissions. At four buffers on the
+#    *old* 30/s pacer it was 2.13 fps with 12 skips and a gateway 429, so the
+#    buffer count and SEND_RATE below are one decision too.
+#
+#  * the send pacer. SEND_RATE is transactions per second per endpoint. A frame
+#    sends nine transactions, so this is the frame's own send cost, and it is a
+#    pacing choice on our side rather than a protocol bound. Measured 2026-09-26
+#    on R15 at four buffers, 60 s each: 30/s 2.13 fps with 12 skips and a
+#    `testnet.fogo.io` 429, 45/s 3.28 with none, 60/s 3.30 with none. 45 is the
+#    default because 60 buys 0.02 fps and costs the input path: the landed ratio
+#    through the page fell from 0.977 at 45/s to 0.75 at 60/s on two buffers,
+#    because the deposits compete with the renders for the same two nodes.
+#
+#    RPC_C names a third node, and the measurement says not to. The eight strip
+#    sends of a frame are one `asyncio.gather`, so the step is set by the
+#    *slowest* node it touches, and the only other public nodes answer from
+#    Tokyo at 281-491 ms against `.173`'s 4.6 ms. Adding the best of them
+#    (`64.130.37.72`, genesis verified, never behind) took the frame rate from
+#    3.28 to 2.23 fps, `strip_send` from 0.210 s to 0.423 s, and the
+#    key-to-picture median from 548 ms to 1314 ms. The flag is here because the
+#    pool is generic over its URLs and a node nearer than these would make it
+#    worth using.
+#
+#    `64.130.44.172` stays out of every list: R9b measured it 14,336 slots behind
+#    `.173`, and a node that far behind is a stalled readback, not a second
+#    opinion. A node that will not answer at the rate answers 429, so the
+#    receipt's `errors` and `config.send_pacer_rate_per_endpoint`, not the rate
+#    itself, are what say whether a rate was sustainable.
 #
 #  * the one-buffer read path. At BUFFERS=1 the buffer is held from the moment a
 #    submission starts until the readback has copied 1,113,792 bytes out of it,
@@ -68,7 +97,7 @@ set -eu
 RD=${RELAYER_DIR:-/home/ec2-user/doom-relayer-20260925}
 NAME=${1:-play-r15}
 SECONDS_LIMIT=${2:-300}
-STRIP_RATE=${3:-32}
+STRIP_RATE=${3:-64}
 REPO=${RELAYER_REPO:-$RD}
 PIN=${PIN:-$REPO/scripts/doom_relayer_deploy.json}
 PY=${PY:-/home/ec2-user/basanos-main/.venv/bin/python}
@@ -105,14 +134,15 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --script "$RD/scripts/doom_relayer_server.py" \
   --run-dir "$RD/out/$NAME" \
   --rpc-a http://64.130.44.173:8899 --rpc-b https://testnet.fogo.io \
+  ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-45} \
   --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
   --image-bytes 916496 \
-  --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-2} \
+  --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-4} \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
-  --strip-cu-limit ${STRIP_CU_LIMIT:-0} \
+  --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   ${readback_flags[@]+"${readback_flags[@]}"} \
   ${RESET_START_ACCOUNT:+--reset-start-account "$RESET_START_ACCOUNT"}

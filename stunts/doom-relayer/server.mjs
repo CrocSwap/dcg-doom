@@ -1078,7 +1078,8 @@ function isMain() {
 // than a silently default pipeline: every one of these changes what the sender
 // does on chain, and a default that looks like a choice is worse than a refusal.
 const CHAIN_FLAGS = new Set([
-  "keys-dir", "payer-key", "python", "script", "run-dir", "rpc-a", "rpc-b",
+  "keys-dir", "payer-key", "python", "script", "run-dir", "rpc-a", "rpc-b", "rpc-c",
+  "send-pacer-rate",
   "image-sha256", "image-bytes", "seconds", "strip-rate", "render-buffers",
   "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
@@ -1134,6 +1135,8 @@ if (isMain()) {
     runDir: args.get("run-dir") ?? undefined,
     rpcA: args.get("rpc-a") ?? undefined,
     rpcB: args.get("rpc-b") ?? undefined,
+    rpcC: args.get("rpc-c") ?? undefined,
+    sendPacerRate: args.get("send-pacer-rate") ?? undefined,
     imageSha256: args.get("image-sha256") ?? undefined,
     imageBytes: args.get("image-bytes") ? Number(args.get("image-bytes")) : undefined,
     seconds: args.get("seconds") ? Number(args.get("seconds")) : undefined,
