@@ -79,6 +79,18 @@ pub const WAD_IMAGE_OFFSET: usize = super::CTX_MIN_BYTES;
 pub const BOOTSTRAP_OFFSET: usize = align16_const(WAD_IMAGE_OFFSET + WAD_IMAGE_BYTES);
 pub const CONTEXT_BYTES: usize = BOOTSTRAP_OFFSET + BOOTSTRAP_BYTES;
 
+/// The same two sizes for a `diagnostic-profile` image, which carries patch
+/// 0030's accumulator in `doom_ctx_t` and is therefore
+/// `CTX_PHASE_PROFILE_BYTES` longer.  `BOOTSTRAP_OFFSET` is derived from
+/// `CTX_MIN_BYTES`, so the static resource account moves with the context
+/// account and a host runner that preallocates its own layout is refused by
+/// the first E2R/5 phase with `InvalidAccountData` before it renders
+/// anything.  Select on the image manifest's `enabled_cargo_features`, not on
+/// the runner's own features.
+pub const BOOTSTRAP_OFFSET_DIAGNOSTIC: usize =
+    align16_const(super::CTX_MIN_BYTES + super::CTX_PHASE_PROFILE_BYTES + WAD_IMAGE_BYTES);
+pub const CONTEXT_BYTES_DIAGNOSTIC: usize = BOOTSTRAP_OFFSET_DIAGNOSTIC + BOOTSTRAP_BYTES;
+
 const CONTROLLER_HEADER_BYTES: usize = 28;
 
 // DOOM-E2R diagnostic-only phase IDs. These are disjoint from the retained

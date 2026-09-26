@@ -79,6 +79,19 @@ const HOST_COMMON_FLAGS: &[&str] = &[
 ];
 const HOST_CONTEXT_REPO_FILES: &[&str] = &["src/doom_sbf_ctx.c", "src/doom_sbf_engine.c"];
 const HOST_PLATFORM_REPO_FILES: &[&str] = &["src/doom_sbf_platform.c"];
+
+/// The optimization level the SBF engine archives are compiled at.
+///
+/// `HOST_COMMON_FLAGS` is `-O2` because that is the level the golden-verified
+/// host build uses, and the SBF engine archives inherited the same constant,
+/// so the renderer -- `r_draw`, `r_plane`, `r_segs`, `r_bsp`, `r_things`,
+/// which is where a strip's compute actually goes -- has never been compiled
+/// at `-O3` for the target it runs on.  The hotloop TU has been `-O3` for SBF
+/// since it was split out, so this is the one place where the SBF image mixes
+/// two levels.  Read from the environment so an A/B is a rebuild of the engine
+/// archives and not a rebuild of `build.rs` itself; the value that ran is
+/// recorded in the identity manifest either way.
+const SBF_ENGINE_OPT_DEFAULT: &str = "-O3";
 const HOST_NATIVE_CODEC_UPSTREAM_FILES: &[&str] =
     &["headless/doom_state.c", "headless/doom_controller.c"];
 const HOST_NATIVE_CODEC_REPO_FILES: &[&str] = &[
@@ -1302,6 +1315,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RENDER_CLIP_MEASUREMENT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LEGACY_5120_BUFFER");
     println!("cargo:rerun-if-env-changed=DOOM_SBF_SOURCE_TREE");
+    println!("cargo:rerun-if-env-changed=DOOM_SBF_ENGINE_OPT");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=AR");
@@ -1423,7 +1437,6 @@ fn compile_ctx_engine(target: &str) {
     // then the freestanding SBF backend flags the hotloop build uses.
     // DOOM_SBF_BUILD is SBF-only: host feature builds (driver link, crate
     // tests) keep the real host backing so the objects stay honest.
-    let common: &[&str] = HOST_COMMON_FLAGS;
     // NB: cargo-build-sbf v1.51 reports TARGET as `sbpf-solana-solana`; the
     // older `sbf-solana-solana` spelling is kept so the same build.rs works
     // under both.  (The pre-existing hotloop block above still checks only
@@ -1431,6 +1444,37 @@ fn compile_ctx_engine(target: &str) {
     // untouched -- changing its codegen would silently shift the retained
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
+    // The one flag the two targets do not share: `-O2` is the host's level and
+    // the SBF engine gets its own.  See SBF_ENGINE_OPT_DEFAULT.  The value is a
+    // whitespace-separated flag *list*, not a single flag, so that an A/B of an
+    // inlining or codegen parameter is a rebuild of the engine archives and not
+    // a rebuild of `build.rs`.  Whatever it says is what the identity manifest
+    // records.
+    let mut common_flags: Vec<&str> = HOST_COMMON_FLAGS.to_vec();
+    let sbf_engine_opt = if is_sbf {
+        env::var("DOOM_SBF_ENGINE_OPT").unwrap_or_else(|_| SBF_ENGINE_OPT_DEFAULT.to_owned())
+    } else {
+        SBF_ENGINE_OPT_DEFAULT.to_owned()
+    };
+    if is_sbf {
+        let expanded: Vec<&str> = sbf_engine_opt.split_whitespace().collect();
+        assert!(
+            !expanded.is_empty(),
+            "DOOM_SBF_ENGINE_OPT must name at least one flag"
+        );
+        let mut slot = 0;
+        while slot < common_flags.len() {
+            if common_flags[slot] == "-O2" {
+                // Splice rather than replace, so the shared flags after the
+                // level survive and only `-O2` gives way to the list.
+                common_flags.splice(slot..slot + 1, expanded.iter().copied());
+                slot += expanded.len();
+            } else {
+                slot += 1;
+            }
+        }
+    }
+    let common: &[&str] = &common_flags;
     let diagnostic_profile = is_sbf && env::var("CARGO_FEATURE_DIAGNOSTIC_PROFILE").is_ok();
     // Diagnostic-only drawer ablation: the same image shape as the phase
     // profile build with the framebuffer stores removed, so the CU difference
