@@ -1342,6 +1342,45 @@ test("a frame stream for a session that does not exist is refused", async () => 
 // and `--status-batch` / `--status-min-interval` / `--strip-cu-limit` were lost
 // the same way on 2026-09-26 at 05:0x. So this reads start.sh.
 
+test("the one-buffer read path reaches the pipeline, and only when asked for", () => {
+  // `start.sh`'s `READBACK=overlap` is the whole of the one-buffer change, and
+  // there are three places it can be lost: the node CLI's parser (a switch the
+  // generic branch would swallow its neighbour as a value), the node option
+  // list, and `argv()`. The failure is silent -- the session runs the old serial
+  // path at 1.8 fps and the runbook says otherwise -- so each hop is pinned.
+  const overlap = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    preReadSnapshot: true, overlapReadback: true,
+  }).argv();
+  assert.ok(overlap.includes("--pre-read-snapshot"), "--pre-read-snapshot was dropped");
+  assert.ok(overlap.includes("--overlap-readback"), "--overlap-readback was dropped");
+  // Switches, so no value follows: a value would be read as the next flag's name.
+  assert.equal(overlap[overlap.indexOf("--pre-read-snapshot") + 1], "--overlap-readback");
+  // And absent by default, so nothing changes for a runbook that says nothing.
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  for (const flag of ["--pre-read-snapshot", "--overlap-readback"]) {
+    assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
+  }
+  // `server.mjs` must read both as switches. `--pre-read-snapshot` followed by
+  // another flag is the exact input that loses the second one if the generic
+  // branch handles it, so the parser is read rather than trusted.
+  const serverSource = readFileSync(new URL("../server.mjs", import.meta.url), "utf8");
+  assert.ok(
+    serverSource.includes('const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback"])'),
+    "the two switches are not declared as switches, so the parser eats the next flag",
+  );
+  assert.ok(serverSource.includes('preReadSnapshot: args.get("pre-read-snapshot") != null'));
+  assert.ok(serverSource.includes('overlapReadback: args.get("overlap-readback") != null'));
+  // And start.sh is the thing an operator types, so its three values have to be
+  // the three flag sets above.
+  const start = readFileSync(new URL("../start.sh", import.meta.url), "utf8");
+  assert.ok(
+    start.includes("overlap) readback_flags=(--pre-read-snapshot --overlap-readback)"),
+    "start.sh's READBACK=overlap does not ask for both flags",
+  );
+  assert.ok(start.includes("serial) readback_flags=()"), "start.sh's default is not the old serial path");
+});
+
 test("every flag start.sh passes is built in argv()", () => {
   // The failure is a flag that exists in start.sh, in the python parser and in
   // the node option list, and is never *built* into the child's argv -- so it
