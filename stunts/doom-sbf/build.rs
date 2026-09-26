@@ -1445,14 +1445,32 @@ fn compile_ctx_engine(target: &str) {
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
     // The one flag the two targets do not share: `-O2` is the host's level and
-    // the SBF engine gets its own.  See SBF_ENGINE_OPT_DEFAULT.
+    // the SBF engine gets its own.  See SBF_ENGINE_OPT_DEFAULT.  The value is a
+    // whitespace-separated flag *list*, not a single flag, so that an A/B of an
+    // inlining or codegen parameter is a rebuild of the engine archives and not
+    // a rebuild of `build.rs`.  Whatever it says is what the identity manifest
+    // records.
     let mut common_flags: Vec<&str> = HOST_COMMON_FLAGS.to_vec();
-    let sbf_engine_opt =
-        env::var("DOOM_SBF_ENGINE_OPT").unwrap_or_else(|_| SBF_ENGINE_OPT_DEFAULT.to_owned());
+    let sbf_engine_opt = if is_sbf {
+        env::var("DOOM_SBF_ENGINE_OPT").unwrap_or_else(|_| SBF_ENGINE_OPT_DEFAULT.to_owned())
+    } else {
+        SBF_ENGINE_OPT_DEFAULT.to_owned()
+    };
     if is_sbf {
-        for slot in common_flags.iter_mut() {
-            if *slot == "-O2" {
-                *slot = sbf_engine_opt.as_str();
+        let expanded: Vec<&str> = sbf_engine_opt.split_whitespace().collect();
+        assert!(
+            !expanded.is_empty(),
+            "DOOM_SBF_ENGINE_OPT must name at least one flag"
+        );
+        let mut slot = 0;
+        while slot < common_flags.len() {
+            if common_flags[slot] == "-O2" {
+                // Splice rather than replace, so the shared flags after the
+                // level survive and only `-O2` gives way to the list.
+                common_flags.splice(slot..slot + 1, expanded.iter().copied());
+                slot += expanded.len();
+            } else {
+                slot += 1;
             }
         }
     }
