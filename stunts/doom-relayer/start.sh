@@ -76,6 +76,19 @@
 #    receipt's `errors` and `config.send_pacer_rate_per_endpoint`, not the rate
 #    itself, are what say whether a rate was sustainable.
 #
+#  * MIN_CURSOR_STEP, the smallest cursor step between two rendered frames, in
+#    tics, default 1. A frame is only worth block space if it is a game state
+#    nobody has rendered, and the renderer now gates on the highest cursor it has
+#    already handed to a submission or got back from one -- not, as before, on the
+#    last frame that *finished*, which let all four buffers take the same cursor
+#    before any of them came back. Measured 2026-09-26 on R15 at four buffers,
+#    60 s: 204 frames of 85 distinct cursors, so 3.37 fps was 1.4 new pictures/s
+#    and about 58% of the render compute was spent re-rendering states the chain
+#    had already published. 1 renders every new cursor, which against
+#    ADV_TICS=4 sweeps is every sweep; 8 renders every other sweep and buys the
+#    engine's advances the block space, at the cost of pictures. Leave it at 1
+#    unless a session is chasing engine tics/s rather than pictures.
+#
 #  * the one-buffer read path. At BUFFERS=1 the buffer is held from the moment a
 #    submission starts until the readback has copied 1,113,792 bytes out of it,
 #    and that is the whole reason one buffer rendered at 1.8 fps while four did
@@ -141,6 +154,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
+  --min-cursor-step-tics ${MIN_CURSOR_STEP:-1} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \

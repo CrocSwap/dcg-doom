@@ -428,6 +428,13 @@ export class PipelineSender {
     if (options.frameDeadlineSeconds !== undefined && options.frameDeadlineSeconds !== null) {
       argv.push("--frame-deadline-seconds", String(options.frameDeadlineSeconds));
     }
+    // The renderer's minimum cursor step. Same trap as the flags above: a flag
+    // that is not built into `argv()` is a flag the pipeline has never seen, and
+    // this one decides whether the session spends its block compute on pictures
+    // of states the chain has already published.
+    if (options.minCursorStepTics !== undefined && options.minCursorStepTics !== null) {
+      argv.push("--min-cursor-step-tics", String(options.minCursorStepTics));
+    }
     if (options.rpcLagDropSlots !== undefined && options.rpcLagDropSlots !== null) {
       argv.push("--rpc-lag-drop-slots", String(options.rpcLagDropSlots));
     }
