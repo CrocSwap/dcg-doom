@@ -145,4 +145,5 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   ${readback_flags[@]+"${readback_flags[@]}"} \
+  ${STRIPS_BEHIND_SNAPSHOT:+--strips-behind-snapshot} \
   ${RESET_START_ACCOUNT:+--reset-start-account "$RESET_START_ACCOUNT"}
