@@ -20,6 +20,14 @@ const CHROME = process.env.PROOF_CHROME ?? "/Applications/Google Chrome.app/Cont
 const PORT = Number(process.env.PROOF_CDP_PORT ?? 9333);
 const HOLD_MS = Number(process.env.PROOF_HOLD_MS ?? 1400);
 const SETTLE_MS = Number(process.env.PROOF_SETTLE_MS ?? 2600);
+// A window with no keys pressed and no screenshot taken, for the one question the
+// rest of this run cannot answer: how many of the frames the chain completed
+// does the page paint. The 2026-09-26 run reported 0.98 painted against 1.83
+// chain fps with nothing torn and nothing refused, and no counter on either
+// side said where the rest went -- so this samples the page and the relayer
+// together, once a second, where they can be compared.
+const CLEAN_SECONDS = Number(process.env.PROOF_CLEAN_SECONDS ?? 20);
+const RELAYER_BASE = new URL(PAGE).searchParams.get("relayer") ?? "http://127.0.0.1:8787";
 
 mkdirSync(OUT, {recursive: true});
 
@@ -188,6 +196,63 @@ const before = await evaluate(`(async () => {
 })()`);
 console.log("first frame:", before);
 
+// One sample of the page and the relayer at the same instant. The four numbers
+// that have to agree for a frame to reach a canvas: the frames the chain
+// completed, the frames the relayer was told about (`frames_seen`), the frames
+// it pushed to a page (`frames_pushed`), the frames the page's stream handled,
+// and the frames the page painted.
+async function sample(label) {
+  const page = await evaluate(`(() => {
+    const s = window.doomPlay?.state;
+    return {
+      painted: s?.paintedFrames ?? 0,
+      stream: s?.stream ? s.stream.summary() : null,
+      error: document.getElementById("error")?.hidden ? null : document.getElementById("error")?.textContent ?? null,
+    };
+  })()`);
+  let healthz = null;
+  try {
+    healthz = await (await fetch(`${RELAYER_BASE}/healthz`)).json();
+  } catch (error) {
+    healthz = {error: String(error)};
+  }
+  return {
+    label,
+    at: Date.now(),
+    painted: page.painted,
+    stream: page.stream,
+    frames_seen: healthz?.frame_push?.frames_seen ?? null,
+    frames_pushed: healthz?.frame_push?.frames_pushed ?? null,
+    frames_without_bytes: healthz?.frame_push?.frames_without_bytes ?? null,
+    subscribers: healthz?.frame_push?.subscribers ?? null,
+    error: page.error,
+  };
+}
+
+function rate(rows, key) {
+  const first = rows[0]?.[key];
+  const last = rows[rows.length - 1]?.[key];
+  const seconds = (rows[rows.length - 1]?.at - rows[0]?.at) / 1000;
+  if (first === null || first === undefined || last === null || last === undefined || seconds <= 0) return null;
+  return {count: last - first, seconds, per_second: (last - first) / seconds};
+}
+
+await shot("proof-join");
+
+// The clean window, before any key is pressed and with no screenshot inside it.
+const clean = [];
+for (let i = 0; i < CLEAN_SECONDS; i += 1) {
+  clean.push(await sample("clean"));
+  await sleep(1000);
+}
+const last = clean[clean.length - 1] ?? {};
+console.log(
+  `clean window ${clean.length}s: painted ${JSON.stringify(rate(clean, "painted"))} · ` +
+    `frames_seen ${JSON.stringify(rate(clean, "frames_seen"))} · frames_pushed ${JSON.stringify(rate(clean, "frames_pushed"))} · ` +
+    `stream handled ${last.stream?.pushed} (torn ${last.stream?.torn}, skipped ${last.stream?.skipped}, ` +
+    `without_bytes ${last.stream?.without_bytes}, reconnects ${last.stream?.reconnects}, errors ${last.stream?.errors})`,
+);
+
 // `key` is what a player presses; `action` is the id the page files it under.
 // They differ for fire: the page's KEY_MAP calls Space and F `attack` (the
 // engine's button name) and labels the row FIRE, so asking the panel for a
@@ -204,7 +269,9 @@ const KEYS = [
 ];
 
 const rows = [];
+const during = [];
 for (const spec of KEYS) {
+  during.push(await sample(`before-${spec.key}`));
   const pictureBefore = await evaluate(`window.doomPlay.state.lastFrame?.digest ?? null`);
   await key("keyDown", spec.code, spec.keyName, spec.vk);
   await sleep(HOLD_MS);
@@ -287,7 +354,26 @@ const after = await evaluate(`({
   },
 })`);
 await shot("proof-final");
-writeFileSync(`${OUT}/proof.json`, JSON.stringify({page: PAGE, joined, before, rows, after}, null, 2));
+during.push(await sample("after"));
+const painted = rate(during, "painted");
+const seen = rate(during, "frames_seen");
+const pushedToPages = rate(during, "frames_pushed");
+const stream = during[during.length - 1]?.stream ?? null;
+console.log(
+  `presses: painted ${JSON.stringify(painted)} · frames_seen ${JSON.stringify(seen)} · frames_pushed ${JSON.stringify(pushedToPages)} · ` +
+    `stream handled ${stream?.pushed} (torn ${stream?.torn}, skipped ${stream?.skipped}, without_bytes ${stream?.without_bytes}, ` +
+    `reconnects ${stream?.reconnects}, errors ${stream?.errors})`,
+);
+writeFileSync(`${OUT}/proof.json`, JSON.stringify({
+  page: PAGE,
+  relayer: RELAYER_BASE,
+  joined,
+  before,
+  clean_window: {seconds: CLEAN_SECONDS, samples: clean, painted: rate(clean, "painted"), frames_seen: rate(clean, "frames_seen"), frames_pushed: rate(clean, "frames_pushed")},
+  rows,
+  press_window: {samples: during, painted, frames_seen: seen, frames_pushed: pushedToPages, stream},
+  after,
+}, null, 2));
 console.log("summary:", JSON.stringify(after.summary));
 console.log("status:", JSON.stringify(after.status));
 console.log("banner:", after.banner);

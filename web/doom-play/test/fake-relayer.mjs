@@ -166,6 +166,14 @@ const MIME = {".html": "text/html", ".js": "text/javascript", ".mjs": "text/java
 // header is a fixed 12 bytes in front of the 32 raw public key bytes.
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
+// `MEASURED_INPUT_ROUND_TRIP_SECONDS` in scripts/doom_r7_render_loop.py: how
+// long a staged tic takes to reach the chain. This fake resolves its lead the
+// same way the producer does -- twice the round trip at the configured rate --
+// so the page is offered a lead with the producer's arithmetic behind it rather
+// than a number typed in.
+const MEASURED_INPUT_ROUND_TRIP_SECONDS = 0.86;
+const INPUT_ROUND_TRIP_SAFETY_FACTOR = 2;
+
 function verifyEd25519(publicKeyHex, message, signature) {
   if (typeof publicKeyHex !== "string" || !/^[0-9a-f]{64}$/i.test(publicKeyHex)) return false;
   const bytes = (value) => value instanceof Uint8Array ? Buffer.from(value.buffer, value.byteOffset, value.byteLength) : null;
@@ -188,22 +196,52 @@ export class FakeRelayer {
     ringLimit = 4,
     ticsPerSecond = 35,
     startCursor = 6016,
-    leadTics = 61,
+    leadTics = null,
     chainLagFrames = 1,
     verifySignatures = true,
+    publishLead = true,
+    streamRetryMs = 1000,
     frames = null,
   } = {}) {
     const fixture = fixtureStrips();
     this.meta = fixture.meta;
     this.startCursor = startCursor;
     this.ticsPerSecond = ticsPerSecond;
-    this.leadTics = leadTics;
+    // The producer's resolved lead, the way it resolves one: twice the measured
+    // round trip at the configured rate, never below twelve. 61 at 35 tic/s,
+    // which is what R15's producer published. A test can pass its own.
+    this.leadTics = leadTics ?? Math.max(12, Math.ceil(INPUT_ROUND_TRIP_SAFETY_FACTOR * MEASURED_INPUT_ROUND_TRIP_SECONDS * ticsPerSecond));
     this.ringLimit = ringLimit;
     this.frameIntervalMs = frameIntervalMs;
     this.chainLagFrames = chainLagFrames;
     this.verifySignatures = verifySignatures;
+    // Whether to publish the producer's lead on the status at all. Off models a
+    // relayer that has not resolved one -- every mock relayer, and a session
+    // whose producer has not published one yet -- so a page that can only aim
+    // with a published lead is caught rather than admired.
+    this.publishLead = publishLead;
+    // The SSE `retry:` line, which is the browser's own reconnect delay. A
+    // dropped stream costs the page every frame completed while it is away, so
+    // this is a dial and not a constant: a local socket comes back in a second
+    // and a tunnel comes back when it comes back.
+    this.streamRetryMs = streamRetryMs;
     this.sessions = new Map();
     this.subscriptions = new Set();
+    // The open `/frames` responses, so a test can cut the stream the way a
+    // tunnel hiccup does. Measured on R15 2026-09-26: the page painted 68 of the
+    // ~86 frames the chain completed in the same 47 s, with nothing torn and
+    // nothing refused, and a stream that drops is the one shape of loss the
+    // push path has no counter for.
+    this.streams = new Set();
+    this.streamsDropped = 0;
+    // Every subscribe, with what it asked for and what it was handed, so a test
+    // can say how long a page was away and what it got back rather than inferring
+    // it from a rate.
+    this.subscribes = [];
+    // Frames handed over on subscribe rather than pushed to a live stream: how
+    // many of them arrived because a page came back and asked for what it
+    // missed.
+    this.replays = 0;
     this.ring = new Map();
     this.frameIndex = 0;
     this.cursor = startCursor;
@@ -328,13 +366,25 @@ export class FakeRelayer {
     return record;
   }
 
-  // The same four-frame ring and the same `since` rule as the real relayer:
-  // the newest frame is handed over on subscribe, and a subscriber that says
-  // which frame it last painted is not sent one it already has.
+  // The same four-frame ring and the same `since` rule as the real relayer: a
+  // fresh subscriber is handed the newest frame, and a subscriber that says
+  // which frame it last painted is handed every frame the ring still holds that
+  // is newer than that, oldest first. Answering with the newest alone is a page
+  // that loses every frame completed while its stream was down.
   subscribeFrames({since = null} = {}) {
-    const newest = [...this.ring.values()].pop() ?? null;
-    const pending = newest !== null && (since === null || newest.frame_index > since) ? [newest] : [];
+    const held = [...this.ring.values()];
+    const newest = held.pop() ?? null;
+    const pending = since === null
+      ? (newest === null ? [] : [newest])
+      : held.concat(newest === null ? [] : [newest]).filter((record) => record.frame_index > since);
     const subscription = {listeners: new Set(), pending, closed: false};
+    this.subscribes.push({
+      at: Date.now(),
+      since,
+      frames: pending.map((record) => record.frame_index),
+      newest: newest === null ? null : newest.frame_index,
+      oldest_held: held.length > 0 ? held[0].frame_index : null,
+    });
     subscription.add = (listener) => {
       subscription.listeners.add(listener);
       return () => subscription.listeners.delete(listener);
@@ -345,6 +395,19 @@ export class FakeRelayer {
     };
     this.subscriptions.add(subscription);
     return subscription;
+  }
+
+  // Cut every open stream, the way a closed tunnel does. A page reconnects by
+  // itself and says which frame it last painted, so what it gets back is
+  // whatever the relayer's `since` rule hands over.
+  dropStreams() {
+    const count = this.streams.size;
+    for (const response of [...this.streams]) {
+      this.streamsDropped += 1;
+      response.destroy();
+    }
+    this.streams.clear();
+    return count;
   }
 
   status(session) {
@@ -366,8 +429,17 @@ export class FakeRelayer {
       writable_floor: this.cursor,
       input_fate: {deposited: this.stagedTics, landed: this.landedTics},
       pipeline: {state: "running", cursor_stalled_seconds: 0},
+      // The producer's own lead, under the names the real relayer publishes it
+      // under (`server.mjs` `status()`, from the child's `input_stage_lead_tics`).
+      // This fake also answers `lead_tics`, which the real relayer's healthz uses
+      // and whose status does not, so a page reading the status has to read the
+      // name the real relayer uses -- which it did not, and nothing offline could
+      // have said so. `publishLead: false` models a relayer that has resolved no
+      // lead at all, which is every mock relayer.
+      input_stage_lead_tics: this.publishLead ? this.leadTics : null,
+      input_round_trip_seconds: this.publishLead ? MEASURED_INPUT_ROUND_TRIP_SECONDS : null,
       lead_tics: this.leadTics,
-      measured_round_trip_seconds: 0.86,
+      measured_round_trip_seconds: MEASURED_INPUT_ROUND_TRIP_SECONDS,
       frame_counters: {frames_submitted: this.pushed, frame_stalls: 0, frame_skips: 0, frame_retries: 0, frame_deadline_seconds: 1},
       latest_frame: {buffer: 0, snapshot_account: ADDRESSES.snapshot, strip_accounts: ADDRESSES.strips, cursor: this.cursor, gametic: this.cursor},
       context: ADDRESSES.context,
@@ -381,7 +453,6 @@ export class FakeRelayer {
       state: session?.state ?? "playing",
     };
   }
-
   createSession(publicKey) {
     const id = `s-${Math.random().toString(16).slice(2, 10)}`;
     const session = {id, publicKey, state: "playing", createdAt: Date.now(), lastSeenAt: Date.now(), clientSeq: 0};
@@ -599,8 +670,10 @@ export class FakeRelayer {
           "x-accel-buffering": "no",
           ...cors,
         });
-        response.write("retry: 1000\n\n");
+        response.write(`retry: ${this.streamRetryMs}\n\n`);
+        this.streams.add(response);
         const subscription = this.subscribeFrames({since: since === null ? null : Number(since)});
+        this.replays += subscription.pending.length;
         for (const record of subscription.pending) {
           response.write(`event: frame\nid: ${record.frame_index}\ndata: ${JSON.stringify(record)}\n\n`);
         }
@@ -613,6 +686,7 @@ export class FakeRelayer {
           clearInterval(keepAlive);
           stop();
           subscription.close();
+          this.streams.delete(response);
         };
         request.on("close", close);
         request.on("error", close);

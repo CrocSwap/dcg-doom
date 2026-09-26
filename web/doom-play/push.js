@@ -21,6 +21,10 @@
 import {decodeFrame, STRIP_COUNT, STRIP_HEADER_BYTES} from "./strip.js";
 
 export const DEFAULT_CROSS_CHECK_EVERY = 20;
+// How long the page waits before opening the stream again after it drops. The
+// relayer sends `retry: 1000`; this is the same number, held here because the
+// `EventSource` whose retry that is gives up its URL on every reconnect.
+export const DEFAULT_RECONNECT_DELAY_MS = 1000;
 
 function fromBase64(encoded) {
   const binary = atob(encoded);
@@ -214,7 +218,7 @@ export function compareFrames(pushed, read) {
 // if the page is too slow to keep up, the queue grows and the page says so, and
 // it is the operator who has to decide that a slow viewer wants skipping.
 export class FrameStream {
-  constructor({base, sessionId, onFrame, onCrossCheck, crossCheck, crossCheckEvery = DEFAULT_CROSS_CHECK_EVERY, EventSourceImpl = null, readChain = null, retryDelayMs = 500} = {}) {
+  constructor({base, sessionId, onFrame, onCrossCheck, crossCheck, crossCheckEvery = DEFAULT_CROSS_CHECK_EVERY, EventSourceImpl = null, readChain = null, retryDelayMs = 500, reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS} = {}) {
     this.base = base;
     this.sessionId = sessionId;
     this.onFrame = onFrame;
@@ -255,6 +259,13 @@ export class FrameStream {
     // disagreement. Long enough for a re-render to be announced, short enough
     // that a check does not hold the stream up.
     this.retryDelayMs = retryDelayMs;
+    // How long to wait before opening the stream again after it drops. The
+    // relayer's SSE `retry:` line is 1,000 ms and this is the same number: an
+    // `EventSource` that reconnects on its own is not an option here, because it
+    // reconnects to the URL it was built with (see `#open`).
+    this.reconnectDelayMs = reconnectDelayMs;
+    this.reconnects = 0;
+    this.reconnectTimer = null;
     this.stopped = false;
     this.queue = [];
     this.draining = false;
@@ -268,16 +279,43 @@ export class FrameStream {
   start() {
     if (this.stopped) return this;
     if (!this.EventSourceImpl) throw new Error("this browser has no EventSource");
-    this.source = new this.EventSourceImpl(this.url);
-    this.source.addEventListener("frame", (event) => this.#receive(event));
-    this.source.addEventListener("error", () => {
-      // EventSource reconnects by itself; the `retry:` line sets the delay. All
-      // this records is that the stream was not healthy, because a page that
-      // looks alive while its stream is down is the failure this whole change
-      // exists to remove.
-      this.errors = (this.errors ?? 0) + 1;
-    });
+    this.#open();
     return this;
+  }
+
+  // Open the stream, naming the frame this page last painted.
+  //
+  // An `EventSource` reconnects by itself, and it reconnects to *the URL it was
+  // constructed with*: the `since` this page computed when it started is the
+  // `since` every later reconnect carries, so a page that has been painting for
+  // a minute comes back from a dropped stream asking for the whole stream again
+  // and is handed the newest frame. Every frame completed while it was away is
+  // then gone, with nothing torn, nothing refused, and no counter anywhere --
+  // measured on R15, 2026-09-26, at three frames in thirty-two.
+  //
+  // So the error is handled here and the stream is opened again with the
+  // current answer, after a delay rather than immediately: a relayer that is
+  // down must not be asked for a connection per event loop turn, and the
+  // `EventSource` retry the page gave up was bounded on purpose.
+  #open() {
+    const source = new this.EventSourceImpl(this.url);
+    source.addEventListener("frame", (event) => this.#receive(event));
+    source.addEventListener("error", () => {
+      if (this.source !== source) return; // an error from a stream already replaced
+      this.errors = (this.errors ?? 0) + 1;
+      this.reconnects += 1;
+      this.source = null;
+      source.close();
+      if (this.stopped) return;
+      if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        if (!this.stopped) this.#open();
+      }, this.reconnectDelayMs);
+      this.reconnectTimer?.unref?.();
+    });
+    this.source = source;
+    return source;
   }
 
   // Frames are handled in arrival order, one at a time, and a frame whose
@@ -552,6 +590,11 @@ export class FrameStream {
       without_bytes: this.withoutBytes ?? 0,
       skipped: this.skipped,
       errors: this.errors ?? 0,
+      // Streams opened again after one dropped. Non-zero with a painted rate
+      // below the relayer's is the shape of a page that lost frames in transit
+      // and could not see it happen, which is the question "why is the painted
+      // rate below the chain's" has to be answerable from a receipt.
+      reconnects: this.reconnects,
       last_frame_index: this.lastFrameIndex,
       cross_checks: this.crossChecks,
       cross_check_matches: this.crossCheckMatches ?? 0,
@@ -574,6 +617,10 @@ export class FrameStream {
 
   stop() {
     this.stopped = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.queue = [];
     this.source?.close();
     this.source = null;

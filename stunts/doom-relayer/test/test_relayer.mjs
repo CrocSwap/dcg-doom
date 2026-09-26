@@ -389,11 +389,36 @@ function backgroundSender({frontier, cursor = 0}) {
       return {cursor, gametic: cursor, signature: "chain-frame-1", strips: null};
     },
     async readProgress() {
-      return {cursor, gametic: cursor, capacity: 6016, halted: false};
+      return {
+        cursor,
+        gametic: cursor,
+        capacity: 6016,
+        halted: false,
+        // The child publishes both of these in every status; see `refreshSlot`.
+        inputStageLeadTics: 61,
+        inputRoundTripSeconds: 1.89,
+      };
     },
     async close() {},
   };
 }
+
+test("the status a page reads carries the lead the child published", async () => {
+  // `readProgress` has asked the child for the producer's lead since
+  // 2026-09-26. `refreshSlot` copied fourteen fields onto the slot and left
+  // these two off, so every `status` a page read published `null` for the lead
+  // and the page aimed its own 17 tics while the child was publishing 61 in the
+  // same answer, one field down. Measured live on R15, 2026-09-26.
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  await relayer.init();
+  const slot = relayer.pool.slots[0];
+  await relayer.refreshSlot(slot);
+  assert.equal(slot.inputStageLeadTics, 61);
+  assert.equal(slot.inputRoundTripSeconds, 1.89);
+  const answer = relayer.status(slot);
+  assert.equal(answer.input_stage_lead_tics, 61, JSON.stringify(answer).slice(0, 200));
+  assert.equal(answer.input_round_trip_seconds, 1.89);
+});
 
 test("chain mode stages a signed batch, and refuses input past the staging frontier", async () => {
   const sender = backgroundSender({frontier: 20});
@@ -1193,7 +1218,7 @@ test("a frame with no bytes is counted, not pushed", () => {
   assert.equal(relayer.frameStreamSeen, 2);
 });
 
-test("a late subscriber is handed the newest frame, and `since` skips it", () => {
+test("a late subscriber is handed the newest frame, and `since` sends it what it missed", () => {
   const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
   for (let index = 1; index <= 7; index += 1) relayer.onFrame(frameEvent(index));
   const late = relayer.subscribeFrames();
@@ -1201,8 +1226,21 @@ test("a late subscriber is handed the newest frame, and `since` skips it", () =>
   // A page that has painted 7 and reconnects must not be sent 7 again.
   const resumed = relayer.subscribeFrames({since: 7});
   assert.deepEqual(resumed.pending, [], "`since` is the frame the page already has");
+  // A page that has painted 3 and reconnects is sent every frame this relayer
+  // still holds after 3, oldest first -- which is what a dropped stream costs.
+  // Answering with the newest alone loses 4, 5 and 6 with nothing torn, nothing
+  // refused and no counter anywhere: measured on R15, 2026-09-26, at three
+  // frames in thirty-two.
   const behind = relayer.subscribeFrames({since: 3});
-  assert.deepEqual(behind.pending.map((record) => record.frame_index), [7]);
+  assert.deepEqual(behind.pending.map((record) => record.frame_index), [4, 5, 6, 7]);
+  // And a `since` the ring no longer reaches is the ring, because a frame this
+  // relayer has forgotten is one no answer can bring back.
+  for (let index = 8; index <= 11; index += 1) relayer.onFrame(frameEvent(index));
+  const farBehind = relayer.subscribeFrames({since: 3});
+  assert.deepEqual(farBehind.pending.map((record) => record.frame_index), [8, 9, 10, 11]);
+  // A `since` that is not a number is no `since` at all rather than everything.
+  const junk = relayer.subscribeFrames({since: Number("not a frame")});
+  assert.deepEqual(junk.pending, [], `a junk since was answered with ${JSON.stringify(junk.pending.map((r) => r.frame_index))}`);
 });
 
 test("the stream holds four frames and forgets the rest", () => {
