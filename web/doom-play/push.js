@@ -108,15 +108,6 @@ export async function readChainDigest(reader, record) {
   return {slot, strips};
 }
 
-// Two pushed records for one cursor are the same frame when their digests are,
-// so a re-render that produced identical pixels does not grow the list.
-function sameFrame(a, b) {
-  if (a.stripHashes.length !== b.stripHashes.length) return false;
-  return a.stripHashes.every((digest, index) => digest === b.stripHashes[index])
-    && a.snapshotHash === b.snapshotHash
-    && a.stateRoot === b.stateRoot;
-}
-
 function u32le(bytes, offset) {
   return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
 }
@@ -296,23 +287,13 @@ export class FrameStream {
     this.pushed += 1;
     if (record.frame_index != null) this.lastFrameIndex = record.frame_index;
     if (frame.cursor !== null && frame.cursor !== undefined) {
-      // A *list* per cursor, not one record. Measured on R13 at 1.84 fps,
-      // 2026-09-26: a cursor the chain is holding was re-rendered, the map
-      // kept the later frame's digests, and three of five cross-checks reported
-      // a strip digest mismatch against a frame the page had genuinely been
-      // sent. A re-render of the same cursor is a real thing the loop does, and
-      // "cursor -> digests" is not a key; "cursor -> the digests of every frame
-      // pushed for it" is.
-      const entry = {
+      this.digestsByCursor.set(frame.cursor, {
         frameIndex: record.frame_index ?? null,
         stripHashes: frame.stripHashes,
         snapshotHash: frame.snapshotHash,
         stateRoot: frame.stateRoot,
         pushedAt: Date.now(),
-      };
-      const existing = this.digestsByCursor.get(frame.cursor) ?? [];
-      if (!existing.some((candidate) => sameFrame(candidate, entry))) existing.push(entry);
-      this.digestsByCursor.set(frame.cursor, existing);
+      });
       while (this.digestsByCursor.size > this.digestsLimit) {
         this.digestsByCursor.delete(this.digestsByCursor.keys().next().value);
       }
@@ -341,38 +322,22 @@ export class FrameStream {
       // and the answer is exact. When the chain holds the pushed frame, that
       // record is the frame itself.
       const cursor = chain?.strips?.[0]?.cursor ?? null;
-      const candidates = cursor === null ? [] : this.digestsByCursor.get(cursor) ?? [];
-      if (candidates.length > 0) {
-        // The chain holds one of the frames that were pushed for this cursor. A
-        // cursor can have more than one, so every candidate is tried and the
-        // first match is the answer; a mismatch is only reported when none of
-        // them match.
-        const attempts = candidates.map((known) => ({
-          known,
-          result: compareDigests(
-            {
-              cursor,
-              gametic: chain.strips[0].gametic,
-              stripHashes: known.stripHashes,
-              snapshotHash: known.snapshotHash,
-              stateRoot: known.stateRoot,
-            },
-            chain,
-          ),
-        }));
-        const hit = attempts.find((attempt) => attempt.result.match) ?? attempts[0];
-        comparison = hit.result;
-        comparison.checked_frame_index = hit.known.frameIndex;
+      const known = cursor === null ? null : this.digestsByCursor.get(cursor) ?? null;
+      if (known) {
+        comparison = compareDigests(
+          {
+            cursor,
+            gametic: chain.strips[0].gametic,
+            stripHashes: known.stripHashes,
+            snapshotHash: known.snapshotHash,
+            stateRoot: known.stateRoot,
+          },
+          chain,
+        );
+        comparison.checked_frame_index = known.frameIndex;
         comparison.chain_cursor = cursor;
         comparison.pushed_cursor = frame.cursor;
         comparison.behind_by_tics = frame.cursor - cursor;
-        comparison.candidates = candidates.length;
-        if (candidates.length > 1) {
-          comparison.rerendered = true;
-          if (comparison.match) {
-            comparison.reason = `${comparison.reason} (frame ${hit.known.frameIndex} of ${candidates.length} pushed for this cursor)`;
-          }
-        }
       } else {
         comparison = {
           comparable: false,
