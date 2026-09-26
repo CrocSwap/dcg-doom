@@ -33,10 +33,24 @@
 #    raises it; the chain's own per-transaction ceiling is the only upper bound
 #    this side knows about.
 #
+#  * the image. 2026-09-26 06:2x UTC the program was upgraded to the four-buffer
+#    image (out/runs/doom-4-buffers-20260926/, sha 4bb632e2..., 916,496 B) and
+#    the relayer followed it. That image made the snapshot name in
+#    RENDER-BUFFERED mandatory: a zero name is refused as malformed, so a
+#    relayer whose `buffered_render_request` does not carry the account's own
+#    hash spends nine transactions a frame to be told 301. The hash below is the
+#    one the live program was verified to carry, and `preflight` re-reads it from
+#    the chain, so a host running an older relayer against the newer program
+#    refuses to start rather than burning transactions.
+#
+#  * the render buffer count. BUFFERS is 1..4, the program's own `BUFFER_COUNT`.
+#    Buffers 0 and 1 are the accounts a two-buffer session already used, so
+#    raising the count is a widening and not a move.
+#
 # Usage: start.sh [name] [seconds] [strip-rate]
 set -eu
 RD=${RELAYER_DIR:-/home/ec2-user/doom-relayer-20260925}
-NAME=${1:-play-r13}
+NAME=${1:-play-r14}
 SECONDS_LIMIT=${2:-300}
 STRIP_RATE=${3:-32}
 REPO=${RELAYER_REPO:-$RD}
@@ -45,8 +59,8 @@ PY=${PY:-/home/ec2-user/basanos-main/.venv/bin/python}
 mkdir -p "$RD/out/$NAME"
 
 # Every on-chain step in this repository goes through stage_cap.sh at 90 s
-# (docs/project-rules.md rule 3). The deploy check is a filesystem read, so it
-# is not an on-chain step and is not capped; it is also the gate, and a gate that
+# (docs/project-rules.md rule 3). The deploy check is a filesystem read, so it is
+# not an on-chain step and is not capped; it is also the gate, and a gate that
 # can be killed at 90 s is not a gate.
 "$PY" "$REPO/scripts/doom_relayer_deploy_check.py" --host-dir "$RD" --pin "$PIN" \
   --json "$RD/out/$NAME/deploy-check.json"
@@ -55,14 +69,14 @@ export PYTHONPATH=/home/ec2-user/basanos-main/src
 cd "$RD"
 exec node "$RD/stunts/doom-relayer/server.mjs" \
   --mode chain --port 8787 --host 127.0.0.1 \
-  --keys-dir ${KEYS_DIR:-/home/ec2-user/doom-keys/r12-page} \
+  --keys-dir ${KEYS_DIR:-/home/ec2-user/doom-keys/r14-page} \
   --payer-key /home/ec2-user/doom-keys/tokyo-testnet-payer.json \
   --python "$PY" \
   --script "$RD/scripts/doom_relayer_server.py" \
   --run-dir "$RD/out/$NAME" \
   --rpc-a http://64.130.44.173:8899 --rpc-b https://testnet.fogo.io \
-  --image-sha256 0d84966dbfb5f6faeaf338c3e2ebc16eb6703294dead4bd1f7dc1ba7abcefe54 \
-  --image-bytes 916080 \
+  --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
+  --image-bytes 916496 \
   --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-2} \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
@@ -70,4 +84,4 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-0} \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
-  --reset-start-account ${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}
+  ${RESET_START_ACCOUNT:+--reset-start-account "$RESET_START_ACCOUNT"}
