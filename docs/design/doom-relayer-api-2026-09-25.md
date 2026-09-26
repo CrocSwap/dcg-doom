@@ -81,9 +81,19 @@ that is a real constraint and not an oversight.
   "ok": true, "accepted": 8, "first_seq": 0, "next_seq": 8,
   "cursor": 8, "gametic": 8, "tics": 8,
   "deposit_signature": "...", "advance_signature": "...",
+  "latest_frame": {"buffer": 1, "cursor": 6016, "gametic": 6016,
+                   "snapshot_account": "...", "strip_accounts": ["... eight ..."]},
   "frame": {"cursor": 8, "gametic": 8, "signature": "...", "explorer": "..."}
 }
 ```
+
+`latest_frame` names the render buffer holding the newest **complete** frame
+and carries that buffer's accounts. It rides on this answer as well as on
+`GET /v1/sessions/{id}` because a held key is when a viewer most wants to be
+reading the buffer that is not being written. The child reads a frame back
+before it counts it, so it is the only side that knows; a frame is nine
+transactions, a snapshot and then eight strips, and a viewer that reads the
+buffer being written sees strips from two frames.
 
 The checks, in order, and what each one costs an attacker:
 
@@ -98,6 +108,8 @@ The checks, in order, and what each one costs an attacker:
 | `binding` matches the session | 409 `batch_refused` | cross-slot replay |
 | `issued_at` within skew | 409 `batch_refused` | a batch cannot be held and fired much later |
 | `first_seq` at or just ahead of `next_seq` | 409 `batch_refused` | a gap in the staged slots would stall the sweep |
+| `first_seq` no further than `staging_frontier + --input-lead-tics` | 409 `input_window_full` | backpressure: this is the bound that stops a client queueing input the chain will not run for seconds |
+| the producer has not generated past `first_seq - 1` | 409 `input_stale` | those tics are on chain and cannot be rewritten; the detail carries the resume point, and a batch that straddles it is trimmed rather than refused |
 | no command sets `BT_SPECIAL` (0x80) | 409 `batch_refused` | the program refuses it anyway; refusing here saves a transaction |
 | message length | 400 `message_too_long` | one deposit carries at most 64 commands |
 
@@ -115,10 +127,27 @@ Slot, current tic, next expected sequence, and the strip account addresses:
 {
   "slot": 0, "next_seq": 128, "cursor": 128, "gametic": 128,
   "context": "...", "snapshot_account": "...", "strip_accounts": ["... eight ..."],
+  "latest_frame": {"buffer": 1, "cursor": 6016, "gametic": 6016,
+                   "snapshot_account": "...", "strip_accounts": ["... eight ..."]},
   "frame": {"cursor": 128, "gametic": 128, "signature": "...", "explorer": "..."},
   "tics_landed": 128, "frames_landed": 8
 }
 ```
+
+`latest_frame` may name a different buffer than `snapshot_account` and
+`strip_accounts`, which stay the context's buffer 0: they are what the
+session was created against, and a viewer that adopts the pointer reads the
+whole frame -- the snapshot and all eight strips -- in one
+`getMultipleAccounts`.
+
+A batch aimed above the producer's staging limit is **queued, not refused**.
+The producer reads the command stream by absolute sequence and its sweeper
+raises the limit as the packets it waits on land, so a tic above the limit is
+read when the chain reaches it. A client that aims ahead -- which it has to,
+because the round trip to the producer is wider than the window it is aiming
+at -- is refused for being early otherwise. `--input-lead-tics` (default 96)
+and the child's `--input-stage-ceiling-tics` (default 96) are the bounds that
+keep "one round trip ahead" from being a backlog.
 
 ### `DELETE /v1/sessions/{id}`
 
