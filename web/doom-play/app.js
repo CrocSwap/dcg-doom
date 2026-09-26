@@ -13,18 +13,8 @@ import {encodeInput, heldToCommands} from "./input.js";
 import {InputLog} from "./inputlog.js";
 import {FrameStream, decodePushedFrame, frameAccounts, readChainDigest, DEFAULT_CROSS_CHECK_EVERY} from "./push.js";
 
-// The engine rate to assume before the relayer has reported one. Measured at
-// 23.8-26.3 tics/s across two drive sessions at strip rate 64, so 25 is the
-// middle of what has actually been seen rather than a design number.
-const DEFAULT_TICS_PER_SECOND = 25;
-// The relayer's own sequence window, and how far inside it the page aims.
-const SEQ_WINDOW = 240;
-// Batches in flight at once, so the cadence is the interval and not the round
-// trip.
-const MAX_PUSH_IN_FLIGHT = 2;
 // The open keypress holds the page will carry at once. A press lives until the
-// frame carrying it is painted, which at this session's lead is seconds, so the
-// list is bounded rather than open-ended; the overflow is counted.
+// frame carrying it is painted, so the list is bounded and overflow is counted.
 const MAX_OPEN_HOLDS = 24;
 // How often the viewer reads a frame. A frame is complete only between one
 // frame's last strip landing and the next frame's first, so a torn read is the
@@ -125,7 +115,6 @@ const ui = {
   inputlogList: el("inputlog-list"),
   inputlogSummary: el("inputlog-summary"),
   inputlogBanner: el("inputlog-banner"),
-  inputlogLead: el("inputlog-lead"),
   inputlogTorn: el("inputlog-torn"),
   hintCapacity: el("hint-capacity"),
   spectatorHint: el("spectator-hint"),
@@ -159,39 +148,14 @@ const state = {
   buffer: Number(localStorage.getItem(BUFFER_KEY) ?? 0) || 0,
   session: null,
   relayerBase: null,
-  nextSeq: 0,
-  // The chain's committed cursor and the furthest sequence input may still be
-  // deposited at. Input is placed against these two, not against a count of
-  // what the page has sent: the engine consumes tics whether or not anyone
-  // writes them, so a page that does not follow the cursor writes into slots
-  // the game has already read.
+  // The chain cursor is shown beside frames; the relayer owns input assignment.
   cursor: 0,
-  stagingFrontier: null,
-  inputWindow: null,
-  // The tic producer's own two cursors, as the relayer reports them. This is
-  // the other end of the input rendezvous: `producerStageLimit` is the
-  // sequence it will deposit next and `producerGeneratedCursor` the last one it
-  // has, so a batch aimed between them is read rather than dropped.
-  producerStageLimit: null,
-  producerGeneratedCursor: null,
-  // The producer's NEXT tic to generate, which is not `producerGeneratedCursor`
-  // (the end of the batch it has already published) and is the only cursor a
-  // writer can honestly aim ahead of. See doom_relayer_server.py.
-  producerNextCursor: null,
-  // The producer's own staging lead and the round trip it was resolved from.
-  // Shown next to the page's own POST round trip, because they are different
-  // quantities and a lead built from the wrong one is a lead that loses the
-  // keypress it exists to deliver.
-  producerLeadTics: null,
-  producerRoundTripSeconds: null,
   // Whether keystrokes can still reach the engine, and the relayer's per-deposit
   // record of what happened to the ones already sent.
   pipeline: null,
   inputFate: null,
-  // When the two producer numbers above were read, and the engine rate they are
-  // read against. The page's aim is a prediction, and a prediction needs the
-  // age of its input.
-  producerReadAt: 0,
+  keyStateEvents: [],
+  keyTimingBreakdown: [],
   ticsPerSecond: null,
   // The relayer's pointer to the render buffer holding the newest COMPLETE
   // frame, and that buffer's accounts. The page reads this buffer, not the one
@@ -200,13 +164,14 @@ const state = {
   frameCounters: null,
   // A key going down, and the two things that can be measured about how long it
   // takes to show. They are different quantities, and conflating them is how a
-  // 408 ms "key to picture" was measured on a session whose lead was 2.155 s.
+  // The latency meter must wait for the picture containing the stamped tic.
   //
-  //   stampLatencies       keydown -> the first painted frame whose gametic is
-  //                        at or past the tic this press's input was stamped
-  //                        for. This is the latency a player feels, and the one
-  //                        the bar is written against.
-  //   nextPictureLatencies keydown -> the first painted frame past the gametic
+  //   stampLatencies       keydown -> the first painted frame whose cursor is
+  //                        past the tic this press's input was stamped for.
+  //                        Cursor and input stamps share a sequence even when
+  //                        RESET restores a game state with a nonzero gametic.
+  //                        This is the latency a player feels.
+  //   nextPictureLatencies keydown -> the first painted frame past the cursor
   //                        that was on screen when the key went down. "Time to
   //                        the next picture": it says the page is drivable, and
   //                        it says nothing about whether the key is in the
@@ -221,9 +186,9 @@ const state = {
   // what made the first version of this meter report zero samples on a live
   // session -- every press was closed before its frame arrived.
   //
-  // `stampSamples` is the per-press log: which key, how long, and the pair that
-  // makes the sample checkable (the tic it was stamped for and the gametic of
-  // the frame that ended the wait).
+  // `stampSamples` is the per-press log: which key, how long, and the cursor
+  // pair that makes the sample checkable (the stamped tic and the cursor of the
+  // frame that ended the wait). The frame's gametic is retained as context.
   holds: [],
   holdsStarted: 0,
   holdsUnstamped: 0,
@@ -231,27 +196,16 @@ const state = {
   stampLatencies: [],
   nextPictureLatencies: [],
   stampSamples: [],
-  // Every batch this page has in flight, as {held, firstSeq, at}. An answer
-  // carries no batch identity and the page may have MAX_PUSH_IN_FLIGHT open, so
-  // the answer is matched to the oldest still-unanswered batch that was signed
-  // with a key held. Without `held` a keyless batch's tic would be read as this
-  // keypress's stamp.
-  pendingPushes: [],
-  // (paintedAt, gametic) for recent paints, so a stamp that arrives after its
-  // frame was painted is timed against that paint rather than the answer.
+  // Recent paints by cursor, so a stamp that arrives after its frame was
+  // painted is timed against that paint rather than the answer. `at` also
+  // excludes frames painted before keydown.
   paintTics: [],
   clientSeq: 0,
   inputsSent: 0,
   batchesSigned: 0,
   refusals: 0,
-  // The measured POST round trip in ms, and the lead it implies in tics. Both
-  // are on the panel and both are in the receipt: the lead is the design's
-  // price for a window narrower than the round trip, and its size is the
-  // number that says whether the price is right.
+  // Browser-to-relayer POST round trip, measured separately from key latency.
   roundTripMs: null,
-  leadTics: null,
-  aimedAt: null,
-  seqWindow: SEQ_WINDOW,
   latencies: [],
   lastFrame: null,
   lastFrameSlot: null,
@@ -283,7 +237,7 @@ const state = {
   tornReads: 0,
 };
 
-// One row per key press, with the fate of every tic it aimed at.
+// One row per key press, with the fate of its relayer-assigned tic.
 const inputLog = new InputLog({
   link: (signature) => {
     const anchor = document.createElement("a");
@@ -296,9 +250,8 @@ const inputLog = new InputLog({
 });
 
 function renderInputLog() {
-  inputLog.setLead(state.leadTics, state.ticsPerSecond);
   inputLog.render(
-    ui.inputlogList, ui.inputlogSummary, ui.inputlogLead, ui.inputlogTorn, state.tornReads,
+    ui.inputlogList, ui.inputlogSummary, null, ui.inputlogTorn, state.tornReads,
     ui.inputlogBanner,
   );
 }
@@ -422,20 +375,22 @@ async function paintFrame(frame) {
   while (state.paintTimes.length > 2 && state.paintedAt - state.paintTimes[0] > 4000) {
     state.paintTimes.shift();
   }
-  // The (paint time, gametic) ring, so a stamp that arrives after its frame was
-  // painted can still be timed against the paint rather than against the answer.
-  state.paintTics.push({at: state.paintedAt, gametic: frame.gametic});
-  if (state.paintTics.length > 64) state.paintTics.shift();
-  measureKeypress(frame.gametic, state.paintedAt);
+  // The (paint time, cursor, gametic) ring, so a stamp that arrives after its
+  // frame was painted can still be timed against the paint rather than against
+  // the answer. Cursor shares the input sequence; gametic can start elsewhere
+  // after RESET.
+  state.paintTics.push({at: state.paintedAt, cursor: frame.cursor, gametic: frame.gametic});
+  if (state.paintTics.length > 4096) state.paintTics.shift();
+  measureKeypress(frame.cursor, frame.gametic, state.paintedAt);
   updateStatus();
 }
 
 // The two keypress meters, and the one place either of them is recorded.
 //
-// `nextPicture`: the first frame past the gametic that was on screen when the
+// `nextPicture`: the first frame past the cursor that was on screen when the
 // key went down. Recorded once per press, whatever else happens.
 //
-// `stamp`: the first frame at or past the tic the press's input was stamped for.
+// `stamp`: the first frame past the cursor tic the press's input was stamped for.
 // `stampTic` is null until the relayer answers, so this does nothing until the
 // page knows the tic, and then it fires on the very next qualifying paint -- or,
 // if that paint has already happened, on the paint ring's earliest entry at or
@@ -445,31 +400,34 @@ async function paintFrame(frame) {
 // Every open press is offered the frame, not just the newest one: two presses a
 // few hundred milliseconds apart have two stamped tics, and each closes on its
 // own frame.
-function measureKeypress(gametic, at) {
-  if (!state.holds.length || typeof gametic !== "number") return;
+function measureKeypress(cursor, gametic, at) {
+  if (!state.holds.length || typeof cursor !== "number") return;
   const done = [];
   for (const hold of state.holds) {
-    if (hold.nextPictureMs === null && gametic > hold.gameticAtKeyDown) {
+    if (at < hold.downAt) continue;
+    if (hold.nextPictureMs === null && cursor > hold.cursorAtKeyDown) {
       hold.nextPictureMs = at - hold.downAt;
       state.nextPictureLatencies.push(hold.nextPictureMs);
       if (state.nextPictureLatencies.length > 40) state.nextPictureLatencies.shift();
     }
-    if (hold.stampTic === null || gametic < hold.stampTic) continue;
+    // A frame at exactly the input sequence predates that tic's execution.
+    if (hold.stampTic === null || cursor <= hold.stampTic) continue;
     hold.stampMs = at - hold.downAt;
-    // The stamped tic and the gametic of the frame that ended the wait, together.
+    // The stamped tic and the cursor of the frame that ended the wait, together.
     // They are only comparable as a pair: a held key keeps offering batches and
     // each one is stamped at a later tic, so the page's *latest* stamped tic
     // belongs to a later press than the sample this one produced.
     const sample = {
       key: hold.key,
       tic: hold.stampTic,
+      cursor,
       gametic,
       ms: hold.stampMs,
       next_picture_ms: hold.nextPictureMs,
-      lead_tics: hold.leadTics,
     };
     state.stampSamples.push(sample);
     if (state.stampSamples.length > 60) state.stampSamples.shift();
+    refreshKeyTimingBreakdown();
     state.lastStampSample = sample;
     state.stampLatencies.push(hold.stampMs);
     if (state.stampLatencies.length > 40) state.stampLatencies.shift();
@@ -478,21 +436,67 @@ function measureKeypress(gametic, at) {
   state.holds = state.holds.filter((hold) => !done.includes(hold));
 }
 
+function refreshKeyTimingBreakdown() {
+  const rows = [];
+  for (const sample of state.stampSamples) {
+    const event = state.keyStateEvents.find((row) => row.seq === sample.tic);
+    const post = state.keyPostSamples?.find((row) => row.tic === sample.tic);
+    if (!event || !post) continue;
+    const hasClockBridge = Number.isFinite(post.post_received_at_ms)
+      && Number.isFinite(post.sent_wall_ms)
+      && Number.isFinite(post.post_rtt_ms)
+      && Number.isFinite(post.page_down_wall_ms);
+    // The browser and Tokyo do not share a wall clock. Estimate their offset
+    // from this request's midpoint (symmetric network delay), then use the
+    // relayer's receipt time for keydown -> POST. The remaining server-side
+    // intervals below use the relayer's clock on both ends.
+    const clockOffsetMs = hasClockBridge
+      ? Number(post.post_received_at_ms) - Number(post.sent_wall_ms) - Number(post.post_rtt_ms) / 2
+      : null;
+    const pageToPost = hasClockBridge
+      ? Number(post.post_received_at_ms) - Number(post.page_down_wall_ms) - clockOffsetMs
+      : null;
+    const waitToDeposit = Number.isFinite(event.deposit_submitted_at_ms) && Number.isFinite(post.post_received_at_ms)
+      ? Number(event.deposit_submitted_at_ms) - Number(post.post_received_at_ms)
+      : null;
+    const cursorToTic = Number.isFinite(event.cursor_reached_at_ms) && Number.isFinite(event.deposit_submitted_at_ms)
+      ? Number(event.cursor_reached_at_ms) - Number(event.deposit_submitted_at_ms)
+      : null;
+    const known = [pageToPost, waitToDeposit, cursorToTic]
+      .filter((value) => Number.isFinite(value));
+    rows.push({
+      tic: sample.tic,
+      key: sample.key,
+      keydown_to_picture_ms: sample.ms,
+      page_to_post_ms_estimated: pageToPost,
+      browser_to_relayer_clock_offset_ms_estimated: clockOffsetMs,
+      wait_to_deposit_ms_measured: waitToDeposit,
+      cursor_to_tic_ms_measured: cursorToTic,
+      render_and_paint_ms_residual: known.length === 3
+        ? Math.max(0, sample.ms - known.reduce((sum, value) => sum + value, 0))
+        : null,
+      deposit_signature: event.deposit_signature ?? null,
+    });
+  }
+  state.keyTimingBreakdown = rows;
+}
+
 // The relayer has said which tic it stamped a batch for. The batch was signed
 // while some press was open, and the press it belongs to is the newest one that
 // does not have a tic yet: presses are seconds apart in anything a person plays,
 // and a held key offers a batch every 100 ms, so the first answer after a
 // keydown is that keydown's.
-function noteStampedTic(tic) {
+function noteStampedTic(tic, targetHold = null) {
   if (typeof tic !== "number" || !Number.isFinite(tic)) return;
   pruneHolds();
-  const hold = [...state.holds].reverse().find((row) => row.stampTic === null);
+  const hold = targetHold ?? [...state.holds].reverse().find((row) => row.stampTic === null);
   if (hold === undefined) return;
   hold.stampTic = tic;
   // If the frame carrying that tic is already on screen the paint ring knows
-  // when it was painted; otherwise the next qualifying paint records it.
-  const first = state.paintTics.find((row) => row.gametic >= tic);
-  if (first) measureKeypress(first.gametic, first.at);
+  // when it was painted; otherwise the next qualifying paint records it. A
+  // frame painted before keydown cannot count as the press's picture.
+  const first = state.paintTics.find((row) => row.at >= hold.downAt && row.cursor > tic);
+  if (first) measureKeypress(first.cursor, first.gametic, first.at);
 }
 
 // A press that will never get a stamp: every key of it is up, nothing has
@@ -520,17 +524,6 @@ function pruneHolds() {
     kept.push(hold);
   }
   state.holds = kept;
-}
-
-// The first unanswered batch that was signed with a key held. An answer does not
-// say which of the page's open batches it belongs to, and the page may have two
-// open, so this is a scan rather than a shift: a keyless batch that answers
-// first must not be read as this keypress's stamp.
-function takeStampedBatch() {
-  const index = state.pendingPushes.findIndex((row) => row.held);
-  if (index < 0) return null;
-  const [row] = state.pendingPushes.splice(index, 1);
-  return row;
 }
 
 function median(values) {
@@ -602,7 +595,7 @@ function updateStatus() {
   //                     feels.
   //   NEXT PIC          keydown to the next painted frame of any kind. The
   //                     page's drivability, and much the smaller number: on R15
-  //                     it read 408 ms while the lead the keypress actually had
+  //                     it read 408 ms while the key's actual stamped tic landed
   //                     to wait out was 2,155 ms.
   //
   // The stamp cell counts its own coverage, because a session where no POST
@@ -621,7 +614,7 @@ function updateStatus() {
       `${state.holds.length} still open, ${state.holdsDropped} dropped at the bound` +
       (state.lastStampSample
         ? `; last: ${state.lastStampSample.key} stamped at tic ${state.lastStampSample.tic}, ` +
-          `painted at gametic ${state.lastStampSample.gametic}`
+          `painted at cursor ${state.lastStampSample.cursor}`
         : "");
   }
   const next = median(state.nextPictureLatencies);
@@ -950,15 +943,13 @@ const pressRows = new Map();
 function keyDown(code) {
   const name = KEY_MAP[code];
   if (!name) return false;
-  pressKey(name, KEY_LABEL[code] ?? name.toUpperCase());
-  return true;
+  return pressKey(name, KEY_LABEL[code] ?? name.toUpperCase()) ?? true;
 }
 
 function keyUp(code) {
   const name = KEY_MAP[code];
   if (!name) return false;
-  releaseKey(name);
-  return true;
+  return releaseKey(name);
 }
 
 // Shared by the keyboard and the on-screen pad, because a press measured from
@@ -974,24 +965,26 @@ function pressKey(name, label) {
   // key that comes up and goes down again is. The clock does not stop at keyup:
   // a tap is 300 ms and the picture carrying it arrives seconds later, so the
   // hold lives until its frame does.
-  if (!first) return;
+  if (!first) return null;
   pruneHolds();
-  state.holds.push({
+  const hold = {
     key: name,
     downAt: performance.now(),
-    gameticAtKeyDown: state.lastFrame ? state.lastFrame.gametic : -1,
+    downWallMs: Date.now(),
+    cursorAtKeyDown: state.lastFrame ? state.lastFrame.cursor : -1,
     stampTic: null,
     nextPictureMs: null,
     stampMs: null,
-    // The lead this press was aimed with, which is the price the press paid. On
-    // the sample, so a report can divide the latency by it rather than guess.
-    leadTics: state.leadTics ?? null,
     keys: [name],
-  });
+    inputRecord: pressRows.get(name),
+  };
+  state.holds.push(hold);
   state.holdsStarted += 1;
+  return hold;
 }
 
 function releaseKey(name) {
+  if (!state.keys[name]) return false;
   state.keys[name] = false;
   inputLog.release(pressRows.get(name));
   pressRows.delete(name);
@@ -999,14 +992,16 @@ function releaseKey(name) {
   // been painted yet, and closing here is what made a live session report zero
   // keypress samples: every press was closed before its picture arrived.
   pruneHolds();
+  return true;
 }
 
 addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
   if (event.repeat) return;
-  if (keyDown(event.code)) {
+  const changed = keyDown(event.code);
+  if (changed) {
     event.preventDefault();
-    scheduleInputPush();
+    scheduleInputPush({holds: changed === true ? [] : [changed]});
   }
 });
 
@@ -1028,15 +1023,15 @@ for (const button of document.querySelectorAll(".pad button")) {
   const name = button.dataset.key;
   const press = (event) => {
     event.preventDefault();
-    pressKey(name, name.toUpperCase());
+    const hold = pressKey(name, name.toUpperCase());
     syncPad();
-    scheduleInputPush();
+    if (hold) scheduleInputPush({holds: [hold]});
   };
   const release = (event) => {
     event.preventDefault();
-    releaseKey(name);
+    const changed = releaseKey(name);
     syncPad();
-    scheduleInputPush();
+    if (changed) scheduleInputPush();
   };
   button.addEventListener("pointerdown", press);
   button.addEventListener("pointerup", release);
@@ -1053,210 +1048,64 @@ function syncPad() {
   }
 }
 
-// Aiming ahead of the producer, because a batch cannot be aimed at it.
-//
-// The engine reads an input slot when its cursor reaches it, and the producer
-// has already fixed every tic below its generated cursor, so a batch aimed at
-// the live window is a batch aimed below the producer by the time it lands.
-// Measured on the first drive: the round trip from this page to the producer is
-// 0.3-0.4 s, which is 7-11 tics at the measured 23.8-26.3 tics/s, and the
-// window is four tics wide. 19 POSTs, 0 accepted, all 409 `input_stale`, 0
-// command tics deposited against 6,116-12,416 tics consumed. Aiming at a
-// window narrower than the trip cannot win, however exactly it is aimed.
-//
-// So the page leads the window by its own round trip, and repeats the held key
-// state across an overlapping batch rather than counting the tics it has sent.
-// The lead is the price: a keystroke is read by the engine one lead after it is
-// signed, which is the input-to-picture latency this design implies.
-const PUSH_TICS = 16;
-const PUSH_INTERVAL_MS = 100;
-// The lead, in tics, above the producer's NEXT tic to generate.
-//
-// It has to cover three distances, and the first version of this page covered
-// none of them properly:
-//   * the push interval, because the producer reads a reading at most one
-//     cadence old;
-//   * the POST round trip, because the producer keeps generating while the
-//     request is in the air;
-//   * the producer's own batch, `round(35 * 0.1)` = 4 tics, because it
-//     snapshots a whole batch at once and a write that arrives inside that
-//     window is a coin flip.
-// Measured on the 2026-09-26 play session: the aim had a median of 12 tics over
-// `producer_generated_cursor`, which is itself four tics ahead of the producer's
-// real position, and 93.7% of the tics the chain deposited carried no key.
-const PRODUCER_BATCH_TICS = 4;
-// Stay this far inside the relayer's own 240-tic sequence window, so a
-// mispredicted aim is a refusal the page can read a resume point from rather
-// than a batch_refused for being too far ahead.
-const SEQ_WINDOW_MARGIN = 40;
-// The floor, for a relayer that publishes no lead of its own. The producer's
-// lead is 61 on R15 and this was 16, which is the whole of the fault.
-const MIN_LEAD_TICS = 16;
-// The ceiling on any aim, published or derived: the relayer's sequence window
-// less the margin above. `ceiling` in `pushInput` applies the same bound to the
-// sequence itself; this one stops a published number from being the thing that
-// decides how far a page writes.
-const MAX_LEAD_TICS = SEQ_WINDOW - SEQ_WINDOW_MARGIN;
-let pushTimer = null;
-let pushesInFlight = 0;
-let lastPushAt = 0;
-function scheduleInputPush() {
-  if (pushTimer !== null) return;
-  pushTimer = requestAnimationFrame(() => {
-    pushTimer = null;
-    // Two batches may be in flight so the cadence is the interval rather than
-    // the round trip. They cannot collide: each is aimed from its own reading
-    // of the producer's position and carries its own client_seq, and both write
-    // the same key state over the same tics.
-    if (pushesInFlight >= MAX_PUSH_IN_FLIGHT) {
-      scheduleInputPush();
-      return;
-    }
-    const wait = lastPushAt + PUSH_INTERVAL_MS - performance.now();
-    if (wait > 0) {
-      pushTimer = setTimeout(() => {
-        pushTimer = null;
-        void pushInput();
-      }, wait);
-      return;
-    }
-    void pushInput();
+// The page reports the current key state. It does not calculate a tic, producer
+// lead, or delivery window; the relayer assigns the first still-depositable tic.
+// V2 sends key-state transitions only. The sender reserves their sequence under
+// the same lock it uses to build a DEPOSIT+ADVANCE transaction, so the page
+// neither predicts a cursor nor pays a second delivery lead. Transitions are
+// kept in order: a quick down/up pair occupies two successive tics instead of
+// being coalesced into a key-up that loses the tap.
+const liveInputQueue = [];
+let liveInputBusy = false;
+let liveInputFrame = null;
+let liveInputRetryAt = 0;
+let liveInputRetryTimer = null;
+let lastQueuedKeyState = null;
+
+function sameKeyState(left, right) {
+  return Object.keys(right).every((key) => Boolean(left?.[key]) === Boolean(right[key]));
+}
+
+function scheduleInputPush({holds = []} = {}) {
+  if (!state.session || !state.wallet) return;
+  const keys = {...state.keys};
+  const previous = liveInputQueue.at(-1)?.keys ?? lastQueuedKeyState;
+  if (previous && sameKeyState(previous, keys) && holds.length === 0) return;
+  liveInputQueue.push({keys, holds: [...holds], queuedAt: performance.now(), attempts: 0});
+  lastQueuedKeyState = keys;
+  if (liveInputFrame !== null) return;
+  liveInputFrame = requestAnimationFrame(() => {
+    liveInputFrame = null;
+    void pushQueuedInput();
   });
 }
 
-// Where the producer's next tic to generate will be when our POST reaches it.
-// The number the relayer last reported is as old as that answer, and the
-// producer does not stop, so the page carries it forward by its own age.
-function predictedNext() {
-  const observed = state.producerNextCursor ?? state.producerGeneratedCursor;
-  if (observed === null || observed === undefined) return null;
-  const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
-  const ageSeconds = Math.max(0, performance.now() - state.producerReadAt) / 1000;
-  // `producerGeneratedCursor` is the END of the batch the producer has already
-  // published, so when that is all there is, the next tic is a batch lower.
-  const base = state.producerNextCursor === null || state.producerNextCursor === undefined
-    ? observed - PRODUCER_BATCH_TICS
-    : observed;
-  return base + Math.floor(ageSeconds * rate);
-}
-
-// The lead, in tics: the producer's own, when it publishes one, and otherwise
-// the push cadence plus the measured round trip plus the producer's batch.
-//
-// The producer is the side that holds the window open, and it resolves this
-// quantity from a measurement of how long a staged tic takes to reach the
-// chain: `Server.lead_tics` in `scripts/doom_relayer_server.py`, published as
-// `input_stage_lead_tics` on every status and every input answer. On R15 that
-// is 61 tics (35 tic/s configured, 2 x the 0.86 s round trip), where this page
-// was building 16 out of its own POST latency -- which is only the page's share
-// of the same delivery, and the smaller half of it.
-//
-// The price is latency, and it is a real one: 61 tics at the 23 tic/s R15
-// actually ran is 2.6 s from keypress to the engine reading the tic, against
-// 310 ms measured with the 16-tic aim. What that buys is the ratio: with the
-// 16-tic aim, 201 of 510 staged tics (39.4%) reached a DEPOSIT carrying a key
-// and the other 309 were deposited as zeros, because the producer snapshotted
-// those tics before this page's write arrived. A lead inside the race is not a
-// cheaper lead, it is a lost keystroke.
-//
-// The local arithmetic stays as the floor rather than being replaced, for a
-// relayer that publishes nothing and for a published number that is stale
-// because the rate it was resolved from is not this session's rate. The larger
-// of the two is used, so neither source can quietly aim short.
-//
-// **MEASURED 2026-09-26: this maximum is most of the keypress latency, and
-// removing it does not work.** The honest keypress meter (the one that waits for
-// a frame at or past the stamped tic) put the baseline median at 4,270 ms on
-// R15, and the arithmetic says why: the producer's published lead is 45 tics,
-// which is 1.77 s and is the producer's own distance from its staged tic to the
-// chain's committed cursor, so the batch below sits 45 + 45 = 90 tics past the
-// chain's cursor and 90/22.2 tic/s is 4.05 s. The page pays the delivery lead
-// twice, once inside the producer's position and once in its own aim.
-//
-// So the aim was changed to the page's own hop alone -- the POST round trip, the
-// push cadence and the producer's batch, about 16 tics -- and measured twice on
-// R15. Both sessions were worse and both broke: input refusals went from 1 in a
-// 110 s session to 100 and then 176, `input_command_tics_deposited` went to 0,
-// the producer stopped depositing, the chain's cursor stopped at 45,890, and
-// `tic-sender-result.json` was never written. The chain itself was fine -- the
-// meta read afterwards at `M_HALT 0`, `M_CURSOR 45890`, `M_LAST_SWEEP_TICS 4` --
-// so this is a client-side producer hang and not a chain fault, and it is not
-// diagnosed.
-//
-// The reading is that a 16-tic aim is inside the race the 2026-09-26 input round
-// measured (201 of 510 staged tics reached a DEPOSIT carrying a key at a 16-tic
-// aim, against 0.98 at the published lead), and "mostly zeros" turns into a
-// refusal flood rather than into a cheaper keypress. The lead has to come down
-// by making the *delivery* shorter, not by aiming closer to the producer: one
-// transaction carrying both the input and the advance that consumes it takes the
-// delivery from a round trip plus a sweep to a single round trip, and that is
-// the change to make. Until it exists, this maximum stays.
-function aimLead() {
-  const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
-  const tripTics = Math.ceil(((state.roundTripMs ?? 0) / 1000) * rate);
-  const cadenceTics = Math.ceil((PUSH_INTERVAL_MS / 1000) * rate);
-  const derived = Math.max(MIN_LEAD_TICS, tripTics + cadenceTics + PRODUCER_BATCH_TICS);
-  const published = state.producerLeadTics;
-  const usable = typeof published === "number" && Number.isFinite(published) && published > 0
-    ? Math.round(published)
-    : 0;
-  return Math.min(MAX_LEAD_TICS, Math.max(derived, usable));
-}
-
-async function pushInput() {
-  if (!state.session || !state.wallet) return;
-  const held = Object.values(state.keys).some(Boolean);
-  if (held && state.producerReadAt === 0) {
-    // The first batch of a hold has no producer position of its own, and the
-    // one the session was opened with is as old as the join.
-    await readWindow();
-  }
-  const next = predictedNext();
-  // The floor is the producer's next tic to generate: a write at or below it
-  // names tics the producer is about to snapshot, so its command is either
-  // ignored or a coin flip. The chain cursor is a second floor, because a tic
-  // the engine has read is gone whatever the producer says. The page's own last
-  // batch is deliberately not a floor: the batches overlap and repeat the same
-  // keys, so a floor there would walk the aim up faster than the engine runs
-  // and build the backlog the relayer's lead bound exists to prevent.
-  const floor = Math.max(
-    state.cursor,
-    next === null ? 0 : next,
-  );
-  if (!held || floor <= 0) {
-    // No keys, or nothing has been read yet: the next frame offers again.
-    // Nothing is lost by waiting, because a tic nobody writes is a tic with no
-    // keys held.
-    if (held) scheduleInputPush();
+async function pushQueuedInput() {
+  if (liveInputBusy || !state.session || !state.wallet || !liveInputQueue.length) return;
+  if (performance.now() < liveInputRetryAt) {
+    if (liveInputRetryTimer === null) {
+      liveInputRetryTimer = setTimeout(() => {
+        liveInputRetryTimer = null;
+        void pushQueuedInput();
+      }, liveInputRetryAt - performance.now());
+    }
     return;
   }
-  const lead = aimLead();
-  const ceiling = Math.max(floor, state.cursor + state.seqWindow - SEQ_WINDOW_MARGIN);
-  const firstSeq = Math.min(floor + lead, ceiling);
-  const count = PUSH_TICS;
-  state.leadTics = firstSeq - floor;
-  state.aimedAt = firstSeq;
-  const commands = heldToCommands(state.keys, firstSeq, count);
-  state.clientSeq += 1;
-  const message = encodeInput({
-    slot: state.session.slot,
-    firstSeq,
-    commands,
-    clientSeq: state.clientSeq,
-    issuedAt: Math.floor(Date.now() / 1000),
-    binding: state.session.binding,
-  });
-  const signature = await state.wallet.sign(message);
-  const sentAt = performance.now();
-  lastPushAt = sentAt;
-  pushesInFlight += 1;
-  state.batchesSigned += 1;
-  // Queued before the fetch, not after, so a fast relayer cannot answer a batch
-  // this page has not recorded yet. `held` is what the answer is matched on: a
-  // batch with no key held carries no keypress and must not be read as one.
-  const flight = {held, firstSeq, at: sentAt};
-  state.pendingPushes.push(flight);
+  liveInputBusy = true;
+  const flight = liveInputQueue.shift();
   try {
+    state.clientSeq += 1;
+    const message = encodeInput({
+      slot: state.session.slot,
+      keys: flight.keys,
+      clientSeq: state.clientSeq,
+      issuedAt: Math.floor(Date.now() / 1000),
+      binding: state.session.binding,
+    });
+    const signature = await state.wallet.sign(message);
+    const sentAt = performance.now();
+    const sentWallMs = Date.now();
+    state.batchesSigned += 1;
     const response = await fetch(`${state.relayerBase}/v1/sessions/${encodeURIComponent(state.session.id)}/input`, {
       method: "POST",
       headers: {"content-type": "application/json"},
@@ -1264,114 +1113,64 @@ async function pushInput() {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      // A refusal that names a resume point is not a failure to show, it is the
-      // relayer saying where the chain is. Take its word for the sequence and
-      // offer again. The panel still records it: a keystroke the relayer would
-      // not take is a fate the player is entitled to see.
       state.refusals += 1;
-      inputLog.noteBatch({
-        firstSeq,
-        count,
-        commands,
-        refused: true,
-        reason: payload.error ?? payload.detail?.reason ?? `relayer returned ${response.status}`,
-        at: sentAt,
-      });
-      renderInputLog();
-      if (payload.detail?.next_seq !== undefined) {
-        if (payload.detail.cursor !== undefined) state.cursor = payload.detail.cursor;
-        if (payload.detail.staging_frontier !== undefined) state.stagingFrontier = payload.detail.staging_frontier;
-        if (payload.detail.input_window !== undefined) state.inputWindow = payload.detail.input_window;
-        if (payload.detail.producer_generated_cursor !== undefined) {
-          state.producerGeneratedCursor = payload.detail.producer_generated_cursor;
-          // Only stamp the reading as fresh when the answer also carried the
-          // next cursor the aim is built from. Stamping it without that left the
-          // prediction frozen at an old cursor while claiming to be current, so
-          // the aim walked backwards into tics the producer had already read.
-          if (payload.detail.producer_next_cursor !== undefined && payload.detail.producer_next_cursor !== null) {
-            state.producerNextCursor = payload.detail.producer_next_cursor;
-            state.producerReadAt = performance.now();
-          }
-        }
-        if (payload.detail.producer_stage_limit !== undefined) {
-          state.producerStageLimit = payload.detail.producer_stage_limit;
-        }
-        // A batch the producer has already passed says exactly how far short
-        // the aim was, and the producer's own position is the number to aim
-        // from next time. The lead grows by the shortfall; it is the measured
-        // round trip plus whatever the round trip under-measured.
-        if (payload.detail.producer_generated_cursor !== undefined) {
-          const short = payload.detail.producer_generated_cursor - firstSeq + 1;
-          if (short > 0) state.leadTics = Math.min(MAX_LEAD_TICS, Math.max(state.leadTics ?? 0, short + MIN_LEAD_TICS));
-        }
-        // Take the relayer's word for the sequence to write next. It is the
-        // producer's own position, which is the only side that knows it; the
-        // chain cursor is below it and a floor there is a refusal.
-        state.nextSeq = Math.max(state.nextSeq, payload.detail.next_seq);
-        if (held) scheduleInputPush();
-        return;
-      }
       throw new Error(payload.error ?? `relayer returned ${response.status}`);
     }
-    adoptAccounts(payload);
-    // The tic this hold's input was stamped for, which is the relayer's word and
-    // not the page's aim: `accepted_from` is the first sequence the producer
-    // actually took, and it is lower than `firstSeq` whenever the head of the
-    // batch was already on chain. The keypress meter waits for this and then
-    // looks for a painted frame at or past it, so it measures when the keypress
-    // is *in* a picture rather than when a picture happened to arrive.
-    const stamped = takeStampedBatch();
-    if (stamped !== null) {
-      const stampedTic = payload.accepted_from ?? stamped.firstSeq;
-      state.lastStampedTic = stampedTic;
-      noteStampedTic(stampedTic);
+    if (payload.key_state && Number.isFinite(payload.key_state.seq)) {
+      const existing = state.keyStateEvents.findIndex((row) => row.seq === payload.key_state.seq);
+      if (existing < 0) state.keyStateEvents.push(payload.key_state);
+      else state.keyStateEvents[existing] = {...state.keyStateEvents[existing], ...payload.key_state};
     }
-    inputLog.noteBatch({
-      firstSeq,
-      count,
-      commands,
-      accepted: payload.accepted ?? count,
-      acceptedFrom: payload.accepted_from ?? firstSeq,
-      trimmedFromSeq: payload.trimmed_from_seq ?? null,
-      queuedAboveStageLimit: payload.queued_above_stage_limit ?? null,
-      at: sentAt,
-    });
-    renderInputLog();
-    // The batch's own end, so the next one overlaps it rather than leaving a
-    // hole. It is not a floor: the aim is the producer's position plus the
-    // lead, and this is only here to say how much of the window is written.
-    state.nextSeq = Math.max(state.nextSeq, firstSeq + count);
-    state.inputsSent += count;
-    const elapsed = performance.now() - sentAt;
-    state.latencies.push(elapsed);
+    const responseAt = performance.now();
+    const postRttMs = responseAt - sentAt;
+    state.roundTripMs = postRttMs;
+    state.latencies.push(postRttMs);
     if (state.latencies.length > 40) state.latencies.shift();
-    // The round trip the lead is built from is the worst of the recent ones:
-    // the aim has to survive the slow request, not the median one.
-    state.roundTripMs = Math.max(...state.latencies.slice(-8));
+    state.inputsSent += 1;
+    const stampTic = payload.stamp_tic ?? payload.accepted_from;
+    if (typeof stampTic === "number") {
+      state.lastStampedTic = stampTic;
+      const oneTic = heldToCommands(flight.keys, stampTic, 1);
+      for (const hold of flight.holds) {
+        inputLog.noteStampedState(hold.inputRecord, stampTic, oneTic);
+        noteStampedTic(stampTic, hold);
+      }
+    }
+    state.keyPostSamples ??= [];
+    state.keyPostSamples.push({
+      tic: stampTic ?? null,
+      page_to_response_ms: responseAt - flight.queuedAt,
+      post_rtt_ms: postRttMs,
+      send_queue_ms: sentAt - flight.queuedAt,
+      post_received_at_ms: payload.post_received_at_ms ?? null,
+      tic_assigned_at_ms: payload.tic_assigned_at_ms ?? null,
+      sent_wall_ms: sentWallMs,
+      page_down_wall_ms: flight.holds[0]?.downWallMs ?? sentWallMs,
+    });
+    if (state.keyPostSamples.length > 80) state.keyPostSamples.shift();
+    inputLog.observe({cursor: payload.cursor, input_fate: payload.input_fate});
+    refreshKeyTimingBreakdown();
+    renderInputLog();
+    if (typeof payload.cursor === "number") state.cursor = payload.cursor;
+    if (payload.pipeline) state.pipeline = payload.pipeline;
     const median = [...state.latencies].sort((a, b) => a - b)[Math.floor(state.latencies.length / 2)];
-    const producer = state.producerLeadTics === null
-      ? "producer lead n/a"
-      : `producer lead ${state.producerLeadTics}` +
-        (state.producerRoundTripSeconds === null
-          ? ""
-          : ` · ${(state.producerRoundTripSeconds * 1000).toFixed(0)} ms round trip`);
-    setCell(ui.inputLatency, `${median.toFixed(0)} ms · lead ${state.leadTics} · ${producer}`);
+    setCell(ui.inputLatency, `${median.toFixed(0)} ms POST round trip · tic assigned by relayer`);
     setCell(ui.inputsSent, String(state.inputsSent));
-    if (payload.frame?.signature) state.signature = payload.frame.signature;
     clearError("action");
   } catch (error) {
+    flight.attempts += 1;
+    liveInputQueue.unshift(flight);
     showError(error, "action");
+    const delay = Math.min(2000, 100 * (2 ** Math.min(flight.attempts - 1, 4)));
+    liveInputRetryAt = performance.now() + delay;
   } finally {
-    // This batch is answered, refused or failed, so it is no longer a candidate
-    // for a later answer to be matched against. Left in the list, a refused
-    // held batch would be stamped by the *next* hold's answer and report a
-    // latency against a tic that carried no key at all.
-    state.pendingPushes = state.pendingPushes.filter((row) => row !== flight);
-    pushesInFlight -= 1;
-    // Held keys keep offering, on the interval, for as long as they are down.
-    // This is the loop the R8l6 session was missing: one batch per keydown is
-    // a nudge, not a walk.
-    if (Object.values(state.keys).some(Boolean)) scheduleInputPush();
+    liveInputBusy = false;
+    if (liveInputQueue.length && liveInputFrame === null && performance.now() >= liveInputRetryAt) {
+      liveInputFrame = requestAnimationFrame(() => {
+        liveInputFrame = null;
+        void pushQueuedInput();
+      });
+    }
   }
 }
 
@@ -1425,7 +1224,11 @@ async function joinSession() {
     binding: toHex(binding),
   });
   await pollSessionStatus();
-  scheduleInputPush();
+  liveInputQueue.length = 0;
+  lastQueuedKeyState = null;
+  if (Object.values(state.keys).some(Boolean)) {
+    scheduleInputPush({holds: state.holds.filter((hold) => hold.stampTic === null)});
+  }
 }
 
 // Puts the page into playing shape for a session, whether it was just created
@@ -1467,34 +1270,12 @@ function adoptAccounts(payload) {
     describeChain();
   }
   if (payload.cursor !== undefined) state.cursor = payload.cursor;
-  if (payload.staging_frontier !== undefined) state.stagingFrontier = payload.staging_frontier;
-  if (payload.input_window !== undefined && payload.input_window !== null) state.inputWindow = payload.input_window;
-  if (payload.producer_generated_cursor !== undefined) {
-    state.producerGeneratedCursor = payload.producer_generated_cursor;
-  }
-  if (payload.producer_next_cursor !== undefined && payload.producer_next_cursor !== null) {
-    state.producerNextCursor = payload.producer_next_cursor;
-  }
-  if (payload.producer_stage_limit !== undefined) {
-    state.producerStageLimit = payload.producer_stage_limit;
-  }
   if (payload.pipeline !== undefined && payload.pipeline !== null) state.pipeline = payload.pipeline;
-  if (payload.input_fate !== undefined && payload.input_fate !== null) state.inputFate = payload.input_fate;
-  // The producer's own lead and the round trip it was read from. The pipeline
-  // resolves both from a measurement of the delay between producing a tic and
-  // the chain's own input frontier passing it, and publishes them in every
-  // status and every input answer. The node dropped them until 2026-09-26, so
-  // the page could only re-derive a lead from its own POST latency -- 16-20 tics
-  // where the producer had measured 61 -- and nothing on the page said so.
-  if (payload.input_stage_lead_tics !== undefined && payload.input_stage_lead_tics !== null) {
-    state.producerLeadTics = payload.input_stage_lead_tics;
+  if (payload.input_fate !== undefined && payload.input_fate !== null) {
+    state.inputFate = payload.input_fate;
+    if (Array.isArray(payload.input_fate.key_states)) state.keyStateEvents = payload.input_fate.key_states;
+    refreshKeyTimingBreakdown();
   }
-  if (payload.input_round_trip_seconds !== undefined && payload.input_round_trip_seconds !== null) {
-    state.producerRoundTripSeconds = payload.input_round_trip_seconds;
-  }
-  // Every answer that carries the producer's position is stamped with when it
-  // arrived, because the aim carries it forward by its age.
-  if (payload.producer_generated_cursor !== undefined) state.producerReadAt = performance.now();
   if (payload.tics_per_second) state.ticsPerSecond = payload.tics_per_second;
   // The relayer's pointer to the buffer holding the newest complete frame,
   // with that buffer's accounts: the page reads this buffer rather than the one
@@ -1511,27 +1292,14 @@ function adoptAccounts(payload) {
   if (payload.frame_counters) state.frameCounters = payload.frame_counters;
 }
 
-// A fresh cursor and staging frontier. The relayer reads the chain for this, so
-// it is the only honest way for the page to learn where input may be written.
-async function readWindow() {
-  if (!state.session) return;
-  const status = await relayer(`/v1/sessions/${encodeURIComponent(state.session.id)}`);
-  adoptAccounts(status);
-  state.nextSeq = Math.max(state.nextSeq, status.cursor ?? 0);
-}
-
-
 async function pollSessionStatus() {
   if (!state.session) return;
   try {
     const status = await relayer(`/v1/sessions/${encodeURIComponent(state.session.id)}`);
     adoptAccounts(status);
-    state.nextSeq = Math.max(state.nextSeq, status.cursor ?? 0);
     setCell(ui.slotCell, String(status.slot));
-    // Only replace the latency readout when the relayer actually knows a rate.
-    // Before the first batch of a hold the panel shows the engine rate; after
-    // it, the panel shows the round trip and the lead, which is the pair a
-    // player reads to know whether their keystrokes are landing.
+    // Before the first input, show the engine rate. Input POST and key-to-picture
+    // latency are separate measurements once the first transition is assigned.
     if (status.tics_per_second && !state.latencies.length) {
       setCell(ui.inputLatency, `${status.tics_per_second.toFixed(1)} tic/s`);
     }
@@ -1542,6 +1310,7 @@ async function pollSessionStatus() {
     }
     // Everything the panel needs, on a poll that was already happening.
     inputLog.observe(status);
+    refreshKeyTimingBreakdown();
     renderInputLog();
     clearError();
   } catch (error) {

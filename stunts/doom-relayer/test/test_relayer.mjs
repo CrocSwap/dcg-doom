@@ -41,6 +41,19 @@ async function batch(wallet, relayer, session, {firstSeq, count = 4, clientSeq, 
   };
 }
 
+async function keyState(wallet, session, {clientSeq, keys = {forward: true}} = {}) {
+  const binding = Uint8Array.from(Buffer.from(session.binding, "hex"));
+  const message = encodeInput({
+    slot: session.slot,
+    keys,
+    clientSeq: clientSeq ?? 1,
+    issuedAt: Math.floor(Date.now() / 1000),
+    binding,
+  });
+  const signature = new Uint8Array(await subtle.sign({name: "Ed25519"}, wallet.privateKey, await import("../../../web/doom-play/input.js").then((m) => m.signingPayload(message))));
+  return {message: Buffer.from(message).toString("base64"), signature: Buffer.from(signature).toString("base64")};
+}
+
 // Start a relayer on an ephemeral port and return a fetch bound to it.
 async function withServer(options, work) {
   const relayer = createRelayer({mode: "mock", network: "testnet", ...options});
@@ -342,6 +355,26 @@ test("a signed batch is accepted, deposited and advanced", async () => {
     assert.equal(body.frame.signature, "mock-frame-1-8");
     assert.ok(body.frame.explorer);
     assert.equal(relayer.stats.inputsAccepted, 8);
+  });
+});
+
+test("a signed key-state transition is stamped by the relayer without an explicit tic", async () => {
+  await withServer({}, async ({relayer, call}) => {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const down = await call("POST", `/v1/sessions/${created.id}/input`, await keyState(wallet, created, {clientSeq: 1, keys: {forward: true}}));
+    const up = await call("POST", `/v1/sessions/${created.id}/input`, await keyState(wallet, created, {clientSeq: 2, keys: {}}));
+    assert.equal(down.status, 200, JSON.stringify(down.body));
+    assert.equal(up.status, 200, JSON.stringify(up.body));
+    assert.equal(down.body.stamp_tic, 0);
+    assert.equal(up.body.stamp_tic, 8);
+    assert.equal(down.body.stamp_gametic, 0);
+    assert.equal(up.body.stamp_gametic, 8);
+    assert.equal(down.body.key_state.seq, 0);
+    assert.equal(up.body.key_state.seq, 8);
+    assert.equal(down.body.accepted, 1);
+    assert.equal(relayer.sender.calls.filter((row) => row.op === "deposit").length, 2);
+    assert.equal(relayer.stats.inputsRejected, 0);
   });
 });
 
@@ -1471,4 +1504,9 @@ test("a third node and a send rate reach the pipeline's argv", () => {
   for (const flag of ["--rpc-c", "--send-pacer-rate"]) {
     assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
   }
+  const singleNode = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    rpcA: "http://fast:8899", rpcB: "",
+  }).argv();
+  assert.equal(singleNode[singleNode.indexOf("--rpc-b") + 1], "");
 });
