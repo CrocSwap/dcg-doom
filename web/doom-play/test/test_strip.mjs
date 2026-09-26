@@ -30,8 +30,13 @@ import {
   frameGroupKey,
   frameToRgba,
   stripDigest,
+  snapshotDigest,
+  parseSnapshot,
+  frameReadAddresses,
   toHex,
   u32le,
+  SNAPSHOT_HASH_DOMAIN,
+  SNAPSHOT_HEADER_BYTES,
 } from "../strip.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -70,9 +75,9 @@ async function finishStrip(fields) {
   return account;
 }
 
-function syntheticFrame({cursor = 10, gametic = 20} = {}) {
-  const snapshotHash = new Uint8Array(32).fill(0xab);
-  const stateRoot = new Uint8Array(32).fill(0xcd);
+function syntheticFrame({cursor = 10, gametic = 20, snapshotHash: givenHash, stateRoot: givenRoot} = {}) {
+  const snapshotHash = givenHash ?? new Uint8Array(32).fill(0xab);
+  const stateRoot = givenRoot ?? new Uint8Array(32).fill(0xcd);
   return Promise.all(
     Array.from({length: STRIP_COUNT}, (_, stripId) => {
       const pixels = new Uint8Array(STRIP_PIXELS_BYTES);
@@ -227,6 +232,99 @@ test("the group key covers cursor, gametic, snapshot hash and state root", async
     const moved = {...base, [field]: field.endsWith("Hash") || field === "stateRoot" ? new Uint8Array(base[field].fill(0x00)) : base[field] + 1};
     assert.notEqual(frameGroupKey(moved), key, `${field} participates in the group key`);
   }
+});
+
+// A buffered snapshot account, hashed the way the program hashes it. The
+// digest is written out here rather than called, so the test is a second
+// implementation of the layout instead of a restatement of the one it checks.
+function makeSnapshot({cursor = 10, gametic = 20, payloadBytes = 64, stateRoot, abiId}) {
+  const root = stateRoot ?? new Uint8Array(32).fill(0xcd);
+  const abi = abiId ?? new Uint8Array(32).fill(0x5a);
+  const payload = new Uint8Array(SNAPSHOT_HEADER_BYTES + payloadBytes);
+  payload.set(new TextEncoder().encode("DOOM-RSN"), 0);
+  const view = new DataView(payload.buffer);
+  view.setUint32(8, 3, true);
+  view.setUint32(12, SNAPSHOT_HEADER_BYTES, true);
+  view.setUint32(16, payload.length, true);
+  view.setUint32(20, cursor, true);
+  view.setUint32(24, gametic, true);
+  view.setUint32(28, payloadBytes, true);
+  payload.set(root, 32);
+  payload.set(abi, 160);
+  for (let i = 0; i < payloadBytes; i += 1) payload[SNAPSHOT_HEADER_BYTES + i] = (i * 3) & 0xff;
+  const digestInput = Buffer.concat([
+    Buffer.from(SNAPSHOT_HASH_DOMAIN, "ascii"),
+    payload.subarray(0, 128),
+    Buffer.alloc(32),
+    payload.subarray(160, 192),
+    payload.subarray(192, 192 + payloadBytes),
+  ]);
+  const digest = new Uint8Array(createHash("sha256").update(digestInput).digest());
+  payload.set(digest, 128);
+  return payload;
+}
+
+test("the snapshot domain is the seed the program writes, NUL included", () => {
+  assert.equal(SNAPSHOT_HASH_DOMAIN, "DOOM-RENDER-SNAPSHOT/3\0");
+  assert.equal(SNAPSHOT_HASH_DOMAIN.length, 23);
+  assert.equal(SNAPSHOT_HASH_DOMAIN.at(-1), "\0");
+  assert.equal(SNAPSHOT_HEADER_BYTES, 192);
+});
+
+test("a snapshot parses, and its hash is the one the program wrote", async () => {
+  const account = makeSnapshot({cursor: 6016, gametic: 6016, payloadBytes: 4096});
+  const snapshot = await parseSnapshot(account);
+  assert.equal(snapshot.cursor, 6016);
+  assert.equal(snapshot.gametic, 6016);
+  assert.equal(snapshot.payloadBytes, 4096);
+  assert.equal(snapshot.digest, toHex(account.subarray(128, 160)));
+  // The digest function the page verifies with agrees with the one the test
+  // built the account with, over the same header.
+  const again = await snapshotDigest({header: account, abiId: account.subarray(160, 192), payloadBytes: 4096});
+  assert.equal(toHex(again), snapshot.digest);
+});
+
+test("a snapshot whose payload was written after the hash is refused", async () => {
+  const account = makeSnapshot({payloadBytes: 4096});
+  account[SNAPSHOT_HEADER_BYTES + 10] ^= 0xff;
+  await assert.rejects(() => parseSnapshot(account), /snapshot digest mismatch/);
+});
+
+test("a frame is painted only when the snapshot is the one its strips name", async () => {
+  // Eight strips that agree with each other are not yet a frame: the pipeline
+  // writes the snapshot first and the eight strips after it, eight
+  // transactions, so a read in between sees one frame's snapshot beside the
+  // previous frame's strips. The strips commit to the snapshot, so the
+  // snapshot is what says the frame is whole.
+  const base = {cursor: 10, gametic: 20, payloadBytes: 64};
+  const matching = await parseSnapshot(makeSnapshot(base));
+  const strips = await syntheticFrame({
+    cursor: matching.cursor,
+    gametic: matching.gametic,
+    snapshotHash: matching.snapshotHash,
+    stateRoot: matching.stateRoot,
+  });
+  // The snapshot has already moved on to the next frame; the strips are the
+  // last complete frame, and this read is a frame mid-write.
+  const ahead = await parseSnapshot(makeSnapshot({...base, cursor: 44, gametic: 44}));
+  await assert.rejects(() => decodeFrame(strips, {snapshot: ahead}), /mid-write/);
+
+  const frame = await decodeFrame(strips, {snapshot: matching});
+  assert.equal(frame.cursor, 10);
+  assert.equal(frame.pixels.length, FRAME_BYTES);
+  // And without the snapshot in hand the eight strips are still a frame: mock
+  // mode has no snapshot account to read.
+  assert.equal((await decodeFrame(strips)).cursor, 10);
+});
+
+test("a frame is one account read: the snapshot and its eight strips", () => {
+  const strips = Array.from({length: STRIP_COUNT}, (_, i) => `strip-${i}`);
+  const addresses = frameReadAddresses({snapshot: "snapshot", strips});
+  assert.equal(addresses.length, STRIP_COUNT + 1);
+  assert.equal(addresses[0], "snapshot");
+  assert.deepEqual(addresses.slice(1), strips);
+  assert.throws(() => frameReadAddresses({snapshot: "snapshot", strips: strips.slice(0, 7)}), /8 strip accounts/);
+  assert.throws(() => frameReadAddresses({strips}), /snapshot account/);
 });
 
 test("u32le reads little-endian", () => {

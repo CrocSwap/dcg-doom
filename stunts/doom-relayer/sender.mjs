@@ -591,6 +591,11 @@ export class PipelineSender {
       producer: hello.producer ?? null,
       frameCounters: hello.frame_counters ?? null,
       rpcUrls: hello.rpc_urls ?? null,
+      // Which buffer holds the newest COMPLETE frame, and that buffer's
+      // accounts. The child reads each frame back before counting it, so it
+      // knows; the viewer, reading eight strip accounts that land in eight
+      // transactions, cannot.
+      latestFrame: hello.latest_frame ?? null,
     };
   }
 
@@ -644,15 +649,26 @@ export class PipelineSender {
   // viewer reads the strip accounts off the chain itself. This reports the
   // newest frame the child knows landed.
   async renderFrame() {
-    const status = await this.readProgress();
-    const frame = status.last_frame;
+    await this.readProgress();
+    // readProgress returns a fresh object literal, so `last_frame` was read off
+    // an object that never had it and this always threw `no_frame` -- which is
+    // why the page's rendered-on-chain cell never left the snapshot account
+    // link in chain mode. The raw answer is on `this.status`.
+    const frame = this.status?.latest_frame ?? this.status?.last_frame ?? null;
     if (!frame) throw new SenderError("no frame has landed yet", "no_frame");
+    // The child's own keys first, so this is the same object the status answer
+    // carries and a page cannot tell the two apart; the camelCase aliases are
+    // for the fields this class has always returned by that name.
     return {
+      ...frame,
+      buffer: frame.buffer ?? null,
       cursor: frame.cursor,
       gametic: frame.gametic,
       snapshotHash: frame.snapshot_hash,
       stateRoot: frame.state_root,
       signature: frame.signature,
+      snapshotAccount: frame.snapshot_account ?? null,
+      stripAccounts: frame.strip_accounts ?? null,
       strips: null,
       background: true,
     };
@@ -675,6 +691,7 @@ export class PipelineSender {
       ticsPerSecond: status.tics_per_second,
       framesCompleted: status.frames_completed,
       framesPerSecond: status.frames_per_second,
+      latestFrame: status.latest_frame ?? null,
       spendFogo: status.spend_fogo,
     };
   }

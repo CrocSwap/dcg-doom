@@ -434,10 +434,13 @@ test("chain mode stages a signed batch, and refuses input past the staging front
     // force a frame; the newest one it knows about is reported instead.
     assert.equal(first.body.frame.signature, "chain-frame-1");
 
-    // A batch that runs past the frontier is accepted as far as it goes, and
-    // the page re-offers the rest. Each sequence is written exactly once. The
-    // frontier is 20 and the cursor is not moving, so the third batch is the
-    // first one with nowhere left to put its tics.
+    // A batch that runs past the frontier is queued, not trimmed and not
+    // refused. The producer reads the command stream by absolute sequence and
+    // reaches those tics as its in-flight packets land, and a page that leads
+    // the window by its own round trip -- 0.3-0.4 s measured, 7-11 tics at the
+    // measured 23.8-26.3 tics/s, against a four-tic window -- puts every batch
+    // above the frontier on purpose. Refusing there is the R10 input drop:
+    // 19 POSTs, 0 accepted, all 409 `input_stale`, 0 command tics deposited.
     const second = await call(
       "POST",
       `/v1/sessions/${created.id}/input`,
@@ -455,14 +458,16 @@ test("chain mode stages a signed batch, and refuses input past the staging front
       await batch(wallet, relayer, created, {firstSeq: 16, count: 8, clientSeq: 3}),
     );
     assert.equal(third.status, 200);
-    assert.equal(third.body.accepted, 4);
-    assert.equal(third.body.next_seq, 20);
-    assert.deepEqual(sender.deposits[2], {firstSeq: 16, tics: 4});
+    assert.equal(third.body.accepted, 8);
+    assert.deepEqual(sender.deposits[2], {firstSeq: 16, tics: 8});
 
+    // What is still refused is a batch so far past the frontier that it is a
+    // backlog rather than a keystroke: the R8l5 failure this bound was written
+    // for, one lead further out. The frontier is 20 and the lead is 96 tics.
     const fourth = await call(
       "POST",
       `/v1/sessions/${created.id}/input`,
-      await batch(wallet, relayer, created, {firstSeq: 20, count: 8, clientSeq: 4}),
+      await batch(wallet, relayer, created, {firstSeq: 116, count: 8, clientSeq: 4}),
     );
     assert.equal(fourth.status, 409);
     assert.equal(fourth.body.code, "input_window_full");
@@ -470,6 +475,17 @@ test("chain mode stages a signed batch, and refuses input past the staging front
     // Nothing was staged, so the page's next_seq has not moved and the same
     // batch is still valid to re-offer.
     assert.equal(sender.deposits.length, 3);
+
+    // And just inside the lead it is accepted whole, which is the whole point:
+    // a page aiming two round trips ahead is not refused for being early.
+    const fifth = await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 108, count: 8, clientSeq: 5}),
+    );
+    assert.equal(fifth.status, 200, JSON.stringify(fifth.body));
+    assert.equal(fifth.body.accepted, 8);
+    assert.deepEqual(sender.deposits[3], {firstSeq: 108, tics: 8});
 
     // And the frame-bytes endpoint says why it has none, rather than handing
     // back eight empty strip accounts.
@@ -921,6 +937,65 @@ test("every flag start.sh passes reaches the child, including the reset account"
   assert.equal(argv[argv.indexOf("--frame-deadline-seconds") + 1], "2");
   assert.equal(argv[argv.indexOf("--rpc-lag-drop-slots") + 1], "512");
   assert.equal(argv[argv.indexOf("--rpc-lag-check-seconds") + 1], "10");
+});
+
+test("the session answer names the buffer holding the latest complete frame", async () => {
+  // The child reads a frame back before it counts it, so it knows which buffer
+  // is whole; the viewer reads eight strip accounts that land in eight
+  // transactions and cannot. The pointer has to reach the page together with
+  // that buffer's accounts, or the page reads the buffer being written -- which
+  // at strip rate 64 is most reads, and was 1 frame painted in 60 s.
+  const pointer = {
+    buffer: 1,
+    cursor: 51140,
+    gametic: 51140,
+    snapshot_hash: "ab".repeat(32),
+    state_root: "cd".repeat(32),
+    signature: "chain-frame-7",
+    snapshot_account: "snap-1",
+    strip_accounts: Array.from({length: 8}, (_, i) => `strip-1-${i}`),
+  };
+  const inner = backgroundSender({frontier: 20, cursor: 0});
+  const sender = {
+    ...inner,
+    async readProgress() {
+      return {...(await inner.readProgress()), latestFrame: pointer};
+    },
+    async renderFrame() {
+      return {...pointer, strips: null, background: true};
+    },
+  };
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return {status: response.status, body: await response.json()};
+  };
+  try {
+    const wallet = await player();
+    const created = (await call("POST", "/v1/sessions", {publicKey: wallet.publicKey})).body;
+    const status = (await call("GET", `/v1/sessions/${created.id}`)).body;
+    assert.equal(status.latest_frame.buffer, 1);
+    assert.equal(status.latest_frame.snapshot_account, "snap-1");
+    assert.deepEqual(status.latest_frame.strip_accounts, pointer.strip_accounts);
+    // And it rides on the input answer too, so a held key does not have to wait
+    // for the status poll to learn which buffer to read.
+    const posted = (await call(
+      "POST",
+      `/v1/sessions/${created.id}/input`,
+      await batch(wallet, relayer, created, {firstSeq: 0, count: 8, clientSeq: 1}),
+    )).body;
+    assert.equal(posted.latest_frame.buffer, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("a producer-trimmed batch is a partial accept, not a server fault", async () => {

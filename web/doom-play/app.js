@@ -7,9 +7,23 @@
 
 import {DEFAULT_NETWORK, explorerAddress, explorerTransaction, requireNetwork} from "./network.js";
 import {ChainReader, WadImageReader, readPlaypal, base58ToBytes, bytesToBase58} from "./rpc.js";
-import {decodeFrame, frameToRgba, toHex, StripError, FRAME_WIDTH, FRAME_HEIGHT} from "./strip.js";
+import {decodeFrame, frameToRgba, parseSnapshot, frameReadAddresses, toHex, StripError, FRAME_WIDTH, FRAME_HEIGHT} from "./strip.js";
 import {loadOrCreateBurner, forgetSession, recallSession, rememberSession, ed25519Available} from "./burner.js";
 import {encodeInput, heldToCommands} from "./input.js";
+
+// The engine rate to assume before the relayer has reported one. Measured at
+// 23.8-26.3 tics/s across two drive sessions at strip rate 64, so 25 is the
+// middle of what has actually been seen rather than a design number.
+const DEFAULT_TICS_PER_SECOND = 25;
+// The relayer's own sequence window, and how far inside it the page aims.
+const SEQ_WINDOW = 240;
+// Batches in flight at once, so the cadence is the interval and not the round
+// trip.
+const MAX_PUSH_IN_FLIGHT = 2;
+// How often the viewer reads a frame. A frame is complete only between one
+// frame's last strip landing and the next frame's first, so a torn read is the
+// expected case at strip rate 64 and is retried at once.
+const POLL_MS = 250;
 
 const THEME_KEY = "doom-play.theme";
 const RELAYER_KEY = "doom-play.relayer";
@@ -103,6 +117,15 @@ const state = {
   // has, so a batch aimed between them is read rather than dropped.
   producerStageLimit: null,
   producerGeneratedCursor: null,
+  // When the two producer numbers above were read, and the engine rate they are
+  // read against. The page's aim is a prediction, and a prediction needs the
+  // age of its input.
+  producerReadAt: 0,
+  ticsPerSecond: null,
+  // The relayer's pointer to the render buffer holding the newest COMPLETE
+  // frame, and that buffer's accounts. The page reads this buffer, not the one
+  // being written.
+  framePointer: null,
   frameCounters: null,
   // A key going down, and the first frame painted after it. That pair is the
   // input-to-picture latency a player feels, and it is the only one of the
@@ -111,9 +134,20 @@ const state = {
   pictureLatencies: [],
   clientSeq: 0,
   inputsSent: 0,
+  batchesSigned: 0,
+  refusals: 0,
+  // The measured POST round trip in ms, and the lead it implies in tics. Both
+  // are on the panel and both are in the receipt: the lead is the design's
+  // price for a window narrower than the round trip, and its size is the
+  // number that says whether the price is right.
+  roundTripMs: null,
+  leadTics: null,
+  aimedAt: null,
+  seqWindow: SEQ_WINDOW,
   latencies: [],
   lastFrame: null,
   lastFrameSlot: null,
+  lastFrameBuffer: null,
   paintedFrames: 0,
   paintedAt: 0,
   frameTimes: [],
@@ -357,47 +391,73 @@ async function readFromRelayer() {
   if (!Array.isArray(payload.strips) || payload.strips.length !== 8) return null;
   return {
     slot: null,
-    payloads: payload.strips.map((encoded) => {
+    // Mock mode has no snapshot account to read alongside the strips, so the
+    // strips are the frame: decodeFrame falls back to the eight agreeing.
+    hasSnapshot: false,
+    payloads: [null, ...payload.strips.map((encoded) => {
       const binary = atob(encoded);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
       return bytes;
-    }),
+    })],
   };
 }
 
+// The buffer to read: the one the relayer says holds the newest complete
+// frame, or the configured one before it has said anything. With two buffers
+// the pipeline round-robins, so the configured buffer is the one being written
+// about half the time.
+function frameTarget() {
+  const pointer = state.framePointer;
+  const buffer = pointer && Array.isArray(pointer.strip_accounts) ? pointer.buffer : null;
+  const strips = pointer && Array.isArray(pointer.strip_accounts) ? pointer.strip_accounts : net.doom.strips[state.buffer];
+  const snapshot = pointer && pointer.snapshot_account ? pointer.snapshot_account : net.doom.snapshots[buffer ?? state.buffer];
+  return {buffer: buffer ?? state.buffer, snapshot, strips};
+}
+
 async function readOnce() {
-  const addresses = net.doom.strips[state.buffer];
-  if (!addresses || addresses.length !== 8) {
-    showError(new Error(`buffer ${state.buffer} has no strip accounts configured`));
+  const target = frameTarget();
+  const strips = target.strips;
+  if (!strips || strips.length !== 8) {
+    showError(new Error(`buffer ${target.buffer} has no strip accounts configured`));
     return;
   }
   let slot = null;
   let payloads = null;
+  let hasSnapshot = true;
   try {
-    ({slot, payloads} = await state.reader.getAccounts(addresses));
+    // One getMultipleAccounts for the snapshot and all eight strips of one
+    // render buffer. They land in nine transactions, and at strip rate 64 a
+    // frame is complete only briefly; two calls can straddle a write, and the
+    // strips of one frame do not commit to each other -- only to the snapshot,
+    // which is why the snapshot is in this read.
+    ({slot, payloads} = await state.reader.getAccounts(frameReadAddresses(target)));
   } catch (error) {
     const relayed = await readFromRelayer().catch(() => null);
     if (!relayed) throw error;
     ({slot, payloads} = relayed);
+    hasSnapshot = Boolean(relayed.hasSnapshot);
     setCell(ui.stageState, "MOCK MODE · RELAYER FRAME");
   }
-  const present = payloads.filter(Boolean).length;
+  const present = payloads.slice(1).filter(Boolean).length;
   ui.stripSummary.textContent = `${present} / 8`;
   for (let i = 0; i < 8; i += 1) {
-    const ok = Boolean(payloads[i]);
+    const ok = Boolean(payloads[i + 1]);
     stripChips[i].classList.toggle("ok", ok);
     if (ok) stripChips[i].title = `strip ${i} present`;
   }
-  if (present < 8) {
-    // A frame is all eight strips or nothing. Keep the last good one.
+  if (present < 8 || (hasSnapshot && !payloads[0])) {
+    // A frame is the snapshot and all eight strips or nothing. Keep the last
+    // good one.
     setCell(ui.railState, "PARTIAL");
     return;
   }
-  const frame = await decodeFrame(payloads);
+  const snapshot = hasSnapshot ? await parseSnapshot(payloads[0]) : null;
+  const frame = await decodeFrame(payloads.slice(1), {snapshot});
   frame.digest = await digestHex(frame.pixels);
   await paintFrame(frame);
   state.lastFrameSlot = slot;
+  state.lastFrameBuffer = target.buffer;
   clearError();
 }
 
@@ -421,10 +481,13 @@ function startPolling() {
       showError(error);
     }
     if (stopped) return;
-    // Frames land at roughly 1-2/s on the measured deployment. Poll a bit
-    // faster than that so a new frame shows up promptly, and back off on
-    // repeated failure rather than hammering a struggling node.
-    const delay = state.lastError ? 3000 : 700;
+    // Frames land at 1-2/s at strip rate 16 and faster at 64, and a frame is
+    // complete only for as long as the pipeline has not started the next one,
+    // so a read that catches a frame mid-write is the expected case rather than
+    // a fault: it is retried at the next poll with no backoff, because backing
+    // off is what held the painted rate at one frame a minute. Other failures
+    // are a node or a relayer having a bad time, and those do back off.
+    const delay = state.lastError && !state.lastError.startsWith("StripError") ? 3000 : POLL_MS;
     timer = setTimeout(loop, delay);
   };
   loop();
@@ -527,73 +590,111 @@ function syncPad() {
   }
 }
 
-// One batch per animation frame while keys are held, placed at the front of
-// the relayer's staging window. Vanilla Doom runs at 35 tics/s; the engine reads
-// an input slot when its cursor reaches it and the producer has already
-// deposited every tic below its own staging limit, so the only tics a keypress
-// can still reach are the handful just behind the relayer's frontier. A page
-// that instead counted the tics it had sent drifted behind the engine at
-// 35 tics/s, and after ten seconds of no keys every batch it offered named a
-// tic the chain had already consumed: inputs accepted, player still.
+// Aiming ahead of the producer, because a batch cannot be aimed at it.
 //
-// Only one push is ever in flight. Two overlapping pushes would both read the
-// same nextSeq and send the same firstSeq, and the relayer would rightly
-// refuse the second, so the keys a player is holding would silently stop
-// registering.
-const MAX_PUSH_TICS = 8;
+// The engine reads an input slot when its cursor reaches it, and the producer
+// has already fixed every tic below its generated cursor, so a batch aimed at
+// the live window is a batch aimed below the producer by the time it lands.
+// Measured on the first drive: the round trip from this page to the producer is
+// 0.3-0.4 s, which is 7-11 tics at the measured 23.8-26.3 tics/s, and the
+// window is four tics wide. 19 POSTs, 0 accepted, all 409 `input_stale`, 0
+// command tics deposited against 6,116-12,416 tics consumed. Aiming at a
+// window narrower than the trip cannot win, however exactly it is aimed.
+//
+// So the page leads the window by its own round trip, and repeats the held key
+// state across an overlapping batch rather than counting the tics it has sent.
+// The lead is the price: a keystroke is read by the engine one lead after it is
+// signed, which is the input-to-picture latency this design implies.
+const PUSH_TICS = 16;
+const PUSH_INTERVAL_MS = 100;
+// Two round trips of lead, and never less than twelve tics: the first number
+// covers the trip, the second covers a trip the page has not measured yet.
+const LEAD_ROUND_TRIPS = 2;
+const MIN_LEAD_TICS = 12;
+const MAX_LEAD_TICS = 96;
+// Stay this far inside the relayer's own 240-tic sequence window, so a
+// mispredicted aim is a refusal the page can read a resume point from rather
+// than a batch_refused for being too far ahead.
+const SEQ_WINDOW_MARGIN = 40;
 let pushTimer = null;
-let pushInFlight = false;
+let pushesInFlight = 0;
+let lastPushAt = 0;
 function scheduleInputPush() {
   if (pushTimer !== null) return;
   pushTimer = requestAnimationFrame(() => {
     pushTimer = null;
-    if (pushInFlight) {
-      // Try again on the next frame rather than dropping the keystroke.
+    // Two batches may be in flight so the cadence is the interval rather than
+    // the round trip. They cannot collide: each is aimed from its own reading
+    // of the producer's position and carries its own client_seq, and both write
+    // the same key state over the same tics.
+    if (pushesInFlight >= MAX_PUSH_IN_FLIGHT) {
       scheduleInputPush();
+      return;
+    }
+    const wait = lastPushAt + PUSH_INTERVAL_MS - performance.now();
+    if (wait > 0) {
+      pushTimer = setTimeout(() => {
+        pushTimer = null;
+        void pushInput();
+      }, wait);
       return;
     }
     void pushInput();
   });
 }
 
+// Where the producer's generated cursor will be when our POST reaches it. The
+// number the relayer last reported is as old as that answer, and the producer
+// does not stop, so the page carries it forward by its own age.
+function predictedGenerated() {
+  const observed = state.producerGeneratedCursor;
+  if (observed === null || observed === undefined) return null;
+  const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
+  const ageSeconds = Math.max(0, performance.now() - state.producerReadAt) / 1000;
+  return observed + Math.floor(ageSeconds * rate);
+}
+
+// The lead, in tics, the page aims ahead of the producer by: the measured round
+// trip twice over, never less than twelve tics.
+function aimLead() {
+  const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
+  const tripTics = Math.ceil(((state.roundTripMs ?? 0) / 1000) * rate);
+  return Math.max(MIN_LEAD_TICS, Math.min(MAX_LEAD_TICS, LEAD_ROUND_TRIPS * tripTics));
+}
+
 async function pushInput() {
   if (!state.session || !state.wallet) return;
   const held = Object.values(state.keys).some(Boolean);
-  if (held) {
-    // A fresh window before every signed batch. The frontier moves with the
-    // cursor, so a window read a status poll ago is already tens of tics out
-    // of date and the batch would be signed for slots the engine has read.
+  if (held && state.producerReadAt === 0) {
+    // The first batch of a hold has no producer position of its own, and the
+    // one the session was opened with is as old as the join.
     await readWindow();
   }
-  // The floor is the relayer's own next sequence, floored at the chain's
-  // cursor: never rewind, and never offer a tic the chain has consumed.
-  //
-  // And floored one past the producer's generated cursor, which is the bound
-  // that actually decides the batch's fate: a write at or below it names tics
-  // DEPOSIT has already fixed, so it is refused as `input_stale` with the
-  // sequence to resume at. The producer generates at 35 tics/s against an engine
-  // at 26, so it runs ahead of the chain cursor by 12-16 tics; a floor at the
-  // cursor therefore aimed every batch at a sequence the engine had already
-  // read, and the page held a key for a minute with 21 refusals and 0 tics
-  // deposited. The writable window is (generated_cursor, stage_limit].
-  const generated = state.producerGeneratedCursor;
-  const floor = Math.max(state.nextSeq, state.cursor, generated === null || generated === undefined ? -1 : generated + 1);
-  state.nextSeq = floor;
-  const frontier = state.stagingFrontier ?? floor;
-  // Aim at the live window, which is the last few tics before the frontier. The
-  // producer has already deposited everything below that, so a batch anywhere
-  // else in the staging window is accepted, counted and never read by the game.
-  // The relayer measures the window; the page only has to point at it.
-  const width = Math.max(1, Math.min(state.inputWindow ?? MAX_PUSH_TICS, frontier - floor));
-  if (!held || frontier <= floor) {
-    // No keys, or the frontier has not moved: the next frame offers again.
+  const generated = predictedGenerated();
+  // The floor is one past the producer's generated cursor: a write at or below
+  // it names tics DEPOSIT has already fixed, so it can never be read by the
+  // game. The chain cursor is a second floor, because a tic the engine has read
+  // is gone whatever the producer says. The page's own last batch is
+  // deliberately not a floor: the batches overlap and repeat the same keys, so
+  // a floor there would walk the aim up faster than the engine runs and build
+  // the backlog the relayer's lead bound exists to prevent.
+  const floor = Math.max(
+    state.cursor,
+    generated === null ? 0 : generated + 1,
+  );
+  if (!held || floor <= 0) {
+    // No keys, or nothing has been read yet: the next frame offers again.
     // Nothing is lost by waiting, because a tic nobody writes is a tic with no
     // keys held.
     if (held) scheduleInputPush();
     return;
   }
-  const firstSeq = Math.max(floor, frontier - width);
-  const count = width;
+  const lead = aimLead();
+  const ceiling = Math.max(floor, state.cursor + state.seqWindow - SEQ_WINDOW_MARGIN);
+  const firstSeq = Math.min(floor + lead, ceiling);
+  const count = PUSH_TICS;
+  state.leadTics = firstSeq - floor;
+  state.aimedAt = firstSeq;
   const commands = heldToCommands(state.keys, firstSeq, count);
   state.clientSeq += 1;
   const message = encodeInput({
@@ -606,7 +707,9 @@ async function pushInput() {
   });
   const signature = await state.wallet.sign(message);
   const sentAt = performance.now();
-  pushInFlight = true;
+  lastPushAt = sentAt;
+  pushesInFlight += 1;
+  state.batchesSigned += 1;
   try {
     const response = await fetch(`${state.relayerBase}/v1/sessions/${encodeURIComponent(state.session.id)}/input`, {
       method: "POST",
@@ -618,46 +721,59 @@ async function pushInput() {
       // A refusal that names a resume point is not a failure to show, it is the
       // relayer saying where the chain is. Take its word for the sequence and
       // offer again.
+      state.refusals += 1;
       if (payload.detail?.next_seq !== undefined) {
         if (payload.detail.cursor !== undefined) state.cursor = payload.detail.cursor;
         if (payload.detail.staging_frontier !== undefined) state.stagingFrontier = payload.detail.staging_frontier;
         if (payload.detail.input_window !== undefined) state.inputWindow = payload.detail.input_window;
         if (payload.detail.producer_generated_cursor !== undefined) {
           state.producerGeneratedCursor = payload.detail.producer_generated_cursor;
+          state.producerReadAt = performance.now();
         }
         if (payload.detail.producer_stage_limit !== undefined) {
           state.producerStageLimit = payload.detail.producer_stage_limit;
         }
+        // A batch the producer has already passed says exactly how far short
+        // the aim was, and the producer's own position is the number to aim
+        // from next time. The lead grows by the shortfall; it is the measured
+        // round trip plus whatever the round trip under-measured.
+        if (payload.detail.producer_generated_cursor !== undefined) {
+          const short = payload.detail.producer_generated_cursor - firstSeq + 1;
+          if (short > 0) state.leadTics = Math.min(MAX_LEAD_TICS, Math.max(state.leadTics ?? 0, short + MIN_LEAD_TICS));
+        }
         // Take the relayer's word for the sequence to write next. It is the
         // producer's own position, which is the only side that knows it; the
         // chain cursor is below it and a floor there is a refusal.
-        state.nextSeq = payload.detail.next_seq;
+        state.nextSeq = Math.max(state.nextSeq, payload.detail.next_seq);
         if (held) scheduleInputPush();
         return;
       }
       throw new Error(payload.error ?? `relayer returned ${response.status}`);
     }
     adoptAccounts(payload);
-    // The next tic to write is the one after the batch just deposited. The
-    // relayer's own next_seq is not read back here: it counts accepted batches
-    // and would drag the aim above the live window, where a write is accepted
-    // and never read.
-    state.nextSeq = firstSeq + count;
+    // The batch's own end, so the next one overlaps it rather than leaving a
+    // hole. It is not a floor: the aim is the producer's position plus the
+    // lead, and this is only here to say how much of the window is written.
+    state.nextSeq = Math.max(state.nextSeq, firstSeq + count);
     state.inputsSent += count;
-    state.latencies.push(performance.now() - sentAt);
+    const elapsed = performance.now() - sentAt;
+    state.latencies.push(elapsed);
     if (state.latencies.length > 40) state.latencies.shift();
+    // The round trip the lead is built from is the worst of the recent ones:
+    // the aim has to survive the slow request, not the median one.
+    state.roundTripMs = Math.max(...state.latencies.slice(-8));
     const median = [...state.latencies].sort((a, b) => a - b)[Math.floor(state.latencies.length / 2)];
-    setCell(ui.inputLatency, `${median.toFixed(0)} ms`);
+    setCell(ui.inputLatency, `${median.toFixed(0)} ms · lead ${state.leadTics}`);
     setCell(ui.inputsSent, String(state.inputsSent));
     if (payload.frame?.signature) state.signature = payload.frame.signature;
     clearError("action");
   } catch (error) {
     showError(error, "action");
   } finally {
-    pushInFlight = false;
-    // Held keys keep offering, one batch per frame, for as long as they are
-    // down. This is the loop the R8l6 session was missing: one batch per
-    // keydown is eight tics, which is a nudge, not a walk.
+    pushesInFlight -= 1;
+    // Held keys keep offering, on the interval, for as long as they are down.
+    // This is the loop the R8l6 session was missing: one batch per keydown is
+    // a nudge, not a walk.
     if (Object.values(state.keys).some(Boolean)) scheduleInputPush();
   }
 }
@@ -741,6 +857,22 @@ function adoptAccounts(payload) {
   if (payload.producer_stage_limit !== undefined) {
     state.producerStageLimit = payload.producer_stage_limit;
   }
+  // Every answer that carries the producer's position is stamped with when it
+  // arrived, because the aim carries it forward by its age.
+  if (payload.producer_generated_cursor !== undefined) state.producerReadAt = performance.now();
+  if (payload.tics_per_second) state.ticsPerSecond = payload.tics_per_second;
+  // The relayer's pointer to the buffer holding the newest complete frame,
+  // with that buffer's accounts: the page reads this buffer rather than the one
+  // the pipeline is writing.
+  if (payload.latest_frame?.buffer !== undefined && payload.latest_frame?.buffer !== null) {
+    state.framePointer = payload.latest_frame;
+    if (Array.isArray(payload.latest_frame.strip_accounts)) {
+      net.doom.strips[payload.latest_frame.buffer] = payload.latest_frame.strip_accounts;
+    }
+    if (payload.latest_frame.snapshot_account) {
+      net.doom.snapshots[payload.latest_frame.buffer] = payload.latest_frame.snapshot_account;
+    }
+  }
   if (payload.frame_counters) state.frameCounters = payload.frame_counters;
 }
 
@@ -762,7 +894,12 @@ async function pollSessionStatus() {
     state.nextSeq = Math.max(state.nextSeq, status.cursor ?? 0);
     setCell(ui.slotCell, String(status.slot));
     // Only replace the latency readout when the relayer actually knows a rate.
-    if (status.tics_per_second) setCell(ui.inputLatency, `${status.tics_per_second.toFixed(1)} tic/s`);
+    // Before the first batch of a hold the panel shows the engine rate; after
+    // it, the panel shows the round trip and the lead, which is the pair a
+    // player reads to know whether their keystrokes are landing.
+    if (status.tics_per_second && !state.latencies.length) {
+      setCell(ui.inputLatency, `${status.tics_per_second.toFixed(1)} tic/s`);
+    }
     if (status.frame?.signature) state.signature = status.frame.signature;
     if (status.state && status.state !== "playing") {
       setCell(ui.sessionState, status.state.toUpperCase(), "warn");

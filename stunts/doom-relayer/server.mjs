@@ -133,6 +133,7 @@ export class Relayer {
     seqWindow = 240,
     ticsPerFrame = 16,
     advanceTics = 4,
+    inputLeadTics = 96,
   } = {}) {
     this.networkName = network;
     this.network = NETWORKS[network];
@@ -145,6 +146,14 @@ export class Relayer {
     this.ticsPerFrame = ticsPerFrame;
     // How wide the live input window is: one advance packet's worth of tics.
     this.advanceTics = advanceTics;
+    // How far past the staging frontier a page may aim, in tics. A page that
+    // aims at the frontier is aiming below the producer by the time its batch
+    // lands: the round trip to this process is 0.3-0.4 s measured, which is
+    // 7-11 tics at the measured 23.8-26.3 tics/s, and the frontier is about
+    // four tics wide. So the page leads the window by its own round trip and
+    // its batches arrive above the frontier, and this is the bound that keeps
+    // "ahead by one round trip" from becoming a backlog.
+    this.inputLeadTics = inputLeadTics;
     this.sender = sender ?? createSender({mode});
     this.pool = pool ?? new SlotPool({slots: []});
     this.sessions = new Map();
@@ -283,6 +292,7 @@ export class Relayer {
     slot.stagingFrontier = progress.stagingFrontier ?? null;
     slot.producer = progress.producer ?? slot.producer ?? null;
     slot.frameCounters = progress.frameCounters ?? slot.frameCounters ?? null;
+    slot.latestFrame = progress.latestFrame ?? slot.latestFrame ?? null;
     slot.rpcUrls = progress.rpcUrls ?? slot.rpcUrls ?? null;
     slot.nextSeq = Math.max(slot.nextSeq, slot.cursor);
     return slot;
@@ -319,6 +329,11 @@ export class Relayer {
       producer_stage_limit: slot.producer?.stage_limit ?? null,
       producer_generated_cursor: slot.producer?.generated_cursor ?? null,
       frame_counters: slot.frameCounters ?? null,
+      // Which render buffer holds the newest COMPLETE frame, and that buffer's
+      // accounts. The child read the frame back before counting it, so it knows
+      // which buffer is whole; the viewer does not, and reading the buffer being
+      // written is what made it refuse to paint at strip rate 64.
+      latest_frame: slot.latestFrame ?? null,
       rpc_urls: slot.rpcUrls ?? null,
       input_capacity: slot.inputCapacity,
       tics_landed: slot.ticsLanded,
@@ -518,12 +533,19 @@ export class Relayer {
     let frontier = null;
     if (this.sender.background) {
       frontier = await this.sender.stagingFrontier();
-      const room = frontier - decoded.firstSeq;
+      // A page aims ahead of the producer by its own round trip, so a batch
+      // routinely lands above the frontier: the producer reads the command
+      // stream by absolute sequence and reaches those tics as its in-flight
+      // packets land. What is refused is a batch so far ahead that it is a
+      // backlog rather than a keystroke, which is the R8l5 failure this check
+      // was written for and still is, one lead further out.
+      const ceiling = frontier + this.inputLeadTics;
+      const room = ceiling - decoded.firstSeq;
       if (room <= 0) {
         this.stats.inputsRejected += 1;
         const error = new Error(
-          `input window is full: ${decoded.firstSeq} is ${decoded.firstSeq - frontier} tics past the ` +
-            `staging frontier ${frontier}`,
+          `input window is full: ${decoded.firstSeq} is ${decoded.firstSeq - ceiling} tics past the ` +
+            `staging frontier ${frontier} plus the ${this.inputLeadTics}-tic lead`,
         );
         error.status = 409;
         error.code = "input_window_full";
@@ -596,6 +618,7 @@ export class Relayer {
     if (this.sender.background) {
       try {
         const frame = await this.sender.renderFrame({slot: slot.label, bufferId: 0});
+        if (frame.buffer !== undefined) slot.latestFrame = frame;
         if (frame.signature && frame.signature !== slot.lastFrameSignature) {
           slot.lastFrameSignature = frame.signature;
           slot.framesLanded += 1;
@@ -627,6 +650,10 @@ export class Relayer {
       tics: advanced.tics,
       deposit_signature: result.signature,
       advance_signature: advanced.signature,
+      // The frame pointer rides on the input answer too: a held key is the
+      // moment the page most wants to be reading the buffer that is not being
+      // written, and the status poll is up to two seconds behind.
+      latest_frame: slot.latestFrame ?? null,
       frame: {
         cursor: slot.cursor,
         gametic: slot.gametic,
@@ -913,6 +940,7 @@ if (isMain()) {
     logger,
     sender,
     advanceTics: args.get("advance-tics") ? Number(args.get("advance-tics")) : 4,
+    inputLeadTics: args.get("input-lead-tics") ? Number(args.get("input-lead-tics")) : 96,
   });
   const corsOrigin = args.get("cors-origin") ?? "*";
   const server = createServer(relayer, {onLog: (line) => logger(line), corsOrigin});
