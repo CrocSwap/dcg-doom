@@ -883,12 +883,18 @@ const PUSH_INTERVAL_MS = 100;
 // `producer_generated_cursor`, which is itself four tics ahead of the producer's
 // real position, and 93.7% of the tics the chain deposited carried no key.
 const PRODUCER_BATCH_TICS = 4;
-const MIN_LEAD_TICS = 16;
-const MAX_LEAD_TICS = 64;
 // Stay this far inside the relayer's own 240-tic sequence window, so a
 // mispredicted aim is a refusal the page can read a resume point from rather
 // than a batch_refused for being too far ahead.
 const SEQ_WINDOW_MARGIN = 40;
+// The floor, for a relayer that publishes no lead of its own. The producer's
+// lead is 61 on R15 and this was 16, which is the whole of the fault.
+const MIN_LEAD_TICS = 16;
+// The ceiling on any aim, published or derived: the relayer's sequence window
+// less the margin above. `ceiling` in `pushInput` applies the same bound to the
+// sequence itself; this one stops a published number from being the thing that
+// decides how far a page writes.
+const MAX_LEAD_TICS = SEQ_WINDOW - SEQ_WINDOW_MARGIN;
 let pushTimer = null;
 let pushesInFlight = 0;
 let lastPushAt = 0;
@@ -932,13 +938,39 @@ function predictedNext() {
   return base + Math.floor(ageSeconds * rate);
 }
 
-// The lead, in tics: the push cadence, the measured round trip and the
-// producer's own batch, and never less than MIN_LEAD_TICS.
+// The lead, in tics: the producer's own, when it publishes one, and otherwise
+// the push cadence plus the measured round trip plus the producer's batch.
+//
+// The producer is the side that holds the window open, and it resolves this
+// quantity from a measurement of how long a staged tic takes to reach the
+// chain: `Server.lead_tics` in `scripts/doom_relayer_server.py`, published as
+// `input_stage_lead_tics` on every status and every input answer. On R15 that
+// is 61 tics (35 tic/s configured, 2 x the 0.86 s round trip), where this page
+// was building 16 out of its own POST latency -- which is only the page's share
+// of the same delivery, and the smaller half of it.
+//
+// The price is latency, and it is a real one: 61 tics at the 23 tic/s R15
+// actually ran is 2.6 s from keypress to the engine reading the tic, against
+// 310 ms measured with the 16-tic aim. What that buys is the ratio: with the
+// 16-tic aim, 201 of 510 staged tics (39.4%) reached a DEPOSIT carrying a key
+// and the other 309 were deposited as zeros, because the producer snapshotted
+// those tics before this page's write arrived. A lead inside the race is not a
+// cheaper lead, it is a lost keystroke.
+//
+// The local arithmetic stays as the floor rather than being replaced, for a
+// relayer that publishes nothing and for a published number that is stale
+// because the rate it was resolved from is not this session's rate. The larger
+// of the two is used, so neither source can quietly aim short.
 function aimLead() {
   const rate = state.ticsPerSecond ?? DEFAULT_TICS_PER_SECOND;
   const tripTics = Math.ceil(((state.roundTripMs ?? 0) / 1000) * rate);
   const cadenceTics = Math.ceil((PUSH_INTERVAL_MS / 1000) * rate);
-  return Math.max(MIN_LEAD_TICS, Math.min(MAX_LEAD_TICS, tripTics + cadenceTics + PRODUCER_BATCH_TICS));
+  const derived = Math.max(MIN_LEAD_TICS, tripTics + cadenceTics + PRODUCER_BATCH_TICS);
+  const published = state.producerLeadTics;
+  const usable = typeof published === "number" && Number.isFinite(published) && published > 0
+    ? Math.round(published)
+    : 0;
+  return Math.min(MAX_LEAD_TICS, Math.max(derived, usable));
 }
 
 async function pushInput() {

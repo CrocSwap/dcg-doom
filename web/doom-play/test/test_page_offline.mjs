@@ -108,6 +108,11 @@ async function measureWindow(page, relayer, seconds) {
 }
 
 const FAST = {frameIntervalMs: 60};
+// The cadence R15 actually ran at: one render buffer, 196 frames in 106.8 s.
+// The paint-path questions are about what a frame costs, not how often they
+// arrive, but a test that only ever runs at 16 fps cannot see a stall of a
+// couple of seconds, which is what a dropped stream costs.
+const LIVE = {frameIntervalMs: 550, ticsPerSecond: 23};
 
 if (!chromeAvailable()) {
   test("the painted path, offline", {skip: "Chrome is not installed on this machine"}, () => {});
@@ -130,7 +135,7 @@ if (!chromeAvailable()) {
         `painted ${window.paintedFps.toFixed(2)} fps against ${window.pushedFps.toFixed(2)} pushed`,
       );
       assert.equal(window.after.stream.torn ?? 0, 0, "a pushed frame is eight whole strips, not a torn read");
-    }, {...FAST, query: "&cross-check-every=0"});
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
   test("a node that never answers does not stop the picture", {timeout: 180_000}, async () => {
@@ -168,7 +173,7 @@ if (!chromeAvailable()) {
       assert.ok(row.stream.cross_check_matches > 0, `no cross-check matched: ${JSON.stringify(row.crossCheck)}`);
       assert.equal(row.stream.cross_check_mismatches, 0, JSON.stringify(row.crossCheck));
       assert.equal(row.error, null, `a matching cross-check raised an error: ${row.error}`);
-    }, {...FAST, query: "&cross-check-every=5"});
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=5"});
   });
 
   test("a node that fails outright is counted, not fatal", {timeout: 180_000}, async () => {
@@ -214,7 +219,99 @@ if (!chromeAvailable()) {
         return null;
       })()`);
       assert.equal(back, row.session, "the reloaded page did not re-attach to the same session");
-    }, {...FAST, query: "&cross-check-every=0"});
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
+  });
+
+  test("the page aims at the producer's published lead, not at its own round trip", {timeout: 180_000}, async () => {
+    // The producer resolves the lead from how long a staged tic takes to reach
+    // the chain and publishes it; the page used to build its own out of the
+    // latency of its own POST, which is only the page's share of that delivery.
+    // On R15 that was 16 tics where the producer had 61, and 201 of 510 staged
+    // tics reached a DEPOSIT carrying a key: the rest were deposited as zeros
+    // because the producer had already snapshotted them. This test fails on the
+    // page that aims at 16.
+    await withPage(async ({page, relayer}) => {
+      await sleep(2_000);
+      await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
+      // Long enough for the aim to be consumed: the fake marks a staged tic
+      // landed once the chain cursor is a whole lead past the producer's
+      // generated cursor, so a 61-tic lead at 35 tic/s is 1.7 s before the first
+      // tic of a keypress is read. That is the price of the aim, and it is why
+      // this hold is longer than the other tests'.
+      await sleep(3_500);
+      const held = await snapshot(page);
+      await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
+      const published = await page.evaluate("window.doomPlay.state.producerLeadTics");
+      assert.equal(published, relayer.leadTics, `the page never read the producer's lead (${JSON.stringify(published)})`);
+      assert.equal(
+        held.leadTics,
+        relayer.leadTics,
+        `the page aimed ${JSON.stringify(held.leadTics)} tics ahead of the producer's next tic ` +
+          `where the producer published ${relayer.leadTics}`,
+      );
+      assert.ok(relayer.leadTics > 16, `this relayer published ${relayer.leadTics}, which is not above the 16 the page used to aim`);
+      // And the aim is inside the relayer's own window, so the lead did not turn
+      // a deposit race into a batch_refused.
+      assert.equal(held.refusals, 0, `aiming ${relayer.leadTics} tics ahead was refused: ${JSON.stringify(relayer.refusals.slice(0, 2))}`);
+      assert.ok(relayer.acceptedBatches > 0, "the relayer accepted nothing");
+      assert.ok(relayer.landedTics > 0, `the engine consumed none of the ${relayer.stagedTics} tics staged in 3.5 s`);
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
+  });
+
+  test("a relayer that publishes no lead falls back to the page's own arithmetic", {timeout: 180_000}, async () => {
+    // A page that can only aim with a published lead is a page that cannot play
+    // against a relayer that has not published one, which is every mock relayer
+    // and every session whose producer has not resolved a lead yet.
+    await withPage(async ({page, relayer}) => {
+      await sleep(2_000);
+      const published = await page.evaluate("window.doomPlay.state.producerLeadTics");
+      assert.equal(published, null, `this relayer published ${JSON.stringify(published)} and was meant to publish nothing`);
+      await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
+      await sleep(1_200);
+      const held = await snapshot(page);
+      await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
+      assert.ok(held.batchesSigned > 0, "the page signed nothing");
+      assert.equal(typeof held.leadTics, "number", `a batch was signed without an aim: ${JSON.stringify(held)}`);
+      assert.ok(
+        held.leadTics >= 16,
+        `with no published lead the page aimed ${JSON.stringify(held.leadTics)} tics, under the floor of 16`,
+      );
+    }, {relayerOptions: {...FAST, publishLead: false}, query: "&cross-check-every=0"});
+  });
+
+  test("a stream that drops is caught up, not resumed at the newest frame", {timeout: 180_000}, async () => {
+    // The page reconnects by itself and says which frame it last painted, and
+    // the relayer used to answer that with the newest frame alone -- so every
+    // frame completed while the stream was away was gone, with nothing torn,
+    // nothing refused, and no counter anywhere saying so. That is the shape the
+    // R15 measurement of 2026-09-26 had: 68 frames painted against ~86 the chain
+    // completed in the same 47 s.
+    //
+    // What is recoverable is what the relayer still holds: a four-frame ring at
+    // the live 1.83 fps covers two seconds, which is what a tunnel hiccup is.
+    // Past the ring the frames are gone for good and the operator's call, not
+    // the page's, so the bound under this is the ring.
+    await withPage(async ({page, relayer}) => {
+      await sleep(2_000);
+      const before = await snapshot(page);
+      const pushedBefore = relayer.pushed;
+      await sleep(6_000);
+      assert.equal(relayer.dropStreams(), 1, "the fake relayer had no open stream to drop");
+      await sleep(12_000);
+      const after = await snapshot(page);
+      const pushed = relayer.pushed - pushedBefore;
+      const painted = after.painted - before.painted;
+      assert.ok(
+        after.stream.errors > before.stream.errors,
+        `the page did not notice the stream dropping (${JSON.stringify(after.stream)}), so this test did not test anything`,
+      );
+      assert.ok(
+        painted >= pushed - 1,
+        `the page painted ${painted} of ${pushed} frames the relayer produced across a dropped stream; the ring holds ` +
+          `${relayer.ringLimit} of them and the stream was away for ${relayer.streamRetryMs} ms (${JSON.stringify(after.stream)})`,
+      );
+      assert.equal(after.stream.torn ?? 0, 0, "a replayed frame is a whole frame, not a torn read");
+    }, {relayerOptions: {...LIVE, streamRetryMs: 2_000}, query: "&cross-check-every=0"});
   });
 
   test("a keypress is signed, accepted and consumed by the engine", {timeout: 180_000}, async () => {
@@ -241,7 +338,7 @@ if (!chromeAvailable()) {
       assert.ok(relayer.landedTics > 0, `the engine consumed none of the ${relayer.stagedTics} staged tics`);
       assert.ok(held.keys.includes("right"), "the page does not think right is held");
       assert.equal(after.error, null, `the page raised: ${after.error}`);
-    }, {...FAST, query: "&cross-check-every=0"});
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
   test("a keypress shows up in the picture, and the four directions differ", {timeout: 300_000}, async () => {
@@ -267,7 +364,7 @@ if (!chromeAvailable()) {
         await sleep(300);
       }
       return seen;
-    }, {...FAST, query: "&cross-check-every=0"});
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
     for (const [name, batch] of Object.entries(directions)) {
       assert.ok(batch, `pressing ${name} staged no batch: ${JSON.stringify(directions)}`);
     }

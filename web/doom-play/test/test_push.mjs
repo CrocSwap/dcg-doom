@@ -203,6 +203,73 @@ test("the stream asks for frames after the last one it painted", () => {
   assert.equal(stream.url, "http://r.invalid/v1/sessions/a%20b/frames?since=41");
 });
 
+test("a dropped stream is opened again asking for what it missed", async () => {
+  // `EventSource` reconnects to the URL it was constructed with, so a page that
+  // lets it comes back from every drop asking for the whole stream and is handed
+  // the newest frame: every frame completed while it was away is gone, with
+  // nothing torn, nothing refused and no counter anywhere. Measured on R15,
+  // 2026-09-26, at three frames in thirty-two.
+  const painted = [];
+  const urls = [];
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-1",
+    onFrame: (frame) => painted.push(frame.frameIndex),
+    EventSourceImpl: class extends FakeEventSource {
+      constructor(url) {
+        super(url);
+        urls.push(url);
+      }
+    },
+    reconnectDelayMs: 1,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  for (let index = 1; index <= 5; index += 1) {
+    await FakeEventSource.last.deliver(pushedRecord({frameIndex: index}));
+  }
+  const first = FakeEventSource.last;
+  assert.match(first.url, /\/frames$/, "the first request names no frame, because the page has painted none");
+  first.fire("error", {});
+  assert.equal(first.closed, true, "the dropped stream was left open, so the browser would reconnect to the old URL");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(urls.length, 2, `the stream was not opened again (${JSON.stringify(urls)})`);
+  assert.match(urls[1], /\/frames\?since=5$/, `the reconnect did not ask for what the page missed: ${urls[1]}`);
+  const summary = stream.summary();
+  assert.equal(summary.errors, 1);
+  assert.equal(summary.reconnects, 1);
+  // And the picture carries on from where it was, without a re-paint.
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 5}));
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 6}));
+  assert.deepEqual(painted, [1, 2, 3, 4, 5, 6]);
+  assert.equal(stream.summary().skipped, 1, "the frame the relayer handed back was re-painted");
+  // A second drop does not open two streams.
+  FakeEventSource.last.fire("error", {});
+  FakeEventSource.last.fire("error", {});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(urls.length, 3, `a second drop opened ${urls.length - 2} streams (${JSON.stringify(urls)})`);
+  stream.stop();
+  FakeEventSource.last.fire("error", {});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(urls.length, 3, "a stopped stream was opened again after it dropped");
+});
+
+test("a stream that is stopped mid-drop does not come back", async () => {
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-1",
+    onFrame: () => {},
+    EventSourceImpl: FakeEventSource,
+    reconnectDelayMs: 50,
+  });
+  stream.start();
+  stream.stop();
+  FakeEventSource.last.fire("error", {});
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(FakeEventSource.last.closed, true);
+  assert.equal(stream.summary().reconnects, 0, "a stopped stream counted a reconnect it never made");
+});
+
 test("one frame in twenty is read from the chain and compared", async () => {
   const reads = [];
   const checks = [];

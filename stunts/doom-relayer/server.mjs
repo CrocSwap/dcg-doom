@@ -229,10 +229,22 @@ export class Relayer {
   // Subscribe to the frame stream. The newest frame is handed over immediately
   // so a page that joins between frames does not sit on a stale picture for a
   // whole cadence; `since` lets a reconnecting page say which frame it last
-  // painted, so it is not sent one it already has.
+  // painted, and it is answered with *every* frame this relayer still holds that
+  // is newer than that, oldest first.
+  //
+  // It used to be answered with the newest frame alone, which is a page that
+  // loses every frame completed while its stream was down and no counter
+  // anywhere says so -- nothing torn, nothing refused, the picture simply
+  // further behind. Measured on R15, 2026-09-26: 68 frames painted against the
+  // ~86 the chain completed in the same 47 s. A frame outside the ring is gone
+  // for good, which is the ring's bound and the operator's policy; a frame
+  // inside it does not have to be.
   subscribeFrames({since = null} = {}) {
-    const newest = [...this.frameStream.values()].pop() ?? null;
-    const pending = newest !== null && (since === null || (newest.frame_index ?? 0) > since) ? [newest] : [];
+    const held = [...this.frameStream.values()];
+    const newest = held.pop() ?? null;
+    const pending = since === null
+      ? (newest === null ? [] : [newest])
+      : held.concat(newest === null ? [] : [newest]).filter((record) => (record.frame_index ?? 0) > since);
     const subscription = {listeners: new Set(), pending};
     this.subscriptions.add(subscription);
     return {

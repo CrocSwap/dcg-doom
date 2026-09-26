@@ -1193,7 +1193,7 @@ test("a frame with no bytes is counted, not pushed", () => {
   assert.equal(relayer.frameStreamSeen, 2);
 });
 
-test("a late subscriber is handed the newest frame, and `since` skips it", () => {
+test("a late subscriber is handed the newest frame, and `since` sends it what it missed", () => {
   const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
   for (let index = 1; index <= 7; index += 1) relayer.onFrame(frameEvent(index));
   const late = relayer.subscribeFrames();
@@ -1201,8 +1201,21 @@ test("a late subscriber is handed the newest frame, and `since` skips it", () =>
   // A page that has painted 7 and reconnects must not be sent 7 again.
   const resumed = relayer.subscribeFrames({since: 7});
   assert.deepEqual(resumed.pending, [], "`since` is the frame the page already has");
+  // A page that has painted 3 and reconnects is sent every frame this relayer
+  // still holds after 3, oldest first -- which is what a dropped stream costs.
+  // Answering with the newest alone loses 4, 5 and 6 with nothing torn, nothing
+  // refused and no counter anywhere: measured on R15, 2026-09-26, at three
+  // frames in thirty-two.
   const behind = relayer.subscribeFrames({since: 3});
-  assert.deepEqual(behind.pending.map((record) => record.frame_index), [7]);
+  assert.deepEqual(behind.pending.map((record) => record.frame_index), [4, 5, 6, 7]);
+  // And a `since` the ring no longer reaches is the ring, because a frame this
+  // relayer has forgotten is one no answer can bring back.
+  for (let index = 8; index <= 11; index += 1) relayer.onFrame(frameEvent(index));
+  const farBehind = relayer.subscribeFrames({since: 3});
+  assert.deepEqual(farBehind.pending.map((record) => record.frame_index), [8, 9, 10, 11]);
+  // A `since` that is not a number is no `since` at all rather than everything.
+  const junk = relayer.subscribeFrames({since: Number("not a frame")});
+  assert.deepEqual(junk.pending, [], `a junk since was answered with ${JSON.stringify(junk.pending.map((r) => r.frame_index))}`);
 });
 
 test("the stream holds four frames and forgets the rest", () => {
