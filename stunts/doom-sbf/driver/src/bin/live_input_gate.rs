@@ -791,6 +791,44 @@ async fn reconstruct(
     Ok((phases, init_cu))
 }
 
+/// The account layout the image under test expects.
+///
+/// A `diagnostic-profile` image carries patch 0030's 176-byte phase
+/// accumulator inside `doom_ctx_t`, so both the context account and the
+/// static resource account it derives its offset from are that much longer.
+/// The runner is built with `ctx-engine` only, so it cannot read its own
+/// feature set as the answer: the layout has to come from the image's
+/// manifest, which is the image's own record of what it was built with.
+struct Layout {
+    context_bytes: usize,
+    static_bytes: usize,
+    diagnostic: bool,
+}
+
+impl Layout {
+    fn from_manifest(manifest: &serde_json::Value) -> Result<Self, Box<dyn Error>> {
+        let features = manifest["enabled_cargo_features"]
+            .as_array()
+            .ok_or("image manifest has no enabled_cargo_features")?;
+        let diagnostic = features
+            .iter()
+            .any(|f| f.as_str() == Some("diagnostic-profile"));
+        Ok(if diagnostic {
+            Layout {
+                context_bytes: resource_sbf::CONTEXT_BYTES_DIAGNOSTIC,
+                static_bytes: resource_sbf::CONTEXT_BYTES_DIAGNOSTIC,
+                diagnostic: true,
+            }
+        } else {
+            Layout {
+                context_bytes: resource_sbf::CONTEXT_BYTES,
+                static_bytes: rsr::ACCOUNT_BYTES,
+                diagnostic: false,
+            }
+        })
+    }
+}
+
 fn bank_with(
     capture: &Capture,
     context: Pubkey,
@@ -799,12 +837,13 @@ fn bank_with(
     controller: Pubkey,
     authority: Pubkey,
     render_accounts: Option<(Pubkey, Pubkey)>,
+    layout: &Layout,
 ) -> ProgramTest {
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
     bank.set_compute_max_units(u64::from(base::NORMAL_LIMIT));
     bank.add_program("doom_sbf", base::PROGRAM, None);
-    bank.add_account(context, base::account(vec![0; resource_sbf::CONTEXT_BYTES]));
+    bank.add_account(context, base::account(vec![0; layout.context_bytes]));
     bank.add_account(RESOURCE, base::account(capture.resource.clone()));
     for (ordinal, bytes) in capture.wad.iter().enumerate() {
         bank.add_account(wad_key(ordinal), base::account(bytes.clone()));
@@ -819,7 +858,7 @@ fn bank_with(
     bank.add_account(FRAME, base::account(vec![0; resource_sbf::RI2_FRAME_BYTES]));
     bank.add_account(authority, system_account(100_000_000_000));
     if let Some((static_key, snapshot)) = render_accounts {
-        bank.add_account(static_key, base::account(vec![0; rsr::ACCOUNT_BYTES]));
+        bank.add_account(static_key, base::account(vec![0; layout.static_bytes]));
         bank.add_account(snapshot, base::account(vec![0; rsn3::SNAPSHOT_BYTES]));
         for strip_id in 0..8u8 {
             bank.add_account(
@@ -1109,10 +1148,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("image manifest does not carry the live render path".into());
     }
+    let layout = Layout::from_manifest(&manifest_json)?;
     if !manifest_json["resource_ri2_sbf_abi_descriptor"]
         .as_str()
         .unwrap_or_default()
-        .contains(&format!("context={}", resource_sbf::CONTEXT_BYTES))
+        .contains(&format!("context={}", layout.context_bytes))
     {
         return Err("image manifest context size is not the driver's".into());
     }
@@ -1193,6 +1233,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         keys.controller.pubkey(),
         keys.authority.pubkey(),
         Some((static_key, snapshot_key)),
+        &layout,
     );
     let ctx = bank.start_with_context().await;
     let mut session = Session {
@@ -2234,6 +2275,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         starve_keys.controller.pubkey(),
         starve_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let starve_state_signer = starve_keys.state.pubkey();
     let starve_ctx = starve_bank.start_with_context().await;
@@ -2319,6 +2361,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         good_keys.controller.pubkey(),
         good_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let good_state_signer = good_keys.state.pubkey();
     let good_ctx = good_bank.start_with_context().await;
@@ -2654,6 +2697,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dead_keys.controller.pubkey(),
         dead_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let dead_ctx = dead_bank.start_with_context().await;
     let mut dead = Session {
@@ -2817,6 +2861,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         halt_keys.controller.pubkey(),
         halt_keys.authority.pubkey(),
         None,
+        &layout,
     );
     let halt_ctx = halt_bank.start_with_context().await;
     let mut halt = Session {
@@ -2931,6 +2976,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "manifest_sha256": base::sha(&manifest_bytes),
         "manifest_source_commit": manifest_json["compile_source_commit"],
         "manifest_source_tree": manifest_json["compile_source_tree"],
+        "context_account_bytes": layout.context_bytes,
+        "static_resource_account_bytes": layout.static_bytes,
+        "diagnostic_profile_image": layout.diagnostic,
         "driver_source_sha256": base::sha(DRIVER_SOURCE),
         "capture": capture_dir.display().to_string(),
         "resource_sha256": base::sha(&capture_data.resource),

@@ -93,8 +93,15 @@ pub const CTX_GUARD_REFUSED: u32 = 199;
 /// (30088de1f). A production build's context layout is a consensus input to
 /// the deployed images, the live accounts and the sender scripts; a
 /// measurement-only patch has no business changing it.
+///
+/// `CTX_PHASE_PROFILE_BYTES` is the 176 on its own, unconditionally: a host
+/// runner that measures a `diagnostic-profile` image has to preallocate
+/// *that image's* layout, and it cannot read that image's features from its
+/// own feature set.
+pub const CTX_PHASE_PROFILE_BYTES: usize = 176;
+
 #[cfg(all(feature = "ctx-engine", feature = "diagnostic-profile"))]
-pub const CTX_MIN_BYTES: usize = 3_440_952 + 176 + 24;
+pub const CTX_MIN_BYTES: usize = 3_440_952 + CTX_PHASE_PROFILE_BYTES + 24;
 #[cfg(all(feature = "ctx-engine", not(feature = "diagnostic-profile")))]
 pub const CTX_MIN_BYTES: usize = 3_440_952 + 24;
 
