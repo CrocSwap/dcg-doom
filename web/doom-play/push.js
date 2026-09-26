@@ -245,6 +245,12 @@ export class FrameStream {
     this.crossCheckRetries = 0;
     this.superseded = 0;
     this.lastReason = null;
+    // The cross-check runs beside the paint loop rather than inside it, so it
+    // is tracked here: `idle()` waits for it, and a caller that stops the stream
+    // does not have to care.
+    this.crossCheckRunning = false;
+    this.crossCheckInFlight = null;
+    this.crossCheckDropped = 0;
     // Wait this long before reading the chain a second time after a
     // disagreement. Long enough for a re-render to be announced, short enough
     // that a check does not hold the stream up.
@@ -299,7 +305,16 @@ export class FrameStream {
           this.skipped += 1;
           continue;
         }
-        await this.#handle(next);
+        // A frame that throws on the way to the canvas is counted and the queue
+        // carries on. Letting it out of this loop instead used to leave every
+        // frame already queued unpainted until the next event arrived, which
+        // turned one bad frame into a gap in the picture.
+        try {
+          await this.#handle(next);
+        } catch (error) {
+          this.torn = (this.torn ?? 0) + 1;
+          this.lastError = error instanceof Error ? error.message : String(error);
+        }
       }
     } finally {
       this.draining = false;
@@ -346,7 +361,42 @@ export class FrameStream {
       }
     }
     await this.onFrame(frame, record);
-    await this.#maybeCrossCheck(record, frame);
+    // The cross-check is *not* awaited here. See `#crossCheck`.
+    void this.#crossCheck(record, frame);
+  }
+
+  // The chain spot check, off the painting path.
+  //
+  // This used to be awaited inside the serial drain loop, which made an audit
+  // into a gate: one slow chain read, or a node that accepted the request and
+  // never answered it, stopped the picture for as long as it took and then for
+  // good. That is the fault measured on the R15 context on 2026-09-26 -- the
+  // relayer pushed every frame it saw and the page painted 0.02 fps with the
+  // stream's own counter frozen at the frame the first cross-check fired on. The
+  // read is bounded as well (`DEFAULT_TIMEOUT_MS` in rpc.js), so "slow" cannot
+  // become "forever"; neither bound is a substitute for the other.
+  //
+  // One check runs at a time and the rest are dropped while it does, so a node
+  // that is down cannot make the page queue audits faster than it can answer
+  // them. The drop is counted, because a cross-check rate that quietly fell to
+  // zero is exactly the thing nobody would notice.
+  #crossCheck(record, frame) {
+    if (this.stopped) return;
+    if (!this.readChain || this.crossCheckEvery <= 0) return;
+    if (this.pushed % this.crossCheckEvery !== 0) return;
+    if (this.crossCheckRunning) {
+      this.crossCheckDropped += 1;
+      return;
+    }
+    this.crossCheckRunning = true;
+    this.crossCheckInFlight = this.#maybeCrossCheck(record, frame)
+      .catch((error) => {
+        this.lastError = error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        this.crossCheckRunning = false;
+        this.crossCheckInFlight = null;
+      });
   }
 
   // Every Nth frame, read the same accounts' headers from the chain and compare
@@ -477,12 +527,18 @@ export class FrameStream {
     return comparison;
   }
 
-  // Resolve once the queue has been drained. Painting is asynchronous (every
-  // frame runs eight digest checks, and a cross-check reads the chain), so "the
-  // stream has taken this frame" and "the frame is on the canvas" are different
-  // moments, and a caller that cares about the second asks for this.
+  // Resolve once the queue has been drained and any cross-check in flight has
+  // finished. Painting is asynchronous (every frame runs eight digest checks)
+  // and the cross-check is no longer inside the paint loop, so "the stream has
+  // taken this frame", "the frame is on the canvas" and "the audit of that frame
+  // is in" are three different moments. A caller that cares about the last one
+  // asks for this.
   async idle() {
     while (this.draining || this.queue.length > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    while (this.crossCheckInFlight) {
+      await this.crossCheckInFlight;
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
@@ -504,6 +560,9 @@ export class FrameStream {
       // Disagreements that survived a second read. This is the only bucket that
       // means the push path is wrong.
       cross_check_retries: this.crossCheckRetries,
+      // Checks that were due while one was still running. A non-zero number with
+      // a falling `cross_checks` is a node the page could not keep up with.
+      cross_check_dropped: this.crossCheckDropped,
       // Disagreements that went away because the relayer re-rendered the cursor
       // while the read was open. Counted, so the rate of re-renders is visible
       // rather than looking like a rate of lies.

@@ -5,9 +5,10 @@
   "description": "Doom on Fogo: an on-chain frame viewer and a burner-signed input page.",
   "type": "module",
   "scripts": {
-    "test": "node --test test/test_strip.mjs test/test_input.mjs test/test_palette.mjs",
+    "test": "node --test test/test_strip.mjs test/test_input.mjs test/test_palette.mjs test/test_push.mjs",
     "test:all": "node --test test/*.mjs",
-    "check": "node --check app.js && node --check network.js && node --check rpc.js && node --check strip.js && node --check input.js && node --check burner.js",
-    "serve": "python3 -m http.server 8000"
+    "check": "node --check app.js && node --check network.js && node --check rpc.js && node --check strip.js && node --check input.js && node --check burner.js && node --check push.js",
+    "serve": "python3 -m http.server 8000",
+    "test:offline": "node --test test/test_page_offline.mjs"
   }
 }

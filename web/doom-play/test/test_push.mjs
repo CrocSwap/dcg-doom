@@ -652,3 +652,85 @@ test("tornStrips names both ways a chain read can be torn", async () => {
   const mixedRoot = good.map((strip, index) => (index === 2 ? {...strip, stateRoot: "ff".repeat(32)} : strip));
   assert.match(tornStrips(mixedRoot), /disagree on gametic, snapshot or state root/);
 });
+
+// Painting a frame runs eight SHA-256 checks through WebCrypto, which is a real
+// promise chain and not one turn of the event loop, so "the frame is on the
+// canvas" has to be waited for rather than assumed.
+async function waitFor(predicate, what, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+// The two faults measured on the R15 context on 2026-09-26, where the relayer
+// pushed every frame it saw and the page painted 0.02 fps: the cross-check was
+// awaited inside the serial paint loop, so a chain read held the picture, and a
+// frame that threw on the way to the canvas took the rest of the queue with it.
+// Both are here rather than only in the browser test, because neither needs a
+// browser to fail and both are the kind of thing that comes back.
+
+test("a chain read that never answers does not stop the paint loop", async () => {
+  // The read is a promise that is never settled, which is what a node that
+  // accepts a request and says nothing looks like from here. `crossCheckEvery: 1`
+  // fires on the very first frame, so the read is inside the loop from the start.
+  const painted = [];
+  let reads = 0;
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-hang",
+    onFrame: (frame) => painted.push(frame.frameIndex),
+    crossCheckEvery: 1,
+    readChain: () => {
+      reads += 1;
+      return new Promise(() => {});
+    },
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  for (let index = 1; index <= 8; index += 1) {
+    // `deliver` waits on `idle()`, which now waits on the cross-check, so the
+    // frames are fired directly and each paint is waited for by hand.
+    FakeEventSource.last.fire("frame", {data: JSON.stringify(pushedRecord({frameIndex: index}))});
+    await waitFor(() => painted.length >= index, `frame ${index} painted`);
+  }
+  assert.deepEqual(painted, [1, 2, 3, 4, 5, 6, 7, 8], "every frame painted while one chain read is still open");
+  assert.equal(reads, 1, "one read at a time; the rest are dropped rather than queued");
+  const summary = stream.summary();
+  assert.equal(summary.cross_check_dropped, 7, JSON.stringify(summary));
+  // The picture is up to date even though the audit is not.
+  assert.equal(summary.last_frame_index, 8);
+  assert.equal(summary.cross_checks, 1);
+  // And nothing is left unhandled: the open read must not become a rejection the
+  // page never sees.
+  assert.equal(summary.torn, 0);
+  stream.stop();
+});
+
+test("a frame that throws on the way to the canvas is counted, and the next one paints", async () => {
+  const painted = [];
+  const stream = new FrameStream({
+    base: "http://relayer.invalid",
+    sessionId: "s-throw",
+    onFrame: (frame) => {
+      if (frame.frameIndex === 2) throw new Error("the canvas said no");
+      painted.push(frame.frameIndex);
+    },
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  // Three frames in one tick: the second throws, and the third is already queued
+  // behind it. Before the fix the third was left in the queue with nothing to
+  // drain it until the next event arrived.
+  for (const index of [1, 2, 3]) {
+    FakeEventSource.last.fire("frame", {data: JSON.stringify(pushedRecord({frameIndex: index}))});
+  }
+  await stream.idle();
+  assert.deepEqual(painted, [1, 3], "the frame after a bad one still paints");
+  assert.equal(stream.summary().torn, 1, "the bad frame is counted");
+  assert.equal(stream.summary().last_frame_index, 3, "the stream is still moving");
+  stream.stop();
+});
