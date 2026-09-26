@@ -32,7 +32,7 @@ import {
   STRIP_WIDTH,
 } from "../strip.js";
 import {stripDigest} from "../strip.js";
-import {decodeInput, signingPayload, validateInput} from "../input.js";
+import {decodeInput, decodeKeyState, heldToCommands, signingPayload, validateInput} from "../input.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const PAGE_ROOT = join(here, "..");
@@ -57,10 +57,10 @@ const sha256hex = (bytes) => createHash("sha256").update(Buffer.from(bytes)).dig
 // the next, and every strip digest recomputed over the new bytes. Nothing here
 // is a shortcut past `decodePushedFrame`: if the digest is wrong the page
 // refuses the frame, which is what the tests would then see.
-export async function makeFrame(index, {strips: base, meta, startCursor = 6016, ticsPerFrame = 8, cursor: cursorOverride = null} = {}) {
+export async function makeFrame(index, {strips: base, meta, startCursor = 6016, ticsPerFrame = 8, cursor: cursorOverride = null, gameticOffset = 0} = {}) {
   const source = base ?? fixtureStrips().strips;
   const cursor = cursorOverride ?? startCursor + index * ticsPerFrame;
-  const gametic = cursor;
+  const gametic = cursor + gameticOffset;
   const snapshotHash = new Uint8Array(createHash("sha256").update(`snap:${index}`).digest());
   const stateRoot = new Uint8Array(createHash("sha256").update(`root:${index}`).digest());
   const out = [];
@@ -196,6 +196,7 @@ export class FakeRelayer {
     ringLimit = 4,
     ticsPerSecond = 35,
     startCursor = 6016,
+    gameticOffset = 0,
     leadTics = null,
     chainLagFrames = 1,
     verifySignatures = true,
@@ -207,6 +208,7 @@ export class FakeRelayer {
     const fixture = fixtureStrips();
     this.meta = fixture.meta;
     this.startCursor = startCursor;
+    this.gameticOffset = gameticOffset;
     this.ticsPerSecond = ticsPerSecond;
     // The producer's resolved lead, the way it resolves one: twice the measured
     // round trip at the configured rate, never below twelve. 61 at 35 tic/s,
@@ -264,6 +266,8 @@ export class FakeRelayer {
     this.ring = new Map();
     this.frameIndex = 0;
     this.cursor = startCursor;
+    this.liveNextCursor = startCursor;
+    this.keyStateEvents = [];
     this.producerNextCursor = startCursor;
     this.producerGeneratedCursor = startCursor - 4;
     this.staged = new Map();
@@ -320,6 +324,7 @@ export class FakeRelayer {
         meta: fixture.meta,
         startCursor: this.startCursor,
         cursor: this.frameCursor(index),
+        gameticOffset: this.gameticOffset,
       }));
     }
     return this.frameCache.get(index);
@@ -368,6 +373,16 @@ export class FakeRelayer {
     this.producerNextCursor += step;
     this.producerGeneratedCursor = this.producerNextCursor - 4;
     this.cursor += step;
+    for (const event of this.keyStateEvents) {
+      if (event.deposit_submitted_at_ms === undefined) {
+        event.deposit_submitted_at_ms = Date.now();
+        event.deposit_signature = `fake-atomic-${event.seq}`;
+      }
+      if (event.seq < this.cursor && event.cursor_reached_at_ms === undefined) {
+        event.cursor_reached_at_ms = Date.now();
+        this.landedTics += 1;
+      }
+    }
     for (const [seq, tic] of this.staged) {
       if (tic < this.cursor - this.leadTics) {
         this.landedTics += 1;
@@ -479,7 +494,7 @@ export class FakeRelayer {
       slot: 0,
       next_seq: this.lastAccepted,
       cursor: this.cursor,
-      gametic: this.cursor,
+      gametic: this.cursor + this.gameticOffset,
       tics_per_second: this.ticsPerSecond,
       tics_per_second_cap: 35,
       staging_frontier: generated + 64,
@@ -490,7 +505,7 @@ export class FakeRelayer {
       producer_next_cursor: this.producerNextCursor,
       writable_frontier: generated + 64,
       writable_floor: this.cursor,
-      input_fate: {deposited: this.stagedTics, landed: this.landedTics},
+      input_fate: {deposited: this.stagedTics, landed: this.landedTics, key_states: this.keyStateEvents},
       pipeline: {state: "running", cursor_stalled_seconds: 0},
       // The producer's own lead, under the names the real relayer publishes it
       // under (`server.mjs` `status()`, from the child's `input_stage_lead_tics`).
@@ -504,7 +519,7 @@ export class FakeRelayer {
       lead_tics: this.leadTics,
       measured_round_trip_seconds: MEASURED_INPUT_ROUND_TRIP_SECONDS,
       frame_counters: {frames_submitted: this.pushed, frame_stalls: 0, frame_skips: 0, frame_retries: 0, frame_deadline_seconds: 1},
-      latest_frame: {buffer: 0, snapshot_account: ADDRESSES.snapshot, strip_accounts: ADDRESSES.strips, cursor: this.cursor, gametic: this.cursor},
+      latest_frame: {buffer: 0, snapshot_account: ADDRESSES.snapshot, strip_accounts: ADDRESSES.strips, cursor: this.cursor, gametic: this.cursor + this.gameticOffset},
       context: ADDRESSES.context,
       snapshot_account: ADDRESSES.snapshot,
       strip_accounts: ADDRESSES.strips,
@@ -512,7 +527,7 @@ export class FakeRelayer {
       tics_landed: this.landedTics,
       frames_landed: this.pushed,
       input_tics_staged: this.stagedTics,
-      frame: {cursor: this.cursor, gametic: this.cursor, signature: null, explorer: null},
+      frame: {cursor: this.cursor, gametic: this.cursor + this.gameticOffset, signature: null, explorer: null},
       state: session?.state ?? "playing",
     };
   }
@@ -571,6 +586,57 @@ export class FakeRelayer {
       error2.code = "bad_batch";
       throw error2;
     }
+    if (batch.sequenceMode === "now") {
+      if (batch.clientSeq <= session.clientSeq && session.clientSeq !== 0) {
+        const error = new Error(`client_seq ${batch.clientSeq} is not ahead of ${session.clientSeq}`);
+        error.status = 409;
+        error.code = "stale_client_seq";
+        throw error;
+      }
+      session.clientSeq = batch.clientSeq;
+      const seq = Math.max(this.liveNextCursor, this.cursor);
+      this.liveNextCursor = seq + 1;
+      const assignedAt = Date.now();
+      const postReceivedAt = assignedAt;
+      const event = {seq, key_mask: batch.keyMask, assigned_at_ms: assignedAt};
+      this.keyStateEvents.push(event);
+      const commands = heldToCommands(decodeKeyState(batch.keyMask), seq, 1);
+      const view = new DataView(commands.buffer, commands.byteOffset, commands.byteLength);
+      const command = {
+        clientSeq: batch.clientSeq,
+        sequenceMode: "now",
+        firstSeq: seq,
+        count: 1,
+        keyMask: batch.keyMask,
+        forward: view.getUint8(0),
+        side: view.getUint8(1),
+        turns: view.getUint8(2) ? [view.getUint8(2)] : [],
+        buttons: view.getUint8(3),
+      };
+      this.batches.push(command);
+      this.lastBatch = command;
+      this.acceptedBatches += 1;
+      this.stagedTics += 1;
+      return {
+        accepted: 1,
+        accepted_from: seq,
+        stamp_tic: seq,
+        stamp_gametic: seq,
+        next_seq: seq + 1,
+        post_received_at_ms: postReceivedAt,
+        tic_assigned_at_ms: assignedAt,
+        key_state: event,
+        client_seq: batch.clientSeq,
+        ...this.status(session),
+      };
+    }
+    if (batch.clientSeq <= session.clientSeq && session.clientSeq !== 0) {
+      const error = new Error(`client_seq ${batch.clientSeq} is not ahead of ${session.clientSeq}`);
+      error.status = 409;
+      error.code = "stale_client_seq";
+      throw error;
+    }
+    session.clientSeq = batch.clientSeq;
     // The relayer's own rules, the ones `validateInput` is the reference for, so
     // a page that aims badly is refused for the reason it would be refused live.
     // The floor is the chain cursor, not a count of what this relayer has

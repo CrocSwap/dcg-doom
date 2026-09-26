@@ -151,9 +151,9 @@ read on the same page over the same period: 0.22 fps and 151 torn reads.
 
 The panel under the chain readout is the answer to "I pressed a key and nothing
 happened". It keeps one row per key press, newest first: the key, when it went
-down and up, the tic range it aimed at, and the fate of every one of those tics.
-A fate is named, not summarised, and a landed tic links the transaction that
-carried it on the Fogo explorer.
+down and up, the tic the relayer stamped for that key state, and the fate of
+that tic. A fate is named, not summarised, and a landed tic links the transaction
+that carried it on the Fogo explorer.
 
 The fates and where each comes from are in `inputlog.js`. Two of them are worth
 knowing about:
@@ -164,8 +164,10 @@ knowing about:
 * **queued, never deposited** — offered above the producer's staging limit, and
   the pipeline stopped before the chain reached it.
 
-The one-line summary above the list is pressed / landed / failed, the landed
-ratio over resolved tics, and the current input lead in tics and milliseconds.
+The page sends ordered key-state transitions without a tic number. The relayer
+assigns the earliest free tic it can deposit and returns that stamp. The
+one-line summary above the list is pressed / landed / failed and the landed
+ratio over resolved tics; the page does not estimate a delivery lead.
 
 When the context is spent, the pipeline has stopped, or the session is gone, a
 red banner replaces the numbers. A page whose job is to say whether keys are

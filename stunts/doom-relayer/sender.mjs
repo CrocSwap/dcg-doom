@@ -29,6 +29,7 @@ import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
 import {STRIP_ACCOUNT_BYTES, STRIP_HEADER_BYTES, STRIP_PIXELS_BYTES, stripDigest, toHex} from "../../web/doom-play/strip.js";
+import {decodeKeyState, heldToCommands} from "../../web/doom-play/input.js";
 
 export class SenderError extends Error {
   constructor(message, code = "sender_error", detail = {}) {
@@ -194,6 +195,23 @@ export class MockSender {
     }
     record.deposits.push({firstSeq, bytes: Buffer.from(commands).toString("hex")});
     return {accepted: commands.length / 4, firstSeq, signature: `mock-deposit-${this.sent}`};
+  }
+
+  async keyState({slot, keyMask}) {
+    const record = this.#slot(slot);
+    const firstSeq = record.cursor;
+    const commands = heldToCommands(decodeKeyState(keyMask), firstSeq, this.ticsPerAdvance);
+    const deposit = await this.deposit({slot, firstSeq, commands});
+    const advanced = await this.advance({slot, maxTics: this.ticsPerAdvance, expectedCursor: firstSeq});
+    return {
+      accepted: 1,
+      acceptedFrom: firstSeq,
+      cursor: advanced.cursor,
+      gametic: advanced.gametic,
+      keyStateEvent: {seq: firstSeq, mask: keyMask, assigned_at_ms: Date.now()},
+      deposit,
+      advanced,
+    };
   }
 
   async advance({slot, maxTics = 0, expectedCursor = null}) {
@@ -397,8 +415,10 @@ export class PipelineSender {
       "--keys-dir", this.keysDir,
       "--payer-key", this.payerKey,
     ];
-    if (options.rpcA) argv.push("--rpc-a", options.rpcA);
-    if (options.rpcB) argv.push("--rpc-b", options.rpcB);
+    if (options.rpcA !== undefined && options.rpcA !== null) argv.push("--rpc-a", options.rpcA);
+    // Empty RPC_B is an intentional single-node configuration. It must reach
+    // argparse as an empty value or Python restores its public-node default.
+    if (options.rpcB !== undefined && options.rpcB !== null) argv.push("--rpc-b", options.rpcB);
     // A third node, and the send rate, are the two levers on the frame's
     // own send cost: eight strip sends take 8 / (rate x endpoints) seconds.
     // Both are pushed only when set, so an unnamed session is the two-node
@@ -425,6 +445,7 @@ export class PipelineSender {
     // reset-start-account one is the whole RESET/9 path, so its absence meant
     // a dead player's use press ended the session instead of restarting it.
     if (options.resetStartAccount) argv.push("--reset-start-account", options.resetStartAccount);
+    if (options.atomicLiveInputs) argv.push("--atomic-live-inputs");
     if (options.frameDeadlineSeconds !== undefined && options.frameDeadlineSeconds !== null) {
       argv.push("--frame-deadline-seconds", String(options.frameDeadlineSeconds));
     }
@@ -689,6 +710,23 @@ export class PipelineSender {
       // numbers in `pipeline` are how a page tells the two apart.
       queuedAboveStageLimit: reply.queued_above_stage_limit ?? null,
       trimmedFromSeq: reply.trimmed_from_seq ?? null,
+      pipeline: reply.pipeline ?? null,
+    };
+  }
+
+  async keyState({slot, keyMask}) {
+    if (this.closed) throw new SenderError("the pipeline process is not running", "pipeline_exited");
+    const reply = await this.request({op: "key_state", key_mask: keyMask});
+    this.status = {...this.status, ...reply};
+    return {
+      accepted: reply.accepted ?? 1,
+      acceptedFrom: reply.accepted_from,
+      stampGametic: reply.stamp_gametic ?? null,
+      cursor: reply.cursor,
+      gametic: reply.gametic,
+      ticAssignedAtMs: reply.tic_assigned_at_ms ?? null,
+      keyStateEvent: reply.key_state ?? null,
+      producerNextCursor: reply.producer_next_cursor,
       pipeline: reply.pipeline ?? null,
     };
   }

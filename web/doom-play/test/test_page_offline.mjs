@@ -71,18 +71,20 @@ const snapshot = (page) => page.evaluate(`(() => {
     stream: s.stream ? s.stream.summary() : null,
     crossCheck: s.lastCrossCheck,
     panel: window.doomPlay.inputLog.summary(),
-    leadTics: s.leadTics,
-    aimedAt: s.aimedAt,
+    clientChoosesTics: Object.hasOwn(s, "aimedAt") || Object.hasOwn(s, "leadTics"),
     inputsSent: s.inputsSent,
     batchesSigned: s.batchesSigned,
     refusals: s.refusals,
     roundTripMs: s.roundTripMs,
+    ticsPerSecond: s.ticsPerSecond,
     // The two keypress meters. stampLatencies is keydown to the first painted
     // frame at or past the tic the input was stamped for, and is the latency a
     // player feels; nextPictureLatencies is keydown to the next frame of any
     // kind, which is not a keypress latency.
     stampLatencies: s.stampLatencies.slice(),
     stampSamples: (s.stampSamples ?? []).slice(),
+    keyPostSamples: (s.keyPostSamples ?? []).slice(),
+    keyTimingBreakdown: (s.keyTimingBreakdown ?? []).slice(),
     nextPictureLatencies: s.nextPictureLatencies.slice(),
     holdsStarted: s.holdsStarted,
     holdsUnstamped: s.holdsUnstamped,
@@ -294,10 +296,8 @@ if (!chromeAvailable()) {
       const remembered = await page.evaluate(`JSON.parse(localStorage.getItem("doom-play.burner.session.v1") ?? "null")`);
       assert.ok(remembered?.id, "the session was not remembered, so a reload cannot re-attach");
       assert.match(remembered.binding, /^[0-9a-f]{64}$/, "the remembered binding is not 32 bytes of hex");
-      // And the status poll the join owes has run: the producer's position is
-      // stamped, not merely present.
-      const readAt = await page.evaluate("window.doomPlay.state.producerReadAt");
-      assert.ok(readAt > 0, "the join-time status poll never ran");
+      // And the join-time status poll supplied the engine rate.
+      assert.ok(row.ticsPerSecond > 0, "the join-time status poll never ran");
       // Now reload. The page must come back attached, with no JOIN click.
       await page.navigate(
         `${relayer.base}/web/doom-play/index.html?relayer=${relayer.base}&net=testnet&rpc=${relayer.base}&frame-source=push&cross-check-every=0`,
@@ -313,89 +313,42 @@ if (!chromeAvailable()) {
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
-  test("the page aims at the producer's published lead, and that lead is most of the latency", {timeout: 180_000}, async () => {
-    // The producer resolves a lead of its own from how long a staged tic takes to
-    // reach the chain -- 45-48 tics on R15, which is 1.77 s -- and this page
-    // takes the larger of that and its own hop. On the 2026-09-26 baseline that
-    // put the stamped tic 90 tics past the chain's cursor, and the measured
-    // keypress-to-picture median was 4,270 ms against 90/22.2 tic/s = 4.05 s of
-    // arithmetic: the page pays the delivery lead twice, once inside the
-    // producer's position and once in its own aim.
-    //
-    // The obvious fix -- aim the page's own hop alone -- was measured twice on
-    // R15 and broke both sessions: input refusals went from 1 in a 110 s session
-    // to 100 and then 176, no command tics were deposited, the producer stopped,
-    // the chain's cursor stuck at 45,890 and `tic-sender-result.json` was never
-    // written. The chain was fine -- the meta read afterwards at `M_HALT 0`,
-    // `M_CURSOR 45890`, `M_LAST_SWEEP_TICS 4` -- so that is a client-side
-    // producer hang and it is not diagnosed. A 16-tic aim is inside the race the
-    // 2026-09-26 input round measured, and mostly-zeros becomes a refusal flood
-    // rather than a cheaper keypress. The comment on `aimLead` carries the
-    // numbers; this test is here so the behaviour is pinned and the next attempt
-    // starts from the measurement rather than from the idea.
-    //
-    // What it asserts is the two halves: the page reads the published lead, and
-    // its aim is the producer's next tic plus that lead. It fails on a page that
-    // ignores the published lead.
+  test("the page sends sequence-free transitions and the relayer stamps the next free tic", {timeout: 180_000}, async () => {
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
-      const producerNext = await page.evaluate("window.doomPlay.state.producerNextCursor");
       await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
-      // Long enough for the aim to be consumed: the fake marks a staged tic
-      // landed once the chain cursor is a whole lead past the producer's
-      // generated cursor, so a 61-tic lead at 35 tic/s is 1.7 s before the first
-      // tic of a keypress is read. That is the price of the aim, and it is why
-      // this hold is longer than the other tests'.
-      await sleep(3_500);
-      const held = await snapshot(page);
+      await sleep(150);
       await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
-      const batch = relayer.batches[0] ?? null;
-      assert.ok(batch, "the page staged no batch");
-      const published = await page.evaluate("window.doomPlay.state.producerLeadTics");
-      assert.equal(published, relayer.leadTics, `the page never read the producer's lead (${JSON.stringify(published)})`);
-      assert.ok(relayer.leadTics > 16, `this relayer published ${relayer.leadTics}, which is not above the 16 the page used to aim`);
-      assert.equal(
-        held.leadTics,
-        relayer.leadTics,
-        `the page aimed ${JSON.stringify(held.leadTics)} tics ahead of the producer's next tic ` +
-          `where the producer published ${relayer.leadTics}`,
-      );
-      // And the aim really is the producer's next tic plus the published lead.
-      // `producerNext` was read before the keydown and the fake's producer
-      // advances 2 tics every 60 ms, so the measured hop also carries the page's
-      // push cadence.
-      const hop = batch.firstSeq - producerNext;
-      assert.ok(
-        hop >= relayer.leadTics && hop <= relayer.leadTics + 40,
-        `the batch started ${hop} tics past the producer's next tic, where the published lead was ${relayer.leadTics}`,
-      );
-      // And the aim is inside the relayer's own window, so the lead did not turn
-      // a deposit race into a batch_refused.
-      assert.equal(held.refusals, 0, "the aim was refused");
-      assert.ok(relayer.acceptedBatches > 0, "the relayer accepted nothing");
-      assert.ok(relayer.landedTics > 0, `the engine consumed none of the ${relayer.stagedTics} tics staged in 3.5 s`);
+      await sleep(250);
+      const row = await snapshot(page);
+      const down = relayer.batches[0];
+      const up = relayer.batches[1];
+      assert.ok(down && up, `the page did not send both key transitions: ${JSON.stringify(relayer.batches)}`);
+      assert.equal(down.sequenceMode, "now");
+      assert.equal(up.sequenceMode, "now");
+      assert.equal(down.keyMask, 8, "right did not arrive as held key state");
+      assert.equal(up.keyMask, 0, "keyup did not clear the held key state");
+      assert.ok(up.firstSeq > down.firstSeq, "keyup was not stamped after keydown");
+      assert.equal(row.clientChoosesTics, false, "the page still chooses the stamped tic");
+      assert.equal(row.refusals, 0);
+      assert.equal(relayer.refusals.length, 0);
+      assert.ok(row.lastStampedTic >= down.firstSeq);
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
-  test("a relayer that publishes no lead falls back to the page's own arithmetic", {timeout: 180_000}, async () => {
-    // A page that can only aim with a published lead is a page that cannot play
-    // against a relayer that has not published one, which is every mock relayer
-    // and every session whose producer has not resolved a lead yet.
+  test("a late quick tap is queued in order instead of refused or collapsed", {timeout: 180_000}, async () => {
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
-      const published = await page.evaluate("window.doomPlay.state.producerLeadTics");
-      assert.equal(published, null, `this relayer published ${JSON.stringify(published)} and was meant to publish nothing`);
-      await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
-      await sleep(1_200);
-      const held = await snapshot(page);
-      await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
-      assert.ok(held.batchesSigned > 0, "the page signed nothing");
-      assert.equal(typeof held.leadTics, "number", `a batch was signed without an aim: ${JSON.stringify(held)}`);
-      assert.ok(
-        held.leadTics >= 16,
-        `with no published lead the page aimed ${JSON.stringify(held.leadTics)} tics, under the floor of 16`,
-      );
-    }, {relayerOptions: {...FAST, publishLead: false}, query: "&cross-check-every=0"});
+      await page.key("keyDown", "ArrowUp", "ArrowUp", 38);
+      await sleep(20);
+      await page.key("keyUp", "ArrowUp", "ArrowUp", 38);
+      await sleep(350);
+      const transitions = relayer.batches.slice(-2);
+      assert.deepEqual(transitions.map((row) => row.keyMask), [1, 0]);
+      assert.ok(transitions[1].firstSeq > transitions[0].firstSeq, "keyup was not stamped after keydown");
+      assert.equal(relayer.refusals.length, 0);
+      assert.equal(relayer.badSignatures, 0);
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
   test("a stream that drops is caught up, not resumed at the newest frame", {timeout: 180_000}, async () => {
@@ -434,20 +387,10 @@ if (!chromeAvailable()) {
   });
 
   test("the keypress meter waits for the stamped tic, and the next-picture meter does not", {timeout: 180_000}, async () => {
-    // The two numbers, and the fault this test exists for.
-    //
-    // The page measured keydown -> the next frame past the gametic that was on
-    // screen, and called it input-to-picture. On R15 that read 408 ms on a
-    // session whose lead was 2,155 ms, because the frame it timed was the next
-    // picture to arrive and had nothing to do with the key. The honest meter is
-    // keydown -> the first frame at or past the tic the relayer stamped this
-    // hold's input for, which is the frame the key is actually in.
-    //
-    // The fake relayer publishes at 60 ms and advances 2 tics a frame at 35
-    // tic/s, and publishes a lead of 61 tics. So the next-picture meter has to
-    // read tens of milliseconds and the keypress meter has to read about the
-    // lead -- 61 tics is 1.74 s at this rate. A page that reports the same
-    // number for both is timing the first one twice.
+    // The stamped tic and frame cursor share one sequence; gametic need not.
+    // RESET can restore cursor zero while the saved game state starts at a
+    // nonzero gametic. A picture at the same cursor still predates the tic.
+    // This fake starts at cursor zero and gametic 6016 to preserve that case.
     await withPage(async ({page, relayer}) => {
       await sleep(2_000);
       const before = await snapshot(page);
@@ -459,10 +402,11 @@ if (!chromeAvailable()) {
       await sleep(300);
       await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
       const released = await snapshot(page);
-      assert.equal(released.holdsOpen, 1, "the press stopped being measured at the keyup");
-      // Long enough for the stamped tic to be reached: the lead plus the frame
-      // cadence, which is the price of a 61-tic lead at 35 tic/s.
-      await sleep(6_000);
+      assert.ok(
+        released.holdsOpen === 1 || released.stampSamples.length === before.stampSamples.length + 1,
+        "the press was dropped at keyup before its stamped frame was measured",
+      );
+      await sleep(800);
       const after = await snapshot(page);
 
       assert.equal(after.holdsStarted, before.holdsStarted + 1, "the press was not counted");
@@ -472,32 +416,43 @@ if (!chromeAvailable()) {
       const nexts = after.nextPictureLatencies.slice(before.nextPictureLatencies.length);
       assert.equal(stamps.length, 1, `the keypress meter recorded ${JSON.stringify(stamps)} samples for one press`);
       assert.ok(nexts.length >= 1, `the next-picture meter recorded nothing: ${JSON.stringify(after)}`);
+      const timing = after.keyTimingBreakdown.find((row) => row.tic === stamps[0].tic);
+      assert.ok(timing, `the stamped press has no timing breakdown: ${JSON.stringify(after.keyTimingBreakdown)}`);
+      assert.ok(Number.isFinite(timing.page_to_post_ms_estimated));
+      let completedTiming = timing;
+      for (let attempt = 0; attempt < 25; attempt += 1) {
+        if (Number.isFinite(completedTiming.wait_to_deposit_ms_measured)
+          && Number.isFinite(completedTiming.cursor_to_tic_ms_measured)) break;
+        await sleep(100);
+        const refreshed = await snapshot(page);
+        completedTiming = refreshed.keyTimingBreakdown.find((row) => row.tic === stamps[0].tic) ?? completedTiming;
+      }
+      assert.ok(Number.isFinite(completedTiming.wait_to_deposit_ms_measured));
+      assert.ok(Number.isFinite(completedTiming.cursor_to_tic_ms_measured));
+      assert.ok(Number.isFinite(completedTiming.render_and_paint_ms_residual));
+      assert.ok(Number.isFinite(completedTiming.browser_to_relayer_clock_offset_ms_estimated));
 
-      // The definitional check: the frame that ended the wait was at or past the
-      // tic the relayer stamped, so the keypress is in that picture.
+      // The definitional check: this frame's cursor is past the input sequence.
       assert.ok(after.lastStampSample !== null, "no sample recorded the pair it waited on");
       assert.ok(
-        after.lastStampSample.gametic >= after.lastStampSample.tic,
-        `the wait ended on gametic ${after.lastStampSample.gametic} against a stamped tic of ${after.lastStampSample.tic}`,
+        after.lastStampSample.cursor > after.lastStampSample.tic,
+        `the wait ended on cursor ${after.lastStampSample.cursor} against a stamped tic of ${after.lastStampSample.tic}`,
       );
-      // And the two meters are not the same quantity. The next picture is one
-      // frame away; the keypress is a whole lead away.
+      assert.equal(after.lastStampSample.gametic, after.lastStampSample.cursor + 6016);
+      // Both meters should be bounded by one frame cadence in this simulation.
       const stamp = stamps[0].ms;
       const next = nexts[0];
-      const leadMs = (relayer.leadTics / relayer.ticsPerSecond) * 1000;
+      assert.ok(stamp >= 0, `a frame painted before keydown produced ${stamp.toFixed(0)} ms`);
+      assert.ok(next >= 0, `a frame painted before keydown produced ${next.toFixed(0)} ms`);
+      assert.ok(stamp < 1000, `atomic key-to-picture wait was ${stamp.toFixed(0)} ms`);
       assert.ok(
-        stamp >= 0.5 * leadMs,
-        `the keypress meter read ${stamp.toFixed(0)} ms against a lead of ${leadMs.toFixed(0)} ms ` +
-          `(stamped tic ${after.lastStampedTic}), so it timed a frame rather than the keypress`,
-      );
-      assert.ok(
-        next < stamp,
+        next <= stamp,
         `the next-picture meter (${next.toFixed(0)} ms) is not below the keypress meter (${stamp.toFixed(0)} ms), ` +
-          "so one of them is timing the wrong frame",
+          "so one of them is timing a different frame",
       );
       assert.ok(after.painted > before.painted, "the page painted nothing during the press");
       assert.equal(after.holdsOpen, 0, "the press never closed");
-    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
+    }, {relayerOptions: {...FAST, startCursor: 0, gameticOffset: 6016}, query: "&cross-check-every=0"});
   });
 
   test("a keypress is signed, accepted and consumed by the engine", {timeout: 180_000}, async () => {
@@ -514,10 +469,10 @@ if (!chromeAvailable()) {
       assert.ok(
         after.batchesSigned > before.batchesSigned,
         `pressing right signed no batch (batches ${before.batchesSigned} -> ${after.batchesSigned}, ` +
-          `lead ${JSON.stringify(after.leadTics)}, refused ${after.refusals}, error ${JSON.stringify(after.error)})`,
+          `refused ${after.refusals}, error ${JSON.stringify(after.error)})`,
       );
-      assert.equal(typeof after.leadTics, "number", `a batch was signed without an aim: ${JSON.stringify(after)}`);
       assert.ok(after.roundTripMs > 0, "the page never saw a completed POST");
+      assert.equal(after.clientChoosesTics, false, "the page still chooses the stamped tic");
       assert.ok(relayer.acceptedBatches > 0, "the relayer accepted nothing");
       assert.equal(relayer.badSignatures, 0, "the relayer refused a signature the burner made");
       assert.equal(relayer.refusals.length, 0, `the relayer refused ${JSON.stringify(relayer.refusals.slice(0, 2))}`);
@@ -528,9 +483,8 @@ if (!chromeAvailable()) {
   });
 
   test("a keypress shows up in the picture, and the four directions differ", {timeout: 300_000}, async () => {
-    // Each key has to change the ticcmd the page signs, and the four directions
-    // have to differ from one another. This reads what the relayer verified, not
-    // what the page believes about itself.
+    // The signed key masks distinguish all four directions. Ticcmd bytes are
+    // materialized by the sender only after it chooses the sequence.
     const directions = await withPage(async ({page, relayer}) => {
       await sleep(1_500);
       const seen = {};
@@ -543,8 +497,7 @@ if (!chromeAvailable()) {
         relayer.batches.length = 0;
         await page.key("keyDown", code, keyName, vk);
         await sleep(900);
-        // The first batch staged *while the key was down*. The batch after the
-        // release carries no keys, which is correct and would say nothing.
+        // The first transition signed while the key was down.
         seen[name] = relayer.batches[0] ?? null;
         await page.key("keyUp", code, keyName, vk);
         await sleep(300);
@@ -554,17 +507,9 @@ if (!chromeAvailable()) {
     for (const [name, batch] of Object.entries(directions)) {
       assert.ok(batch, `pressing ${name} staged no batch: ${JSON.stringify(directions)}`);
     }
-    // 50 forward, 50 back, and the two turn steps: 4 is counter-clockwise
-    // (left) and 252 is clockwise (right). The bytes are the engine's, so these
-    // are the numbers a Doom ticcmd is made of rather than the page's names.
-    const d = (name) => JSON.stringify(directions[name]);
-    assert.equal(directions.forward.forward, 50, `forward is not 50 forward: ${d("forward")}`);
-    assert.deepEqual(directions.forward.turns, [], `forward turned the player: ${d("forward")}`);
-    assert.equal(directions.back.forward, 206, `back is not 50 back (50 is -50 as a byte): ${d("back")}`);
-    assert.deepEqual(directions.back.turns, [], `back turned the player: ${d("back")}`);
-    assert.deepEqual(directions.left.turns, [4], `left is not one step counter-clockwise: ${d("left")}`);
-    assert.equal(directions.left.forward, 0, `left also moved the player: ${d("left")}`);
-    assert.deepEqual(directions.right.turns, [252], `right is not one step clockwise: ${d("right")}`);
-    assert.equal(directions.right.forward, 0, `right also moved the player: ${d("right")}`);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(directions).map(([name, batch]) => [name, batch.keyMask])),
+      {forward: 1, back: 2, left: 4, right: 8},
+    );
   });
 }
