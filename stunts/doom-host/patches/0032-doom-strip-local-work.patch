@@ -1,0 +1,328 @@
+diff --git a/linuxdoom-1.10/r_plane.c b/linuxdoom-1.10/r_plane.c
+index cc4ba2b..0e4b9a1 100644
+--- a/linuxdoom-1.10/r_plane.c
++++ b/linuxdoom-1.10/r_plane.c
+@@ -372,7 +372,17 @@ void R_DrawPlanes (void)
+     int			x;
+     int			stop;
+     int			angle;
++    int			draw_start;
++    int			draw_stop;
++    int			clip_left;
++    int			clip_right;
++    int			y;
++    int			clip_mode;
+ 				
++    clip_mode = (doom_render_fuzz_columns >> 30) & 3u;
++    clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
++    clip_right = clip_left + 40;
++
+ #ifdef RANGECHECK
+     if (ds_p - drawsegs > MAXDRAWSEGS)
+ 	I_Error ("R_DrawPlanes: drawsegs overflow (%i)",
+@@ -392,6 +402,9 @@ void R_DrawPlanes (void)
+ 	if (pl->minx > pl->maxx)
+ 	    continue;
+ 
++	if (clip_mode && (pl->maxx < clip_left || pl->minx >= clip_right))
++	    continue;
++
+ 	
+ 	// sky flat
+ 	if (pl->picnum == skyflatnum)
+@@ -404,7 +417,14 @@ void R_DrawPlanes (void)
+ 	    //  by INVUL inverse mapping.
+ 	    dc_colormap = colormaps;
+ 	    dc_texturemid = skytexturemid;
+-	    for (x=pl->minx ; x <= pl->maxx ; x++)
++	    draw_start = pl->minx;
++	    draw_stop = pl->maxx;
++	    if (clip_mode)
++	    {
++		if (draw_start < clip_left) draw_start = clip_left;
++		if (draw_stop >= clip_right) draw_stop = clip_right - 1;
++	    }
++	    for (x=draw_start ; x <= draw_stop ; x++)
+ 	    {
+ 		dc_yl = PL_TOP(pl,x);
+ 		dc_yh = PL_BOTTOM(pl,x);
+@@ -441,12 +461,55 @@ void R_DrawPlanes (void)
+ 		
+ 	stop = pl->maxx + 1;
+ 
+-	for (x=pl->minx ; x<= stop ; x++)
++	if (clip_mode)
++	{
++	    draw_start = pl->minx < clip_left ? clip_left : pl->minx;
++	    draw_stop = stop < clip_right ? stop : clip_right;
++
++	    /* A run already open at the strip's first column starts here for this
++	     * render. Its columns to the left are another strip's responsibility. */
++	    if (pl->minx < clip_left)
++	    {
++		if (PL_TOP(pl,clip_left) <= PL_BOTTOM(pl,clip_left))
++		    for (y=PL_TOP(pl,clip_left) ;
++			y<=PL_BOTTOM(pl,clip_left) && y<viewheight ; y++)
++			spanstart[y] = clip_left;
++	    }
++
++	    for (x=draw_start ; x<draw_stop ; x++)
++	    {
++		R_MakeSpans(x,PL_TOP(pl,x-1),
++			    PL_BOTTOM(pl,x-1),
++			    PL_TOP(pl,x),
++			    PL_BOTTOM(pl,x));
++	    }
++
++	    if (stop < clip_right)
++	    {
++		/* The plane ends in this strip. Consume its existing right sentinel. */
++		R_MakeSpans(stop,PL_TOP(pl,stop-1),
++			    PL_BOTTOM(pl,stop-1),
++			    PL_TOP(pl,stop),
++			    PL_BOTTOM(pl,stop));
++	    }
++	    else
++	    {
++		/* Close spans at the right edge without reading or building columns
++		 * owned by the next strip. */
++		x = clip_right - 1;
++		for (y=PL_TOP(pl,x) ; y<=PL_BOTTOM(pl,x) ; y++)
++		    R_MapPlane(y,spanstart[y],x);
++	    }
++	}
++	else
+ 	{
+-	    R_MakeSpans(x,PL_TOP(pl,x-1),
+-			PL_BOTTOM(pl,x-1),
+-			PL_TOP(pl,x),
+-			PL_BOTTOM(pl,x));
++	    for (x=pl->minx ; x<= stop ; x++)
++	    {
++		R_MakeSpans(x,PL_TOP(pl,x-1),
++			    PL_BOTTOM(pl,x-1),
++			    PL_TOP(pl,x),
++			    PL_BOTTOM(pl,x));
++	    }
+ 	}
+ 	
+ 	Z_ChangeTag (ds_source, PU_CACHE);
+diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
+index 986a74b..9fff819 100644
+--- a/linuxdoom-1.10/r_segs.c
++++ b/linuxdoom-1.10/r_segs.c
+@@ -76,6 +76,15 @@ R_RenderMaskedSegRange
+     column_t*	col;
+     int		lightnum;
+     int		texnum;
++
++    if ((doom_render_fuzz_columns >> 30) & 3u)
++    {
++	int clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
++	int clip_right = clip_left + 40;
++	if (x1 < clip_left) x1 = clip_left;
++	if (x2 >= clip_right) x2 = clip_right - 1;
++	if (x1 > x2) return;
++    }
+     
+     // Calculate light table.
+     // Use different light tables
+@@ -181,11 +190,16 @@ void R_RenderSegLoop (void)
+     fixed_t		texturecolumn;
+     int			top;
+     int			bottom;
++    int			draw_column;
+ 
+     //texturecolumn = 0;				// shut up compiler warning
+ 	
+     for ( ; rw_x < rw_stopx ; rw_x++)
+     {
++	draw_column = !((doom_render_fuzz_columns >> 30) & 3u)
++	    || (rw_x >= (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u)
++		&& rw_x < (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u + 40u));
++
+ 	// mark floor / ceiling areas
+ 	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
+ 
+@@ -227,7 +241,7 @@ void R_RenderSegLoop (void)
+ 	}
+ 	
+ 	// texturecolumn and lighting are independent of wall tiers
+-	if (segtextured)
++	if (segtextured && draw_column)
+ 	{
+ 	    // calculate texture offset
+ 	    angle = (rw_centerangle + xtoviewangle[rw_x])>>ANGLETOFINESHIFT;
+@@ -248,11 +262,14 @@ void R_RenderSegLoop (void)
+ 	if ((DOOM_CTX->midtexture))
+ 	{
+ 	    // single sided line
+-	    dc_yl = yl;
+-	    dc_yh = yh;
+-	    dc_texturemid = rw_midtexturemid;
+-	    dc_source = R_GetColumn((DOOM_CTX->midtexture),texturecolumn);
+-	    colfunc ();
++	    if (draw_column)
++	    {
++		dc_yl = yl;
++		dc_yh = yh;
++		dc_texturemid = rw_midtexturemid;
++		dc_source = R_GetColumn((DOOM_CTX->midtexture),texturecolumn);
++		colfunc ();
++	    }
+ 	    ceilingclip[rw_x] = viewheight;
+ 	    floorclip[rw_x] = -1;
+ 	}
+@@ -270,11 +287,14 @@ void R_RenderSegLoop (void)
+ 
+ 		if (mid >= yl)
+ 		{
+-		    dc_yl = yl;
+-		    dc_yh = mid;
+-		    dc_texturemid = rw_toptexturemid;
+-		    dc_source = R_GetColumn((DOOM_CTX->toptexture),texturecolumn);
+-		    colfunc ();
++		    if (draw_column)
++		    {
++			dc_yl = yl;
++			dc_yh = mid;
++			dc_texturemid = rw_toptexturemid;
++			dc_source = R_GetColumn((DOOM_CTX->toptexture),texturecolumn);
++			colfunc ();
++		    }
+ 		    ceilingclip[rw_x] = mid;
+ 		}
+ 		else
+@@ -299,12 +319,15 @@ void R_RenderSegLoop (void)
+ 		
+ 		if (mid <= yh)
+ 		{
+-		    dc_yl = mid;
+-		    dc_yh = yh;
+-		    dc_texturemid = rw_bottomtexturemid;
+-		    dc_source = R_GetColumn((DOOM_CTX->bottomtexture),
+-					    texturecolumn);
+-		    colfunc ();
++		    if (draw_column)
++		    {
++			dc_yl = mid;
++			dc_yh = yh;
++			dc_texturemid = rw_bottomtexturemid;
++			dc_source = R_GetColumn((DOOM_CTX->bottomtexture),
++						    texturecolumn);
++			colfunc ();
++		    }
+ 		    floorclip[rw_x] = mid;
+ 		}
+ 		else
+@@ -317,7 +340,7 @@ void R_RenderSegLoop (void)
+ 		    floorclip[rw_x] = yh+1;
+ 	    }
+ 			
+-	    if (maskedtexture)
++	    if (maskedtexture && draw_column)
+ 	    {
+ 		// save texturecol
+ 		//  for backdrawing of masked mid texture
+diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
+index 5bfe993..7184867 100644
+--- a/linuxdoom-1.10/r_things.c
++++ b/linuxdoom-1.10/r_things.c
+@@ -388,7 +388,15 @@ R_DrawVisSprite
+     fixed_t		frac;
+     patch_t*		patch;
+ 	
+-	
++    if ((doom_render_fuzz_columns >> 30) & 3u)
++    {
++	int clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
++	int clip_right = clip_left + 40;
++	if (x1 < clip_left) x1 = clip_left;
++	if (x2 >= clip_right) x2 = clip_right - 1;
++	if (x1 > x2) return;
++    }
++
+     patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
+ 
+     dc_colormap = vis->colormap;
+@@ -407,11 +415,11 @@ R_DrawVisSprite
+ 	
+     dc_iscale = abs(vis->xiscale)>>detailshift;
+     dc_texturemid = vis->texturemid;
+-    frac = vis->startfrac;
++    frac = vis->startfrac + (x1 - vis->x1) * vis->xiscale;
+     spryscale = vis->scale;
+     sprtopscreen = centeryfrac - FixedMul(dc_texturemid,spryscale);
+ 	
+-    for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x++, frac += vis->xiscale)
++    for (dc_x=x1 ; dc_x<=x2 ; dc_x++, frac += vis->xiscale)
+     {
+ 	texturecolumn = frac>>FRACBITS;
+ #ifdef RANGECHECK
+@@ -835,8 +843,25 @@ void R_DrawSprite (vissprite_t* spr)
+     fixed_t		scale;
+     fixed_t		lowscale;
+     int			silhouette;
++    int			sprite_x1;
++    int			sprite_x2;
++    int			clip_mode;
++    int			clip_left;
++    int			clip_right;
+ 		
+-    for (x = spr->x1 ; x<=spr->x2 ; x++)
++    sprite_x1 = spr->x1;
++    sprite_x2 = spr->x2;
++    clip_mode = (doom_render_fuzz_columns >> 30) & 3u;
++    clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
++    clip_right = clip_left + 40;
++    if (clip_mode)
++    {
++	if (sprite_x1 < clip_left) sprite_x1 = clip_left;
++	if (sprite_x2 >= clip_right) sprite_x2 = clip_right - 1;
++	if (sprite_x1 > sprite_x2) return;
++    }
++
++    for (x = sprite_x1 ; x<=sprite_x2 ; x++)
+ 	clipbot[x] = cliptop[x] = -2;
+     
+     // Scan drawsegs from end to start for obscuring segs.
+@@ -845,8 +870,8 @@ void R_DrawSprite (vissprite_t* spr)
+     for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
+     {
+ 	// determine if the drawseg obscures the sprite
+-	if (ds->x1 > spr->x2
+-	    || ds->x2 < spr->x1
++	if (ds->x1 > sprite_x2
++	    || ds->x2 < sprite_x1
+ 	    || (!ds->silhouette
+ 		&& !ds->maskedtexturecol_m) )
+ 	{
+@@ -854,8 +879,8 @@ void R_DrawSprite (vissprite_t* spr)
+ 	    continue;
+ 	}
+ 			
+-	r1 = ds->x1 < spr->x1 ? spr->x1 : ds->x1;
+-	r2 = ds->x2 > spr->x2 ? spr->x2 : ds->x2;
++	r1 = ds->x1 < sprite_x1 ? sprite_x1 : ds->x1;
++	r2 = ds->x2 > sprite_x2 ? sprite_x2 : ds->x2;
+ 
+ 	if (ds->scale1 > ds->scale2)
+ 	{
+@@ -920,7 +945,7 @@ void R_DrawSprite (vissprite_t* spr)
+     // all clipping has been performed, so draw the sprite
+ 
+     // check for unclipped columns
+-    for (x = spr->x1 ; x<=spr->x2 ; x++)
++    for (x = sprite_x1 ; x<=sprite_x2 ; x++)
+     {
+ 	if (clipbot[x] == -2)		
+ 	    clipbot[x] = viewheight;
+@@ -931,7 +956,7 @@ void R_DrawSprite (vissprite_t* spr)
+ 		
+     mfloorclip = clipbot;
+     mceilingclip = cliptop;
+-    R_DrawVisSprite (spr, spr->x1, spr->x2);
++    R_DrawVisSprite (spr, sprite_x1, sprite_x2);
+ }
+ 
+ 
