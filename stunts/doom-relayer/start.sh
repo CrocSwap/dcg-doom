@@ -97,10 +97,18 @@
 #    before any of them came back. Measured 2026-09-26 on R15 at four buffers,
 #    60 s: 204 frames of 85 distinct cursors, so 3.37 fps was 1.4 new pictures/s
 #    and about 58% of the render compute was spent re-rendering states the chain
-#    had already published. 1 renders every new cursor, which against
-#    ADV_TICS=4 sweeps is every sweep; 8 renders every other sweep and buys the
-#    engine's advances the block space, at the cost of pictures. Leave it at 1
-#    unless a session is chasing engine tics/s rather than pictures.
+#    had already published.
+#
+#    The default is 8, not 1, and the measurement says why. Against
+#    ADV_TICS=4 sweeps, 1 renders every sweep and 8 renders every other one --
+#    which sounds like a straight trade of pictures for engine tics, and is not:
+#    measured 60 s each on R15, 1 gave 1.60 new cursors/s and 1.52 new pictures/s
+#    at 17.5 engine tics/s with key-to-picture at 993 ms, and 8 gave 2.30 and
+#    2.16 at 22.2 tics/s with key-to-picture at 408 ms. The renderer was not the
+#    compute-bound term; the chain's release queue was (`await_strips` at a
+#    0.50-0.60 s median, 7 blocks at 13 blocks/s). The compute it stops asking
+#    for goes to the sweeps, the sweeps publish cursors faster, and there are
+#    then more cursors to render than the renderer can use. 16 is not measured.
 #
 #  * the one-buffer read path. At BUFFERS=1 the buffer is held from the moment a
 #    submission starts until the readback has copied 1,113,792 bytes out of it,
@@ -175,7 +183,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth 4 --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
   --frame-deadline-seconds ${FRAME_DEADLINE:-2.0} \
-  --min-cursor-step-tics ${MIN_CURSOR_STEP:-1} \
+  --min-cursor-step-tics ${MIN_CURSOR_STEP:-8} \
   --render-pool-workers ${RENDER_POOL_WORKERS:-0} \
   --status-batch ${STATUS_BATCH:-100} --status-min-interval ${STATUS_MIN_INTERVAL:-0.25} \
   --strip-cu-limit ${STRIP_CU_LIMIT:-1400000} \
