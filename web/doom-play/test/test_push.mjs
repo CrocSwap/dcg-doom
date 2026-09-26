@@ -16,7 +16,15 @@ import {fileURLToPath} from "node:url";
 import {dirname, join} from "node:path";
 
 import {STRIP_COUNT, STRIP_ACCOUNT_BYTES, STRIP_HASH_DOMAIN, decodeFrame} from "../strip.js";
-import {FrameStream, compareFrames, decodePushedFrame, frameAccounts, framePayloads} from "../push.js";
+import {
+  FrameStream,
+  compareDigests,
+  compareFrames,
+  decodePushedFrame,
+  frameAccounts,
+  framePayloads,
+  readChainDigest,
+} from "../push.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const meta = JSON.parse(readFileSync(join(here, "fixtures", "frame-cursor-6016.json"), "utf8"));
@@ -206,7 +214,7 @@ test("one frame in twenty is read from the chain and compared", async () => {
     crossCheckEvery: 5,
     readChain: async (record) => {
       reads.push(record.frame_index);
-      return decodeFrame(realStrips);
+      return chainDigestOf(realStrips, 1168);
     },
     EventSourceImpl: FakeEventSource,
   });
@@ -217,7 +225,7 @@ test("one frame in twenty is read from the chain and compared", async () => {
   }
   assert.deepEqual(reads, [5, 10], "every fifth frame is read from the chain, and only that one");
   assert.equal(checks.length, 2);
-  assert.ok(checks.every((check) => check.comparison.match), "the chain read agrees with what was painted");
+  assert.ok(checks.every((check) => check.comparison.match), `the chain read agrees with what was painted: ${JSON.stringify(checks.map((c) => c.comparison))}`);
   const summary = stream.summary();
   assert.equal(summary.cross_checks, 2);
   assert.equal(summary.cross_check_matches, 2);
@@ -233,10 +241,11 @@ test("a chain read that disagrees is counted as a mismatch, not swallowed", asyn
     onCrossCheck: (value) => checks.push(value),
     crossCheckEvery: 1,
     readChain: async () => {
-      const frame = await decodeFrame(realStrips);
-      const pixels = new Uint8Array(frame.pixels);
-      pixels[42] = (pixels[42] + 1) & 0xff;
-      return {...frame, pixels};
+      // A relayer that edited one strip on the way past: the chain's digest for
+      // that strip is the original one and the pushed frame's is not.
+      const chain = chainDigestOf(realStrips, 1168);
+      chain.strips[2] = {...chain.strips[2], digest: "00".repeat(32)};
+      return chain;
     },
     EventSourceImpl: FakeEventSource,
   });
@@ -285,4 +294,100 @@ test("a malformed event body is counted, not thrown", async () => {
 
 test("the strip digest domain is the one the program writes, NUL included", () => {
   assert.equal(STRIP_HASH_DOMAIN, "DOOM-RENDER-STRIP/1\0");
+});
+
+// The chain read the cross-check makes: the eight strip *headers*, 192 B each.
+// `readChainDigest` is what makes the check comparable at all -- the first
+// version read 1,072,384 B and lost the race to every frame, ten checks and ten
+// "the chain moved on" (measured, R13 at 2.02 fps, 2026-09-26).
+function chainDigestOf(strips, slot) {
+  return {
+    slot,
+    strips: strips.map((strip) => {
+      const view = new DataView(strip.buffer, strip.byteOffset, strip.byteLength);
+      return {
+        stripId: view.getUint32(16, true),
+        cursor: view.getUint32(20, true),
+        gametic: view.getUint32(24, true),
+        digest: Buffer.from(strip.subarray(96, 128)).toString("hex"),
+        snapshotHash: Buffer.from(strip.subarray(32, 64)).toString("hex"),
+        stateRoot: Buffer.from(strip.subarray(64, 96)).toString("hex"),
+      };
+    }),
+  };
+}
+
+// A 192-byte snapshot header, which the read asks for alongside the strips and
+// does not use: the strips carry the identity the check compares.
+const SNAPSHOT_HEADER = new Uint8Array(192);
+
+const sliceReader = (payloads) => ({
+  getAccounts: async (addresses, {dataSlice} = {}) => {
+    assert.ok(dataSlice, "the cross-check must ask for a header slice, not whole accounts");
+    assert.equal(dataSlice.length, 128, "128 bytes is the whole strip header");
+    return {slot: 1168, payloads: addresses.map((_, index) => payloads[index].subarray(0, dataSlice.length))};
+  },
+});
+
+test("the chain read asks for 128-byte headers, not 1 MiB accounts", async () => {
+  let seenAddresses = null;
+  const reader = {
+    getAccounts: async (addresses, options) => {
+      seenAddresses = addresses;
+      return sliceReader([SNAPSHOT_HEADER, ...realStrips]).getAccounts(addresses, options);
+    },
+  };
+  const record = pushedRecord();
+  const chain = await readChainDigest(reader, record);
+  assert.equal(seenAddresses.length, 9, "the snapshot and its eight strips");
+  assert.equal(seenAddresses[0], record.snapshot_account, "aimed at the frame's own accounts");
+  assert.equal(chain.strips.length, 8);
+  assert.equal(chain.strips[0].digest, Buffer.from(realStrips[0].subarray(96, 128)).toString("hex"));
+  assert.equal(chain.slot, 1168);
+});
+
+test("a chain header that has not landed yet is not a mismatch", async () => {
+  const reader = {getAccounts: async () => ({slot: 1168, payloads: [null, ...Array(8).fill(null)]})};
+  assert.equal(await readChainDigest(reader, pushedRecord()), null);
+});
+
+test("matching digests compare as a match, and a differing one as a mismatch", async () => {
+  const frame = await decodePushedFrame(pushedRecord());
+  const chain = chainDigestOf(realStrips, 1168);
+  const good = compareDigests(frame, chain);
+  assert.equal(good.comparable, true);
+  assert.equal(good.match, true);
+  assert.match(good.reason, /all 8 strip digests match the chain at slot 1168/);
+
+  const edited = chainDigestOf(realStrips, 1168);
+  edited.strips[5] = {...edited.strips[5], digest: "ab".repeat(32)};
+  const bad = compareDigests(frame, edited);
+  assert.equal(bad.comparable, true);
+  assert.equal(bad.match, false);
+  assert.equal(bad.strip, 5);
+  assert.match(bad.reason, /strip 5 digest differs/);
+
+  const moved = chainDigestOf(realStrips, 1168);
+  moved.strips[0] = {...moved.strips[0], cursor: moved.strips[0].cursor + 16, gametic: moved.strips[0].gametic + 16};
+  const late = compareDigests(frame, moved);
+  assert.equal(late.comparable, false, "a chain that moved on is not a mismatch");
+  assert.match(late.reason, /moved on/);
+});
+
+test("a digest match is a pixel match, because the digest covers the pixels", async () => {
+  // The claim the cheap check rests on. A strip digest is SHA-256 over its id,
+  // cursor, gametic, snapshot hash and pixels, so equal digests on verified
+  // frames mean equal pixels.
+  const frame = await decodePushedFrame(pushedRecord());
+  const chain = chainDigestOf(realStrips, 1168);
+  assert.equal(compareDigests(frame, chain).match, true);
+  for (const [index, strip] of frame.stripHashes.entries()) {
+    assert.equal(strip, chain.strips[index].digest, `strip ${index} digest agrees`);
+  }
+  // And the pushed frame's own digests were verified on the way in: editing a
+  // pixel makes the frame undecodable, so it never reaches a comparison.
+  const tampered = realStrips.map((strip, index) => (index === 1
+    ? new Uint8Array([...strip.slice(0, 200), strip[200] ^ 1, ...strip.slice(201)])
+    : strip));
+  await assert.rejects(() => decodePushedFrame({...pushedRecord(), strip_accounts_b64: tampered.map(toBase64)}));
 });

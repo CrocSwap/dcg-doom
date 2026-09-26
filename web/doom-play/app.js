@@ -11,7 +11,7 @@ import {decodeFrame, frameToRgba, parseSnapshot, frameReadAddresses, toHex, Stri
 import {loadOrCreateBurner, forgetSession, recallSession, rememberSession, ed25519Available} from "./burner.js";
 import {encodeInput, heldToCommands} from "./input.js";
 import {InputLog} from "./inputlog.js";
-import {FrameStream, decodePushedFrame, frameAccounts, DEFAULT_CROSS_CHECK_EVERY} from "./push.js";
+import {FrameStream, decodePushedFrame, frameAccounts, readChainDigest, DEFAULT_CROSS_CHECK_EVERY} from "./push.js";
 
 // The engine rate to assume before the relayer has reported one. Measured at
 // 23.8-26.3 tics/s across two drive sessions at strip rate 64, so 25 is the
@@ -593,15 +593,13 @@ async function digestHex(bytes) {
 // difference in painted rate and torn reads is the difference between the paths
 // and not between two implementations of the painter.
 
-async function readPushedFromChain(record) {
-  const accounts = frameAccounts(record);
-  if (accounts === null) throw new Error(`frame ${record.frame_index} named no chain accounts`);
-  const {slot, payloads} = await state.reader.getAccounts(frameReadAddresses(accounts));
-  const snapshot = payloads[0] ? await parseSnapshot(payloads[0]) : null;
-  const frame = await decodeFrame(payloads.slice(1), {snapshot});
-  frame.slot = slot;
-  return frame;
-}
+// The cross-check's chain read: the eight strip headers and the snapshot header,
+// 1,728 bytes, and the digests out of them. The pixel-for-pixel version of this
+// read 1,072,384 B and lost the race to every frame -- measured, ten checks and
+// ten "the chain moved on" on the R13 context at 2.02 fps. The digests are the
+// stronger comparison anyway: a strip's digest covers its pixels, and the pushed
+// frame's eight were verified before it was painted.
+const readPushedFromChain = (record) => readChainDigest(state.reader, record);
 
 function startPush() {
   stopFrames();
