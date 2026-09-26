@@ -10,7 +10,7 @@ import {webcrypto} from "node:crypto";
 import {readFileSync} from "node:fs";
 
 import {encodeInput, heldToCommands, MAX_COMMANDS_PER_BATCH, BT_ATTACK, BT_SPECIAL} from "../../../web/doom-play/input.js";
-import {createRelayer, createServer, API_VERSION} from "../server.mjs";
+import {createRelayer, createServer, parseArgs, API_VERSION} from "../server.mjs";
 import {SlotPool, makeSlot, SLOT_STATE, PoolError} from "../pool.mjs";
 import {MockSender, createSender, SenderError, PipelineSender, PIPELINE_REQUIREMENTS} from "../sender.mjs";
 
@@ -1366,7 +1366,7 @@ test("the one-buffer read path reaches the pipeline, and only when asked for", (
   // branch handles it, so the parser is read rather than trusted.
   const serverSource = readFileSync(new URL("../server.mjs", import.meta.url), "utf8");
   assert.ok(
-    serverSource.includes('const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback"])'),
+    /const BOOLEAN_CHAIN_FLAGS = new Set\(\[[^\]]*"pre-read-snapshot", "overlap-readback"/.test(serverSource),
     "the two switches are not declared as switches, so the parser eats the next flag",
   );
   assert.ok(serverSource.includes('preReadSnapshot: args.get("pre-read-snapshot") != null'));
@@ -1428,6 +1428,26 @@ test("the flags this round added are built, with their defaults intact", () => {
   for (const flag of ["--status-batch", "--status-min-interval", "--strip-cu-limit"]) {
     assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
   }
+});
+
+test("the early-strip switch reaches the pipeline, and is off by default", () => {
+  // `--strips-behind-snapshot` is a switch, and a switch that the generic
+  // argument branch treats as taking a value never reaches the pipeline: it
+  // would eat the token after it. So it is in `BOOLEAN_CHAIN_FLAGS` as well as
+  // in `argv()`, and it is absent unless asked for, because the wait it removes
+  // is what produces the name the strips carry.
+  const argv = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    stripsBehindSnapshot: true,
+  }).argv();
+  assert.ok(argv.includes("--strips-behind-snapshot"), `argv() did not build the flag: ${JSON.stringify(argv)}`);
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  assert.ok(!plain.includes("--strips-behind-snapshot"), "the early-strip path is on without being asked for");
+  // And the relayer's own server parses it as a switch, so a start.sh that asks
+  // for it gets the pipeline's flag rather than the next token.
+  const parsed = parseArgs(["node", "server.mjs", "--strips-behind-snapshot", "--pre-read-snapshot"]);
+  assert.equal(parsed.get("strips-behind-snapshot"), "1");
+  assert.equal(parsed.get("pre-read-snapshot"), "1");
 });
 
 test("a third node and a send rate reach the pipeline's argv", () => {

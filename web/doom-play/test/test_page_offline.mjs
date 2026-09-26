@@ -113,6 +113,12 @@ const FAST = {frameIntervalMs: 60};
 // arrive, but a test that only ever runs at 16 fps cannot see a stall of a
 // couple of seconds, which is what a dropped stream costs.
 const LIVE = {frameIntervalMs: 550, ticsPerSecond: 23};
+// The four-buffer cadence the chain measured at 3.27-3.33 fps, 2026-09-26: four
+// frames in flight, delivered in bursts, in completion order rather than
+// submission order, and the same cursor rendered by several of them. This is
+// the shape every previous offline test ran without, and the shape the page was
+// losing 60% of its frames to.
+const FOUR_BUFFER = {frameIntervalMs: 303, buffers: 4, ticsPerSecond: 17};
 
 if (!chromeAvailable()) {
   test("the painted path, offline", {skip: "Chrome is not installed on this machine"}, () => {});
@@ -136,6 +142,80 @@ if (!chromeAvailable()) {
       );
       assert.equal(window.after.stream.torn ?? 0, 0, "a pushed frame is eight whole strips, not a torn read");
     }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
+  });
+
+  test("the page paints at the chain's rate with four buffers in flight", {timeout: 180_000}, async () => {
+    // The paint gap, end to end, at the rate the chain actually renders.
+    //
+    // With one render buffer in flight the relayer's pushes are in submission
+    // order, so a page that dropped anything behind the last index it painted
+    // looked perfect: every offline test here ran that way. Four buffers make
+    // the completion order the push order's permutation, and the page painted
+    // 1.30 of the chain's 3.33 on R15 on 2026-09-26 with `skipped` carrying the
+    // difference and nothing torn.
+    //
+    // The assertions are the four places a frame can be lost, in the order the
+    // brief asks for them: the stream delivered everything, the ring turned over
+    // many times, the eight digest checks and the draw kept up, and the only
+    // thing dropped was a frame this page had already painted.
+    await withPage(async ({page, relayer}) => {
+      await sleep(3_000);
+      const window = await measureWindow(page, relayer, 14);
+      const stream = window.after.stream;
+      // 1. delivery. Everything the relayer pushed arrived. A frame submitted
+      //    inside the window is delivered when the burst it is in completes, so
+      //    the two counts can differ by up to one burst at either edge.
+      const received = stream.received - window.before.stream.received;
+      assert.ok(
+        Math.abs(received - window.pushed) <= FOUR_BUFFER.buffers,
+        `the stream received ${received} records for the ${window.pushed} the relayer pushed in this window, so the loss is on the wire`,
+      );
+      // 2. the ring, and 3. decode and draw: the page kept up with a burst of
+      //    four every 1.2 s without the queue growing.
+      const painted = window.after.painted - window.before.painted;
+      assert.ok(
+        painted >= window.pushed - FOUR_BUFFER.buffers,
+        `the page painted ${painted} of ${window.pushed} pushed frames in ${window.seconds.toFixed(1)}s ` +
+          `(${JSON.stringify(stream)}, error ${JSON.stringify(window.after.error)})`,
+      );
+      assert.ok(
+        stream.queue_high <= 8,
+        `the queue reached ${stream.queue_high} records, so the page is behind the relayer rather than painting it`,
+      );
+      assert.ok(
+        stream.handle_ms_max < 3 * FOUR_BUFFER.frameIntervalMs,
+        `one frame cost the loop ${stream.handle_ms_max.toFixed(1)} ms at worst, so decode and draw are not the limit`,
+      );
+      // 4. the loss, and where it is not. Every skipped frame is a replay.
+      assert.equal(stream.skipped, 0, `frames this page had never painted were dropped: ${JSON.stringify(stream)}`);
+      // The page is at the chain's rate, and the frames it painted that were
+      // older than the picture on screen are counted rather than hidden.
+      assert.ok(
+        window.paintedFps > 0.9 * window.pushedFps,
+        `painted ${window.paintedFps.toFixed(2)} fps against ${window.pushedFps.toFixed(2)} pushed`,
+      );
+      assert.equal(stream.torn ?? 0, 0, "a pushed frame is eight whole strips, not a torn read");
+      assert.ok(stream.painted_stale > 0, `no frame went backwards, so this did not reproduce R15: ${JSON.stringify(stream)}`);
+      assert.equal(stream.stale_dropped, 0, "a stale frame is painted by default");
+    }, {relayerOptions: {...FOUR_BUFFER}, query: "&cross-check-every=0"});
+  });
+
+  test("a viewer that refuses to go backwards pays for it in painted frames", {timeout: 180_000}, async () => {
+    // The old policy, as a switch, measured rather than asserted: never move the
+    // picture to an older state. On the R15 confirm session that threw away 48
+    // of 202 pushes, 3.37 pushed fps against 2.57 painted.
+    await withPage(async ({page, relayer}) => {
+      await page.evaluate("window.doomPlay.state.stream.dropStaleFrames = true");
+      await sleep(2_000);
+      const window = await measureWindow(page, relayer, 12);
+      const stream = window.after.stream;
+      assert.ok(stream.stale_dropped > 0, `no frame went backwards, so this did not test anything: ${JSON.stringify(stream)}`);
+      assert.equal(stream.painted_stale, 0, "a stale frame cannot also be painted");
+      assert.ok(
+        window.painted < window.pushed,
+        `painted ${window.painted} of ${window.pushed} and dropped none of them, which is not what the switch does`,
+      );
+    }, {relayerOptions: {...FOUR_BUFFER}, query: "&cross-check-every=0"});
   });
 
   test("a node that never answers does not stop the picture", {timeout: 180_000}, async () => {

@@ -33,6 +33,10 @@ function fromBase64(encoded) {
   return bytes;
 }
 
+// A monotonic millisecond clock that is the same in the browser and under
+// `node --test`, which is where the stream's own cost is measured.
+const performanceNow = () => globalThis.performance?.now?.() ?? Date.now();
+
 // The pushed record, as this module wants it: validated for shape, and nothing
 // else. `decodeFrame` is where a frame is actually checked, and a shape check
 // here only stops a malformed record from reaching it.
@@ -213,12 +217,24 @@ export function compareFrames(pushed, read) {
 }
 
 // The stream. One EventSource, one frame at a time, in arrival order, because
-// a picture that is a frame old is still the right picture and a picture that
-// is a frame out of order is a lie. Frames are therefore never dropped here --
-// if the page is too slow to keep up, the queue grows and the page says so, and
-// it is the operator who has to decide that a slow viewer wants skipping.
+// a picture that is a frame old is still the right picture. Frames are never
+// dropped for being late -- if the page is too slow to keep up, the queue grows
+// and the page says so, and it is the operator who has to decide that a slow
+// viewer wants skipping.
+//
+// **What is dropped is a replay, and a replay is named by the frame's own
+// index.** It used to be dropped by `frame_index <= lastFrameIndex`, which
+// looked like the same test and is not: `frame_index` is the relayer's
+// *submission* counter, and with more than one render buffer in flight a frame
+// submitted second can complete first. Measured on the R15 confirm session,
+// 2026-09-26, from the relayer's own `frames.jsonl`: 105 of 201 consecutive
+// pushes carried a lower `frame_index` than the push before them, and replaying
+// that push order through the old rule paints 79 frames and drops 123 -- 1.30
+// fps against a chain rendering 3.33, with nothing torn, nothing refused, and a
+// counter that read like a supersession count. A frame the page has never seen
+// is not a replay and is not dropped.
 export class FrameStream {
-  constructor({base, sessionId, onFrame, onCrossCheck, crossCheck, crossCheckEvery = DEFAULT_CROSS_CHECK_EVERY, EventSourceImpl = null, readChain = null, retryDelayMs = 500, reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS} = {}) {
+  constructor({base, sessionId, onFrame, onCrossCheck, crossCheck, crossCheckEvery = DEFAULT_CROSS_CHECK_EVERY, EventSourceImpl = null, readChain = null, retryDelayMs = 500, reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS, dropStaleFrames = false} = {}) {
     this.base = base;
     this.sessionId = sessionId;
     this.onFrame = onFrame;
@@ -269,6 +285,34 @@ export class FrameStream {
     this.stopped = false;
     this.queue = [];
     this.draining = false;
+    // The frame_index of every frame this page has painted, bounded. A
+    // reconnect replays the ring the relayer still holds, which includes frames
+    // already painted, and identity is what says so: an index in here is a
+    // frame this page has shown. Monotonic `lastFrameIndex` cannot, because with
+    // several render buffers in flight the completion order is not the
+    // submission order.
+    this.paintedIndices = new Set();
+    this.paintedIndexLimit = 120;
+    // A frame older than the picture already on screen, painted anyway. With
+    // four render buffers this is a quarter of the pushes (measured: 26
+    // strictly-decreasing `gametic` pairs in 201 pushes on R15, 2026-09-26) and
+    // it is a live-view choice, not a fault: the picture is a real render of a
+    // real state that the chain committed, it is one frame interval old, and
+    // the next push moves forward again. It is counted, and it can be refused
+    // with `dropStaleFrames`, which is the old behaviour and costs a third of
+    // the painted rate.
+    this.paintedStale = 0;
+    this.dropStaleFrames = dropStaleFrames;
+    this.staleDropped = 0;
+    this.lastPaintedGametic = null;
+    // Where the time between two pushes goes, so "the page painted 1.3 of the
+    // chain's 3.3" has an answer that is a number rather than a guess. These
+    // are the whole per-frame cost: the eight digest checks, the pixels, and
+    // whatever the page's own `onFrame` does with them.
+    this.received = 0;
+    this.queueHigh = 0;
+    this.handleMsTotal = 0;
+    this.handleMsMax = 0;
   }
 
   get url() {
@@ -329,17 +373,19 @@ export class FrameStream {
       this.torn = (this.torn ?? 0) + 1;
       return;
     }
+    this.received += 1;
     this.queue.push(record);
+    if (this.queue.length > this.queueHigh) this.queueHigh = this.queue.length;
     if (this.draining) return;
     this.draining = true;
     try {
       while (this.queue.length > 0 && !this.stopped) {
         const next = this.queue.shift();
-        if (next?.frame_index != null && this.lastFrameIndex != null
-          && next.frame_index <= this.lastFrameIndex) {
-          // A reconnect can hand back a frame already painted. Re-painting it
-          // would put the picture backwards, which is worse than not painting
-          // it, so it is counted and dropped.
+        if (next?.frame_index != null && this.paintedIndices.has(next.frame_index)) {
+          // A replay: this page has already shown this exact frame. Re-painting
+          // it would put the picture backwards, which is worse than not painting
+          // it, so it is counted and dropped. Identity, not order -- see the
+          // note on the class.
           this.skipped += 1;
           continue;
         }
@@ -347,12 +393,16 @@ export class FrameStream {
         // carries on. Letting it out of this loop instead used to leave every
         // frame already queued unpainted until the next event arrived, which
         // turned one bad frame into a gap in the picture.
+        const started = performanceNow();
         try {
           await this.#handle(next);
         } catch (error) {
           this.torn = (this.torn ?? 0) + 1;
           this.lastError = error instanceof Error ? error.message : String(error);
         }
+        const cost = performanceNow() - started;
+        this.handleMsTotal += cost;
+        if (cost > this.handleMsMax) this.handleMsMax = cost;
       }
     } finally {
       this.draining = false;
@@ -376,8 +426,31 @@ export class FrameStream {
       this.withoutBytes = (this.withoutBytes ?? 0) + 1;
       return;
     }
+    const gametic = frame.gametic ?? null;
+    if (this.dropStaleFrames && this.lastPaintedGametic !== null
+      && gametic !== null && gametic < this.lastPaintedGametic) {
+      // The old rule, kept as a switch: never move the picture to an older
+      // state. It is a third of the pushes on four buffers and it is a policy,
+      // not a fault.
+      this.staleDropped += 1;
+      return;
+    }
     this.pushed += 1;
-    if (record.frame_index != null) this.lastFrameIndex = record.frame_index;
+    if (record.frame_index != null) {
+      this.paintedIndices.add(record.frame_index);
+      while (this.paintedIndices.size > this.paintedIndexLimit) {
+        this.paintedIndices.delete(this.paintedIndices.values().next().value);
+      }
+      // The cursor the page reconnects with is the newest frame it has shown,
+      // which with several buffers in flight is not the last one it showed.
+      if (this.lastFrameIndex === null || record.frame_index > this.lastFrameIndex) {
+        this.lastFrameIndex = record.frame_index;
+      }
+    }
+    if (this.lastPaintedGametic !== null && gametic !== null && gametic < this.lastPaintedGametic) {
+      this.paintedStale += 1;
+    }
+    if (gametic !== null) this.lastPaintedGametic = gametic;
     if (frame.cursor !== null && frame.cursor !== undefined) {
       // A *list* per cursor. The loop re-renders an unchanged cursor, so a cursor
       // can have more than one frame, and "cursor -> digests" is not a key.
@@ -586,9 +659,27 @@ export class FrameStream {
   summary() {
     return {
       pushed: this.pushed,
+      // Every record the stream delivered, which is `pushed + skipped +
+      // stale_dropped + torn + without_bytes` and is the number that says
+      // whether the loss is on the wire or in this loop.
+      received: this.received,
       torn: this.torn ?? 0,
       without_bytes: this.withoutBytes ?? 0,
+      // A frame this page has already painted, handed over again. Only that.
       skipped: this.skipped,
+      // Frames painted whose state was older than the picture already on
+      // screen, which is a quarter of the pushes with four render buffers.
+      // Counted, not dropped, unless `dropStaleFrames`.
+      painted_stale: this.paintedStale,
+      // The old policy, available as a switch: 48 of 202 pushes on the R15
+      // confirm session, and 2.57 painted fps against 3.37 pushed.
+      stale_dropped: this.staleDropped,
+      // The deepest the queue has been, and the whole per-frame cost of this
+      // loop, so a painted rate below the chain's can be attributed to the page
+      // or to the wire from the page's own numbers.
+      queue_high: this.queueHigh,
+      handle_ms_max: this.handleMsMax,
+      handle_ms_mean: this.pushed > 0 ? this.handleMsTotal / (this.pushed + this.skipped) : 0,
       errors: this.errors ?? 0,
       // Streams opened again after one dropped. Non-zero with a painted rate
       // below the relayer's is the shape of a page that lost frames in transit

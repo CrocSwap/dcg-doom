@@ -11,7 +11,7 @@
 import {spawn} from "node:child_process";
 import {createHash, randomBytes} from "node:crypto";
 import {createConnection} from "node:net";
-import {existsSync, mkdtempSync} from "node:fs";
+import {existsSync, mkdtempSync, rmSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {setTimeout as sleep} from "node:timers/promises";
@@ -91,6 +91,7 @@ export class Browser {
     this.waiting = new Map();
     this.handlers = new Map();
     this.closed = false;
+    this.killer = null;
     this.ws.onMessage((text) => this.#onMessage(text));
   }
 
@@ -128,6 +129,31 @@ export class Browser {
       /* already gone */
     }
     this.process.kill();
+    // The profile goes with the process, and on macOS it carries the
+    // `code_sign_clone` directory Chrome writes for its own code signing, which
+    // is megabytes per run. Chrome does not always exit on SIGTERM, so the
+    // profile is removed on exit *or* after a second, whichever comes first, and
+    // the child is unreferenced so a wedged browser cannot hold the test
+    // process open.
+    const cleanup = () => {
+      clearTimeout(this.killer);
+      try {
+        rmSync(this.profile, {recursive: true, force: true});
+      } catch {
+        /* the profile is already gone */
+      }
+    };
+    this.killer = setTimeout(() => {
+      try {
+        this.process.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+    }, 1_000);
+    this.killer.unref?.();
+    this.process.once("exit", cleanup);
+    this.process.unref?.();
   }
 }
 

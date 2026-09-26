@@ -461,6 +461,11 @@ export class PipelineSender {
     // pushed without a value and are absent unless asked for.
     if (options.preReadSnapshot) argv.push("--pre-read-snapshot");
     if (options.overlapReadback) argv.push("--overlap-readback");
+    // Send a frame's strips behind its snapshot instead of after waiting for
+    // it. A switch for the same reason as the two above: the pipeline is only
+    // reachable through `argv()`, and a flag that is not built here is a
+    // flag the pipeline has never seen.
+    if (options.stripsBehindSnapshot) argv.push("--strips-behind-snapshot");
     argv.push("--spend-cap-fogo", String(options.spendCapFogo ?? 10));
     return argv;
   }

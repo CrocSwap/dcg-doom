@@ -1093,9 +1093,9 @@ const CHAIN_FLAGS = new Set([
 // the first to the *text* of the second and then skip it, so the second would
 // never reach the pipeline and the session would quietly run the serial path
 // while the runbook said otherwise.
-const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback"]);
+const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot"]);
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = new Map();
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -1159,6 +1159,9 @@ if (isMain()) {
     rpcLagCheckSeconds: args.get("rpc-lag-check-seconds") ? Number(args.get("rpc-lag-check-seconds")) : undefined,
     preReadSnapshot: args.get("pre-read-snapshot") != null,
     overlapReadback: args.get("overlap-readback") != null,
+    // The early-strip experiment. Off by default; the receipt carries the
+    // refusal rate, which is the number that decides whether it can ever be on.
+    stripsBehindSnapshot: args.get("strips-behind-snapshot") != null,
   });
   const relayer = createRelayer({
     network,

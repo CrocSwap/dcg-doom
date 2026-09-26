@@ -10,7 +10,7 @@
 
 import {spawn} from "node:child_process";
 import {createHash} from "node:crypto";
-import {mkdirSync, writeFileSync} from "node:fs";
+import {mkdirSync, rmSync, writeFileSync} from "node:fs";
 import {createConnection} from "node:net";
 import {setTimeout as sleep} from "node:timers/promises";
 
@@ -94,6 +94,10 @@ function wsConnect(url) {
 
 // -- the browser ------------------------------------------------------------
 
+// The profile goes with the browser: on macOS it carries the `code_sign_clone`
+// directory Chrome writes into it, which is megabytes per run. `PROOF_CLEAN=0`
+// keeps it, for a run that wants to look at the profile.
+const PROFILE = process.env.PROOF_PROFILE ?? "/tmp/doom-proof-profile";
 const chrome = spawn(CHROME, [
   "--headless=new",
   `--remote-debugging-port=${PORT}`,
@@ -102,10 +106,47 @@ const chrome = spawn(CHROME, [
   "--no-default-browser-check",
   "--disable-gpu",
   "--window-size=1600,1200",
-  "--user-data-dir=/tmp/doom-proof-profile",
+  `--user-data-dir=${PROFILE}`,
   "about:blank",
 ], {stdio: ["ignore", "ignore", "pipe"]});
 chrome.stderr.on("data", () => {});
+
+// One exit path for every way this file ends, including a failed join.
+let closed = false;
+function closeChrome() {
+  if (closed) return;
+  closed = true;
+  try {
+    chrome.kill();
+  } catch {
+    /* already gone */
+  }
+  if (process.env.PROOF_CLEAN === "0") return;
+  const sweep = () => {
+    try {
+      rmSync(PROFILE, {recursive: true, force: true});
+    } catch {
+      /* the profile is already gone */
+    }
+  };
+  chrome.once("exit", sweep);
+  const timer = setTimeout(() => {
+    try {
+      chrome.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    sweep();
+  }, 2_000);
+  timer.unref?.();
+}
+process.on("exit", closeChrome);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    closeChrome();
+    process.exit(1);
+  });
+}
 
 async function target() {
   for (let attempt = 0; attempt < 60; attempt += 1) {
@@ -180,7 +221,7 @@ if (typeof joined !== "string" || !/^[0-9a-f]{8,}$/.test(joined)) {
   console.log("JOIN FAILED; the page says:", await evaluate(`document.getElementById("error")?.textContent ?? ""`));
   writeFileSync(`${OUT}/proof.json`, JSON.stringify({joined, ok: false}, null, 2));
   await shot("proof-join-failed");
-  chrome.kill();
+  closeChrome();
   process.exit(1);
 }
 
@@ -379,4 +420,4 @@ console.log("status:", JSON.stringify(after.status));
 console.log("banner:", after.banner);
 console.log("torn reads:", after.torn, "painted:", after.painted);
 ws.close();
-chrome.kill();
+closeChrome();
