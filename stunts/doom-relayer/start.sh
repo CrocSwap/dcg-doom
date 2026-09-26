@@ -76,6 +76,19 @@
 #    receipt's `errors` and `config.send_pacer_rate_per_endpoint`, not the rate
 #    itself, are what say whether a rate was sustainable.
 #
+#  * RPC_B. The second node, and `RPC_B=none` runs the session on one.
+#    Measured 2026-09-26 on R15 at four buffers, 60 s, the two-node session froze
+#    the *whole process* -- the engine's sweeps and the render together -- three
+#    times for 10.2, 10.2 and 10.7 s, which is 31 s of a 60 s session, and the
+#    render's own `sendTransaction` on the public node went from 0.13 s to
+#    1.2 s inside those windows while the fast node answered in 4.6 ms. The
+#    relayer's own error list has two `getSlot ... HTTP 429` from
+#    `testnet.fogo.io` in the same 60 s, six lag checks. So the two-node pool
+#    spends 52% of a session waiting on one rate-limited public endpoint, and
+#    the switch is here to measure the alternative rather than argue about it.
+#    One node makes the sender's dual-RPC agreement vacuous (see
+#    `apply_rpc_health`) and leaves no fallback, so the default is still two.
+#
 #  * MIN_CURSOR_STEP, the smallest cursor step between two rendered frames, in
 #    tics, default 1. A frame is only worth block space if it is a game state
 #    nobody has rendered, and the renderer now gates on the highest cursor it has
@@ -146,7 +159,7 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --python "$PY" \
   --script "$RD/scripts/doom_relayer_server.py" \
   --run-dir "$RD/out/$NAME" \
-  --rpc-a http://64.130.44.173:8899 --rpc-b https://testnet.fogo.io \
+  --rpc-a ${RPC_A:-http://64.130.44.173:8899} ${RPC_B+--rpc-b "$RPC_B"} \
   ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-45} \
   --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
   --image-bytes 916496 \
