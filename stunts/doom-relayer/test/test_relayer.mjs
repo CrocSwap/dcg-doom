@@ -7,6 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {webcrypto} from "node:crypto";
+import {readFileSync} from "node:fs";
 
 import {encodeInput, heldToCommands, MAX_COMMANDS_PER_BATCH, BT_ATTACK, BT_SPECIAL} from "../../../web/doom-play/input.js";
 import {createRelayer, createServer, API_VERSION} from "../server.mjs";
@@ -1290,5 +1291,64 @@ test("a frame stream for a session that does not exist is refused", async () => 
     assert.equal(response.status, 404);
   } finally {
     server.close();
+  }
+});
+
+// -- start.sh and argv() must agree -----------------------------------------
+//
+// A chain-mode flag reaches the pipeline process in exactly one place:
+// `PipelineSender.argv()`. A flag that is in start.sh, in the python parser and
+// in `main()` but not there is a flag the pipeline has never seen, and the
+// runbook says otherwise. That is not hypothetical: `--reset-start-account`
+// sat in start.sh from 2026-09-26 00:0x with the whole RESET/9 path behind it,
+// and `--status-batch` / `--status-min-interval` / `--strip-cu-limit` were lost
+// the same way on 2026-09-26 at 05:0x. So this reads start.sh.
+
+test("every flag start.sh passes is built in argv()", () => {
+  // The failure is a flag that exists in start.sh, in the python parser and in
+  // the node option list, and is never *built* into the child's argv -- so it
+  // never reaches the pipeline and the runbook is describing a flag the program
+  // has never seen. `--reset-start-account` sat in start.sh from 2026-09-26
+  // 00:0x with the whole RESET/9 path behind it; `--status-batch`,
+  // `--status-min-interval` and `--strip-cu-limit` were lost the same way on
+  // 2026-09-26 at 05:0x, with the pipeline running on its defaults while three
+  // numbers in the runbook said otherwise.
+  //
+  // So: read start.sh's exec line, and require each flag to appear in argv()'s
+  // own source. Conditional construction (`if (options.x) argv.push(...)`) is
+  // correct and is not the thing being tested -- being absent from argv() is.
+  const start = readFileSync(new URL("../start.sh", import.meta.url), "utf8");
+  const senderSource = readFileSync(new URL("../sender.mjs", import.meta.url), "utf8");
+  const argvSource = senderSource.slice(senderSource.indexOf("  argv() {"), senderSource.indexOf("  async start() {"));
+  const body = start.slice(start.indexOf("exec node"));
+  // The node server's own CLI flags, which start.sh passes to `server.mjs` and
+  // which argv() is not supposed to build: they configure this process, not the
+  // pipeline child. Everything else on that line is the child's.
+  const nodeOwn = new Set([
+    "--mode", "--port", "--host", "--network", "--cors-origin", "--slots",
+    "--advance-pipeline-depth", "--sweep-rate", "--input-tics-per-second",
+    "--python", "--script", "--keys-dir", "--payer-key", "--run-dir",
+  ]);
+  const passed = [...new Set([...body.matchAll(/(?<=--)[a-z][a-z0-9-]*/g)].map((match) => `--${match[0]}`))]
+    .filter((flag) => !nodeOwn.has(flag));
+  assert.ok(passed.length > 12, `start.sh's exec line looks wrong: ${passed.length} flags`);
+  const missing = passed.filter((flag) => !argvSource.includes(`"${flag}"`));
+  assert.deepEqual(missing, [], `start.sh passes ${missing.join(" ")} but argv() never builds them`);
+});
+
+test("the flags this round added are built, with their defaults intact", () => {
+  const argv = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    statusBatch: 250, statusMinInterval: 0.5, stripCuLimit: 1_400_000,
+  }).argv();
+  assert.deepEqual(
+    [argv[argv.indexOf("--status-batch") + 1], argv[argv.indexOf("--status-min-interval") + 1], argv[argv.indexOf("--strip-cu-limit") + 1]],
+    ["250", "0.5", "1400000"],
+  );
+  // And absent by default, so the pipeline's own defaults are what run when the
+  // runbook says nothing.
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  for (const flag of ["--status-batch", "--status-min-interval", "--strip-cu-limit"]) {
+    assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
   }
 });
