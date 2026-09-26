@@ -77,7 +77,16 @@ const snapshot = (page) => page.evaluate(`(() => {
     batchesSigned: s.batchesSigned,
     refusals: s.refusals,
     roundTripMs: s.roundTripMs,
-    latencies: s.pictureLatencies.slice(),
+    // The two keypress meters. stampLatencies is keydown to the first painted
+    // frame at or past the tic the input was stamped for, and is the latency a
+    // player feels; nextPictureLatencies is keydown to the next frame of any
+    // kind, which is not a keypress latency.
+    stampLatencies: s.stampLatencies.slice(),
+    nextPictureLatencies: s.nextPictureLatencies.slice(),
+    holdsStarted: s.holdsStarted,
+    holdsUnstamped: s.holdsUnstamped,
+    lastStampedTic: s.lastStampedTic ?? null,
+    lastStampSample: s.lastStampSample ?? null,
     keys: Object.entries(s.keys).filter(([, held]) => held).map(([name]) => name),
     wallet: Boolean(s.wallet),
     session: s.session?.id ?? null,
@@ -392,6 +401,66 @@ if (!chromeAvailable()) {
       );
       assert.equal(after.stream.torn ?? 0, 0, "a replayed frame is a whole frame, not a torn read");
     }, {relayerOptions: {...LIVE, streamRetryMs: 2_000}, query: "&cross-check-every=0"});
+  });
+
+  test("the keypress meter waits for the stamped tic, and the next-picture meter does not", {timeout: 180_000}, async () => {
+    // The two numbers, and the fault this test exists for.
+    //
+    // The page measured keydown -> the next frame past the gametic that was on
+    // screen, and called it input-to-picture. On R15 that read 408 ms on a
+    // session whose lead was 2,155 ms, because the frame it timed was the next
+    // picture to arrive and had nothing to do with the key. The honest meter is
+    // keydown -> the first frame at or past the tic the relayer stamped this
+    // hold's input for, which is the frame the key is actually in.
+    //
+    // The fake relayer publishes at 60 ms and advances 2 tics a frame at 35
+    // tic/s, and publishes a lead of 61 tics. So the next-picture meter has to
+    // read tens of milliseconds and the keypress meter has to read about the
+    // lead -- 61 tics is 1.74 s at this rate. A page that reports the same
+    // number for both is timing the first one twice.
+    await withPage(async ({page, relayer}) => {
+      await sleep(2_000);
+      const before = await snapshot(page);
+      await page.key("keyDown", "ArrowRight", "ArrowRight", 39);
+      // Long enough for the stamped tic to be reached: the lead plus the frame
+      // cadence, which is the price of a 61-tic lead at 35 tic/s.
+      await sleep(4_000);
+      const held = await snapshot(page);
+      await page.key("keyUp", "ArrowRight", "ArrowRight", 39);
+      await sleep(500);
+      const after = await snapshot(page);
+
+      assert.equal(after.holdsStarted, before.holdsStarted + 1, "the hold was not counted");
+      assert.equal(after.holdsUnstamped, 0, `a press produced no stamped answer: ${JSON.stringify(after)}`);
+      const stamps = after.stampLatencies.slice(before.stampLatencies.length);
+      const nexts = after.nextPictureLatencies.slice(before.nextPictureLatencies.length);
+      assert.equal(stamps.length, 1, `the keypress meter recorded ${JSON.stringify(stamps)} samples for one press`);
+      assert.ok(nexts.length >= 1, `the next-picture meter recorded nothing: ${JSON.stringify(after)}`);
+
+      // The definitional check: the frame that ended the wait was at or past the
+      // tic the relayer stamped, so the keypress is in that picture.
+      assert.ok(after.lastStampSample !== null, "no sample recorded the pair it waited on");
+      assert.ok(
+        after.lastStampSample.gametic >= after.lastStampSample.tic,
+        `the wait ended on gametic ${after.lastStampSample.gametic} against a stamped tic of ${after.lastStampSample.tic}`,
+      );
+      // And the two meters are not the same quantity. The next picture is one
+      // frame away; the keypress is a whole lead away.
+      const stamp = stamps[0];
+      const next = nexts[0];
+      const leadMs = (relayer.leadTics / relayer.ticsPerSecond) * 1000;
+      assert.ok(
+        stamp >= 0.5 * leadMs,
+        `the keypress meter read ${stamp.toFixed(0)} ms against a lead of ${leadMs.toFixed(0)} ms ` +
+          `(stamped tic ${after.lastStampedTic}), so it timed a frame rather than the keypress`,
+      );
+      assert.ok(
+        next < stamp,
+        `the next-picture meter (${next.toFixed(0)} ms) is not below the keypress meter (${stamp.toFixed(0)} ms), ` +
+          "so one of them is timing the wrong frame",
+      );
+      assert.ok(held.painted > before.painted, "the page painted nothing during the hold");
+    }, {relayerOptions: {...FAST}, query: "&cross-check-every=0"});
   });
 
   test("a keypress is signed, accepted and consumed by the engine", {timeout: 180_000}, async () => {
