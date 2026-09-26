@@ -603,3 +603,52 @@ test("two pushes of the same frame for one cursor are stored once", async () => 
   await FakeEventSource.last.deliver(pushedRecord({frameIndex: 2}));
   assert.equal(stream.digestsByCursor.get(cursor).length, 1, "identical digests, one record");
 });
+
+test("a chain read that caught a frame mid-write is not a mismatch", async () => {
+  // Measured on R13 at 2.00 fps, 2026-09-26: three checks in nine reported a
+  // strip digest difference and all three survived a retry, which is the
+  // signature of a torn read rather than of a re-render. The read is at
+  // `processed` on a public node and the one render buffer is overwritten every
+  // 0.5 s, so a read that straddles two frames sees strips from both -- and each
+  // of those strips is individually valid, carrying a correct digest over its
+  // own header and pixels. The only thing that tells them apart is whether they
+  // agree with each other, and the check was not asking.
+  let calls = 0;
+  const stream = new FrameStream({
+    base: "http://r.invalid", sessionId: "s-torn",
+    onFrame: () => {},
+    crossCheckEvery: 1,
+    retryDelayMs: 1,
+    readChain: async () => {
+      calls += 1;
+      const chain = chainDigestOf(realStrips, 42);
+      // Strips 4..7 are from the next frame: a later cursor, its own digests.
+      for (const strip of chain.strips.slice(4)) {
+        strip.cursor += 16;
+        strip.gametic += 16;
+      }
+      return chain;
+    },
+    EventSourceImpl: FakeEventSource,
+  });
+  stream.start();
+  FakeEventSource.stream = stream;
+  await FakeEventSource.last.deliver(pushedRecord({frameIndex: 1}));
+  const summary = stream.summary();
+  assert.equal(calls, 1, "a torn read is not read again: it is not a disagreement to resolve");
+  assert.equal(summary.cross_check_mismatches, 0);
+  assert.equal(summary.cross_check_uncomparable, 1);
+  assert.equal(summary.cross_check_superseded, 0);
+  assert.match(stream.lastCrossCheckReason ?? "the chain read caught a frame mid-write: strip cursors", /the chain read caught a frame mid-write: strip cursors/);
+});
+
+test("tornStrips names both ways a chain read can be torn", async () => {
+  const {tornStrips} = await import("../push.js");
+  const good = chainDigestOf(realStrips, 1).strips;
+  assert.equal(tornStrips(good), null);
+  assert.match(tornStrips(good.slice(0, 7)), /did not return eight/);
+  const mixedCursor = good.map((strip, index) => (index === 5 ? {...strip, cursor: strip.cursor + 16} : strip));
+  assert.match(tornStrips(mixedCursor), /strip cursors/);
+  const mixedRoot = good.map((strip, index) => (index === 2 ? {...strip, stateRoot: "ff".repeat(32)} : strip));
+  assert.match(tornStrips(mixedRoot), /disagree on gametic, snapshot or state root/);
+});

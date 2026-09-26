@@ -108,6 +108,25 @@ export async function readChainDigest(reader, record) {
   return {slot, strips};
 }
 
+// Do the chain's eight strip headers describe one frame? A read that catches a
+// write sees strips from two frames, and every one of them is individually
+// valid -- each carries a correct digest over its own header and pixels -- so
+// the only thing that tells the two apart is whether they agree with each
+// other. Returns the reason, or null when they do.
+export function tornStrips(strips) {
+  if (!Array.isArray(strips) || strips.length !== STRIP_COUNT) return "the chain did not return eight strip headers";
+  const first = strips[0];
+  for (const strip of strips) {
+    if (strip.cursor !== first.cursor) {
+      return `the chain read caught a frame mid-write: strip cursors ${strips.map((s) => s.cursor).join(", ")}`;
+    }
+    if (strip.gametic !== first.gametic || strip.snapshotHash !== first.snapshotHash || strip.stateRoot !== first.stateRoot) {
+      return "the chain read caught a frame mid-write: the strips disagree on gametic, snapshot or state root";
+    }
+  }
+  return null;
+}
+
 // Two pushed records for one cursor are the same frame when their digests are.
 function sameFrame(a, b) {
   if (a.stripHashes.length !== b.stripHashes.length) return false;
@@ -225,6 +244,7 @@ export class FrameStream {
     this.crossCheckUncomparable = 0;
     this.crossCheckRetries = 0;
     this.superseded = 0;
+    this.lastReason = null;
     // Wait this long before reading the chain a second time after a
     // disagreement. Long enough for a re-render to be announced, short enough
     // that a check does not hold the stream up.
@@ -390,6 +410,7 @@ export class FrameStream {
     } else {
       this.crossCheckUncomparable += 1;
     }
+    this.lastReason = comparison.reason ?? null;
     this.onCrossCheck({frame, comparison, checked: this.crossChecks});
   }
 
@@ -412,6 +433,18 @@ export class FrameStream {
     };
     if (chain === null) {
       return {...base, comparable: false, match: false, reason: "the chain does not hold eight strip headers yet"};
+    }
+    // The chain's own eight must agree before any of them is compared with
+    // mine. This is the condition `decodeFrame` imposes on a frame it accepts,
+    // and skipping it is what turned a torn read into a mismatch: the read
+    // happens at `processed` on a public node, the one render buffer is being
+    // overwritten every 0.5 s, and a read that straddles two frames sees strips
+    // from both. Measured on R13 at 2.00 fps, 2026-09-26: three checks in nine
+    // reported a strip digest difference, and all three survived a retry, which
+    // is the signature of a torn read rather than of a re-render.
+    const torn = tornStrips(chain.strips);
+    if (torn !== null) {
+      return {...base, comparable: false, match: false, reason: torn, torn: true, candidates: 0};
     }
     const candidates = this.digestsByCursor.get(cursor) ?? [];
     if (candidates.length === 0) {
@@ -476,6 +509,7 @@ export class FrameStream {
       // rather than looking like a rate of lies.
       cross_check_superseded: this.superseded,
       last_error: this.lastError ?? null,
+      last_reason: this.lastReason ?? null,
     };
   }
 
