@@ -11,6 +11,7 @@ import {decodeFrame, frameToRgba, parseSnapshot, frameReadAddresses, toHex, Stri
 import {loadOrCreateBurner, forgetSession, recallSession, rememberSession, ed25519Available} from "./burner.js";
 import {encodeInput, heldToCommands} from "./input.js";
 import {InputLog} from "./inputlog.js";
+import {FrameStream, decodePushedFrame, frameAccounts, readChainDigest, DEFAULT_CROSS_CHECK_EVERY} from "./push.js";
 
 // The engine rate to assume before the relayer has reported one. Measured at
 // 23.8-26.3 tics/s across two drive sessions at strip rate 64, so 25 is the
@@ -23,7 +24,8 @@ const SEQ_WINDOW = 240;
 const MAX_PUSH_IN_FLIGHT = 2;
 // How often the viewer reads a frame. A frame is complete only between one
 // frame's last strip landing and the next frame's first, so a torn read is the
-// expected case at strip rate 64 and is retried at once.
+// expected case at strip rate 64 and is retried at once. This is the direct-read
+// path; a page with a relayer to push from does not use it (see `push.js`).
 const POLL_MS = 250;
 
 const THEME_KEY = "doom-play.theme";
@@ -34,6 +36,22 @@ const PALETTE_KEY = "doom-play.palette.v1";
 const query = new URLSearchParams(location.search);
 const networkName = query.get("net") ?? DEFAULT_NETWORK;
 const net = requireNetwork(networkName, ["rpcHttp", "doom.program", "doom.context", "doom.strips", "explorer.address"]);
+
+// Which frame source a joined page uses. `push` is the relayer's own complete
+// frames; `read` is this page polling the chain, which is the path the R12
+// numbers (16 frames painted in 74 s, 151 torn reads) were measured on and
+// which is kept so the two can be compared from the same page. `?frame-source=`
+// overrides it and the choice is remembered.
+const FRAME_SOURCE_KEY = "doom-play.frame-source";
+const frameSourceQuery = query.get("frame-source");
+const frameSource = frameSourceQuery === "read" || frameSourceQuery === "push"
+  ? frameSourceQuery
+  : (localStorage.getItem(FRAME_SOURCE_KEY) ?? "push");
+localStorage.setItem(FRAME_SOURCE_KEY, frameSource);
+// How many pushed frames between chain cross-checks. Zero turns the check off,
+// which is a measurement and not a feature: the check is the only thing that
+// would catch a relayer that stopped passing the chain's bytes.
+const crossCheckEvery = Number(query.get("cross-check-every") ?? DEFAULT_CROSS_CHECK_EVERY) || 0;
 
 const el = (id) => document.getElementById(id);
 const ui = {
@@ -71,6 +89,12 @@ const ui = {
   chainCapacity: el("chain-capacity"),
   stripGrid: el("strip-grid"),
   stripSummary: el("strip-summary"),
+  framesSource: el("frames-source"),
+  framesPushed: el("frames-pushed"),
+  framesTorn: el("frames-torn"),
+  framesCrosschecks: el("frames-crosschecks"),
+  framesMismatches: el("frames-mismatches"),
+  framesHint: el("frames-hint"),
   inputlogList: el("inputlog-list"),
   inputlogSummary: el("inputlog-summary"),
   inputlogBanner: el("inputlog-banner"),
@@ -173,6 +197,14 @@ const state = {
   signature: null,
   keys: {},
   stopPolling: null,
+  // The push stream, and what it has done. `stream` is null until a session is
+  // joined and the page is on the push path; `pushSummary` is what the panel
+  // shows and what the receipt reads.
+  stream: null,
+  frameSource,
+  crossCheckEvery,
+  pushSummary: null,
+  lastCrossCheck: null,
   lastError: null,
   // A torn read is the expected case at strip rate 64, not a fault: the strips
   // of a frame land in eight transactions and a read catches them mid-write.
@@ -347,9 +379,44 @@ function fps() {
   return ((state.paintTimes.length - 1) * 1000) / span;
 }
 
+// The frame-path readout. Which path this page is on, and what it has done:
+// pushed frames, how many failed to decode, how many have been compared against
+// the chain, and how many of those comparisons disagreed. The last of those is
+// the number a reader should watch, because it is the only one that can turn the
+// picture into a lie.
+function updateFrameReadout() {
+  const summary = state.stream ? state.stream.summary() : state.pushSummary;
+  const onPush = state.frameSource === "push" && Boolean(state.stream);
+  setCell(ui.framesSource, onPush ? "PUSHED" : state.frameSource === "read" ? "READ FROM CHAIN" : "—");
+  setCell(ui.framesPushed, summary ? String(summary.pushed) : "0");
+  setCell(ui.framesTorn, summary ? String(summary.torn) : "0");
+  const checks = summary ? summary.cross_checks : 0;
+  setCell(ui.framesCrosschecks, String(checks));
+  const mismatches = summary ? summary.cross_check_mismatches : 0;
+  setCell(ui.framesMismatches, String(mismatches), mismatches > 0 ? "bad" : "good");
+  const check = state.lastCrossCheck;
+  if (ui.framesHint) {
+    if (!onPush) {
+      ui.framesHint.textContent =
+        "This page reads the chain itself. That is the path the R12 numbers were measured on: " +
+        "16 frames painted in 74 s with 151 torn reads, because a read can catch a frame mid-write.";
+    } else if (!check) {
+      ui.framesHint.textContent =
+        `A pushed frame is the relayer's own read of the chain, painted without this page asking. ` +
+        `One in ${state.crossCheckEvery || DEFAULT_CROSS_CHECK_EVERY} is read again from the chain and compared.`;
+    } else {
+      ui.framesHint.textContent = `${check.comparable && !check.match ? "MISMATCH" : "chain check"} ` +
+        `${check.checked}: ${check.reason}`;
+    }
+  }
+}
+
 function updateStatus() {
   const frame = state.lastFrame;
-  if (!frame) return;
+  if (!frame) {
+    updateFrameReadout();
+    return;
+  }
   setCell(ui.statTic, String(frame.gametic));
   const rate = fps();
   setCell(ui.statFps, rate === null ? "—" : rate.toFixed(2));
@@ -366,6 +433,7 @@ function updateStatus() {
     : "the relayer has not reported frame counters yet";
   setCell(ui.statSlot, state.lastFrameSlot === null ? "—" : String(state.lastFrameSlot));
   setCell(ui.statCommitment, state.reader?.paintCommitment ?? net.commitment.paint, "good");
+  updateFrameReadout();
 
   const snapshot = net.doom.snapshots[state.buffer];
   const explorer = state.signature ? explorerTransaction(net, state.signature) : explorerFor(snapshot);
@@ -515,6 +583,87 @@ async function readOnce() {
 async function digestHex(bytes) {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   return toHex(digest);
+}
+
+// ---------------------------------------------------------------- the push
+//
+// A joined page takes its frames from the relayer when `frame-source` is `push`
+// (the default) and reads the chain itself when it is `read`. Both paint through
+// the same `paintFrame`, so the two paths are comparable on one page: the
+// difference in painted rate and torn reads is the difference between the paths
+// and not between two implementations of the painter.
+
+// The cross-check's chain read: the eight strip headers and the snapshot header,
+// 1,728 bytes, and the digests out of them. The pixel-for-pixel version of this
+// read 1,072,384 B and lost the race to every frame -- measured, ten checks and
+// ten "the chain moved on" on the R13 context at 2.02 fps. The digests are the
+// stronger comparison anyway: a strip's digest covers its pixels, and the pushed
+// frame's eight were verified before it was painted.
+const readPushedFromChain = (record) => readChainDigest(state.reader, record);
+
+function startPush() {
+  stopFrames();
+  if (!state.session || !state.relayerBase) return;
+  const stream = new FrameStream({
+    base: state.relayerBase,
+    sessionId: state.session.id,
+    crossCheckEvery: state.crossCheckEvery,
+    readChain: readPushedFromChain,
+    onFrame: async (frame, record) => {
+      // The relayer names the buffer it read, so the strip chips and the status
+      // line describe the frame on screen rather than the configured buffer.
+      if (record.buffer !== null && record.buffer !== undefined) {
+        state.lastFrameBuffer = record.buffer;
+        const accounts = frameAccounts(record);
+        if (accounts) {
+          net.doom.strips[record.buffer] = accounts.strips;
+          if (accounts.snapshot) net.doom.snapshots[record.buffer] = accounts.snapshot;
+        }
+      }
+      ui.stripSummary.textContent = "8 / 8";
+      for (const chip of stripChips) chip.classList.add("ok");
+      frame.digest = frame.sha256 ?? null;
+      await paintFrame(frame);
+      state.pushSummary = stream.summary();
+      updateStatus();
+    },
+    onCrossCheck: ({comparison, checked}) => {
+      state.lastCrossCheck = {...comparison, checked};
+      // A mismatch is raised: it is the one condition on this path that means
+      // the picture on screen cannot be trusted, and a page whose job includes
+      // saying whether a frame is honest cannot swallow it into a count.
+      if (comparison.comparable && !comparison.match) {
+        showError(new Error(`frame push disagrees with the chain: ${comparison.reason}`), "push");
+      } else {
+        clearError("push");
+      }
+      updateStatus();
+    },
+  });
+  try {
+    stream.start();
+  } catch (error) {
+    showError(error, "push");
+    // A browser with no EventSource, or a relayer that has no stream route, is
+    // not a reason to show nothing: the direct read is right there and it is
+    // what this page did before.
+  // With no session there is nobody to push from, so a spectator page reads the
+  // chain itself. A joined page switches to the push path in `startFrames`.
+  startPolling();
+
+    return;
+  }
+  state.stream = stream;
+  setCell(ui.stageState, "PUSHED FRAMES");
+}
+
+// Stop whichever frame source is running. Both are stopped on every session
+// change, because a stream for a session that has ended is a page painting
+// somebody else's game.
+function stopFrames() {
+  state.stream?.stop();
+  state.stream = null;
+  state.stopPolling?.();
 }
 
 function startPolling() {
@@ -964,6 +1113,21 @@ function adoptSession(session) {
   ui.join.disabled = true;
   ui.leave.disabled = false;
   ui.spectatorHint.hidden = true;
+  // The session is what the push stream is scoped to, so the frame source is
+  // chosen here rather than at load: a spectator page has no session and no
+  // stream, and a joined page has both.
+  startFrames();
+}
+
+// One place that decides where frames come from, so a session change cannot
+// leave both sources running.
+function startFrames() {
+  stopFrames();
+  if (state.frameSource === "push" && state.session) {
+    startPush();
+    return;
+  }
+  startPolling();
 }
 
 // The session's chain accounts, not network.js's. The relayer drives whichever
@@ -1062,6 +1226,9 @@ async function leaveSession() {
     showError(error, "action");
   }
   state.session = null;
+  // The stream is scoped to the session that just ended. Leaving it open would
+  // paint a game this page no longer has a stake in.
+  stopFrames();
   inputLog.reset();
   renderInputLog();
   forgetSession(localStorage);

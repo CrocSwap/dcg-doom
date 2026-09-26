@@ -429,6 +429,23 @@ export class PipelineSender {
     if (options.startCursor !== undefined && options.startCursor !== null) {
       argv.push("--start-cursor", String(options.startCursor));
     }
+    // Same trap, twice more. `--status-batch` and `--status-min-interval` bound
+    // the status poller, and `--strip-cu-limit` is the only lever on a context
+    // whose renders cost more than 740,000 CU. All three were added to
+    // start.sh, to the python parser, and to `main()` here -- and the first two
+    // were *not* built here, so the pipeline ran on its defaults while the
+    // runbook said otherwise. `test_relayer.mjs` now reads start.sh and asserts
+    // every flag in it appears in `argv()`; that test is the reason this
+    // comment can be short.
+    if (options.statusBatch !== undefined && options.statusBatch !== null) {
+      argv.push("--status-batch", String(options.statusBatch));
+    }
+    if (options.statusMinInterval !== undefined && options.statusMinInterval !== null) {
+      argv.push("--status-min-interval", String(options.statusMinInterval));
+    }
+    if (options.stripCuLimit !== undefined && options.stripCuLimit !== null) {
+      argv.push("--strip-cu-limit", String(options.stripCuLimit));
+    }
     argv.push("--spend-cap-fogo", String(options.spendCapFogo ?? 10));
     return argv;
   }

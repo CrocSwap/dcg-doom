@@ -220,10 +220,14 @@ class TestDoomPlay:
 
     def test_the_relayer_does_not_own_a_key(self):
         # The relayer pays fees, so in chain mode it will need a key, but this
-        # dispatch must not ship one or read one.
+        # dispatch must not ship one or read one. `.sh` joined the allowed set
+        # with `start.sh` (2026-09-26): the check is about key material, and a
+        # deployment script is not key material. The check is on the *suffix*
+        # because that is what has held, and a test that fails when a shell
+        # script is added is a test that gets the addition deleted.
         for path in RELAYER.rglob("*"):
             if path.is_file():
-                assert path.suffix in {".mjs", ".md"}, f"unexpected file in the relayer: {path}"
+                assert path.suffix in {".mjs", ".md", ".sh"}, f"unexpected file in the relayer: {path}"
         readme = (RELAYER / "README.md").read_text()
         assert "no keys" in readme.lower()
 

@@ -112,6 +112,18 @@
       </dl>
       <div class="section-label"><span>STRIP ACCOUNTS</span><strong id="strip-summary">0 / 8</strong></div>
       <div class="strip-grid" id="strip-grid" aria-label="Per-strip digest status"></div>
+      <div class="section-label"><span>FRAMES</span><strong id="frames-source">—</strong></div>
+      <dl class="readout">
+        <div><dt>PUSHED</dt><dd id="frames-pushed">0</dd></div>
+        <div><dt>PUSH TORN</dt><dd id="frames-torn">0</dd></div>
+        <div><dt>CHAIN CHECKS</dt><dd id="frames-crosschecks">0</dd></div>
+        <div><dt>CHECK MISMATCHES</dt><dd id="frames-mismatches">0</dd></div>
+      </dl>
+      <p class="hint" id="frames-hint">
+        A pushed frame is the relayer's own read of the chain, painted without this page
+        asking for it. Every twentieth one is read again from the chain and compared pixel
+        for pixel; the mismatch count is the number that says the push is honest.
+      </p>
       <p class="hint" id="spectator-hint">
         <b>SPECTATING.</b> No relayer, so this page only reads. The R8i context spent all
         <span id="hint-capacity">6016</span> of its input slots, and the deployed image refuses

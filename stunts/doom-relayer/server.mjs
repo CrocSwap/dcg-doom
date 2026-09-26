@@ -37,6 +37,12 @@ const SESSION_TTL_MS = 45 * 60 * 1000;
 // origin, which is safe here: a request only does anything with a signature
 // the caller cannot forge, and the relayer's own origin is not a secret.
 // Narrow it with --cors-origin if the relayer is ever exposed more widely.
+// A route that answers on the response itself -- the frame stream, which never
+// finishes -- returns this instead of a payload. Every other route returns JSON
+// and the server below writes it, so this is the only escape hatch and it is
+// named.
+const RAW_RESPONSE = Symbol("doom-relayer.raw-response");
+
 function corsHeaders(origin = "*") {
   return {
     "access-control-allow-origin": origin,
@@ -160,10 +166,83 @@ export class Relayer {
     this.startedAt = Date.now();
     this.stats = {sessionsCreated: 0, sessionsEnded: 0, inputsAccepted: 0, inputsRejected: 0, ticsLanded: 0, framesRendered: 0};
     this.promise = Promise.resolve();
+    // The frame push. `frameStream` holds the newest few complete frames, keyed
+    // by frame_index, and `subscriptions` is who is currently painting from
+    // them. The bytes come from the pipeline process, which read them off the
+    // chain and already verified every strip digest; a subscriber that gets a
+    // frame from here gets the program's own bytes, not this process's opinion
+    // of them.
+    this.frameStream = new Map();
+    this.frameStreamLimit = 4;
+    this.frameStreamSeen = 0;
+    this.subscriptions = new Set();
+    // A frame the pipeline announced but could not attach bytes to (the ring
+    // turned over, or a mock relayer). Counted, because "the push path silently
+    // stopped pushing" has to be a number on the receipt, not a quiet gap.
+    this.framesWithoutBytes = 0;
+    this.sender.onFrame = (frame) => this.onFrame(frame);
     // Mock mode is synchronous and self-contained: the synthetic slots are what
     // the page is developed against. Chain mode has to ask a process what
     // context it is driving, so that waits for init().
     if (!this.pool.size && !this.sender.background) this.seedSlots(slotCount);
+  }
+
+  // One complete frame from the pipeline process, forwarded to whoever is
+  // painting. This is the whole of the push path: the page is sent the frame
+  // instead of going to look for it, which is the difference between a picture
+  // that keeps up and one that catches a frame mid-write and refuses it.
+  onFrame(frame) {
+    if (!frame || frame.event !== "frame") return;
+    this.frameStreamSeen += 1;
+    const bytes = frame.strip_accounts_b64;
+    if (!Array.isArray(bytes) || bytes.length !== 8) {
+      this.framesWithoutBytes += 1;
+      return;
+    }
+    const record = {
+      frame_index: frame.frame_index ?? null,
+      buffer: frame.buffer ?? null,
+      cursor: frame.cursor ?? null,
+      gametic: frame.gametic ?? null,
+      frame_sha256: frame.frame_sha256 ?? null,
+      snapshot_hash: frame.snapshot_hash ?? null,
+      state_root: frame.state_root ?? null,
+      completed_seconds: frame.completed_seconds ?? null,
+      frames_completed: frame.frames_completed ?? null,
+      snapshot_account: frame.snapshot_account ?? null,
+      strip_accounts: Array.isArray(frame.strip_accounts) ? frame.strip_accounts : [],
+      strip_accounts_b64: bytes,
+      at: Date.now(),
+    };
+    this.frameStream.set(record.frame_index, record);
+    while (this.frameStream.size > this.frameStreamLimit) {
+      this.frameStream.delete(this.frameStream.keys().next().value);
+    }
+    // A status poll also answers with the newest frame, so a page that has not
+    // subscribed yet is not told about a frame it cannot see yet.
+    for (const subscription of this.subscriptions) {
+      for (const listener of subscription.listeners) listener(record);
+    }
+    return record;
+  }
+
+  // Subscribe to the frame stream. The newest frame is handed over immediately
+  // so a page that joins between frames does not sit on a stale picture for a
+  // whole cadence; `since` lets a reconnecting page say which frame it last
+  // painted, so it is not sent one it already has.
+  subscribeFrames({since = null} = {}) {
+    const newest = [...this.frameStream.values()].pop() ?? null;
+    const pending = newest !== null && (since === null || (newest.frame_index ?? 0) > since) ? [newest] : [];
+    const subscription = {listeners: new Set(), pending};
+    this.subscriptions.add(subscription);
+    return {
+      pending,
+      add: (listener) => {
+        subscription.listeners.add(listener);
+        return () => subscription.listeners.delete(listener);
+      },
+      close: () => this.subscriptions.delete(subscription),
+    };
   }
 
   // A background sender is already driving a provisioned context, so the pool
@@ -804,6 +883,18 @@ const ROUTES = [
     uptime_seconds: Math.round((Date.now() - relayer.startedAt) / 1000),
     pool: relayer.pool.summary(),
     stats: relayer.stats,
+    // The push path's own counters. `frames_seen` is every frame the pipeline
+    // announced, `frames_pushed` the ones that carried bytes, and
+    // `subscribers` how many pages are painting from the stream right now. A
+    // `frames_seen` that has stopped growing while `frames_pushed` has not is
+    // the shape of a dead push, and it is only visible as a number.
+    frame_push: {
+      frames_seen: relayer.frameStreamSeen,
+      frames_pushed: relayer.frameStream.size >= 0 ? relayer.frameStreamSeen - relayer.framesWithoutBytes : 0,
+      frames_without_bytes: relayer.framesWithoutBytes,
+      held: relayer.frameStream.size,
+      subscribers: relayer.subscriptions.size,
+    },
   })},
   {method: "GET", pattern: /^\/v1\/config$/, handler: async (relayer) => ({
     api: API_VERSION,
@@ -847,6 +938,49 @@ const ROUTES = [
   {method: "GET", pattern: /^\/v1\/sessions\/([^/]+)\/frame$/, handler: async (relayer, request, [sessionId]) =>
     relayer.frameBytes(decodeURIComponent(sessionId)),
   },
+  // The frame push. Server-sent events rather than a WebSocket, for one
+  // reason that matters here: a frame is 65 KB of base64 arriving several times
+  // a second, one way, and a browser reconnects an EventSource by itself. A
+  // socket would need its own reconnect, its own ordering and its own framing
+  // for no gain. The oldest frame the stream will hold is four, so a page that
+  // falls behind loses frames rather than buffering without bound -- the same
+  // choice a live viewer makes when it skips to the newest picture.
+  {method: "GET", pattern: /^\/v1\/sessions\/([^/]+)\/frames$/, handler: async (relayer, request, [sessionId], response) => {
+    const id = decodeURIComponent(sessionId);
+    // A session is required, and looked up, so a push stream is scoped to a
+    // player the relayer has actually admitted rather than open to anything
+    // that can reach the port.
+    relayer.getSession(id);
+    const url = new URL(request.url, "http://relayer.invalid");
+    const since = url.searchParams.get("since");
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+      ...corsHeaders(request.headers.origin ?? "*"),
+    });
+    // Without this a proxy waits for the buffer to fill before forwarding.
+    response.write("retry: 1000\n\n");
+    const subscription = relayer.subscribeFrames({since: since === null ? null : Number(since)});
+    const write = (record) => {
+      response.write(`event: frame\nid: ${record.frame_index ?? ""}\ndata: ${JSON.stringify(record)}\n\n`);
+    };
+    for (const record of subscription.pending) write(record);
+    // One keep-alive comment every 15 s: an idle tunnel is a closed tunnel, and
+    // a stream that only looks alive when a frame lands cannot tell a quiet
+    // chain from a dead pipe.
+    const keepAlive = setInterval(() => response.write(": keep-alive\n\n"), 15_000);
+    const stopListening = subscription.add(write);
+    const close = () => {
+      clearInterval(keepAlive);
+      stopListening();
+      subscription.close();
+    };
+    request.on("close", close);
+    request.on("error", close);
+    return RAW_RESPONSE;
+  }, stream: true},
   {method: "DELETE", pattern: /^\/v1\/sessions\/([^/]+)$/, handler: async (relayer, request, [sessionId]) =>
     relayer.endSession(decodeURIComponent(sessionId)),
   },
@@ -870,10 +1004,19 @@ export function createServer(relayer, {onLog = null, corsOrigin = "*"} = {}) {
       return fail(response, 404, "no_route", `${request.method} ${url.pathname} is not a route. Routes: ${known}`, {}, corsOrigin);
     }
     const params = url.pathname.match(route.pattern).slice(1);
-    // One request at a time, so a deposit and an advance cannot interleave.
-    void relayer.serialise(async () => {
+    // One request at a time, so a deposit and an advance cannot interleave. A
+    // stream route is the exception and must be one: it never returns, so
+    // queueing it would hold every later request behind a page that is watching
+    // a picture. Streams do not touch the slot, so there is nothing to
+    // interleave.
+    const dispatch = (work) => (route.stream ? work() : relayer.serialise(work));
+    void dispatch(async () => {
       try {
-        const payload = await route.handler(relayer, request, params);
+        const payload = await route.handler(relayer, request, params, response);
+        if (payload === RAW_RESPONSE) {
+          onLog?.(`${request.method} ${url.pathname} stream`);
+          return;
+        }
         send(response, 200, payload, corsOrigin);
         onLog?.(`${request.method} ${url.pathname} 200`);
       } catch (error) {
@@ -968,6 +1111,9 @@ if (isMain()) {
     payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
     resetStartAccount: args.get("reset-start-account") ?? undefined,
     frameDeadlineSeconds: args.get("frame-deadline-seconds") ? Number(args.get("frame-deadline-seconds")) : undefined,
+    stripCuLimit: args.get("strip-cu-limit") ? Number(args.get("strip-cu-limit")) : undefined,
+    statusBatch: args.get("status-batch") ? Number(args.get("status-batch")) : undefined,
+    statusMinInterval: args.get("status-min-interval") !== null ? Number(args.get("status-min-interval")) : undefined,
     rpcLagDropSlots: args.get("rpc-lag-drop-slots") ? Number(args.get("rpc-lag-drop-slots")) : undefined,
     rpcLagCheckSeconds: args.get("rpc-lag-check-seconds") ? Number(args.get("rpc-lag-check-seconds")) : undefined,
   });

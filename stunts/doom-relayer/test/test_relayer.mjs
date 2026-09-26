@@ -7,6 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {webcrypto} from "node:crypto";
+import {readFileSync} from "node:fs";
 
 import {encodeInput, heldToCommands, MAX_COMMANDS_PER_BATCH, BT_ATTACK, BT_SPECIAL} from "../../../web/doom-play/input.js";
 import {createRelayer, createServer, API_VERSION} from "../server.mjs";
@@ -1143,4 +1144,211 @@ test("the input bound is asked of the child, never served from a cached status",
   const second = await sender.stagingFrontier();
   assert.equal(second, 1056);
   assert.equal(asked, 2, "one ask per bound, not one per session");
+});
+
+// -- the frame push --------------------------------------------------------
+
+// A frame event in the shape the python relayer emits: the eight strip
+// accounts the pipeline read off the chain, base64, plus the accounts they came
+// from so a page can cross-check the same ones.
+function frameEvent(index, {bytes = true} = {}) {
+  return {
+    event: "frame",
+    frame_index: index,
+    buffer: index % 2,
+    cursor: 1000 + index * 16,
+    gametic: index * 16,
+    frame_sha256: `sha-${index}`,
+    snapshot_hash: `snap-${index}`,
+    state_root: `root-${index}`,
+    completed_seconds: index * 0.25,
+    frames_completed: index,
+    snapshot_account: "SNP",
+    strip_accounts: Array.from({length: 8}, (_, i) => `STRIP-${i}`),
+    strips: Array.from({length: 8}, (_, i) => ({strip_id: i, strip_hash: `h${i}-${index}`})),
+    strip_accounts_b64: bytes
+      ? Array.from({length: 8}, (_, i) => Buffer.from(`strip-${i}-${index}`).toString("base64"))
+      : null,
+  };
+}
+
+test("a frame from the pipeline reaches a subscriber, in order", () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  const seen = [];
+  relayer.subscribeFrames().add((record) => seen.push(record.frame_index));
+  for (let index = 1; index <= 5; index += 1) relayer.onFrame(frameEvent(index));
+  assert.deepEqual(seen, [1, 2, 3, 4, 5]);
+  assert.equal(relayer.frameStreamSeen, 5);
+  assert.equal(relayer.framesWithoutBytes, 0);
+});
+
+test("a frame with no bytes is counted, not pushed", () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  const seen = [];
+  relayer.subscribeFrames().add((record) => seen.push(record.frame_index));
+  relayer.onFrame(frameEvent(1, {bytes: false}));
+  relayer.onFrame(frameEvent(2));
+  assert.deepEqual(seen, [2], "a frame with no strip accounts is not a frame a page can paint");
+  assert.equal(relayer.framesWithoutBytes, 1);
+  assert.equal(relayer.frameStreamSeen, 2);
+});
+
+test("a late subscriber is handed the newest frame, and `since` skips it", () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  for (let index = 1; index <= 7; index += 1) relayer.onFrame(frameEvent(index));
+  const late = relayer.subscribeFrames();
+  assert.deepEqual(late.pending.map((record) => record.frame_index), [7], "the newest frame, not all seven");
+  // A page that has painted 7 and reconnects must not be sent 7 again.
+  const resumed = relayer.subscribeFrames({since: 7});
+  assert.deepEqual(resumed.pending, [], "`since` is the frame the page already has");
+  const behind = relayer.subscribeFrames({since: 3});
+  assert.deepEqual(behind.pending.map((record) => record.frame_index), [7]);
+});
+
+test("the stream holds four frames and forgets the rest", () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  for (let index = 1; index <= 9; index += 1) relayer.onFrame(frameEvent(index));
+  assert.equal(relayer.frameStream.size, 4, "a slow page loses frames rather than buffering without bound");
+  assert.deepEqual([...relayer.frameStream.keys()], [6, 7, 8, 9]);
+});
+
+test("closing a subscription stops the frames and nothing else", () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  const a = [];
+  const b = [];
+  const first = relayer.subscribeFrames();
+  first.add((record) => a.push(record.frame_index));
+  relayer.subscribeFrames().add((record) => b.push(record.frame_index));
+  first.close();
+  relayer.onFrame(frameEvent(1));
+  assert.deepEqual(a, []);
+  assert.deepEqual(b, [1]);
+  assert.equal(relayer.subscriptions.size, 1);
+});
+
+test("a frame's bytes are the account bytes, and the accounts travel with them", () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  const record = relayer.onFrame(frameEvent(3));
+  assert.equal(record.strip_accounts_b64.length, 8);
+  assert.equal(Buffer.from(record.strip_accounts_b64[0], "base64").toString(), "strip-0-3");
+  assert.equal(record.snapshot_account, "SNP");
+  assert.deepEqual(record.strip_accounts, Array.from({length: 8}, (_, i) => `STRIP-${i}`));
+});
+
+test("the frame stream is served over SSE and is not queued behind other requests", async () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  const base = `http://127.0.0.1:${port}`;
+  const created = await (await fetch(`${base}/v1/sessions`, {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({publicKey: "ab".repeat(32)}),
+  })).json();
+  try {
+    // One frame before the stream opens, so the handshake has something to send.
+    relayer.onFrame(frameEvent(11));
+    const controller = new AbortController();
+    const response = await fetch(`${base}/v1/sessions/${created.id}/frames`, {signal: controller.signal});
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /text\/event-stream/);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let seen = "";
+    const readUntil = async (needle) => {
+      while (!seen.includes(needle)) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        seen += decoder.decode(value, {stream: true});
+      }
+    };
+    await readUntil("retry: 1000");
+    await readUntil("\"frame_index\":11");
+    // A request made while the stream is open must still be answered: the
+    // stream cannot be holding the relayer's request queue.
+    const health = await fetch(`${base}/healthz`);
+    assert.equal(health.status, 200);
+    const healthBody = await health.json();
+    assert.equal(healthBody.frame_push.subscribers, 1);
+    relayer.onFrame(frameEvent(12));
+    await readUntil("\"frame_index\":12");
+    controller.abort();
+  } finally {
+    server.close();
+  }
+});
+
+test("a frame stream for a session that does not exist is refused", async () => {
+  const relayer = createRelayer({mode: "chain", network: "testnet", sender: backgroundSender({frontier: 20})});
+  await relayer.init();
+  const server = createServer(relayer);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/sessions/no-such-session/frames`);
+    assert.equal(response.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+// -- start.sh and argv() must agree -----------------------------------------
+//
+// A chain-mode flag reaches the pipeline process in exactly one place:
+// `PipelineSender.argv()`. A flag that is in start.sh, in the python parser and
+// in `main()` but not there is a flag the pipeline has never seen, and the
+// runbook says otherwise. That is not hypothetical: `--reset-start-account`
+// sat in start.sh from 2026-09-26 00:0x with the whole RESET/9 path behind it,
+// and `--status-batch` / `--status-min-interval` / `--strip-cu-limit` were lost
+// the same way on 2026-09-26 at 05:0x. So this reads start.sh.
+
+test("every flag start.sh passes is built in argv()", () => {
+  // The failure is a flag that exists in start.sh, in the python parser and in
+  // the node option list, and is never *built* into the child's argv -- so it
+  // never reaches the pipeline and the runbook is describing a flag the program
+  // has never seen. `--reset-start-account` sat in start.sh from 2026-09-26
+  // 00:0x with the whole RESET/9 path behind it; `--status-batch`,
+  // `--status-min-interval` and `--strip-cu-limit` were lost the same way on
+  // 2026-09-26 at 05:0x, with the pipeline running on its defaults while three
+  // numbers in the runbook said otherwise.
+  //
+  // So: read start.sh's exec line, and require each flag to appear in argv()'s
+  // own source. Conditional construction (`if (options.x) argv.push(...)`) is
+  // correct and is not the thing being tested -- being absent from argv() is.
+  const start = readFileSync(new URL("../start.sh", import.meta.url), "utf8");
+  const senderSource = readFileSync(new URL("../sender.mjs", import.meta.url), "utf8");
+  const argvSource = senderSource.slice(senderSource.indexOf("  argv() {"), senderSource.indexOf("  async start() {"));
+  const body = start.slice(start.indexOf("exec node"));
+  // The node server's own CLI flags, which start.sh passes to `server.mjs` and
+  // which argv() is not supposed to build: they configure this process, not the
+  // pipeline child. Everything else on that line is the child's.
+  const nodeOwn = new Set([
+    "--mode", "--port", "--host", "--network", "--cors-origin", "--slots",
+    "--advance-pipeline-depth", "--sweep-rate", "--input-tics-per-second",
+    "--python", "--script", "--keys-dir", "--payer-key", "--run-dir",
+  ]);
+  const passed = [...new Set([...body.matchAll(/(?<=--)[a-z][a-z0-9-]*/g)].map((match) => `--${match[0]}`))]
+    .filter((flag) => !nodeOwn.has(flag));
+  assert.ok(passed.length > 12, `start.sh's exec line looks wrong: ${passed.length} flags`);
+  const missing = passed.filter((flag) => !argvSource.includes(`"${flag}"`));
+  assert.deepEqual(missing, [], `start.sh passes ${missing.join(" ")} but argv() never builds them`);
+});
+
+test("the flags this round added are built, with their defaults intact", () => {
+  const argv = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    statusBatch: 250, statusMinInterval: 0.5, stripCuLimit: 1_400_000,
+  }).argv();
+  assert.deepEqual(
+    [argv[argv.indexOf("--status-batch") + 1], argv[argv.indexOf("--status-min-interval") + 1], argv[argv.indexOf("--strip-cu-limit") + 1]],
+    ["250", "0.5", "1400000"],
+  );
+  // And absent by default, so the pipeline's own defaults are what run when the
+  // runbook says nothing.
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  for (const flag of ["--status-batch", "--status-min-interval", "--strip-cu-limit"]) {
+    assert.ok(!plain.includes(flag), `${flag} should not be passed when it is not set`);
+  }
 });
