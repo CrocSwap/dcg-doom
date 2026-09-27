@@ -846,6 +846,7 @@ fn close_one(account: &AccountInfo, payer: &AccountInfo) -> ProgramResult {
         .ok_or(refuse(REFUSE_CLOSE))?;
     **payer.try_borrow_mut_lamports()? = next;
     **account.try_borrow_mut_lamports()? = 0;
+    account.realloc(0, false)?;
     account.assign(&system_program::ID);
     Ok(())
 }
