@@ -29,17 +29,19 @@ pub const REFUSE_CLEAR: u32 = 324;
 pub const REFUSE_CLOSE: u32 = 325;
 
 const BASE_ACCOUNT_COUNT: usize = 15;
-const CLOSE_RENDER_BATCH: usize = 18;
+pub const CLOSE_RENDER_TARGETS: usize = 36;
+pub const CLOSE_RENDER_BATCH: usize = 8;
+pub const CLOSE_RENDER_BATCH_COUNT: usize =
+    (CLOSE_RENDER_TARGETS + CLOSE_RENDER_BATCH - 1) / CLOSE_RENDER_BATCH;
+pub const CLOSE_RESIZE_FIRST_PHASE: u32 = CLOSE_RENDER_BATCH_COUNT as u32;
 const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 256 * 1024;
 const CLOSE_CONTEXT_SHRINK_STEPS: usize =
     (resource_sbf::CONTEXT_BYTES + CLOSE_CONTEXT_SHRINK_CHUNK - 1) / CLOSE_CONTEXT_SHRINK_CHUNK;
 const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9 + CLOSE_RENDER_BATCH;
 const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10 + CLOSE_RENDER_BATCH;
-const CLOSE_FINAL_SHARED_ACCOUNT_COUNT: usize = 4 + CLOSE_RENDER_BATCH;
-const CLOSE_FINAL_SEPARATE_ACCOUNT_COUNT: usize = 5 + CLOSE_RENDER_BATCH;
 const CLOSE_BASE_SHARED_ACCOUNT_COUNT: usize = 4;
 const CLOSE_BASE_SEPARATE_ACCOUNT_COUNT: usize = 5;
-pub const CLOSE_FINAL_PHASE: u32 = 1 + CLOSE_CONTEXT_SHRINK_STEPS as u32;
+pub const CLOSE_FINAL_PHASE: u32 = CLOSE_RESIZE_FIRST_PHASE + CLOSE_CONTEXT_SHRINK_STEPS as u32 - 1;
 const CLOSE_MAGIC: &[u8; 8] = b"DOOM-CL1";
 const CLOSE_VERSION: u32 = 1;
 const CLOSE_CONTEXT: usize = 16;
@@ -862,12 +864,14 @@ fn close_marker_write(
     meta: &Pubkey,
     payer: &Pubkey,
     phase: u32,
+    render_cursor: usize,
 ) -> ProgramResult {
     let mut data = continuation.try_borrow_mut_data()?;
     data.fill(0);
     data[..8].copy_from_slice(CLOSE_MAGIC);
     put_u32(&mut data, 8, CLOSE_VERSION);
     put_u32(&mut data, 12, phase);
+    put_u32(&mut data, 144, render_cursor as u32);
     for (offset, key) in [
         (CLOSE_CONTEXT, context),
         (CLOSE_AUTHORITY, authority),
@@ -886,16 +890,18 @@ fn close_marker_matches(
     meta: &Pubkey,
     payer: &Pubkey,
     phase: u32,
+    render_cursor: usize,
 ) -> Result<bool, ProgramError> {
     let data = continuation.try_borrow_data()?;
     Ok(&data[..8] == CLOSE_MAGIC
         && u32_at(&data, 8) == CLOSE_VERSION
         && u32_at(&data, 12) == phase
+        && u32_at(&data, 144) as usize == render_cursor
         && data[CLOSE_CONTEXT..CLOSE_CONTEXT + 32] == context.as_ref()[..]
         && data[CLOSE_AUTHORITY..CLOSE_AUTHORITY + 32] == authority.as_ref()[..]
         && data[CLOSE_META..CLOSE_META + 32] == meta.as_ref()[..]
         && data[CLOSE_PAYER..CLOSE_PAYER + 32] == payer.as_ref()[..]
-        && data[144..352].iter().all(|byte| *byte == 0)
+        && data[148..352].iter().all(|byte| *byte == 0)
         && data[352..].iter().all(|byte| *byte == 0))
 }
 
@@ -905,12 +911,13 @@ fn validate_render_batch(
     accounts: &[AccountInfo],
     render_start: usize,
     first_index: usize,
+    count: usize,
 ) -> ProgramResult {
-    let mut seen = Vec::with_capacity(CLOSE_RENDER_BATCH + render_start);
+    let mut seen = Vec::with_capacity(count + render_start);
     for account in accounts.iter().take(render_start) {
         seen.push(*account.key);
     }
-    for offset in 0..CLOSE_RENDER_BATCH {
+    for offset in 0..count {
         let target = accounts
             .get(render_start + offset)
             .ok_or(refuse(REFUSE_ACCOUNTS))?;
@@ -981,7 +988,14 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
         return Err(refuse(REFUSE_CLOSE));
     }
     drop(meta_data);
-    validate_render_batch(program, context.key, accounts, render_start, 0)?;
+    validate_render_batch(
+        program,
+        context.key,
+        accounts,
+        render_start,
+        0,
+        CLOSE_RENDER_BATCH,
+    )?;
 
     for index in [1usize, 2, 4, 5, 6] {
         close_one(&accounts[index], payer)?;
@@ -996,10 +1010,18 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
         meta.key,
         &rent_payer,
         1,
+        CLOSE_RENDER_BATCH,
     )
 }
 
-fn process_close_middle<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
+fn process_close_render_batch<'a>(
+    program: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    phase: u32,
+) -> ProgramResult {
+    if phase == 0 || phase >= CLOSE_RENDER_BATCH_COUNT as u32 {
+        return Err(refuse(REFUSE_CLOSE));
+    }
     if accounts.len() < 4 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -1010,11 +1032,11 @@ fn process_close_middle<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     let rent_payer = close_meta_payer(program, context, meta, authority)?;
     let shared_payer = authority.key == &rent_payer;
     let render_start = if shared_payer { 4 } else { 5 };
-    let expected_count = if shared_payer {
-        CLOSE_FINAL_SHARED_ACCOUNT_COUNT
-    } else {
-        CLOSE_FINAL_SEPARATE_ACCOUNT_COUNT
-    };
+    let first_index = phase as usize * CLOSE_RENDER_BATCH;
+    let render_count = CLOSE_RENDER_TARGETS
+        .saturating_sub(first_index)
+        .min(CLOSE_RENDER_BATCH);
+    let expected_count = render_start + render_count;
     if accounts.len() != expected_count || !distinct(accounts) {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -1026,7 +1048,8 @@ fn process_close_middle<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
             authority.key,
             meta.key,
             &rent_payer,
-            1,
+            phase,
+            first_index,
         )?
         || context.data_len() != resource_sbf::CONTEXT_BYTES
     {
@@ -1037,7 +1060,8 @@ fn process_close_middle<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         context.key,
         accounts,
         render_start,
-        CLOSE_RENDER_BATCH,
+        first_index,
+        render_count,
     )?;
     for index in render_start..accounts.len() {
         close_one(&accounts[index], payer)?;
@@ -1048,7 +1072,8 @@ fn process_close_middle<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         authority.key,
         meta.key,
         &rent_payer,
-        2,
+        phase + 1,
+        first_index + render_count,
     )
 }
 
@@ -1095,13 +1120,15 @@ fn process_close_resize<'a>(
     accounts: &'a [AccountInfo<'a>],
     phase: u32,
 ) -> ProgramResult {
-    if !(2..CLOSE_FINAL_PHASE).contains(&phase) {
+    if !(CLOSE_RESIZE_FIRST_PHASE..CLOSE_FINAL_PHASE).contains(&phase) {
         return Err(refuse(REFUSE_CLOSE));
     }
     let (context, meta, continuation, authority, _payer, rent_payer) =
         close_base_accounts(program, accounts)?;
     let expected_len = resource_sbf::CONTEXT_BYTES
-        .checked_sub((phase as usize - 2) * CLOSE_CONTEXT_SHRINK_CHUNK)
+        .checked_sub(
+            (phase as usize - CLOSE_RESIZE_FIRST_PHASE as usize) * CLOSE_CONTEXT_SHRINK_CHUNK,
+        )
         .ok_or(refuse(REFUSE_CLOSE))?;
     if context.data_len() != expected_len
         || !close_marker_matches(
@@ -1111,6 +1138,7 @@ fn process_close_resize<'a>(
             meta.key,
             &rent_payer,
             phase,
+            CLOSE_RENDER_TARGETS,
         )?
     {
         return Err(refuse(REFUSE_CLOSE));
@@ -1126,6 +1154,7 @@ fn process_close_resize<'a>(
         meta.key,
         &rent_payer,
         phase + 1,
+        CLOSE_RENDER_TARGETS,
     )
 }
 
@@ -1143,6 +1172,7 @@ fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) ->
             meta.key,
             &rent_payer,
             CLOSE_FINAL_PHASE,
+            CLOSE_RENDER_TARGETS,
         )?
     {
         return Err(refuse(REFUSE_CLOSE));
@@ -1159,8 +1189,10 @@ fn process_close<'a>(
 ) -> ProgramResult {
     match phase {
         0 => process_close_pre(program, accounts),
-        1 => process_close_middle(program, accounts),
-        phase if (2..CLOSE_FINAL_PHASE).contains(&phase) => {
+        phase if (1..CLOSE_RENDER_BATCH_COUNT as u32).contains(&phase) => {
+            process_close_render_batch(program, accounts, phase)
+        }
+        phase if (CLOSE_RESIZE_FIRST_PHASE..CLOSE_FINAL_PHASE).contains(&phase) => {
             process_close_resize(program, accounts, phase)
         }
         CLOSE_FINAL_PHASE => process_close_final(program, accounts),
