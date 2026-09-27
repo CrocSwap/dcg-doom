@@ -59,6 +59,10 @@ use crate::{continuation_split_sbf, resource_sbf};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-SIM";
 pub const VERSION: u32 = 2;
+/// SIM2 meta schema 3 adds a recorded rent sponsor in previously reserved
+/// bytes. The instruction wire format remains SIM2/2; REINIT upgrades older
+/// meta accounts in place without changing their size.
+pub const META_VERSION: u32 = 3;
 pub const INIT: u8 = 1;
 pub const DEPOSIT: u8 = 2;
 pub const ADVANCE: u8 = 3;
@@ -84,15 +88,15 @@ pub const ADVANCE_STARVED: u8 = 8;
 /// slot reusable, it does not recover rent.
 pub const RESET: u8 = 9;
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384:schema3:rent-payer=340..372|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(not(feature = "metered-sweep"), not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=count-capped:default8:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384:schema3:rent-payer=340..372|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), not(feature = "capacity-extension")))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|grow-buffer=24:step<=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384:schema3:rent-payer=340..372|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(all(feature = "metered-sweep", not(feature = "legacy-5120-buffer"), feature = "capacity-extension"))]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|sweep=metered:max64|header=16|operations=GROW-BUFFER/5+INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9+EXTEND-CAPACITY/7|grow-buffer=24:step<=10240|extend-capacity=24:accounts=meta+buffer+payer+authority+system:max-realloc=10240|init=408:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384:schema3:rent-payer=340..372|buffer=SIM2INPT/3:128+capacity*8:default65536:max65536|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 #[cfg(feature = "legacy-5120-buffer")]
-pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
+pub const ABI_DESCRIPTOR: &str = "DOOM-SIM/2|legacy-buffer-layout=SIM2INPT/2:41088:5120x8|sweep=count-capped:default8:max64|header=16|operations=INIT/1+DEPOSIT/2+ADVANCE/3+ADVANCE/4+ADVANCE/5+SNAPSHOT/4+RESET/9|init=404:accounts=7|deposit=24+4n:n<=64:accounts=2|advance=24:accounts=6|advance-expected=24:accounts=6:expected-cursor|advance-starved=24:accounts=6:expected-cursor:unconsumed-tic-refused|reset=24:accounts=7:authority-signed:start-root-committed:start-account-or-state|halt-needs-force|no-realloc|snapshot=56:accounts=3|meta=PDA(DOOM-SIM2-META,context):384:schema3:rent-payer=340..372|root=DOOM-SIM/2-STATE(ST1,MP1-used)|chain=DOOM-SIM/2-INPUT-CHAIN|special-buttons=refused|render=none";
 
 
 pub const REQUEST_HEADER_BYTES: usize = 16;
@@ -257,7 +261,7 @@ pub const HALT_DEMO_END: u8 = 5;
 const META_MAGIC: &[u8; 8] = b"SIM2META";
 /// Published so a gate can prove a reset kept the input buffer's header.
 pub const BUFFER_MAGIC: &[u8; 8] = b"SIM2INPT";
-const BUFFER_GROW_MAGIC: &[u8; 8] = b"SIM2GROW";
+pub const BUFFER_GROW_MAGIC: &[u8; 8] = b"SIM2GROW";
 const DOMAIN_STATE: &[u8] = b"DOOM-SIM/2-STATE\0";
 const DOMAIN_CHAIN: &[u8] = b"DOOM-SIM/2-INPUT-CHAIN\0";
 const DOMAIN_CHECKPOINT: &[u8] = b"DOOM-SIM/2-CHECKPOINT\0";
@@ -300,7 +304,8 @@ pub const M_CHECKPOINT: usize = 272;
 pub const M_START_ROOT: usize = 304;
 /// Successful RESET/9 count, so a slot's reuse history is visible on chain.
 pub const M_RESETS: usize = 336;
-const M_RESERVED: usize = 340;
+pub const M_RENT_PAYER: usize = 340;
+const M_RESERVED: usize = M_RENT_PAYER + 32;
 
 const B_CAPACITY: usize = 20;
 const B_FIRST_TIC: usize = 24;
@@ -695,7 +700,7 @@ pub fn init_layout(meta: &mut [u8], buffer: &mut [u8], params: &InitParams) -> P
     buffer[B_META..B_META + 32].copy_from_slice(params.meta.as_ref());
 
     meta[..8].copy_from_slice(META_MAGIC);
-    put_u32(meta, 8, VERSION);
+    put_u32(meta, 8, META_VERSION);
     put_u32(meta, 12, META_BYTES as u32);
     put_u32(meta, 16, META_BYTES as u32);
     meta[M_BUMP] = params.bump;
@@ -707,6 +712,7 @@ pub fn init_layout(meta: &mut [u8], buffer: &mut [u8], params: &InitParams) -> P
     meta[M_MIRROR..M_MIRROR + 32].copy_from_slice(params.mirror.as_ref());
     meta[M_BUFFER..M_BUFFER + 32].copy_from_slice(params.buffer.as_ref());
     meta[M_AUTHORITY..M_AUTHORITY + 32].copy_from_slice(params.authority.as_ref());
+    meta[M_RENT_PAYER..M_RENT_PAYER + 32].copy_from_slice(params.authority.as_ref());
     meta[M_STATE_ROOT..M_STATE_ROOT + 32].copy_from_slice(&params.state_root);
     // The start state is the state this meta is initialised with.  RESET/9
     // refuses any other image, so the root is recorded here, once.
@@ -891,7 +897,7 @@ pub struct SweepKeys<'a> {
 pub fn validate_meta(meta: &[u8], keys: &SweepKeys, checkpoint: &[u8]) -> ProgramResult {
     if meta.len() != META_BYTES
         || &meta[..8] != META_MAGIC
-        || u32_at(meta, 8) != VERSION
+        || u32_at(meta, 8) != META_VERSION
         || u32_at(meta, 12) as usize != META_BYTES
         || u32_at(meta, 16) as usize != META_BYTES
         || meta[22..24] != [0, 0]
@@ -901,6 +907,7 @@ pub fn validate_meta(meta: &[u8], keys: &SweepKeys, checkpoint: &[u8]) -> Progra
         || meta[M_STATE..M_STATE + 32] != keys.state.as_ref()[..]
         || meta[M_MIRROR..M_MIRROR + 32] != keys.mirror.as_ref()[..]
         || meta[M_BUFFER..M_BUFFER + 32] != keys.buffer.as_ref()[..]
+        || meta[M_RENT_PAYER..M_RENT_PAYER + 32] == [0; 32]
         || !exact_zero(&meta[M_RESERVED..])
     {
         return Err(refuse(REFUSE_BINDING));
@@ -1156,7 +1163,7 @@ pub fn snapshot_check(
 ) -> ProgramResult {
     if meta.len() != META_BYTES
         || &meta[..8] != META_MAGIC
-        || u32_at(meta, 8) != VERSION
+        || u32_at(meta, 8) != META_VERSION
         || meta[M_STATE..M_STATE + 32] != state_key.as_ref()[..]
         || meta[M_MIRROR..M_MIRROR + 32] != mirror_key.as_ref()[..]
     {
@@ -1194,7 +1201,7 @@ pub fn validate_live_snapshot_state(
     let meta_data = meta.try_borrow_data()?;
     if meta_data.len() != META_BYTES
         || &meta_data[..8] != META_MAGIC
-        || u32_at(&meta_data, 8) != VERSION
+        || u32_at(&meta_data, 8) != META_VERSION
         || u32_at(&meta_data, 12) as usize != META_BYTES
         || u32_at(&meta_data, 16) as usize != META_BYTES
         || meta_data[22..24] != [0, 0]
@@ -1202,6 +1209,7 @@ pub fn validate_live_snapshot_state(
         || meta_data[M_CONTEXT..M_CONTEXT + 32] != context.key.as_ref()[..]
         || meta_data[M_STATE..M_STATE + 32] != state.key.as_ref()[..]
         || meta_data[M_MIRROR..M_MIRROR + 32] != mirror.key.as_ref()[..]
+        || meta_data[M_RENT_PAYER..M_RENT_PAYER + 32] == [0; 32]
     {
         return Err(refuse(REFUSE_BINDING));
     }
@@ -1664,11 +1672,12 @@ fn process_extend_capacity(
     let (context, old_capacity, first_tic, bound_authority, cursor) = {
         let meta_data = meta.try_borrow_data()?;
         if &meta_data[..8] != META_MAGIC
-            || u32_at(&meta_data, 8) != VERSION
+        || u32_at(&meta_data, 8) != META_VERSION
             || u32_at(&meta_data, 12) as usize != META_BYTES
             || u32_at(&meta_data, 16) as usize != META_BYTES
             || meta_data[22..24] != [0, 0]
             || !exact_zero(&meta_data[M_RESERVED..])
+            || meta_data[M_RENT_PAYER..M_RENT_PAYER + 32] == [0; 32]
         {
             return Err(refuse(REFUSE_BINDING));
         }
@@ -1952,7 +1961,10 @@ pub struct MetaView {
 
 impl MetaView {
     pub fn parse(meta: &[u8]) -> Option<Self> {
-        if meta.len() != META_BYTES || &meta[..8] != META_MAGIC || u32_at(meta, 8) != VERSION {
+        if meta.len() != META_BYTES
+            || &meta[..8] != META_MAGIC
+            || !matches!(u32_at(meta, 8), VERSION | META_VERSION)
+        {
             return None;
         }
         Some(Self {
@@ -2139,7 +2151,7 @@ mod tests {
 
         let mut meta = vec![0u8; META_BYTES];
         meta[..8].copy_from_slice(META_MAGIC);
-        put_u32(&mut meta, 8, VERSION);
+        put_u32(&mut meta, 8, META_VERSION);
         put_u32(&mut meta, 12, META_BYTES as u32);
         put_u32(&mut meta, 16, META_BYTES as u32);
         put_u32(&mut meta, M_FIRST_TIC, 0);

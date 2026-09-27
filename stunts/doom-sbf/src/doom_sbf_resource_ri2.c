@@ -123,6 +123,9 @@ static void rsr_prof_emit(void)
 #define RI2_MIRROR_SLOT_BYTES 160u
 #define RI2_MIRROR_SLOTS 384u
 #define RI2_CONTROLLER_BYTES 64u
+#define RI2_NEWGAME_SKILL 3
+#define RI2_NEWGAME_EPISODE 1
+#define RI2_NEWGAME_MAP 1
 
 static const uint8_t ri2_wad_hash[32] = {
     0x1d,0x7d,0x43,0xbe,0x50,0x1e,0x67,0xd9,0x27,0xe4,0x15,0xe0,0xb8,0xf3,0xe2,0x9c,
@@ -1187,6 +1190,55 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
     RI2_PHASE(560); /* setup is now durable in the pinned context */
     if (!ri2_split_arena_ok(bootstrap_bytes))
         return RI2_REFUSE_ARENA;
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    return 0;
+}
+
+/* REINIT/1 phase 4.  E2R's ordinary path reconstructs a pointer-bearing ST1
+ * saved by the same image.  REINIT deliberately takes a different edge: after
+ * the current RI2 image and WAD have been installed by split setup, start a
+ * new E1M1 game from this image and leave a controller at gametic zero.  No
+ * bytes from the old ST1 account are read here.  The resulting state is
+ * encoded by split_finalize in the next bounded instruction. */
+int doom_engine_ex2_resource_sbf_ri2_split_newgame(
+    uint8_t *context, uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    unsigned long *arena_high_water_out)
+{
+    int lump, demo_len;
+    uint8_t *demo;
+
+    if (doom_ctx_guard(context)) return 199;
+    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+        ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_bytes(bootstrap_bytes) ||
+        !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
+        return RI2_REFUSE_ARENA;
+
+    /* Mirror the source-matched RI1 new-game producer.  In particular, the
+     * players array and playeringame[0] must be initialised before G_InitNew,
+     * and demo_p remains bounded by the image's DEMO1 lump. */
+    V_Init();
+    R_Init();
+    R_ExecuteSetViewSize();
+    P_Init();
+    lump = W_GetNumForName("DEMO1");
+    demo_len = W_LumpLength(lump);
+    if (demo_len < 17) return RI2_REFUSE_RESOURCE;
+    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+    defdemoname = "DEMO1";
+    demobuffer = demo;
+    demo_p = demo + 13;
+    demoend = demo + demo_len;
+    memset(players, 0, sizeof(players));
+    memset(playeringame, 0, sizeof(playeringame));
+    playeringame[0] = 1;
+    DOOM_CTX->consoleplayer = 0;
+    displayplayer = 0;
+    gametic = 0;
+    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    G_InitNew((skill_t)RI2_NEWGAME_SKILL, RI2_NEWGAME_EPISODE, RI2_NEWGAME_MAP);
+
+    if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
 }

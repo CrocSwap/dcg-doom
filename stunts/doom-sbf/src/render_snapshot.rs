@@ -237,7 +237,7 @@ fn context_from_meta(program: &Pubkey, meta: &AccountInfo) -> Result<Pubkey, Pro
         return Err(refuse(REFUSE_ACCOUNTS));
     }
     let data = meta.try_borrow_data()?;
-    if &data[..8] != b"SIM2META" || u32_at(&data, 8) != sim2::VERSION {
+    if &data[..8] != b"SIM2META" || u32_at(&data, 8) != sim2::META_VERSION {
         return Err(refuse(REFUSE_BINDING));
     }
     let context = Pubkey::new_from_array(

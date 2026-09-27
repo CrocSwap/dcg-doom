@@ -14,6 +14,8 @@ pub mod bring_up;
 pub mod continuation_sbf;
 #[cfg(feature = "ctx-engine")]
 pub mod continuation_split_sbf;
+#[cfg(feature = "ctx-engine")]
+pub mod lifecycle;
 pub mod ex2;
 #[cfg(feature = "ctx-engine")]
 pub mod ex2_sbf;
@@ -189,6 +191,9 @@ pub fn transport_process_instruction(
     };
     if instruction_data.starts_with(sim2::MAGIC) && version == sim2::VERSION {
         return sim2::process(program_id, accounts, instruction_data);
+    }
+    if instruction_data.starts_with(lifecycle::MAGIC) && version == lifecycle::VERSION {
+        return lifecycle::process(program_id, accounts, instruction_data);
     }
     if instruction_data.starts_with(render_snapshot_v3::MAGIC)
         && version == render_snapshot_v3::VERSION
