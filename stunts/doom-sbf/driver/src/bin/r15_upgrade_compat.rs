@@ -25,11 +25,12 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
-// This local fixture raises the SVM budget so the first run can measure every
-// bounded REINIT phase. The deployed transaction cap remains 1.4M CU and the
-// runbook must not promote an over-budget phase.
-const COMPUTE_LIMIT: u32 = 10_000_000;
+// Keep the local runner at the deployed transaction cap. REINIT transactions
+// must also stay below the 1.2M-CU qualification target.
+const COMPUTE_LIMIT: u32 = 1_400_000;
 const CLOSE_CU_LIMIT: u64 = 1_400_000;
+const REINIT_CU_TARGET: u64 = 1_200_000;
+const REINIT_GENERATION: u32 = 0x2026_0927;
 const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1|render=1:carries-snapshot-hash|refresh-render=5:buffer+strip+snapshot-hash:zero-name-refused-malformed:mismatched-name-refused-308";
 
 fn read_json(path: &PathBuf) -> Result<Value, Box<dyn Error>> {
@@ -464,42 +465,85 @@ async fn reinit(
     set: &LocalSet,
     authority: &Keypair,
     label: &str,
+    generation: u32,
 ) -> Result<Vec<u64>, Box<dyn Error>> {
     let mut units = Vec::new();
     let begin = Instruction {
         program_id: program,
         accounts: base_accounts(set),
-        data: lifecycle::encode_begin().to_vec(),
+        data: lifecycle::encode_begin(generation).to_vec(),
     };
-    units.push(
-        submit(ctx, begin, &[authority])
-            .await
-            .map_err(|error| format!("{label} REINIT BEGIN failed: {error}"))?,
-    );
+    let begin_units = submit(ctx, begin.clone(), &[authority])
+        .await
+        .map_err(|error| format!("{label} REINIT BEGIN failed: {error}"))?;
+    if begin_units > REINIT_CU_TARGET {
+        return Err(format!("{label} REINIT BEGIN used {begin_units} CU").into());
+    }
+    units.push(begin_units);
+    let begin_replay_units = submit(ctx, begin, &[authority])
+        .await
+        .map_err(|error| format!("{label} REINIT BEGIN replay failed: {error}"))?;
+    if begin_replay_units > REINIT_CU_TARGET {
+        return Err(format!("{label} REINIT BEGIN replay used {begin_replay_units} CU").into());
+    }
+    units.push(begin_replay_units);
     for index in 0..36u8 {
         let target = render_target(set, index as usize);
         let clear = Instruction {
             program_id: program,
             accounts: clear_render_accounts(set, target),
-            data: lifecycle::encode_clear_render(index).to_vec(),
+            data: lifecycle::encode_clear_render(index, generation).to_vec(),
         };
-        units.push(
-            submit(ctx, clear, &[authority])
-                .await
-                .map_err(|error| format!("{label} REINIT CLEAR_RENDER/{index} failed: {error}"))?,
-        );
+        let clear_units = submit(ctx, clear.clone(), &[authority])
+            .await
+            .map_err(|error| format!("{label} REINIT CLEAR_RENDER/{index} failed: {error}"))?;
+        if clear_units > REINIT_CU_TARGET {
+            return Err(
+                format!("{label} REINIT CLEAR_RENDER/{index} used {clear_units} CU").into(),
+            );
+        }
+        units.push(clear_units);
+        let clear_replay_units = submit(ctx, clear, &[authority]).await.map_err(|error| {
+            format!("{label} REINIT CLEAR_RENDER/{index} replay failed: {error}")
+        })?;
+        if clear_replay_units > REINIT_CU_TARGET {
+            return Err(format!(
+                "{label} REINIT CLEAR_RENDER/{index} replay used {clear_replay_units} CU"
+            )
+            .into());
+        }
+        units.push(clear_replay_units);
     }
-    for phase in 1..=6u8 {
+    let skipped_step = Instruction {
+        program_id: program,
+        accounts: base_accounts(set),
+        data: lifecycle::encode_step(2, generation).to_vec(),
+    };
+    if submit(ctx, skipped_step, &[authority]).await.is_ok() {
+        return Err(format!("{label} REINIT accepted STEP/2 before STEP/1").into());
+    }
+    for phase in 1..=lifecycle::REINIT_STEP_COUNT {
         let step = Instruction {
             program_id: program,
             accounts: base_accounts(set),
-            data: lifecycle::encode_step(phase).to_vec(),
+            data: lifecycle::encode_step(phase, generation).to_vec(),
         };
-        units.push(
-            submit(ctx, step, &[authority])
-                .await
-                .map_err(|error| format!("{label} REINIT STEP/{phase} failed: {error}"))?,
-        );
+        let step_units = submit(ctx, step.clone(), &[authority])
+            .await
+            .map_err(|error| format!("{label} REINIT STEP/{phase} failed: {error}"))?;
+        if step_units > REINIT_CU_TARGET {
+            return Err(format!("{label} REINIT STEP/{phase} used {step_units} CU").into());
+        }
+        units.push(step_units);
+        let replay_units = submit(ctx, step, &[authority])
+            .await
+            .map_err(|error| format!("{label} REINIT STEP/{phase} replay failed: {error}"))?;
+        if replay_units > REINIT_CU_TARGET {
+            return Err(
+                format!("{label} REINIT STEP/{phase} replay used {replay_units} CU").into(),
+            );
+        }
+        units.push(replay_units);
     }
     let view = sim2::MetaView::parse(&account_data(ctx, set.meta).await?)
         .ok_or_else(|| format!("{label} REINIT metadata failed to parse"))?;
@@ -1028,7 +1072,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let stranger_begin = Instruction {
         program_id: program,
         accounts: stranger_begin_accounts,
-        data: lifecycle::encode_begin().to_vec(),
+        data: lifecycle::encode_begin(REINIT_GENERATION).to_vec(),
     };
     if submit(&mut ctx, stranger_begin, &[&stranger]).await.is_ok() {
         return Err("stranger REINIT unexpectedly succeeded".into());
@@ -1047,7 +1091,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("stranger lifecycle controls changed the context".into());
     }
 
-    let first_reinit_units = reinit(&mut ctx, program, &set, &local_authority, "captured").await?;
+    let first_reinit_units = reinit(
+        &mut ctx,
+        program,
+        &set,
+        &local_authority,
+        "captured",
+        REINIT_GENERATION,
+    )
+    .await?;
     println!("captured REINIT complete at cursor 0");
     let fresh_reinit_units = reinit(
         &mut ctx,
@@ -1055,6 +1107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &reference,
         &local_authority,
         "fresh reference",
+        REINIT_GENERATION,
     )
     .await?;
     println!("fresh reference REINIT complete at cursor 0");
@@ -1065,6 +1118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &reference,
         &local_authority,
         "already fresh",
+        REINIT_GENERATION + 1,
     )
     .await?;
     println!("repeat REINIT complete at cursor 0");
