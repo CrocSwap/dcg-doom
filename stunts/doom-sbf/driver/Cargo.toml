@@ -69,6 +69,10 @@ name = "live_input_gate"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "worst_view_census"
+required-features = ["ctx-engine"]
+
+[[bin]]
 name = "continuation_sbf"
 required-features = ["ctx-engine"]
 

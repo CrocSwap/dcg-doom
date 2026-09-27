@@ -1305,6 +1305,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src/doom_sbf_resource_ri2.c");
 
     let target = env::var("TARGET").expect("Cargo supplies TARGET to build scripts");
+    if env::var_os("DOOM_HOST_RENDER_CENSUS").is_some() {
+        assert!(
+            target != "sbf-solana-solana" && target != "sbpf-solana-solana",
+            "DOOM_HOST_RENDER_CENSUS is host-only and cannot enter an SBF build"
+        );
+        println!("cargo:rustc-cfg=doom_host_render_census");
+    }
     let out_dir =
         PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR to build scripts"));
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STATIC_WRITE_PROBE");
@@ -1314,6 +1321,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SIM_TRANSPORT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RENDER_CLIP_MEASUREMENT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LEGACY_5120_BUFFER");
+    println!("cargo:rerun-if-env-changed=DOOM_HOST_RENDER_CENSUS");
+    println!("cargo:rustc-check-cfg=cfg(doom_host_render_census)");
     println!("cargo:rerun-if-env-changed=DOOM_SBF_SOURCE_TREE");
     println!("cargo:rerun-if-env-changed=DOOM_SBF_ENGINE_OPT");
     println!("cargo:rerun-if-env-changed=DOOM_SCRATCH");
@@ -1444,6 +1453,11 @@ fn compile_ctx_engine(target: &str) {
     // untouched -- changing its codegen would silently shift the retained
     // hotloop CU measurements.)
     let is_sbf = target == "sbf-solana-solana" || target == "sbpf-solana-solana";
+    let host_render_census = env::var_os("DOOM_HOST_RENDER_CENSUS").is_some();
+    assert!(
+        !is_sbf || !host_render_census,
+        "DOOM_HOST_RENDER_CENSUS is host-only and cannot enter an SBF build"
+    );
     // The one flag the two targets do not share: `-O2` is the host's level and
     // the SBF engine gets its own.  See SBF_ENGINE_OPT_DEFAULT.  The value is a
     // whitespace-separated flag *list*, not a single flag, so that an A/B of an
@@ -1553,6 +1567,9 @@ fn compile_ctx_engine(target: &str) {
         // guard in r_draw.h was never true for the 41-TU cut.  The render
         // phase split was therefore never measured, however it was read.
         engine.define("DOOM_SBF_PHASE_PROFILE", None);
+    }
+    if host_render_census {
+        engine.define("DOOM_HOST_RENDER_CENSUS", None);
     }
     if render_count_only {
         engine.define("DOOM_SBF_RENDER_COUNT_ONLY", None);

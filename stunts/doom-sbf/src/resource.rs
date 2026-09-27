@@ -485,6 +485,10 @@ unsafe extern "C" {
     fn doom_resource_sim_session_probe(out: *mut i64) -> i32;
     fn doom_resource_sim_session_frame(out: *mut u8, cap: usize) -> i32;
     fn doom_resource_sim_session_close();
+    #[cfg(doom_host_render_census)]
+    fn doom_host_render_census_reset();
+    #[cfg(doom_host_render_census)]
+    fn doom_host_render_census_values(out: *mut i64);
 }
 
 /// Engine fields the host SIM/2 oracle records per tic.  They are
@@ -573,6 +577,18 @@ impl NativeSimSession {
             return Err(rc);
         }
         Ok(out)
+    }
+
+    /// Returns the frame and host-only work counters. The counters are
+    /// compiled only when DOOM_HOST_RENDER_CENSUS=1 is set for a native build;
+    /// build.rs rejects that setting for SBF targets.
+    #[cfg(doom_host_render_census)]
+    pub fn frame_with_census(&mut self) -> Result<(Vec<u8>, [i64; 56]), i32> {
+        let mut values = [0i64; 56];
+        unsafe { doom_host_render_census_reset() };
+        let frame = self.frame()?;
+        unsafe { doom_host_render_census_values(values.as_mut_ptr()) };
+        Ok((frame, values))
     }
 
     pub fn probe(&self) -> SessionProbe {
