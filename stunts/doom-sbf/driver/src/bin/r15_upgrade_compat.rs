@@ -89,7 +89,14 @@ async fn submit(
     instruction: Instruction,
     extra_signers: &[&Keypair],
 ) -> Result<u64, Box<dyn Error>> {
-    let blockhash = ctx.banks_client.get_latest_blockhash().await?;
+    // ProgramTest can return the same latest blockhash repeatedly while its
+    // bank is idle. Replaying the same lifecycle instruction with that hash
+    // would reproduce the transaction signature and be rejected as
+    // AlreadyProcessed before the program can demonstrate idempotency.
+    let blockhash = ctx
+        .banks_client
+        .get_new_latest_blockhash(&ctx.last_blockhash)
+        .await?;
     let instructions = [
         ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_LIMIT),
         instruction,
