@@ -44,6 +44,8 @@ extern int DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_byte
 extern int DoomStateDecodeSplitPrepare(void);
 extern int DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes);
 extern void doom_sbf_local_diag(unsigned long phase);
+extern void doom_sbf_local_diag_values(unsigned long phase, unsigned long a,
+                                       unsigned long b, unsigned long c);
 
 #ifdef DOOM_SBF_PHASE_PROFILE
 extern void doom_sbf_phase_marker(unsigned long phase);
@@ -1980,14 +1982,20 @@ int doom_engine_rsn3_render_static(
      * validcount is intentionally reused, so leaving those stamps behind
      * would suppress sprites on a repeat or later cursor. */
     if (!cache_hit) {
+        doom_sbf_local_diag_values(11031ul, (unsigned long)DOOM_CTX->numlines,
+                                   (unsigned long)numsectors, (unsigned long)(uintptr_t)lines);
         if (ri2_render_arrays_save(&ri2_arrays, DOOM_CTX->numlines, numsectors)) {
             free(frame);
             (void)doom_sbf_arena_rewind(transient_mark);
             return RI2_REFUSE_OUTPUT;
         }
+        doom_sbf_local_diag_values(11032ul, (unsigned long)(uintptr_t)sectors,
+                                   (unsigned long)(uintptr_t)players[displayplayer].mo,
+                                   (unsigned long)(uintptr_t)thinkercap.next);
     }
     ri2_render_begin(strip_id, &ri2_saved);
     ri2_render_arrays_reset_sector_marks(numsectors);
+    doom_sbf_local_diag(11033ul);
     R_RenderPlayerView(&players[displayplayer]);
     ri2_render_end(&ri2_saved);
     ri2_render_arrays_restore(&ri2_arrays, DOOM_CTX->numlines, numsectors);
