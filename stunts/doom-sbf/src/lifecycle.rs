@@ -1056,7 +1056,11 @@ fn process_close<'a>(
     }
 }
 
-pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub fn process<'a>(
+    program: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
     let request = Request::decode(data)?;
     match request.operation {
         BEGIN => process_begin(program, accounts),
