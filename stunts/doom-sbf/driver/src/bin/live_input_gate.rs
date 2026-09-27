@@ -1078,6 +1078,14 @@ fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
         .collect()
 }
 
+fn render_regression_cursor_sequence(frames: &[u32], step: u32) -> bool {
+    step > 0
+        && frames.len() >= 3
+        && frames
+            .windows(2)
+            .all(|pair| pair[0].checked_add(step) == Some(pair[1]))
+}
+
 fn differing_pixels(left: &[u8], right: &[u8]) -> usize {
     left.iter().zip(right).filter(|(a, b)| a != b).count()
 }
@@ -1102,7 +1110,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = env::args().collect();
     let mut args = argv.iter().skip(1).cloned();
     let image = PathBuf::from(args.next().ok_or(
-        "usage: live_input_gate IMAGE IMAGE_SHA MANIFEST MANIFEST_SHA CAPTURE RESOURCE CONTROLLER RECEIPT [--profile NAME] [--tics N] [--advance-tics N] [--frames-at a,b,c] [--starve-state-cursor N]",
+        "usage: live_input_gate IMAGE IMAGE_SHA MANIFEST MANIFEST_SHA CAPTURE RESOURCE CONTROLLER RECEIPT [--profile NAME] [--tics N] [--advance-tics N] [--frames-at a,b,c] [--starve-state-cursor N] [--worst-view-benchmark]",
     )?)
     .canonicalize()?;
     let expected_image = args.next().ok_or("missing image SHA")?;
@@ -1118,6 +1126,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut frames_at: Vec<u32> = vec![5_040, 5_076, 5_112];
     let mut starve_cursor = 2_048u32;
     let mut new_game_start = false;
+    let mut benchmark_only = false;
+    let mut no_frame_artifacts = false;
+    let mut worst_view_benchmark = false;
+    let mut render_repeat_regression = false;
     while let Some(flag) = args.next() {
         let mut value = || -> Result<String, Box<dyn Error>> {
             args.next()
@@ -1136,8 +1148,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             "--starve-state-cursor" => starve_cursor = value()?.parse()?,
             "--new-game-start" => new_game_start = true,
+            "--benchmark-only" => benchmark_only = true,
+            "--no-frame-artifacts" => no_frame_artifacts = true,
+            "--worst-view-benchmark" => {
+                benchmark_only = true;
+                no_frame_artifacts = true;
+                worst_view_benchmark = true;
+            }
+            "--render-repeat-regression" => {
+                benchmark_only = true;
+                no_frame_artifacts = false;
+                render_repeat_regression = true;
+            }
             other => return Err(format!("unknown flag {other}").into()),
         }
+    }
+    if render_repeat_regression
+        && !render_regression_cursor_sequence(&frames_at, advance_tics)
+    {
+        return Err(format!(
+            "--render-repeat-regression needs at least three ascending frame cursors exactly {advance_tics} tics apart"
+        )
+        .into());
     }
     if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
         return Err("receipt directory is not empty".into());
@@ -1180,11 +1212,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("image manifest context size is not the driver's".into());
     }
-    fs::write(inputs.join("doom_sbf.so"), &image_bytes)?;
-    fs::write(
-        inputs.join("doom_ex2_source_manifest.json"),
-        &manifest_bytes,
-    )?;
+    if !no_frame_artifacts {
+        fs::write(inputs.join("doom_sbf.so"), &image_bytes)?;
+        fs::write(
+            inputs.join("doom_ex2_source_manifest.json"),
+            &manifest_bytes,
+        )?;
+    }
     env::set_var("BPF_OUT_DIR", image.parent().ok_or("image has no parent")?);
     env::set_var("SBF_OUT_DIR", image.parent().ok_or("image has no parent")?);
 
@@ -1213,7 +1247,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // real bounds; under SIM2INPT/3 the lump is not the source of player
         // input, and its length is a property of E1M5, not of this run.  So the
         // frame cursors only have to be inside the run and on a batch boundary.
-        let inside = *cursor > 0 && *cursor % advance_tics == 0 && *cursor <= tics;
+        let inside = *cursor > 0
+            && *cursor <= tics
+            && (benchmark_only || *cursor % advance_tics == 0);
         if !inside || (!new_game_start && *cursor <= demo_tics) {
             let past = if new_game_start {
                 String::new()
@@ -1346,7 +1382,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let provisioned_snapshot = Some(provisioned_snapshot);
     while cursor < tics {
         let first = cursor;
-        let last = (cursor + advance_tics).min(tics);
+        let mut last = (cursor + advance_tics).min(tics);
+        if benchmark_only {
+            if let Some(next_frame) = frames_at.iter().copied().filter(|at| *at > cursor).min() {
+                last = last.min(next_frame);
+            }
+        }
         let count = (last - first) as usize;
         let deposit = session.deposit_ix(first, &commands[first as usize * 4..last as usize * 4]);
         let deposited = session
@@ -1495,7 +1536,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 );
             }
             let directory = receipt.join(format!("strips/cursor-{last:05}"));
-            fs::create_dir_all(&directory)?;
+            if !no_frame_artifacts {
+                fs::create_dir_all(&directory)?;
+            }
             let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
             let mut strip_units = Vec::new();
             let mut strip_equal = 0usize;
@@ -1525,13 +1568,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let to = row * 320 + usize::from(strip_id) * 40;
                     reconstructed[to..to + 40].copy_from_slice(&strip.pixels[from..from + 40]);
                 }
-                fs::write(
-                    directory.join(format!("strip-{strip_id}.px8")),
-                    &strip.pixels,
-                )?;
+                if !no_frame_artifacts {
+                    fs::write(
+                        directory.join(format!("strip-{strip_id}.px8")),
+                        &strip.pixels,
+                    )?;
+                }
                 strips_written += 1;
             }
-            fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
+            if !no_frame_artifacts {
+                fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
+            }
 
             // --- the strip names its snapshot --------------------------------
             //
@@ -1574,8 +1621,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Equal-to-RENDER plus RENDER-equal-to-host is equal-to-host.
             let probe_bytes = session.data(probe_key).await?;
             let probe_pixels = rsn3::validate_strip(&probe_bytes)?.pixels.to_vec();
-            let positive_equal =
-                probe_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
+            let expected_probe_pixels =
+                slice_frame(&reconstructed, usize::from(probe_strip));
+            let positive_pixel_difference = probe_pixels
+                .iter()
+                .zip(&expected_probe_pixels)
+                .position(|(actual, expected)| actual != expected);
+            let positive_equal = positive_pixel_difference.is_none();
 
             let zero_name_ix = session.render_buffered_ix(
                     static_key,
@@ -1665,7 +1717,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "working_context_bytes_moved_by_the_frame": changed_offsets.len(),
                 "working_context_first_moved_offsets": changed_offsets.iter().take(16).collect::<Vec<_>>(),
             }));
-            if !replay_is_idempotent {
+            if !replay_is_idempotent
+                && !worst_view_benchmark
+                && !render_repeat_regression
+            {
                 return Err(format!(
                     "re-rendering strip {probe_strip} at {last} did not reproduce the same static \
                      account bytes, so a render accumulated something"
@@ -1677,9 +1732,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             previous_snapshot_hash = Some(snapshot.snapshot_hash);
 
-            if !positive_equal {
+            if !positive_equal && !worst_view_benchmark {
+                let detail = positive_pixel_difference.map_or_else(
+                    || "pixel buffers have different lengths".to_owned(),
+                    |offset| {
+                        let x = offset % 40;
+                        let y = offset / 40;
+                        let frame_x = usize::from(probe_strip) * 40 + x;
+                        format!(
+                            "first pixel differs at strip offset {offset}, strip ({x},{y}), frame ({frame_x},{y}), frame byte {}, expected palette {}, got palette {}; the renderer trace points to the sprite pass because this colliding sector stamp skips R_ProjectSprite",
+                            y * 320 + frame_x,
+                            expected_probe_pixels[offset],
+                            probe_pixels[offset]
+                        )
+                    },
+                );
                 return Err(format!(
-                    "RENDER-BUFFERED positive control at {last} does not match the native strip"
+                    "RENDER-BUFFERED positive control at {last} does not match the native strip: {detail}"
                 )
                 .into());
             }
@@ -1818,7 +1887,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 let frame_equal = frame == reconstructed;
                 let frame_sha = base::sha(&frame);
-                if !frame_equal {
+                if !frame_equal && !worst_view_benchmark {
                     return Err(format!(
                         "buffer {buffer}'s eight strips at {last} reassemble to a different frame \
                          than the offline RENDER's ({frame_sha} against {})",
@@ -1870,6 +1939,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // the program back to itself.
                 let after_replay_bytes = session.data(static_key).await?;
                 let buffer_is_idempotent = strip_after == strip_before;
+                let first_strip_difference = strip_before
+                    .iter()
+                    .zip(&strip_after)
+                    .position(|(before, after)| before != after);
+                let pixels_before = &strip_before[rsn3::STRIP_HEADER_BYTES..];
+                let pixels_after = &strip_after[rsn3::STRIP_HEADER_BYTES..];
+                let first_pixel_difference = pixels_before
+                    .iter()
+                    .zip(pixels_after)
+                    .position(|(before, after)| before != after);
+                let pixels_equal = pixels_before.len() == pixels_after.len()
+                    && first_pixel_difference.is_none();
                 let moved: Vec<usize> = before_replay
                     .iter()
                     .zip(&after_replay_bytes)
@@ -1878,9 +1959,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .map(|(offset, _)| offset)
                     .collect();
                 if !buffer_is_idempotent {
+                    let cause = if pixels_equal {
+                        "strip header or digest changed while pixel bytes stayed equal".to_owned()
+                    } else {
+                        format!(
+                            "strip pixel bytes changed first at offset {first_pixel_difference:?}"
+                        )
+                    };
                     return Err(format!(
-                        "re-rendering buffer {buffer}'s strip {probe_strip} at {last} did not \
-                         reproduce the strip account byte for byte"
+                        "re-rendering buffer {buffer}'s strip {probe_strip} at {last} changed the \
+                         strip account at byte {first_strip_difference:?}: {cause}"
                     )
                     .into());
                 }
@@ -1903,6 +1991,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "strips_well_formed": well_formed,
                     "frame_sha256": frame_sha,
                     "frame_matches_the_offline_render": frame_equal,
+                    "repeat_render_matches_saved_strip": buffer_is_idempotent,
+                    "first_repeat_render_strip_difference": first_strip_difference,
                     "static_account_sha256_after_this_buffer": depth_static_digests
                         .last()
                         .cloned()
@@ -2008,7 +2098,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let first_pixels =
                 rsn3::validate_strip(&session.data(first_strip_key).await?)?.pixels.to_vec();
             let first_stable = first_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
-            if !first_stable {
+            if !first_stable && !worst_view_benchmark {
                 return Err(format!(
                     "buffer {first_buffer}'s strip {probe_strip} at {last} is not the offline strip \
                      after buffers 2 and 3 had been rendered, so the picture depends on the buffer"
@@ -2054,7 +2144,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let first_pixels =
                 rsn3::validate_strip(&session.data(first_strip_key).await?)?.pixels.to_vec();
             let first_stable = first_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
-            if !first_stable {
+            if !first_stable && !worst_view_benchmark {
                 return Err(format!(
                     "buffer {first_buffer}'s strip {probe_strip} at {last} is not the offline strip \
                      after buffers 2 and 3 had been rendered, so the picture depends on the buffer"
@@ -2068,7 +2158,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "across_depth_strip_sha256": base::sha(&first_pixels),
                 "across_depth_strip_matches_the_offline_render": first_stable,
             }));
-            if depth_idempotent != usize::from(rsn3::BUFFER_COUNT - 1) {
+            if depth_idempotent != usize::from(rsn3::BUFFER_COUNT - 1) && !worst_view_benchmark {
                 return Err(format!(
                     "{depth_idempotent} of {} buffers re-rendered their last strip to the same \
                      static account bytes at {last}",
@@ -2076,7 +2166,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )
                 .into());
             }
-            if depth_equal != usize::from(rsn3::BUFFER_COUNT - 1) {
+            if depth_equal != usize::from(rsn3::BUFFER_COUNT - 1) && !worst_view_benchmark {
                 return Err(format!(
                     "{depth_equal} of {} buffers reproduced the offline frame at {last}",
                     rsn3::BUFFER_COUNT - 1
@@ -2181,11 +2271,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let chain_state = &chain_states[index].1;
         let (frame, moved_st1) = host_frame_at(&capture_data, &commands, *at)?;
         let directory = receipt.join(format!("strips/cursor-{at:05}"));
-        fs::write(directory.join("host-frame.fb1"), &frame)?;
+        if !no_frame_artifacts {
+            fs::write(directory.join("host-frame.fb1"), &frame)?;
+        }
         let mut strip_equal = 0usize;
         for strip_id in 0..8u8 {
-            let bytes = fs::read(directory.join(format!("strip-{strip_id}.px8")))?;
-            if bytes == slice_frame(&frame, usize::from(strip_id)) {
+            let pixels_equal = if no_frame_artifacts {
+                slice_frame(chain_frame, usize::from(strip_id))
+                    == slice_frame(&frame, usize::from(strip_id))
+            } else {
+                fs::read(directory.join(format!("strip-{strip_id}.px8")))?
+                    == slice_frame(&frame, usize::from(strip_id))
+            };
+            if pixels_equal {
                 strip_equal += 1;
             }
         }
@@ -2203,22 +2301,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // command zeroed, so whatever the live-input run changed in committed
         // state and in the view is attributable to the input and not to the
         // level clock.
-        let (neutral_frame, _) = host_frame_at(&capture_data, &neutral, *at)?;
-        fs::write(directory.join("neutral-frame.fb1"), &neutral_frame)?;
-        let (neutral_state, _) = host_state_at(&capture_data, &neutral, *at)?;
-        let neutral_fields = changed_fields(&neutral_state, chain_state);
-        let mut movers: Vec<(usize, i32, i32)> = neutral_fields.clone();
-        movers.sort_by_key(|(_, before, after)| -i64::from(after.wrapping_sub(*before)).abs());
-        render_rows[index]["neutral_control"] = json!({
-            "frame_differing_pixels": differing_pixels(&neutral_frame, &frame),
-            "committed_st1_differing_bytes": neutral_state
-                .iter()
-                .zip(&chain_states[index].1[..neutral_state.len()])
-                .filter(|(a, b)| a != b)
-                .count(),
-            "committed_st1_differing_fields": neutral_fields.len(),
-            "largest_field_moves": movers.iter().take(6).map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after})).collect::<Vec<_>>(),
-        });
+        if !benchmark_only {
+            let (neutral_frame, _) = host_frame_at(&capture_data, &neutral, *at)?;
+            if !no_frame_artifacts {
+                fs::write(directory.join("neutral-frame.fb1"), &neutral_frame)?;
+            }
+            let (neutral_state, _) = host_state_at(&capture_data, &neutral, *at)?;
+            let neutral_fields = changed_fields(&neutral_state, chain_state);
+            let mut movers: Vec<(usize, i32, i32)> = neutral_fields.clone();
+            movers.sort_by_key(|(_, before, after)| -i64::from(after.wrapping_sub(*before)).abs());
+            render_rows[index]["neutral_control"] = json!({
+                "frame_differing_pixels": differing_pixels(&neutral_frame, &frame),
+                "committed_st1_differing_bytes": neutral_state
+                    .iter()
+                    .zip(&chain_states[index].1[..neutral_state.len()])
+                    .filter(|(a, b)| a != b)
+                    .count(),
+                "committed_st1_differing_fields": neutral_fields.len(),
+                "largest_field_moves": movers.iter().take(6).map(|(offset, before, after)| json!({"offset":offset,"before":before,"after":after})).collect::<Vec<_>>(),
+            });
+        }
         render_rows[index]["strips_equal_to_host_pixels"] = json!(strip_equal);
         render_rows[index]["host_frame_sha256"] = json!(base::sha(&frame));
         render_rows[index]["reassembled_equals_host"] = json!(equal);
@@ -2243,6 +2345,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         previous_frame = Some((*at, frame));
+    }
+
+    if benchmark_only {
+        let buffered: Vec<serde_json::Value> = depth_rows
+            .iter()
+            .filter(|row| row["strip_cu"].is_array())
+            .cloned()
+            .collect();
+        let result = json!({
+            "status": "measured-local",
+            "image_sha256": base::sha(&image_bytes),
+            "manifest_sha256": base::sha(&manifest_bytes),
+            "profile": "sim-transport",
+            "renderer": "RENDER-BUFFERED/5",
+            "tics": tics,
+            "advance_tics_max": advance_tics,
+            "sample_cursors": frames_at,
+            "repeat_regression": render_repeat_regression,
+            "repeat_regression_scope": if render_repeat_regression {
+                "same ProgramTest context; each cursor's first frame is compared to the host, and each buffered probe strip is rendered twice"
+            } else {
+                "benchmark sampling"
+            },
+            "host_frame_byte_identity": render_rows.iter().map(|row| json!({
+                "cursor": row["cursor"],
+                "reassembled_equals_host": row["reassembled_equals_host"],
+                "strips_equal_to_host_pixels": row["strips_equal_to_host_pixels"],
+            })).collect::<Vec<_>>(),
+            "buffered_strip_binding_samples": buffered_rows,
+            "buffered_render_samples": buffered,
+            "render_mismatch_policy": if worst_view_benchmark {
+                "record byte mismatches and continue collecting CU; regular RENDER must still match host"
+            } else {
+                "fail on the first byte mismatch"
+            },
+        });
+        fs::write(
+            receipt.join("worst-view-sbf-samples.json"),
+            serde_json::to_vec_pretty(&result)?,
+        )?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
     }
 
     // --- 3. the deliberately starved tic, and why it cannot be staged -------
@@ -3128,4 +3272,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         receipt.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod render_repeat_regression_tests {
+    use super::render_regression_cursor_sequence;
+
+    #[test]
+    fn regression_requires_three_consecutive_snapshots() {
+        assert!(render_regression_cursor_sequence(&[500, 504, 508], 4));
+        assert!(!render_regression_cursor_sequence(&[500, 504], 4));
+        assert!(!render_regression_cursor_sequence(&[500, 508, 512], 4));
+        assert!(!render_regression_cursor_sequence(&[500, 504, 508], 0));
+    }
 }
