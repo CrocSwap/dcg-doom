@@ -233,8 +233,9 @@ fn add_fresh_reference(
     program: Pubkey,
     template_set: &LocalSet,
     templates: &HashMap<Pubkey, Account>,
-) -> Result<LocalSet, Box<dyn Error>> {
-    let context = Pubkey::new_unique();
+) -> Result<(LocalSet, Keypair), Box<dyn Error>> {
+    let context_signer = Keypair::new();
+    let context = context_signer.pubkey();
     let state = Pubkey::new_unique();
     let mirror = Pubkey::new_unique();
     let controller = Pubkey::new_unique();
@@ -336,7 +337,7 @@ fn add_fresh_reference(
             );
         }
     }
-    Ok(LocalSet {
+    Ok((LocalSet {
         context,
         resource: template_set.resource,
         wads: template_set.wads.clone(),
@@ -350,7 +351,57 @@ fn add_fresh_reference(
         buffer,
         snapshots,
         strips,
-    })
+    }, context_signer))
+}
+
+async fn rebuild_static(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    program: Pubkey,
+    static_key: Pubkey,
+    set: &LocalSet,
+    driver_context: &Keypair,
+    authority: &Keypair,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let program_data = solana_program::bpf_loader_upgradeable::get_program_data_address(&program);
+    let rebuild = Instruction {
+        program_id: program,
+        accounts: vec![
+            meta(program, false, false),
+            meta(static_key, true, false),
+            meta(program_data, false, false),
+            meta(authority.pubkey(), false, true),
+            meta(driver_context.pubkey(), true, true),
+            meta(set.continuation, true, false),
+        ],
+        data: rsr::Request::rebuild().encode().to_vec(),
+    };
+    let mut units = vec![submit(ctx, rebuild, &[authority, driver_context])
+        .await
+        .map_err(|error| format!("local RSR/2 REBUILD/4 failed: {error}"))?];
+    for cursor in 0..=rsr::BUILD_FINAL_CURSOR {
+        let mut accounts = vec![meta(static_key, true, false), meta(set.resource, false, false)];
+        if cursor < rsr::BUILD_WAD_CHUNKS {
+            accounts.push(meta(set.wads[cursor as usize], false, false));
+        }
+        let build = Instruction {
+            program_id: program,
+            accounts,
+            data: rsr::Request::build_chunk(cursor).encode().to_vec(),
+        };
+        units.push(submit(ctx, build, &[])
+            .await
+            .map_err(|error| format!("local RSR/2 BUILD/{cursor} failed: {error}"))?);
+    }
+    let rebuilt = account_data(ctx, static_key).await?;
+    let header = &rebuilt[rsr::HEADER_OFFSET..rsr::HEADER_OFFSET + rsr::HEADER_BYTES];
+    let expected_abi = hashv(&[RSR_ABI_DESCRIPTOR.as_bytes()]).to_bytes();
+    if &header[..8] != rsr::MAGIC
+        || u32_at(header, 8) != rsr::VERSION
+        || header[120..152] != expected_abi
+    {
+        return Err("local current-image RSR/2 BUILD did not publish its expected ABI".into());
+    }
+    Ok(units)
 }
 
 fn base_accounts(set: &LocalSet) -> Vec<AccountMeta> {
@@ -816,8 +867,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
-    let reference = add_fresh_reference(&mut bank, program, &set, &templates)?;
+    let (reference, reference_context_signer) =
+        add_fresh_reference(&mut bank, program, &set, &templates)?;
+    let program_data = solana_program::bpf_loader_upgradeable::get_program_data_address(&program);
+    let mut program_data_bytes = vec![0u8; 45];
+    program_data_bytes[..4].copy_from_slice(&3u32.to_le_bytes());
+    program_data_bytes[12] = 1;
+    program_data_bytes[13..45].copy_from_slice(local_authority.pubkey().as_ref());
+    bank.add_account(
+        program_data,
+        Account {
+            lamports: 1_000_000,
+            data: program_data_bytes,
+            owner: solana_program::bpf_loader_upgradeable::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
     let mut ctx = bank.start_with_context().await;
+    let static_rebuild_units = rebuild_static(
+        &mut ctx,
+        program,
+        static_key,
+        &reference,
+        &reference_context_signer,
+        &local_authority,
+    )
+    .await?;
+    println!("current-image static REBUILD/4 + BUILD completed: {static_rebuild_units:?}");
 
     // A stranger can sign, but cannot use this context's metadata to reset or
     // close it. These controls run before any account in the captured set is
