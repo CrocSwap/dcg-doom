@@ -787,12 +787,17 @@ async fn close_set(
             }
             phase_units.push(units);
             let remaining = ctx.banks_client.get_account(target).await?;
-            if remaining.is_none_or(|account| account.owner != program) {
+            if remaining
+                .as_ref()
+                .is_none_or(|account| account.owner != program)
+            {
                 break;
             }
             if index >= 4
                 || attempt == 5
-                || remaining.is_some_and(|account| account.data.is_empty())
+                || remaining
+                    .as_ref()
+                    .is_some_and(|account| account.data.is_empty())
             {
                 return Err(format!("CLOSE/{phase} did not finish target {target}").into());
             }
