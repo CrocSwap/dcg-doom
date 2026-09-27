@@ -30,10 +30,14 @@ pub const REFUSE_CLOSE: u32 = 325;
 
 const BASE_ACCOUNT_COUNT: usize = 15;
 const CLOSE_RENDER_BATCH: usize = 18;
+const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 512 * 1024;
 const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9 + CLOSE_RENDER_BATCH;
 const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10 + CLOSE_RENDER_BATCH;
 const CLOSE_FINAL_SHARED_ACCOUNT_COUNT: usize = 4 + CLOSE_RENDER_BATCH;
 const CLOSE_FINAL_SEPARATE_ACCOUNT_COUNT: usize = 5 + CLOSE_RENDER_BATCH;
+const CLOSE_BASE_SHARED_ACCOUNT_COUNT: usize = 4;
+const CLOSE_BASE_SEPARATE_ACCOUNT_COUNT: usize = 5;
+const CLOSE_FINAL_PHASE: u32 = 8;
 const CLOSE_MAGIC: &[u8; 8] = b"DOOM-CL1";
 const CLOSE_VERSION: u32 = 1;
 const CLOSE_CONTEXT: usize = 16;
@@ -112,7 +116,7 @@ impl Request {
             BEGIN => argument == 0,
             CLEAR_RENDER => argument < RENDER_BUFFER_COUNT as u32,
             STEP => (1..=6).contains(&argument),
-            CLOSE => argument <= 1,
+            CLOSE => argument <= CLOSE_FINAL_PHASE,
             _ => false,
         };
         if !valid_argument {
@@ -778,7 +782,10 @@ fn close_meta_payer(
     meta: &AccountInfo,
     authority: &AccountInfo,
 ) -> Result<Pubkey, ProgramError> {
-    if !owned(program, context, resource_sbf::CONTEXT_BYTES, true)
+    if context.owner != program
+        || context.data_len() == 0
+        || context.data_len() > resource_sbf::CONTEXT_BYTES
+        || !context.is_writable
         || !owned(program, meta, sim2::META_BYTES, true)
         || !authority.is_signer
     {
@@ -852,12 +859,13 @@ fn close_marker_write(
     authority: &Pubkey,
     meta: &Pubkey,
     payer: &Pubkey,
+    phase: u32,
 ) -> ProgramResult {
     let mut data = continuation.try_borrow_mut_data()?;
     data.fill(0);
     data[..8].copy_from_slice(CLOSE_MAGIC);
     put_u32(&mut data, 8, CLOSE_VERSION);
-    put_u32(&mut data, 12, 1);
+    put_u32(&mut data, 12, phase);
     for (offset, key) in [
         (CLOSE_CONTEXT, context),
         (CLOSE_AUTHORITY, authority),
@@ -875,11 +883,12 @@ fn close_marker_matches(
     authority: &Pubkey,
     meta: &Pubkey,
     payer: &Pubkey,
+    phase: u32,
 ) -> Result<bool, ProgramError> {
     let data = continuation.try_borrow_data()?;
     Ok(&data[..8] == CLOSE_MAGIC
         && u32_at(&data, 8) == CLOSE_VERSION
-        && u32_at(&data, 12) == 1
+        && u32_at(&data, 12) == phase
         && data[CLOSE_CONTEXT..CLOSE_CONTEXT + 32] == context.as_ref()[..]
         && data[CLOSE_AUTHORITY..CLOSE_AUTHORITY + 32] == authority.as_ref()[..]
         && data[CLOSE_META..CLOSE_META + 32] == meta.as_ref()[..]
@@ -927,6 +936,9 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
         return Err(refuse(REFUSE_ACCOUNTS));
     }
     let context = &accounts[0];
+    if context.data_len() != resource_sbf::CONTEXT_BYTES {
+        return Err(refuse(REFUSE_CLOSE));
+    }
     let state = &accounts[1];
     let mirror = &accounts[2];
     let meta = &accounts[3];
@@ -981,10 +993,11 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
         authority.key,
         meta.key,
         &rent_payer,
+        1,
     )
 }
 
-fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
+fn process_close_middle<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     if accounts.len() < 4 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -1011,33 +1024,126 @@ fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) ->
             authority.key,
             meta.key,
             &rent_payer,
+            1,
+        )?
+        || context.data_len() != resource_sbf::CONTEXT_BYTES
+    {
+        return Err(refuse(REFUSE_CLOSE));
+    }
+    validate_render_batch(
+        program,
+        context.key,
+        accounts,
+        render_start,
+        CLOSE_RENDER_BATCH,
+    )?;
+    for index in render_start..accounts.len() {
+        close_one(&accounts[index], payer)?;
+    }
+    close_marker_write(
+        continuation,
+        context.key,
+        authority.key,
+        meta.key,
+        &rent_payer,
+        2,
+    )
+}
+
+fn close_base_accounts<'a>(
+    program: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> Result<
+    (
+        &'a AccountInfo<'a>,
+        &'a AccountInfo<'a>,
+        &'a AccountInfo<'a>,
+        &'a AccountInfo<'a>,
+        &'a AccountInfo<'a>,
+        Pubkey,
+    ),
+    ProgramError,
+> {
+    if accounts.len() < CLOSE_BASE_SHARED_ACCOUNT_COUNT {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let context = &accounts[0];
+    let meta = &accounts[1];
+    let continuation = &accounts[2];
+    let authority = &accounts[3];
+    let rent_payer = close_meta_payer(program, context, meta, authority)?;
+    let shared_payer = authority.key == &rent_payer;
+    let expected_count = if shared_payer {
+        CLOSE_BASE_SHARED_ACCOUNT_COUNT
+    } else {
+        CLOSE_BASE_SEPARATE_ACCOUNT_COUNT
+    };
+    if accounts.len() != expected_count || !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let payer = close_payer(accounts, 3, 4, &rent_payer)?;
+    if !owned(program, continuation, e2r::CONTINUATION_BYTES, true) {
+        return Err(refuse(REFUSE_CLOSE));
+    }
+    Ok((context, meta, continuation, authority, payer, rent_payer))
+}
+
+fn process_close_resize<'a>(
+    program: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    phase: u32,
+) -> ProgramResult {
+    if !(2..=7).contains(&phase) {
+        return Err(refuse(REFUSE_CLOSE));
+    }
+    let (context, meta, continuation, authority, _payer, rent_payer) =
+        close_base_accounts(program, accounts)?;
+    let expected_len = resource_sbf::CONTEXT_BYTES
+        .checked_sub((phase as usize - 2) * CLOSE_CONTEXT_SHRINK_CHUNK)
+        .ok_or(refuse(REFUSE_CLOSE))?;
+    if context.data_len() != expected_len
+        || !close_marker_matches(
+            continuation,
+            context.key,
+            authority.key,
+            meta.key,
+            &rent_payer,
+            phase,
         )?
     {
         return Err(refuse(REFUSE_CLOSE));
     }
-    let mut seen = vec![*context.key, *meta.key, *continuation.key];
-    for offset in 0..CLOSE_RENDER_BATCH {
-        let target = &accounts[render_start + offset];
-        let index = CLOSE_RENDER_BATCH + offset;
-        let (expected, bytes) = expected_render_account(program, context.key, index as u8)
-            .map_err(|_| refuse(REFUSE_CLOSE))?;
-        if target.key != &expected
-            || target.owner != program
-            || !target.is_writable
-            || target.data_len() != bytes
-            || seen.contains(target.key)
-        {
-            return Err(refuse(REFUSE_CLOSE));
-        }
-        seen.push(*target.key);
-    }
-    if seen.iter().collect::<std::collections::BTreeSet<_>>().len() != seen.len()
-        || seen.contains(payer.key)
+    let new_len = expected_len
+        .checked_sub(CLOSE_CONTEXT_SHRINK_CHUNK)
+        .ok_or(refuse(REFUSE_CLOSE))?;
+    context.realloc(new_len, false)?;
+    close_marker_write(
+        continuation,
+        context.key,
+        authority.key,
+        meta.key,
+        &rent_payer,
+        phase + 1,
+    )
+}
+
+fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
+    let (context, meta, continuation, authority, payer, rent_payer) =
+        close_base_accounts(program, accounts)?;
+    let expected_len = resource_sbf::CONTEXT_BYTES
+        .checked_sub(6 * CLOSE_CONTEXT_SHRINK_CHUNK)
+        .ok_or(refuse(REFUSE_CLOSE))?;
+    if context.data_len() != expected_len
+        || !close_marker_matches(
+            continuation,
+            context.key,
+            authority.key,
+            meta.key,
+            &rent_payer,
+            CLOSE_FINAL_PHASE,
+        )?
     {
-        return Err(refuse(REFUSE_ACCOUNTS));
-    }
-    for index in render_start..accounts.len() {
-        close_one(&accounts[index], payer)?;
+        return Err(refuse(REFUSE_CLOSE));
     }
     close_one(context, payer)?;
     close_one(meta, payer)?;
@@ -1051,7 +1157,9 @@ fn process_close<'a>(
 ) -> ProgramResult {
     match phase {
         0 => process_close_pre(program, accounts),
-        1 => process_close_final(program, accounts),
+        1 => process_close_middle(program, accounts),
+        2..=7 => process_close_resize(program, accounts, phase),
+        CLOSE_FINAL_PHASE => process_close_final(program, accounts),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -1132,7 +1240,7 @@ mod tests {
             },
             Request {
                 operation: CLOSE,
-                argument: 1,
+                argument: CLOSE_FINAL_PHASE,
             },
         ] {
             assert_eq!(Request::decode(&request.encode()).unwrap(), request);
@@ -1156,10 +1264,15 @@ mod tests {
         assert!(Request::decode(
             &Request {
                 operation: CLOSE,
-                argument: 2
+                argument: CLOSE_FINAL_PHASE + 1
             }
             .encode()
         )
         .is_err());
+        assert!(resource_sbf::CONTEXT_BYTES > 6 * CLOSE_CONTEXT_SHRINK_CHUNK);
+        assert_eq!(
+            resource_sbf::CONTEXT_BYTES - 6 * CLOSE_CONTEXT_SHRINK_CHUNK,
+            295_248
+        );
     }
 }

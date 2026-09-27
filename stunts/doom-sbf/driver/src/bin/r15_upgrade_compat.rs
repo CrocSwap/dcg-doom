@@ -689,7 +689,7 @@ fn close_pre_accounts(set: &LocalSet) -> Vec<AccountMeta> {
     accounts
 }
 
-fn close_final_accounts(set: &LocalSet) -> Vec<AccountMeta> {
+fn close_base_accounts(set: &LocalSet) -> Vec<AccountMeta> {
     let mut accounts = vec![
         meta(set.context, true, false),
         meta(set.meta, true, false),
@@ -699,6 +699,11 @@ fn close_final_accounts(set: &LocalSet) -> Vec<AccountMeta> {
     if set.rent_payer != set.authority {
         accounts.push(meta(set.rent_payer, true, false));
     }
+    accounts
+}
+
+fn close_middle_accounts(set: &LocalSet) -> Vec<AccountMeta> {
+    let mut accounts = close_base_accounts(set);
     accounts.extend((18..36).map(|index| meta(render_target(set, index), true, false)));
     accounts
 }
@@ -764,12 +769,27 @@ async fn close_set(
             }
         }
     }
-    let close_final = Instruction {
+    let close_middle = Instruction {
         program_id: program,
-        accounts: close_final_accounts(set),
+        accounts: close_middle_accounts(set),
         data: lifecycle::encode_close_phase(1).to_vec(),
     };
-    let close_final_units = submit(ctx, close_final, &[authority]).await?;
+    let close_middle_units = submit(ctx, close_middle, &[authority]).await?;
+    let mut phase_units = vec![close_pre_units, close_middle_units];
+    for phase in 2..=7 {
+        let resize = Instruction {
+            program_id: program,
+            accounts: close_base_accounts(set),
+            data: lifecycle::encode_close_phase(phase).to_vec(),
+        };
+        phase_units.push(submit(ctx, resize, &[authority]).await?);
+    }
+    let close_final = Instruction {
+        program_id: program,
+        accounts: close_base_accounts(set),
+        data: lifecycle::encode_close_phase(8).to_vec(),
+    };
+    phase_units.push(submit(ctx, close_final, &[authority]).await?);
     let payer_after = ctx
         .banks_client
         .get_account(set.rent_payer)
@@ -797,7 +817,7 @@ async fn close_set(
     if submit(ctx, double_close, &[authority]).await.is_ok() {
         return Err("double CLOSE unexpectedly succeeded".into());
     }
-    Ok((balance_before, vec![close_pre_units, close_final_units]))
+    Ok((balance_before, phase_units))
 }
 
 #[tokio::main]
