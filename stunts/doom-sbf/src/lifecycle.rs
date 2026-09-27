@@ -30,7 +30,7 @@ pub const REFUSE_CLOSE: u32 = 325;
 
 const BASE_ACCOUNT_COUNT: usize = 15;
 const CLOSE_RENDER_BATCH: usize = 18;
-const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 512 * 1024;
+const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 256 * 1024;
 const CLOSE_CONTEXT_SHRINK_STEPS: usize =
     (resource_sbf::CONTEXT_BYTES + CLOSE_CONTEXT_SHRINK_CHUNK - 1) / CLOSE_CONTEXT_SHRINK_CHUNK;
 const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9 + CLOSE_RENDER_BATCH;
@@ -1160,7 +1160,9 @@ fn process_close<'a>(
     match phase {
         0 => process_close_pre(program, accounts),
         1 => process_close_middle(program, accounts),
-        2..=7 => process_close_resize(program, accounts, phase),
+        phase if (2..CLOSE_FINAL_PHASE).contains(&phase) => {
+            process_close_resize(program, accounts, phase)
+        }
         CLOSE_FINAL_PHASE => process_close_final(program, accounts),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }

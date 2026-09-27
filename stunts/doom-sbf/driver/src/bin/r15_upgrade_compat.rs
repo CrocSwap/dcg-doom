@@ -29,6 +29,7 @@ use solana_transaction::Transaction;
 // bounded REINIT phase. The deployed transaction cap remains 1.4M CU and the
 // runbook must not promote an over-budget phase.
 const COMPUTE_LIMIT: u32 = 10_000_000;
+const CLOSE_CU_LIMIT: u64 = 1_400_000;
 const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1|render=1:carries-snapshot-hash|refresh-render=5:buffer+strip+snapshot-hash:zero-name-refused-malformed:mismatched-name-refused-308";
 
 fn read_json(path: &PathBuf) -> Result<Value, Box<dyn Error>> {
@@ -758,6 +759,9 @@ async fn close_set(
         data: lifecycle::encode_close_phase(0).to_vec(),
     };
     let close_pre_units = submit(ctx, close_pre, &[authority]).await?;
+    if close_pre_units > CLOSE_CU_LIMIT {
+        return Err(format!("CLOSE/0 used {close_pre_units} CU, over {CLOSE_CU_LIMIT}").into());
+    }
     let early_closed = [set.state, set.mirror, set.buffer, set.controller, set.frame]
         .into_iter()
         .chain((0..18).map(|index| render_target(set, index)))
@@ -775,6 +779,9 @@ async fn close_set(
         data: lifecycle::encode_close_phase(1).to_vec(),
     };
     let close_middle_units = submit(ctx, close_middle, &[authority]).await?;
+    if close_middle_units > CLOSE_CU_LIMIT {
+        return Err(format!("CLOSE/1 used {close_middle_units} CU, over {CLOSE_CU_LIMIT}").into());
+    }
     let mut phase_units = vec![close_pre_units, close_middle_units];
     for phase in 2..lifecycle::CLOSE_FINAL_PHASE as u8 {
         let resize = Instruction {
@@ -782,14 +789,22 @@ async fn close_set(
             accounts: close_base_accounts(set),
             data: lifecycle::encode_close_phase(phase).to_vec(),
         };
-        phase_units.push(submit(ctx, resize, &[authority]).await?);
+        let units = submit(ctx, resize, &[authority]).await?;
+        if units > CLOSE_CU_LIMIT {
+            return Err(format!("CLOSE/{phase} used {units} CU, over {CLOSE_CU_LIMIT}").into());
+        }
+        phase_units.push(units);
     }
     let close_final = Instruction {
         program_id: program,
         accounts: close_base_accounts(set),
         data: lifecycle::encode_close_phase(lifecycle::CLOSE_FINAL_PHASE as u8).to_vec(),
     };
-    phase_units.push(submit(ctx, close_final, &[authority]).await?);
+    let final_units = submit(ctx, close_final, &[authority]).await?;
+    if final_units > CLOSE_CU_LIMIT {
+        return Err(format!("CLOSE/final used {final_units} CU, over {CLOSE_CU_LIMIT}").into());
+    }
+    phase_units.push(final_units);
     let payer_after = ctx
         .banks_client
         .get_account(set.rent_payer)
