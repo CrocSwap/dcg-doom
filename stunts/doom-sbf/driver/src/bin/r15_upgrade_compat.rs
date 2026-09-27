@@ -590,9 +590,9 @@ async fn advance_one(
         ],
         data: sim2::encode_advance_starved(cursor, 1),
     };
-    submit(ctx, advance, &[authority])
+    Ok(submit(ctx, advance, &[authority])
         .await
-        .map_err(|error| format!("ADVANCE at cursor {cursor} failed: {error}"))
+        .map_err(|error| format!("ADVANCE at cursor {cursor} failed: {error}"))?)
 }
 
 fn close_accounts(set: &LocalSet) -> Vec<AccountMeta> {
