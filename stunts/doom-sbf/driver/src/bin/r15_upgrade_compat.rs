@@ -25,7 +25,10 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
-const COMPUTE_LIMIT: u32 = 1_400_000;
+// This local fixture raises the SVM budget so the first run can measure every
+// bounded REINIT phase. The deployed transaction cap remains 1.4M CU and the
+// runbook must not promote an over-budget phase.
+const COMPUTE_LIMIT: u32 = 10_000_000;
 const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1|render=1:carries-snapshot-hash|refresh-render=5:buffer+strip+snapshot-hash:zero-name-refused-malformed:mismatched-name-refused-308";
 
 fn read_json(path: &PathBuf) -> Result<Value, Box<dyn Error>> {
@@ -401,7 +404,9 @@ async fn reinit(
         accounts: base_accounts(set),
         data: lifecycle::encode_begin().to_vec(),
     };
-    units.push(submit(ctx, begin, &[authority]).await?);
+    units.push(submit(ctx, begin, &[authority])
+        .await
+        .map_err(|error| format!("{label} REINIT BEGIN failed: {error}"))?);
     for index in 0..36u8 {
         let target = render_target(set, index as usize);
         let clear = Instruction {
@@ -409,15 +414,19 @@ async fn reinit(
             accounts: clear_render_accounts(set, target),
             data: lifecycle::encode_clear_render(index).to_vec(),
         };
-        units.push(submit(ctx, clear, &[authority]).await?);
+        units.push(submit(ctx, clear, &[authority])
+            .await
+            .map_err(|error| format!("{label} REINIT CLEAR_RENDER/{index} failed: {error}"))?);
     }
-    for phase in 1..=5u8 {
+    for phase in 1..=6u8 {
         let step = Instruction {
             program_id: program,
             accounts: base_accounts(set),
             data: lifecycle::encode_step(phase).to_vec(),
         };
-        units.push(submit(ctx, step, &[authority]).await?);
+        units.push(submit(ctx, step, &[authority])
+            .await
+            .map_err(|error| format!("{label} REINIT STEP/{phase} failed: {error}"))?);
     }
     let view = sim2::MetaView::parse(&account_data(ctx, set.meta).await?)
         .ok_or_else(|| format!("{label} REINIT metadata failed to parse"))?;
@@ -435,6 +444,22 @@ struct RenderedFrame {
     snapshot: Vec<u8>,
     strips: Vec<Vec<u8>>,
     compute_units: Vec<u64>,
+}
+
+fn pixels(frame: &RenderedFrame) -> Result<Vec<u8>, Box<dyn Error>> {
+    let views = frame
+        .strips
+        .iter()
+        .map(|bytes| rsn3::validate_strip(bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = Vec::with_capacity(320 * 200);
+    for y in 0..200 {
+        for strip in &views {
+            let start = y * 40;
+            out.extend_from_slice(&strip.pixels[start..start + 40]);
+        }
+    }
+    Ok(out)
 }
 
 async fn render_frame(
@@ -833,7 +858,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let captured_zero = render_frame(&mut ctx, program, static_key, &set, 0).await?;
     let fresh_zero = render_frame(&mut ctx, program, static_key, &reference, 0).await?;
-    if captured_zero.pixels != fresh_zero.pixels {
+    if pixels(&captured_zero)? != pixels(&fresh_zero)? {
         return Err("REINIT cursor-0 pixels differ from the fresh context reference".into());
     }
     let advance_cu = advance_one(&mut ctx, program, &set, &local_authority, 0).await?;
@@ -849,7 +874,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let captured_one = render_frame(&mut ctx, program, static_key, &set, 1).await?;
     let fresh_one = render_frame(&mut ctx, program, static_key, &reference, 1).await?;
-    if captured_one.pixels != fresh_one.pixels {
+    if pixels(&captured_one)? != pixels(&fresh_one)? {
         return Err("REINIT cursor-1 pixels differ from the fresh context reference".into());
     }
 
@@ -857,15 +882,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         close_set(&mut ctx, program, &set, &local_authority).await?;
     let (reference_refund, reference_close_cu) =
         close_set(&mut ctx, program, &reference, &local_authority).await?;
-    let pixel_hash = |frame: &RenderedFrame| {
-        let flat = frame.pixels.iter().flatten().copied().collect::<Vec<_>>();
-        hash(&flat)
-    };
+    let captured_zero_hash = hash(&pixels(&captured_zero)?);
+    let captured_one_hash = hash(&pixels(&captured_one)?);
     println!(
         "{{\"status\":\"measured\",\"capture\":\"{}\",\"captured_accounts\":{},\"fresh_fixture_accounts\":44,\"renderer_abi\":\"{}\",\"reinit_cu\":{:?},\"fresh_reinit_cu\":{:?},\"already_fresh_reinit_cu\":{:?},\"cursor0_pixels_equal\":true,\"cursor0_sha256\":\"{}\",\"cursor0_strips\":8,\"cursor0_repeat_render_byte_identical\":true,\"advance_from\":0,\"advance_to\":1,\"advance_cu\":{},\"fresh_advance_cu\":{},\"cursor1_pixels_equal\":true,\"cursor1_sha256\":\"{}\",\"cursor1_strips\":8,\"cursor1_repeat_render_byte_identical\":true,\"stranger_reinit_refused\":true,\"stranger_close_refused\":true,\"reinit_already_fresh_succeeded\":true,\"close_accounts\":44,\"close_refund_lamports\":{},\"close_refund_fogo\":{:.9},\"close_cu\":{},\"close_left_program_owned_accounts\":0,\"double_close_refused\":true,\"fresh_reference_refund_lamports\":{},\"fresh_reference_close_cu\":{}}}",
         capture.display(), rows.len(), hash(&expected_abi), first_reinit_units, fresh_reinit_units,
-        fresh_again_units, pixel_hash(&captured_zero), advance_cu, fresh_advance_cu,
-        pixel_hash(&captured_one), captured_refund, captured_refund as f64 / 1_000_000_000.0,
+        fresh_again_units, captured_zero_hash, advance_cu, fresh_advance_cu,
+        captured_one_hash, captured_refund, captured_refund as f64 / 1_000_000_000.0,
         captured_close_cu, reference_refund, reference_close_cu
     );
     Ok(())

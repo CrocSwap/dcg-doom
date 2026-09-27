@@ -1240,7 +1240,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
  * new E1M1 game from this image and leave a controller at gametic zero.  No
  * bytes from the old ST1 account are read here.  The resulting state is
  * encoded by split_finalize in the next bounded instruction. */
-int doom_engine_ex2_resource_sbf_ri2_split_newgame(
+int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
     uint8_t *context, uint8_t *bootstrap, unsigned long bootstrap_bytes,
     unsigned long *arena_high_water_out)
 {
@@ -1274,10 +1274,29 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame(
     playeringame[0] = 1;
     DOOM_CTX->consoleplayer = 0;
     displayplayer = 0;
-    gametic = 0;
     DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
-    G_InitNew((skill_t)RI2_NEWGAME_SKILL, RI2_NEWGAME_EPISODE, RI2_NEWGAME_MAP);
 
+    if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
+    if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
+    return 0;
+}
+
+/* REINIT/1 phase 5.  Keep the map loader in its own transaction: on the
+ * target SVM its work is substantially larger than the surrounding setup.
+ * The preceding phase initializes all image-owned globals and the demo
+ * bounds; this phase starts E1M1 using only those current-image values. */
+int doom_engine_ex2_resource_sbf_ri2_split_newgame_start(
+    uint8_t *context, uint8_t *bootstrap, unsigned long bootstrap_bytes,
+    unsigned long *arena_high_water_out)
+{
+    if (doom_ctx_guard(context)) return 199;
+    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+        ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
+    if (!ri2_split_arena_bytes(bootstrap_bytes) ||
+        !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
+        return RI2_REFUSE_ARENA;
+    gametic = 0;
+    G_InitNew((skill_t)RI2_NEWGAME_SKILL, RI2_NEWGAME_EPISODE, RI2_NEWGAME_MAP);
     if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;

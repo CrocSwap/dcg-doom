@@ -100,7 +100,7 @@ impl Request {
         let argument = u32_at(data, 16);
         if (data[12] != CLEAR_RENDER && data[12] != STEP && argument != 0)
             || (data[12] == CLEAR_RENDER && argument >= RENDER_BUFFER_COUNT as u32)
-            || (data[12] == STEP && !(1..=5).contains(&argument))
+            || (data[12] == STEP && !(1..=6).contains(&argument))
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
@@ -464,7 +464,13 @@ unsafe extern "C" {
         controller_len: usize,
         arena_high_water: *mut usize,
     ) -> i32;
-    fn doom_engine_ex2_resource_sbf_ri2_split_newgame(
+    fn doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
+        context: *mut u8,
+        bootstrap: *mut u8,
+        bootstrap_bytes: usize,
+        arena_high_water: *mut usize,
+    ) -> i32;
+    fn doom_engine_ex2_resource_sbf_ri2_split_newgame_start(
         context: *mut u8,
         bootstrap: *mut u8,
         bootstrap_bytes: usize,
@@ -639,7 +645,18 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
             let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
             let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
             unsafe {
-                doom_engine_ex2_resource_sbf_ri2_split_newgame(
+                doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
+                    context_ptr,
+                    bootstrap_ptr,
+                    bootstrap_len,
+                    &mut high_water,
+                )
+            }
+        } else if request.argument == 5 {
+            let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
+            let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
+            unsafe {
+                doom_engine_ex2_resource_sbf_ri2_split_newgame_start(
                     context_ptr,
                     bootstrap_ptr,
                     bootstrap_len,
@@ -912,7 +929,7 @@ mod tests {
             },
             Request {
                 operation: STEP,
-                argument: 5,
+                argument: 6,
             },
             Request {
                 operation: CLOSE,
@@ -932,7 +949,7 @@ mod tests {
         assert!(Request::decode(
             &Request {
                 operation: STEP,
-                argument: 6
+                argument: 7
             }
             .encode()
         )
