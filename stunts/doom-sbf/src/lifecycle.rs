@@ -1,4 +1,4 @@
-//! DOOM-LIF/1: authority-signed, in-place restart and rent recovery.
+//! DOOM-LIF/2: authority-signed, staged in-place restart and rent recovery.
 //!
 //! REINIT clears the old game bytes without decoding them, rebuilds a new game
 //! from the RI2 image currently loaded in the program, and reuses the same
@@ -7,19 +7,27 @@
 //! ST1 or the pinned C context.
 
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv, program_error::ProgramError,
     program_memory::sol_memcpy, pubkey::Pubkey, system_program,
 };
 
-use crate::{continuation_split_sbf as e2r, render_snapshot_v3 as rsn3, resource_sbf, sim2};
+use crate::{
+    continuation_split_sbf as e2r, render_snapshot_v3 as rsn3, resource_sbf, sim2, static_resource,
+};
 
 pub const MAGIC: &[u8; 8] = b"DOOM-LIF";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const BEGIN: u8 = 1;
 pub const CLEAR_RENDER: u8 = 2;
 pub const STEP: u8 = 3;
 pub const CLOSE: u8 = 4;
 pub const REQUEST_BYTES: usize = 24;
+pub const REINIT_WAD_STAGES: u32 = resource_sbf::WAD_ACCOUNT_COUNT as u32;
+pub const REINIT_RSR_STAGES: u32 = 6;
+pub const REINIT_GAME_STAGES: u32 = 2;
+pub const REINIT_FINALIZE_STAGES: u32 = 2;
+pub const REINIT_STEP_COUNT: u32 =
+    REINIT_WAD_STAGES + REINIT_RSR_STAGES + REINIT_GAME_STAGES + REINIT_FINALIZE_STAGES;
 
 pub const REFUSE_MALFORMED: u32 = 320;
 pub const REFUSE_ACCOUNTS: u32 = 321;
@@ -54,8 +62,8 @@ const AUTHORITY: usize = 12;
 const META: usize = 13;
 const BUFFER: usize = 14;
 
-const MARKER_BYTES: usize = 352;
-const MARKER_MAGIC: &[u8; 8] = b"DOOM-RI1";
+const MARKER_BYTES: usize = 356;
+const MARKER_MAGIC: &[u8; 8] = b"DOOM-RI2";
 const MR_PHASE: usize = 12;
 const MR_CONTEXT: usize = 16;
 const MR_AUTHORITY: usize = 48;
@@ -70,6 +78,7 @@ const MR_BUMP: usize = 276;
 const MR_CLEARED: usize = 280;
 const MR_RENT_PAYER: usize = 288;
 const MR_ARENA_HIGH_WATER: usize = 320;
+const MR_GENERATION: usize = 352;
 const RENDER_BUFFER_COUNT: usize = 36;
 
 fn refuse(code: u32) -> ProgramError {
@@ -96,6 +105,7 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
 pub struct Request {
     pub operation: u8,
     pub argument: u32,
+    pub generation: u32,
 }
 
 impl Request {
@@ -105,16 +115,16 @@ impl Request {
             || u32_at(data, 8) != VERSION
             || !matches!(data[12], BEGIN | CLEAR_RENDER | STEP | CLOSE)
             || data[13..16] != [0; 3]
-            || data[20..24] != [0; 4]
         {
             return Err(refuse(REFUSE_MALFORMED));
         }
         let argument = u32_at(data, 16);
+        let generation = u32_at(data, 20);
         let valid_argument = match data[12] {
-            BEGIN => argument == 0,
-            CLEAR_RENDER => argument < RENDER_BUFFER_COUNT as u32,
-            STEP => (1..=6).contains(&argument),
-            CLOSE => argument <= CLOSE_FINAL_PHASE,
+            BEGIN => argument == 0 && generation != 0,
+            CLEAR_RENDER => argument < RENDER_BUFFER_COUNT as u32 && generation != 0,
+            STEP => (1..=REINIT_STEP_COUNT).contains(&argument) && generation != 0,
+            CLOSE => argument <= CLOSE_FINAL_PHASE && generation == 0,
             _ => false,
         };
         if !valid_argument {
@@ -123,6 +133,7 @@ impl Request {
         Ok(Self {
             operation: data[12],
             argument,
+            generation,
         })
     }
 
@@ -132,6 +143,7 @@ impl Request {
         out[8..12].copy_from_slice(&VERSION.to_le_bytes());
         out[12] = self.operation;
         out[16..20].copy_from_slice(&self.argument.to_le_bytes());
+        out[20..24].copy_from_slice(&self.generation.to_le_bytes());
         out
     }
 }
@@ -254,6 +266,7 @@ fn marker_write(
     capacity: u32,
     bump: u8,
     payer: &Pubkey,
+    generation: u32,
 ) {
     data.fill(0);
     data[..8].copy_from_slice(MARKER_MAGIC);
@@ -274,12 +287,14 @@ fn marker_write(
     put_u32(data, MR_CAPACITY, capacity);
     data[MR_BUMP] = bump;
     data[MR_RENT_PAYER..MR_RENT_PAYER + 32].copy_from_slice(payer.as_ref());
+    put_u32(data, MR_GENERATION, generation);
 }
 
-fn marker_matches(data: &[u8], accounts: &[AccountInfo]) -> bool {
+fn marker_matches(data: &[u8], accounts: &[AccountInfo], generation: u32) -> bool {
     data.len() == e2r::CONTINUATION_BYTES
         && &data[..8] == MARKER_MAGIC
         && u32_at(data, 8) == VERSION
+        && u32_at(data, MR_GENERATION) == generation
         && data[MR_CONTEXT..MR_CONTEXT + 32] == accounts[CONTEXT].key.as_ref()[..]
         && data[MR_AUTHORITY..MR_AUTHORITY + 32] == accounts[AUTHORITY].key.as_ref()[..]
         && data[MR_META..MR_META + 32] == accounts[META].key.as_ref()[..]
@@ -288,8 +303,9 @@ fn marker_matches(data: &[u8], accounts: &[AccountInfo]) -> bool {
         && data[MR_MIRROR..MR_MIRROR + 32] == accounts[MIRROR].key.as_ref()[..]
         && data[MR_CONTROLLER..MR_CONTROLLER + 32] == accounts[CONTROLLER].key.as_ref()[..]
         && data[MR_FRAME..MR_FRAME + 32] == accounts[FRAME].key.as_ref()[..]
-        && data[352..MARKER_BYTES].iter().all(|byte| *byte == 0)
-        && data[MARKER_BYTES..].iter().all(|byte| *byte == 0)
+        && data[MR_GENERATION + 4..MARKER_BYTES]
+            .iter()
+            .all(|byte| *byte == 0)
 }
 
 fn buffer_preinit(data: &mut [u8], capacity: u32) -> ProgramResult {
@@ -343,11 +359,23 @@ fn init_placeholders(accounts: &[AccountInfo]) -> ProgramResult {
     Ok(())
 }
 
-fn process_begin(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn process_begin(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
     validate_base(program, accounts)?;
     let (capacity, bump, rent_payer) = read_meta_bindings(program, accounts)?;
     if !accounts[META].is_writable || !accounts[BUFFER].is_writable {
         return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    {
+        let continuation = accounts[CONTINUATION].try_borrow_data()?;
+        if marker_matches(&continuation, accounts, request.generation) {
+            return Ok(());
+        }
+        if meta_data_is_zero(&accounts[META])?
+            && continuation[..8] == MARKER_MAGIC[..]
+            && u32_at(&continuation, 8) == VERSION
+        {
+            return Err(refuse(REFUSE_PENDING));
+        }
     }
     init_placeholders(accounts)?;
     accounts[CONTEXT].try_borrow_mut_data()?[e2r::CONTEXT_CHECKPOINT_OFFSET
@@ -356,21 +384,14 @@ fn process_begin(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     accounts[META].try_borrow_mut_data()?.fill(0);
     buffer_preinit(&mut accounts[BUFFER].try_borrow_mut_data()?, capacity)?;
     let mut continuation = accounts[CONTINUATION].try_borrow_mut_data()?;
-    marker_write(&mut continuation, accounts, capacity, bump, &rent_payer);
-    Ok(())
-}
-
-fn validate_pending_accounts(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    validate_base(program, accounts)?;
-    if !meta_data_is_zero(&accounts[META])? {
-        return Err(refuse(REFUSE_PENDING));
-    }
-    let marker = accounts[CONTINUATION].try_borrow_data()?;
-    if !marker_matches(&marker, accounts)
-        || marker[MR_AUTHORITY..MR_AUTHORITY + 32] != accounts[AUTHORITY].key.as_ref()[..]
-    {
-        return Err(refuse(REFUSE_PENDING));
-    }
+    marker_write(
+        &mut continuation,
+        accounts,
+        capacity,
+        bump,
+        &rent_payer,
+        request.generation,
+    );
     Ok(())
 }
 
@@ -420,17 +441,42 @@ fn process_clear_render(
     let marker = continuation.try_borrow_data()?;
     if &marker[..8] != MARKER_MAGIC
         || u32_at(&marker, 8) != VERSION
+        || u32_at(&marker, MR_GENERATION) != request.generation
         || marker[MR_CONTEXT..MR_CONTEXT + 32] != context.key.as_ref()[..]
         || marker[MR_META..MR_META + 32] != meta.key.as_ref()[..]
         || marker[MR_AUTHORITY..MR_AUTHORITY + 32] != authority.key.as_ref()[..]
-        || !meta_data_is_zero(meta)?
     {
         return Err(refuse(REFUSE_PENDING));
     }
+    let bit = 1u64 << request.argument;
+    let cleared = u64_at(&marker, MR_CLEARED);
+    let complete = u32_at(&marker, MR_PHASE) == REINIT_STEP_COUNT;
     let index = request.argument as u8;
     let (expected, expected_bytes) = expected_render_account(program, context.key, index)?;
     if target.key != &expected || target.data_len() != expected_bytes {
         return Err(refuse(REFUSE_CLEAR));
+    }
+    let meta_zero = meta_data_is_zero(meta)?;
+    if !meta_zero {
+        let meta_data = meta.try_borrow_data()?;
+        let (expected_meta, bump) = sim2::meta_address(program, context.key);
+        if !complete
+            || cleared & bit == 0
+            || meta.key != &expected_meta
+            || &meta_data[..8] != b"SIM2META"
+            || !matches!(u32_at(&meta_data, 8), sim2::VERSION | sim2::META_VERSION)
+            || meta_data[sim2::M_BUMP] != bump
+            || meta_data[sim2::M_CONTEXT..sim2::M_CONTEXT + 32] != context.key.as_ref()[..]
+            || meta_data[sim2::M_AUTHORITY..sim2::M_AUTHORITY + 32] != authority.key.as_ref()[..]
+        {
+            return Err(refuse(REFUSE_PENDING));
+        }
+    }
+    if cleared & bit != 0 {
+        return Ok(());
+    }
+    if !meta_zero || u32_at(&marker, MR_PHASE) != 0 {
+        return Err(refuse(REFUSE_PENDING));
     }
     drop(marker);
     target.try_borrow_mut_data()?.fill(0);
@@ -442,42 +488,18 @@ fn process_clear_render(
 
 #[cfg(target_os = "solana")]
 unsafe extern "C" {
-    fn doom_engine_ex2_resource_sbf_ri2_split_preflight(
+    fn doom_engine_rsn3_build_static_phase(
+        phase: u32,
         context: *mut u8,
-        resource: *const u8,
-        resource_bytes: usize,
-        bootstrap: *mut u8,
-        bootstrap_bytes: usize,
-        arena_high_water: *mut usize,
-    ) -> i32;
-    fn doom_engine_ex2_resource_sbf_ri2_split_setup(
-        context: *mut u8,
+        account_bytes: usize,
         resource: *const u8,
         resource_bytes: usize,
         wad_image: *const u8,
         wad_bytes: usize,
         bootstrap: *mut u8,
         bootstrap_bytes: usize,
-        state: *const u8,
-        state_len: usize,
-        mirror: *const u8,
-        mirror_len: usize,
-        controller: *const u8,
-        controller_len: usize,
-        arena_high_water: *mut usize,
-    ) -> i32;
-    fn doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
-        context: *mut u8,
-        resource: *const u8,
-        resource_bytes: usize,
-        bootstrap: *mut u8,
-        bootstrap_bytes: usize,
-        state: *const u8,
-        state_len: usize,
-        mirror: *const u8,
-        mirror_len: usize,
-        controller: *const u8,
-        controller_len: usize,
+        header: *mut u8,
+        header_bytes: usize,
         arena_high_water: *mut usize,
     ) -> i32;
     fn doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
@@ -537,37 +559,56 @@ fn c_result(rc: i32) -> ProgramResult {
     }
 }
 
-fn copy_wad_to_context(accounts: &[AccountInfo], context: &mut [u8]) -> ProgramResult {
-    let start = resource_sbf::WAD_IMAGE_OFFSET;
-    let end = start + resource_sbf::WAD_IMAGE_BYTES;
-    let mut at = start;
-    for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
-        let wad = accounts[WAD_FIRST + ordinal].try_borrow_data()?;
-        let payload = u32_at(&wad, 24) as usize;
-        let source = resource_sbf::WAD_HEADER_BYTES;
-        if payload > wad.len().saturating_sub(source)
-            || at.checked_add(payload).is_none_or(|next| next > end)
-        {
-            return Err(refuse(REFUSE_ACCOUNTS));
-        }
-        sol_memcpy(
-            &mut context[at..at + payload],
-            &wad[source..source + payload],
-            payload,
-        );
-        at += payload;
+fn copy_wad_chunk_to_context(
+    accounts: &[AccountInfo],
+    context: &mut [u8],
+    ordinal: usize,
+) -> ProgramResult {
+    if ordinal >= static_resource::WAD_CHUNK_BYTES.len() {
+        return Err(refuse(REFUSE_MALFORMED));
     }
-    if at != end {
+    let wad = accounts[WAD_FIRST + ordinal].try_borrow_data()?;
+    let payload = u32_at(&wad, 24) as usize;
+    let payload_bytes =
+        &wad[resource_sbf::WAD_HEADER_BYTES..resource_sbf::WAD_HEADER_BYTES + payload];
+    if payload != static_resource::WAD_CHUNK_BYTES[ordinal]
+        || hashv(&[payload_bytes]).to_bytes() != static_resource::WAD_CHUNK_HASHES[ordinal]
+    {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
+    let before: usize = static_resource::WAD_CHUNK_BYTES[..ordinal].iter().sum();
+    let start = resource_sbf::WAD_IMAGE_OFFSET + before;
+    let end = start + payload;
+    if end > resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    sol_memcpy(
+        &mut context[start..end],
+        &wad[resource_sbf::WAD_HEADER_BYTES..resource_sbf::WAD_HEADER_BYTES + payload],
+        payload,
+    );
     Ok(())
 }
 
 fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
-    validate_pending_accounts(program, accounts)?;
-    let expected_phase = request.argument - 1;
-    let marker = accounts[CONTINUATION].try_borrow_data()?;
-    if u32_at(&marker, MR_PHASE) != expected_phase
+    validate_base(program, accounts)?;
+    let mut marker = accounts[CONTINUATION].try_borrow_data()?;
+    if !marker_matches(&marker, accounts, request.generation) {
+        return Err(refuse(REFUSE_PENDING));
+    }
+    let completed_phase = u32_at(&marker, MR_PHASE);
+    let meta_zero = meta_data_is_zero(&accounts[META])?;
+    if !meta_zero {
+        if completed_phase != REINIT_STEP_COUNT {
+            return Err(refuse(REFUSE_PENDING));
+        }
+        read_meta_bindings(program, accounts)?;
+    }
+    if request.argument <= completed_phase {
+        return Ok(());
+    }
+    if !meta_zero
+        || request.argument != completed_phase + 1
         || u64_at(&marker, MR_CLEARED) != ((1u64 << RENDER_BUFFER_COUNT) - 1)
     {
         return Err(refuse(REFUSE_PENDING));
@@ -579,107 +620,69 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
             .try_into()
             .unwrap(),
     );
+    let prior_high_water = u32_at(&marker, MR_ARENA_HIGH_WATER) as usize;
     drop(marker);
 
     #[cfg(not(target_os = "solana"))]
     {
-        let _ = (capacity, bump, payer);
+        let _ = (capacity, bump, payer, prior_high_water);
         return Err(ProgramError::InvalidInstructionData);
     }
 
     #[cfg(target_os = "solana")]
     {
-        let mut high_water = 0usize;
-        let rc = if request.argument == 1 {
+        let mut high_water = prior_high_water;
+        let rc = if request.argument <= REINIT_WAD_STAGES {
             let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
-            let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
-            let resource = accounts[RESOURCE].try_borrow_data()?;
-            unsafe {
-                doom_engine_ex2_resource_sbf_ri2_split_preflight(
-                    context_ptr,
-                    resource.as_ptr(),
-                    resource.len(),
-                    bootstrap_ptr,
-                    bootstrap_len,
-                    &mut high_water,
-                )
-            }
-        } else if request.argument == 2 {
+            copy_wad_chunk_to_context(accounts, &mut context, request.argument as usize - 1)?;
+            0
+        } else if request.argument <= REINIT_WAD_STAGES + REINIT_RSR_STAGES {
+            let phase = request.argument - REINIT_WAD_STAGES - 1;
             let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
-            copy_wad_to_context(accounts, &mut context)?;
             let resource = accounts[RESOURCE].try_borrow_data()?;
-            let state = accounts[STATE].try_borrow_data()?;
-            let mirror = accounts[MIRROR].try_borrow_data()?;
-            let controller = accounts[CONTROLLER].try_borrow_data()?;
             let wad_image_ptr = context
                 .as_ptr()
                 .wrapping_add(resource_sbf::WAD_IMAGE_OFFSET);
             let wad_image_len = resource_sbf::WAD_IMAGE_BYTES;
             let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
+            let mut state = accounts[STATE].try_borrow_mut_data()?;
             unsafe {
-                doom_engine_ex2_resource_sbf_ri2_split_setup(
+                doom_engine_rsn3_build_static_phase(
+                    phase,
                     context_ptr,
+                    context.len(),
                     resource.as_ptr(),
                     resource.len(),
                     wad_image_ptr,
                     wad_image_len,
                     bootstrap_ptr,
                     bootstrap_len,
-                    state.as_ptr(),
-                    64,
-                    mirror.as_ptr(),
-                    mirror.len(),
-                    controller.as_ptr(),
-                    controller.len(),
+                    state.as_mut_ptr(),
+                    512,
                     &mut high_water,
                 )
             }
-        } else if request.argument == 3 {
-            let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
-            let resource = accounts[RESOURCE].try_borrow_data()?;
-            let state = accounts[STATE].try_borrow_data()?;
-            let mirror = accounts[MIRROR].try_borrow_data()?;
-            let controller = accounts[CONTROLLER].try_borrow_data()?;
-            let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
-            unsafe {
-                doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
-                    context_ptr,
-                    resource.as_ptr(),
-                    resource.len(),
-                    bootstrap_ptr,
-                    bootstrap_len,
-                    state.as_ptr(),
-                    64,
-                    mirror.as_ptr(),
-                    mirror.len(),
-                    controller.as_ptr(),
-                    controller.len(),
-                    &mut high_water,
-                )
-            }
-        } else if request.argument == 4 {
+        } else if request.argument <= REINIT_WAD_STAGES + REINIT_RSR_STAGES + REINIT_GAME_STAGES {
             let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
             let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
             unsafe {
-                doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
-                    context_ptr,
-                    bootstrap_ptr,
-                    bootstrap_len,
-                    &mut high_water,
-                )
+                if request.argument == REINIT_WAD_STAGES + REINIT_RSR_STAGES + 1 {
+                    doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
+                        context_ptr,
+                        bootstrap_ptr,
+                        bootstrap_len,
+                        &mut high_water,
+                    )
+                } else {
+                    doom_engine_ex2_resource_sbf_ri2_split_newgame_start(
+                        context_ptr,
+                        bootstrap_ptr,
+                        bootstrap_len,
+                        &mut high_water,
+                    )
+                }
             }
-        } else if request.argument == 5 {
-            let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
-            let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
-            unsafe {
-                doom_engine_ex2_resource_sbf_ri2_split_newgame_start(
-                    context_ptr,
-                    bootstrap_ptr,
-                    bootstrap_len,
-                    &mut high_water,
-                )
-            }
-        } else {
+        } else if request.argument == REINIT_STEP_COUNT - 1 {
             let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
             let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
             let mut state = accounts[STATE].try_borrow_mut_data()?;
@@ -705,62 +708,61 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
                     &mut high_water,
                 )
             };
-            if rc != 0 {
-                rc
-            } else if state_len < 64
-                || state_len > state.len()
-                || mirror_len != mirror.len()
-                || frame_len != frame.len()
+            if rc == 0
+                && (state_len < 64
+                    || state_len > state.len()
+                    || mirror_len != mirror.len()
+                    || frame_len != frame.len())
             {
                 return Err(refuse(REFUSE_ACCOUNTS));
-            } else {
-                drop(frame);
-                drop(mirror);
-                drop(state);
-                drop(context);
-                e2r::write_published_checkpoint(program, &accounts[..13], high_water)?;
-                let checkpoint = {
-                    let context_data = accounts[CONTEXT].try_borrow_data()?;
-                    context_data[e2r::CONTEXT_CHECKPOINT_OFFSET
-                        ..e2r::CONTEXT_CHECKPOINT_OFFSET + e2r::CONTEXT_CHECKPOINT_BYTES]
-                        .to_vec()
-                };
-                let mut state = accounts[STATE].try_borrow_data()?;
-                let mut mirror = accounts[MIRROR].try_borrow_data()?;
-                let state_len = sim2::state_len_checked(&state)?;
-                let (verified_len, state_root) = sim2::verified_state_root(&state, &mirror)?;
-                if verified_len != state_len || u32_at(&state, 20) != 0 {
-                    return Err(refuse(REFUSE_ACCOUNTS));
-                }
-                let first_tic = u32_at(&state, 20);
-                let state_root = state_root;
-                let checkpoint_hash = sim2::checkpoint_hash(accounts[CONTEXT].key, &checkpoint);
-                drop(mirror);
-                drop(state);
-                let mut meta = accounts[META].try_borrow_mut_data()?;
-                let mut buffer = accounts[BUFFER].try_borrow_mut_data()?;
-                sim2::init_layout(
-                    &mut meta,
-                    &mut buffer,
-                    &sim2::InitParams {
-                        context: *accounts[CONTEXT].key,
-                        state: *accounts[STATE].key,
-                        mirror: *accounts[MIRROR].key,
-                        buffer: *accounts[BUFFER].key,
-                        meta: *accounts[META].key,
-                        authority: *accounts[AUTHORITY].key,
-                        bump,
-                        capacity,
-                        first_tic,
-                        state_len: state_len as u32,
-                        state_root,
-                        checkpoint_hash,
-                    },
-                )?;
-                meta[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32].copy_from_slice(payer.as_ref());
-                accounts[CONTINUATION].try_borrow_mut_data()?.fill(0);
-                return Ok(());
             }
+            rc
+        } else {
+            c_result(0)?;
+            let high_water = high_water.min(u32::MAX as usize) as u32;
+            e2r::write_published_checkpoint(program, &accounts[..13], high_water as usize)?;
+            let checkpoint = {
+                let context_data = accounts[CONTEXT].try_borrow_data()?;
+                context_data[e2r::CONTEXT_CHECKPOINT_OFFSET
+                    ..e2r::CONTEXT_CHECKPOINT_OFFSET + e2r::CONTEXT_CHECKPOINT_BYTES]
+                    .to_vec()
+            };
+            let state = accounts[STATE].try_borrow_data()?;
+            let mirror = accounts[MIRROR].try_borrow_data()?;
+            let state_len = sim2::state_len_checked(&state)?;
+            let (verified_len, state_root) = sim2::verified_state_root(&state, &mirror)?;
+            if verified_len != state_len || u32_at(&state, 20) != 0 {
+                return Err(refuse(REFUSE_ACCOUNTS));
+            }
+            let first_tic = u32_at(&state, 20);
+            let checkpoint_hash = sim2::checkpoint_hash(accounts[CONTEXT].key, &checkpoint);
+            drop(mirror);
+            drop(state);
+            let mut meta = accounts[META].try_borrow_mut_data()?;
+            let mut buffer = accounts[BUFFER].try_borrow_mut_data()?;
+            sim2::init_layout(
+                &mut meta,
+                &mut buffer,
+                &sim2::InitParams {
+                    context: *accounts[CONTEXT].key,
+                    state: *accounts[STATE].key,
+                    mirror: *accounts[MIRROR].key,
+                    buffer: *accounts[BUFFER].key,
+                    meta: *accounts[META].key,
+                    authority: *accounts[AUTHORITY].key,
+                    bump,
+                    capacity,
+                    first_tic,
+                    state_len: state_len as u32,
+                    state_root,
+                    checkpoint_hash,
+                },
+            )?;
+            meta[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32].copy_from_slice(payer.as_ref());
+            let mut marker = accounts[CONTINUATION].try_borrow_mut_data()?;
+            put_u32(&mut marker, MR_PHASE, REINIT_STEP_COUNT);
+            put_u32(&mut marker, MR_ARENA_HIGH_WATER, high_water);
+            return Ok(());
         };
         c_result(rc)?;
         let mut marker = accounts[CONTINUATION].try_borrow_mut_data()?;
@@ -1106,7 +1108,7 @@ pub fn process<'a>(
 ) -> ProgramResult {
     let request = Request::decode(data)?;
     match request.operation {
-        BEGIN => process_begin(program, accounts),
+        BEGIN => process_begin(program, accounts, request),
         CLEAR_RENDER => process_clear_render(program, accounts, request),
         STEP => process_step(program, accounts, request),
         CLOSE => process_close(program, accounts, request.argument),
@@ -1114,26 +1116,29 @@ pub fn process<'a>(
     }
 }
 
-pub fn encode_begin() -> [u8; REQUEST_BYTES] {
+pub fn encode_begin(generation: u32) -> [u8; REQUEST_BYTES] {
     Request {
         operation: BEGIN,
         argument: 0,
+        generation,
     }
     .encode()
 }
 
-pub fn encode_clear_render(index: u8) -> [u8; REQUEST_BYTES] {
+pub fn encode_clear_render(index: u8, generation: u32) -> [u8; REQUEST_BYTES] {
     Request {
         operation: CLEAR_RENDER,
         argument: u32::from(index),
+        generation,
     }
     .encode()
 }
 
-pub fn encode_step(phase: u8) -> [u8; REQUEST_BYTES] {
+pub fn encode_step(phase: u32, generation: u32) -> [u8; REQUEST_BYTES] {
     Request {
         operation: STEP,
-        argument: u32::from(phase),
+        argument: phase,
+        generation,
     }
     .encode()
 }
@@ -1146,6 +1151,7 @@ pub fn encode_close_phase(phase: u8) -> [u8; REQUEST_BYTES] {
     Request {
         operation: CLOSE,
         argument: u32::from(phase),
+        generation: 0,
     }
     .encode()
 }
@@ -1160,22 +1166,27 @@ mod tests {
             Request {
                 operation: BEGIN,
                 argument: 0,
+                generation: 7,
             },
             Request {
                 operation: CLEAR_RENDER,
                 argument: 35,
+                generation: 7,
             },
             Request {
                 operation: STEP,
-                argument: 6,
+                argument: REINIT_STEP_COUNT,
+                generation: 7,
             },
             Request {
                 operation: CLOSE,
                 argument: 0,
+                generation: 0,
             },
             Request {
                 operation: CLOSE,
                 argument: CLOSE_FINAL_PHASE,
+                generation: 0,
             },
         ] {
             assert_eq!(Request::decode(&request.encode()).unwrap(), request);
@@ -1183,7 +1194,8 @@ mod tests {
         assert!(Request::decode(
             &Request {
                 operation: CLEAR_RENDER,
-                argument: 36
+                argument: 36,
+                generation: 7,
             }
             .encode()
         )
@@ -1191,7 +1203,8 @@ mod tests {
         assert!(Request::decode(
             &Request {
                 operation: STEP,
-                argument: 7
+                argument: REINIT_STEP_COUNT + 1,
+                generation: 7,
             }
             .encode()
         )
@@ -1199,11 +1212,40 @@ mod tests {
         assert!(Request::decode(
             &Request {
                 operation: CLOSE,
-                argument: CLOSE_FINAL_PHASE + 1
+                argument: CLOSE_FINAL_PHASE + 1,
+                generation: 0,
             }
             .encode()
         )
         .is_err());
+        assert!(Request::decode(
+            &Request {
+                operation: BEGIN,
+                argument: 0,
+                generation: 0,
+            }
+            .encode()
+        )
+        .is_err());
+        assert!(Request::decode(
+            &Request {
+                operation: STEP,
+                argument: 1,
+                generation: 0,
+            }
+            .encode()
+        )
+        .is_err());
+        assert!(Request::decode(
+            &Request {
+                operation: CLOSE,
+                argument: 0,
+                generation: 1,
+            }
+            .encode()
+        )
+        .is_err());
+        assert_eq!(REINIT_STEP_COUNT, 15);
         assert_eq!(CLOSE_FINAL_PHASE, CLOSE_RENDER_TARGETS as u32 + 1);
     }
 }

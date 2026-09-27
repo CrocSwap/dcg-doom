@@ -479,6 +479,7 @@ async fn reinit(
     if begin_units > REINIT_CU_TARGET {
         return Err(format!("{label} REINIT BEGIN used {begin_units} CU").into());
     }
+    println!("REINIT_CU label={label} stage=begin cu={begin_units}");
     units.push(begin_units);
     let begin_replay_units = submit(ctx, begin, &[authority])
         .await
@@ -486,6 +487,7 @@ async fn reinit(
     if begin_replay_units > REINIT_CU_TARGET {
         return Err(format!("{label} REINIT BEGIN replay used {begin_replay_units} CU").into());
     }
+    println!("REINIT_CU label={label} stage=begin-retry cu={begin_replay_units}");
     units.push(begin_replay_units);
     for index in 0..36u8 {
         let target = render_target(set, index as usize);
@@ -502,6 +504,7 @@ async fn reinit(
                 format!("{label} REINIT CLEAR_RENDER/{index} used {clear_units} CU").into(),
             );
         }
+        println!("REINIT_CU label={label} stage=clear-{index:02} cu={clear_units}");
         units.push(clear_units);
         let clear_replay_units = submit(ctx, clear, &[authority]).await.map_err(|error| {
             format!("{label} REINIT CLEAR_RENDER/{index} replay failed: {error}")
@@ -512,6 +515,7 @@ async fn reinit(
             )
             .into());
         }
+        println!("REINIT_CU label={label} stage=clear-{index:02}-retry cu={clear_replay_units}");
         units.push(clear_replay_units);
     }
     let skipped_step = Instruction {
@@ -534,6 +538,7 @@ async fn reinit(
         if step_units > REINIT_CU_TARGET {
             return Err(format!("{label} REINIT STEP/{phase} used {step_units} CU").into());
         }
+        println!("REINIT_CU label={label} stage=step-{phase:02} cu={step_units}");
         units.push(step_units);
         let replay_units = submit(ctx, step, &[authority])
             .await
@@ -543,6 +548,7 @@ async fn reinit(
                 format!("{label} REINIT STEP/{phase} replay used {replay_units} CU").into(),
             );
         }
+        println!("REINIT_CU label={label} stage=step-{phase:02}-retry cu={replay_units}");
         units.push(replay_units);
     }
     let view = sim2::MetaView::parse(&account_data(ctx, set.meta).await?)
