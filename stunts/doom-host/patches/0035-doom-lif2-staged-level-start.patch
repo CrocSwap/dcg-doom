@@ -1,0 +1,217 @@
+--- a/linuxdoom-1.10/p_setup.c
++++ b/linuxdoom-1.10/p_setup.c
+@@ -670,6 +670,112 @@
+ 
+ 
+ 
++/* LIF/2 staged level setup.  Each phase re-derives the map lump from the
++ * committed image state so no process-local continuation is required. */
++static int P_RI2MapLump(int episode, int map, char lumpname[9])
++{
++    if (gamemode == commercial)
++    {
++        if (map < 10) sprintf(lumpname, "map0%i", map);
++        else sprintf(lumpname, "map%i", map);
++    }
++    else
++    {
++        lumpname[0] = 'E';
++        lumpname[1] = '0' + episode;
++        lumpname[2] = 'M';
++        lumpname[3] = '0' + map;
++        lumpname[4] = 0;
++    }
++    return W_GetNumForName(lumpname);
++}
++
++void P_SetupLevelRI2Phase(unsigned int phase, int episode, int map,
++                          int playermask, skill_t skill)
++{
++    int lumpnum;
++    char lumpname[9];
++    int i;
++
++    switch (phase)
++    {
++    case 0:
++        totalkills = totalitems = totalsecret = wminfo.maxfrags = 0;
++        wminfo.partime = 180;
++        for (i = 0; i < MAXPLAYERS; i++)
++            players[i].killcount = players[i].secretcount = players[i].itemcount = 0;
++        players[(DOOM_CTX->consoleplayer)].viewz_m = 1;
++        S_Start();
++        Z_FreeTags(PU_LEVEL, PU_PURGELEVEL - 1);
++        P_InitThinkers();
++        W_Reload();
++        leveltime = 0;
++        break;
++    case 1:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadBlockMap(lumpnum + ML_BLOCKMAP);
++        break;
++    case 2:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadVertexes(lumpnum + ML_VERTEXES);
++        break;
++    case 3:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadSectors(lumpnum + ML_SECTORS);
++        break;
++    case 4:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadSideDefs(lumpnum + ML_SIDEDEFS);
++        break;
++    case 5:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadLineDefs(lumpnum + ML_LINEDEFS);
++        break;
++    case 6:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadSubsectors(lumpnum + ML_SSECTORS);
++        break;
++    case 7:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadNodes(lumpnum + ML_NODES);
++        break;
++    case 8:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        P_LoadSegs(lumpnum + ML_SEGS);
++        break;
++    case 9:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        rejectmatrix = W_CacheLumpNum(lumpnum + ML_REJECT, PU_LEVEL);
++        P_GroupLines();
++        break;
++    case 10:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        bodyqueslot = 0;
++        deathmatch_p = deathmatchstarts;
++        P_LoadThings(lumpnum + ML_THINGS);
++        if (DOOM_CTX->deathmatch)
++            for (i = 0; i < MAXPLAYERS; i++)
++                if (playeringame[i])
++                {
++                    players[i].mo = NULL;
++                    G_DeathMatchSpawnPlayer(i);
++                }
++        break;
++    case 11:
++        iquehead = iquetail = 0;
++        P_SpawnSpecials();
++        break;
++    case 12:
++        if (precache) R_PrecacheLevel();
++        break;
++    default:
++        break;
++    }
++    (void)playermask;
++    (void)skill;
++}
++
++
+ //
+ // P_Init
+ //
+--- a/linuxdoom-1.10/p_setup.h
++++ b/linuxdoom-1.10/p_setup.h
+@@ -38,6 +38,8 @@
+   skill_t	skill);
+ 
+ // Called by startup code.
++void P_SetupLevelRI2Phase (unsigned int phase, int episode, int map, int playermask, skill_t skill);
++
+ void P_Init (void);
+ 
+ #endif
+--- a/linuxdoom-1.10/g_game.c
++++ b/linuxdoom-1.10/g_game.c
+@@ -419,6 +419,48 @@
+  
+  
+ //
++void G_DoLoadLevelRI2Phase(unsigned int phase)
++{
++    int i;
++    switch (phase)
++    {
++    case 1:
++        skyflatnum = R_FlatNumForName(SKYFLATNAME);
++        if (gamemode == commercial || gamemode == pack_tnt || gamemode == pack_plut)
++        {
++            skytexture = R_TextureNumForName("SKY3");
++            if (gamemap < 12) skytexture = R_TextureNumForName("SKY1");
++            else if (gamemap < 21) skytexture = R_TextureNumForName("SKY2");
++        }
++        levelstarttic = gametic;
++        if (wipegamestate == GS_LEVEL) wipegamestate = -1;
++        gamestate = GS_LEVEL;
++        for (i = 0; i < MAXPLAYERS; i++)
++        {
++            if (playeringame[i] && players[i].playerstate == PST_DEAD)
++                players[i].playerstate = PST_REBORN;
++            memset(players[i].frags, 0, sizeof(players[i].frags));
++        }
++        break;
++    case 15:
++        displayplayer = DOOM_CTX->consoleplayer;
++        starttime = I_GetTime();
++        gameaction = ga_nothing;
++        Z_CheckHeap();
++        memset(gamekeydown, 0, sizeof(gamekeydown));
++        joyxmove = joyymove = 0;
++        mousex = mousey = 0;
++        sendpause = sendsave = paused = false;
++        memset(mousebuttons, 0, sizeof(mousebuttons));
++        memset(joybuttons, 0, sizeof(joybuttons));
++        break;
++    default:
++        if (phase >= 2 && phase <= 14)
++            P_SetupLevelRI2Phase(phase - 2, gameepisode, gamemap, 0, gameskill);
++        break;
++    }
++}
++
+ // G_Responder  
+ // Get info needed to make ticcmd_ts for the players.
+ // 
+@@ -1278,7 +1320,7 @@
+ 
+ 
+ void
+-G_InitNew
++G_InitNewRI2Prepare
+ ( skill_t	skill,
+   int		episode,
+   int		map ) 
+@@ -1394,9 +1436,16 @@
+ 	    break;
+ 	} 
+  
+-    G_DoLoadLevel (); 
+-} 
+- 
++    /* LIF/2 continues through G_DoLoadLevelRI2Phase. */
++} 
++ 
++
++void G_InitNew(skill_t skill, int episode, int map)
++{
++    G_InitNewRI2Prepare(skill, episode, map);
++    G_DoLoadLevel();
++}
++
+ 
+ //
+ // DEMO RECORDING 
+--- a/linuxdoom-1.10/g_game.h
++++ b/linuxdoom-1.10/g_game.h
+@@ -34,6 +34,8 @@
+ void G_DeathMatchSpawnPlayer (int playernum);
+ 
+ void G_InitNew (skill_t skill, int episode, int map);
++void G_InitNewRI2Prepare (skill_t skill, int episode, int map);
++void G_DoLoadLevelRI2Phase (unsigned int phase);
+ 
+ // Can be called by the startup code or M_Responder.
+ // A normal game starts at map 1,

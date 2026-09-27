@@ -54,7 +54,6 @@ extern void R_InitTables(void);
 extern void R_InitLightTables(void);
 extern void R_ExecuteSetViewSize(void);
 extern void R_GenerateLookup(int texture_number);
-extern void doom_sbf_reinit_debug_marker(unsigned long marker);
 extern int DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_bytes);
 extern int DoomStateDecodeSplitPrepare(void);
 extern int DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes);
@@ -527,22 +526,16 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
     if (phase == 2u * RI2_REINIT_VIEW_MAP_BATCHES +
                  RI2_REINIT_VIEW_X_BATCHES + 1u)
     {
-        doom_sbf_reinit_debug_marker(100u);
         for (i = 0; i < viewheight; i++)
         {
-            if (i == 0) doom_sbf_reinit_debug_marker(101u);
             /* The view is bounded to 200 rows, so this signed product stays
              * within i32. Avoid the generic wrapping-shift helper here; its
              * negative-input path is not an instruction supported by this
              * SBF VM profile. */
             dy = (i - viewheight / 2) * FRACUNIT + FRACUNIT / 2;
-            if (i == 0) doom_sbf_reinit_debug_marker(102u);
             dy = abs(dy);
-            if (i == 0) doom_sbf_reinit_debug_marker(103u);
             yslope[i] = FixedDiv((viewwidth << detailshift) / 2 * FRACUNIT, dy);
-            if (i == 0) doom_sbf_reinit_debug_marker(104u);
         }
-        doom_sbf_reinit_debug_marker(105u);
         return 0;
     }
     if (phase == 2u * RI2_REINIT_VIEW_MAP_BATCHES +
@@ -1764,22 +1757,28 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
     return 0;
 }
 
-/* REINIT/1 phase 5.  Keep the map loader in its own transaction: on the
- * target SVM its work is substantially larger than the surrounding setup.
- * The preceding phase initializes all image-owned globals and the demo
- * bounds; this phase starts E1M1 using only those current-image values. */
-int doom_engine_ex2_resource_sbf_ri2_split_newgame_start(
+/* DOOM-LIF/2 stages new-game setup and the E1M1 load. Each invocation binds
+ * the same account-backed arena, and engine globals are serialized in the
+ * context between steps. */
+int doom_engine_ex2_resource_sbf_ri2_split_newgame_phase(
+    uint32_t phase,
     uint8_t *context, uint8_t *bootstrap, unsigned long bootstrap_bytes,
     unsigned long *arena_high_water_out)
 {
+    if (phase >= 16u) return RI2_REFUSE_RESOURCE;
     if (doom_ctx_guard(context)) return 199;
     if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
         ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
     if (!ri2_split_arena_bytes(bootstrap_bytes) ||
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
-    gametic = 0;
-    G_InitNew((skill_t)RI2_NEWGAME_SKILL, RI2_NEWGAME_EPISODE, RI2_NEWGAME_MAP);
+    if (phase == 0u) {
+        gametic = 0;
+        G_InitNewRI2Prepare((skill_t)RI2_NEWGAME_SKILL,
+                            RI2_NEWGAME_EPISODE, RI2_NEWGAME_MAP);
+    } else {
+        G_DoLoadLevelRI2Phase(phase);
+    }
     if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     return 0;
