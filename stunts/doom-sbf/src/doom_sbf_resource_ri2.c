@@ -54,6 +54,7 @@ extern void R_InitTables(void);
 extern void R_InitLightTables(void);
 extern void R_ExecuteSetViewSize(void);
 extern void R_GenerateLookup(int texture_number);
+extern void doom_sbf_reinit_debug_marker(unsigned long marker);
 extern int DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_bytes);
 extern int DoomStateDecodeSplitPrepare(void);
 extern int DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes);
@@ -526,13 +527,19 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
     if (phase == 2u * RI2_REINIT_VIEW_MAP_BATCHES +
                  RI2_REINIT_VIEW_X_BATCHES + 1u)
     {
+        doom_sbf_reinit_debug_marker(100u);
         for (i = 0; i < viewheight; i++)
         {
+            if (i == 0) doom_sbf_reinit_debug_marker(101u);
             dy = doom_i32_add(doom_i32_lshift(i - viewheight / 2, FRACBITS),
                               FRACUNIT / 2);
+            if (i == 0) doom_sbf_reinit_debug_marker(102u);
             dy = abs(dy);
+            if (i == 0) doom_sbf_reinit_debug_marker(103u);
             yslope[i] = FixedDiv((viewwidth << detailshift) / 2 * FRACUNIT, dy);
+            if (i == 0) doom_sbf_reinit_debug_marker(104u);
         }
+        doom_sbf_reinit_debug_marker(105u);
         return 0;
     }
     if (phase == 2u * RI2_REINIT_VIEW_MAP_BATCHES +

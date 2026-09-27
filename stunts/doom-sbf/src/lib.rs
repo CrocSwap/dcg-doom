@@ -125,6 +125,11 @@ pub extern "C" fn doom_sbf_phase_marker(phase: u64) {
     );
 }
 
+#[no_mangle]
+pub extern "C" fn doom_sbf_reinit_debug_marker(marker: u64) {
+    solana_program::log::sol_log_64(0x444f_4f4d_5249_3244, marker, 0, 0, 0);
+}
+
 #[inline(always)]
 pub(crate) fn diagnostic_phase(phase: u64) {
     #[cfg(feature = "diagnostic-profile")]
