@@ -1074,8 +1074,8 @@ fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
         .flat_map(|row| {
             let start = row * 320 + strip * 40;
             frame[start..start + 40].iter().copied()
-    })
-    .collect()
+        })
+        .collect()
 }
 
 fn render_regression_cursor_sequence(frames: &[u32], step: u32) -> bool {

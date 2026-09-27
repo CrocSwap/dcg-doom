@@ -204,6 +204,14 @@ static void ri2_render_arrays_restore(const ri2_render_arrays_t *arrays, int lin
     free(arrays->sector_marks);
 }
 
+static void ri2_render_arrays_reset_sector_marks(int sector_count)
+{
+    int i;
+    /* -1 cannot match the positive fixed per-strip validcount, even if this
+     * context was rendered by the old image before an upgrade. */
+    for (i = 0; i < sector_count; i++) sectors[i].validcount_m = -1;
+}
+
 static uint32_t ri2_u32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -1806,6 +1814,7 @@ int doom_engine_rsn3_render_static(
         return RI2_REFUSE_OUTPUT;
     }
     ri2_render_begin(strip_id, &ri2_saved);
+    ri2_render_arrays_reset_sector_marks(numsectors);
     R_RenderPlayerView(&players[displayplayer]);
     ri2_render_end(&ri2_saved);
     ri2_render_arrays_restore(&ri2_arrays, DOOM_CTX->numlines, numsectors);
