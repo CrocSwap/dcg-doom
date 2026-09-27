@@ -531,8 +531,11 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
         for (i = 0; i < viewheight; i++)
         {
             if (i == 0) doom_sbf_reinit_debug_marker(101u);
-            dy = doom_i32_add(doom_i32_lshift(i - viewheight / 2, FRACBITS),
-                              FRACUNIT / 2);
+            /* The view is bounded to 200 rows, so this signed product stays
+             * within i32. Avoid the generic wrapping-shift helper here; its
+             * negative-input path is not an instruction supported by this
+             * SBF VM profile. */
+            dy = (i - viewheight / 2) * FRACUNIT + FRACUNIT / 2;
             if (i == 0) doom_sbf_reinit_debug_marker(102u);
             dy = abs(dy);
             if (i == 0) doom_sbf_reinit_debug_marker(103u);
