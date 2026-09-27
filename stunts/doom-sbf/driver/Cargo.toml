@@ -69,6 +69,10 @@ name = "live_input_gate"
 required-features = ["ctx-engine"]
 
 [[bin]]
+name = "r15_upgrade_compat"
+required-features = ["ctx-engine", "sim-transport"]
+
+[[bin]]
 name = "worst_view_census"
 required-features = ["ctx-engine"]
 
