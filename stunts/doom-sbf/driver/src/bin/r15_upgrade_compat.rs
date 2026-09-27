@@ -94,7 +94,7 @@ async fn submit(
     // would reproduce the transaction signature and be rejected as
     // AlreadyProcessed before the program can demonstrate idempotency. A slot
     // warp gives each submitted transaction a fresh, ordinary blockhash.
-    let next_slot = ctx.banks_client.get_slot().await? + 1;
+    let next_slot = ctx.banks_client.get_root_slot().await? + 1;
     ctx.warp_to_slot(next_slot)?;
     let blockhash = ctx.last_blockhash;
     let instructions = [
