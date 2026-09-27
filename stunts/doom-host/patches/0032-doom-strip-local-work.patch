@@ -1,8 +1,23 @@
 diff --git a/linuxdoom-1.10/r_plane.c b/linuxdoom-1.10/r_plane.c
-index cc4ba2b..0e4b9a1 100644
+index cc4ba2b..aa5f3fd 100644
 --- a/linuxdoom-1.10/r_plane.c
 +++ b/linuxdoom-1.10/r_plane.c
-@@ -372,7 +372,17 @@ void R_DrawPlanes (void)
+@@ -131,6 +131,14 @@ R_MapPlane
+     }
+ #endif
+ 
++    if ((doom_render_fuzz_columns >> 30) & 3u)
++    {
++	int clip_left = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u);
++	int clip_right = clip_left + 40;
++	if (x2 < clip_left || x1 >= clip_right)
++	    return;
++    }
++
+     if (planeheight != cachedheight[y])
+     {
+ 	cachedheight[y] = planeheight;
+@@ -372,7 +380,16 @@ void R_DrawPlanes (void)
      int			x;
      int			stop;
      int			angle;
@@ -10,7 +25,6 @@ index cc4ba2b..0e4b9a1 100644
 +    int			draw_stop;
 +    int			clip_left;
 +    int			clip_right;
-+    int			y;
 +    int			clip_mode;
  				
 +    clip_mode = (doom_render_fuzz_columns >> 30) & 3u;
@@ -20,7 +34,7 @@ index cc4ba2b..0e4b9a1 100644
  #ifdef RANGECHECK
      if (ds_p - drawsegs > MAXDRAWSEGS)
  	I_Error ("R_DrawPlanes: drawsegs overflow (%i)",
-@@ -392,6 +402,9 @@ void R_DrawPlanes (void)
+@@ -392,6 +409,9 @@ void R_DrawPlanes (void)
  	if (pl->minx > pl->maxx)
  	    continue;
  
@@ -30,7 +44,7 @@ index cc4ba2b..0e4b9a1 100644
  	
  	// sky flat
  	if (pl->picnum == skyflatnum)
-@@ -404,7 +417,14 @@ void R_DrawPlanes (void)
+@@ -404,7 +424,14 @@ void R_DrawPlanes (void)
  	    //  by INVUL inverse mapping.
  	    dc_colormap = colormaps;
  	    dc_texturemid = skytexturemid;
@@ -46,68 +60,6 @@ index cc4ba2b..0e4b9a1 100644
  	    {
  		dc_yl = PL_TOP(pl,x);
  		dc_yh = PL_BOTTOM(pl,x);
-@@ -441,12 +461,56 @@ void R_DrawPlanes (void)
- 		
- 	stop = pl->maxx + 1;
- 
--	for (x=pl->minx ; x<= stop ; x++)
-+	if (clip_mode)
-+	{
-+	    draw_start = pl->minx < clip_left ? clip_left : pl->minx;
-+	    draw_stop = stop < clip_right ? stop : clip_right;
-+
-+	    /* Start spans in the first owned column. This avoids reading or closing
-+	     * span state from the preceding strip. */
-+	    if (draw_start <= pl->maxx)
-+	    {
-+		for (y=PL_TOP(pl,draw_start) ;
-+		    y<=PL_BOTTOM(pl,draw_start) && y<viewheight ; y++)
-+		    spanstart[y] = draw_start;
-+		draw_start++;
-+	    }
-+
-+	    for (x=draw_start ; x<draw_stop ; x++)
-+	    {
-+		R_MakeSpans(x,PL_TOP(pl,x-1),
-+			    PL_BOTTOM(pl,x-1),
-+			    PL_TOP(pl,x),
-+			    PL_BOTTOM(pl,x));
-+	    }
-+
-+	    if (stop < clip_right)
-+	    {
-+		/* The plane ends in this strip. Consume its existing right sentinel. */
-+		R_MakeSpans(stop,PL_TOP(pl,stop-1),
-+			    PL_BOTTOM(pl,stop-1),
-+			    PL_TOP(pl,stop),
-+			    PL_BOTTOM(pl,stop));
-+	    }
-+	    else
-+	    {
-+		/* Close spans at the right edge without reading or building columns
-+		 * owned by the next strip. */
-+		x = clip_right - 1;
-+		for (y=PL_TOP(pl,x) ; y<=PL_BOTTOM(pl,x) && y<viewheight ; y++)
-+		    if (spanstart[y] <= x)
-+			R_MapPlane(y,spanstart[y],x);
-+	    }
-+	}
-+	else
- 	{
--	    R_MakeSpans(x,PL_TOP(pl,x-1),
--			PL_BOTTOM(pl,x-1),
--			PL_TOP(pl,x),
--			PL_BOTTOM(pl,x));
-+	    for (x=pl->minx ; x<= stop ; x++)
-+	    {
-+		R_MakeSpans(x,PL_TOP(pl,x-1),
-+			    PL_BOTTOM(pl,x-1),
-+			    PL_TOP(pl,x),
-+			    PL_BOTTOM(pl,x));
-+	    }
- 	}
- 	
- 	Z_ChangeTag (ds_source, PU_CACHE);
 diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
 index 986a74b..9fff819 100644
 --- a/linuxdoom-1.10/r_segs.c
