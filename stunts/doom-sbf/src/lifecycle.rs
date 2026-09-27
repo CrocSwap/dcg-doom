@@ -922,7 +922,7 @@ fn validate_render_batch(
     Ok(())
 }
 
-fn process_close_pre(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     if accounts.len() < 9 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -984,7 +984,7 @@ fn process_close_pre(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     )
 }
 
-fn process_close_final(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     if accounts.len() < 4 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -1044,7 +1044,11 @@ fn process_close_final(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramRes
     close_one(continuation, payer)
 }
 
-fn process_close(program: &Pubkey, accounts: &[AccountInfo], phase: u32) -> ProgramResult {
+fn process_close<'a>(
+    program: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    phase: u32,
+) -> ProgramResult {
     match phase {
         0 => process_close_pre(program, accounts),
         1 => process_close_final(program, accounts),
