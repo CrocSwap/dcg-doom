@@ -180,12 +180,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         check_layout(row)?;
     }
 
+    env::set_var("BPF_OUT_DIR", image.parent().ok_or("image parent")?);
+    env::set_var("SBF_OUT_DIR", image.parent().ok_or("image parent")?);
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
     bank.set_compute_max_units(u64::from(COMPUTE_LIMIT));
     bank.add_program("doom_sbf", program, None);
-    env::set_var("BPF_OUT_DIR", image.parent().ok_or("image parent")?);
-    env::set_var("SBF_OUT_DIR", image.parent().ok_or("image parent")?);
     let local_authority = Keypair::new();
 
     let rows = manifest["accounts"].as_array().unwrap();
@@ -285,7 +285,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         render_cu.push(submit(&mut ctx, ix, &[]).await?);
         let strip_data = account_data(&mut ctx, strip_keys[strip as usize]).await?;
         let strip_view = rsn3::validate_strip(&strip_data)?;
-        if strip_view.cursor != cursor || strip_view.strip_id != strip {
+        if strip_view.cursor != cursor || strip_view.strip_id != u32::from(strip) {
             return Err(format!("rendered strip {strip} header does not match R15 cursor" ).into());
         }
         if strip == 0 { first_strip = Some(strip_data); }
@@ -312,7 +312,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // authority, then run ADVANCE/5. No REBUILD operation is issued.
     let local_buffer = account_data(&mut ctx, buffer).await?;
     let slot_offset = sim2::BUFFER_HEADER_BYTES + cursor as usize * sim2::SLOT_BYTES;
-    if cursor as usize >= before_view.capacity || slot_offset + sim2::SLOT_BYTES > local_buffer.len() {
+    if cursor >= before_view.capacity || slot_offset + sim2::SLOT_BYTES > local_buffer.len() {
         return Err("R15 cursor is outside its captured input buffer".into());
     }
     if local_buffer[slot_offset..slot_offset + sim2::SLOT_BYTES].iter().all(|b| *b == 0) {
