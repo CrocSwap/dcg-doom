@@ -29,16 +29,17 @@
 #    one without the other is the trap: 64/s at 740,000 CU loses every strip.
 #
 #  * the image. 2026-09-27 the program is qualified for the in-place LIF/2
-#    reinitialise image (out/runs/doom-reinit-fix2-2026-09-27/, sha
-#    4bb1adf3..., 1,067,616 B) and the relayer must verify that exact image.
-#    This image adds batched E1M1 setup used by R15 REINIT.
+#    reinitialise image (out/runs/doom-reinit-fix2-2026-09-27/, 1,067,616 B).
+#    This image adds batched E1M1 setup used by R15 REINIT. The operator copies
+#    the receipt-verified `.so` to IMAGE; this script derives its local digest
+#    and size, and `preflight` reads the live chain image before it sends.
 #    The earlier four-buffer image made the snapshot name in
 #    RENDER-BUFFERED mandatory: a zero name is refused as malformed, so a
 #    relayer whose `buffered_render_request` does not carry the account's own
-#    hash spends nine transactions a frame to be told 301. The hash below is the
-#    one the live program was verified to carry, and `preflight` re-reads it from
-#    the chain, so a host running an older relayer against the newer program
-#    refuses to start rather than burning transactions.
+#    hash spends nine transactions a frame to be told 301. `preflight` compares
+#    the derived local digest and size to the image read from chain, so a host
+#    running an older relayer against the newer program refuses to start rather
+#    than burning transactions.
 #
 #  * the render buffer count. BUFFERS is 1..4, the program's own `BUFFER_COUNT`.
 #    Buffers 0 and 1 are the accounts a two-buffer session already used, so
@@ -126,7 +127,8 @@
 #    readback then reads the eight strip accounts only, and the snapshot account
 #    -- the one account a snapshot transaction writes, and nothing else -- is out
 #    of its bank view. The payload's hash is still recomputed and still has to
-#    match the name the strips are sent with. Default is the old serial path.
+#    match the name the strips are sent with. Default is the measured 09-26
+#    overlap path.
 #
 # Usage: start.sh [name] [seconds] [strip-rate]
 set -eu
@@ -137,10 +139,22 @@ STRIP_RATE=${3:-64}
 REPO=${RELAYER_REPO:-$RD}
 PIN=${PIN:-$REPO/scripts/doom_relayer_deploy.json}
 PY=${PY:-/home/ec2-user/basanos-main/.venv/bin/python}
+# The release image is copied to the host beside the relayer. Derive its
+# identity from those exact bytes unless the operator supplies the digest and
+# size from the retained build receipt. This keeps the source pin independent
+# of the image digest while the verified buffer writer still enforces the
+# reviewed digest during an upgrade.
+IMAGE=${IMAGE:-$RD/image/doom_sbf.so}
+if [ ! -f "$IMAGE" ]; then
+  echo "missing relayer image: $IMAGE" >&2
+  exit 2
+fi
+IMAGE_SHA=${IMAGE_SHA:-$(sha256sum "$IMAGE" | awk '{print $1}')}
+IMAGE_BYTES=${IMAGE_BYTES:-$(wc -c < "$IMAGE" | tr -d ' ')}
 # `overlap` is the one value that is not a boolean, because the overlap is only
 # defined against the strips-only readback and asking for one without the other
 # is asking for a flag that cannot work.
-case "${READBACK:-serial}" in
+case "${READBACK:-overlap}" in
   serial) readback_flags=() ;;
   overlap) readback_flags=(--pre-read-snapshot --overlap-readback) ;;
   pre-read) readback_flags=(--pre-read-snapshot) ;;
@@ -181,8 +195,8 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --run-dir "$RD/out/$NAME" \
   --rpc-a "$rpc_a" --rpc-b "$rpc_b" \
   ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-45} \
-  --image-sha256 4bb1adf3675e35c78f543cd1ecf96cfc097b3a34b6e3a7ca55793eb0b66aea75 \
-  --image-bytes 1067616 \
+  --image-sha256 "$IMAGE_SHA" \
+  --image-bytes "$IMAGE_BYTES" \
   --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-4} \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth ${ADV_PIPELINE_DEPTH:-4} --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \

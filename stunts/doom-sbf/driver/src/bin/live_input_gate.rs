@@ -2823,7 +2823,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // committed start state has a live player, a use command is ordinary input
     // and commits a tic.  It is the same command the dead-player session below
     // is refused.
-    let use_command = [0u8, 0, 0, 0x01];
+    let use_command = [0u8, 0, 0, sim2::BT_USE];
     let use_batch = vec![use_command; 1].concat();
     let use_deposit = session.deposit_ix(cursor, &use_batch);
     let deposited = session
@@ -2843,7 +2843,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let use_view = session.view().await?;
     let live_use = json!({
         "player_state_at_start": common::PST_LIVE,
-        "command_buttons": 1,
+        "command_buttons": sim2::BT_USE,
         "committed": true,
         "cursor_before": cursor,
         "cursor_after": use_view.cursor,
@@ -2912,18 +2912,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if moved_cursor != 4 {
         return Err("the dead slot did not commit its tics".into());
     }
+
+    // Attack is bit 0x01, separate from Use. A dead-player Attack still runs
+    // as ordinary input and advances the cursor rather than requesting RESET/9.
+    let attack = [0u8, 0, 0, sim2::BT_ATTACK];
+    let deposit = dead.deposit_ix(4, &attack);
+    let deposited = dead
+        .send(vec![deposit], &[&dead_authority], cu_limit())
+        .await?;
+    if deposited.result.is_err() {
+        return Err(format!("dead-slot attack deposit: {:?}", deposited.result).into());
+    }
+    dead.cursor_before = 4;
+    let attack_advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let attacked = dead
+        .send(vec![attack_advance], &[&dead_authority], cu_limit())
+        .await?;
+    if attacked.result.is_err() {
+        return Err(format!("a dead player's Attack was refused: {:?}", attacked.result).into());
+    }
+    let dead_view = dead.view().await?;
+    if dead_view.cursor != 5 || dead_view.halt != 0 {
+        return Err("a dead player's Attack did not commit as ordinary input".into());
+    }
+    let dead_attack = json!({
+        "player_state_at_start": common::PST_DEAD,
+        "command_buttons": sim2::BT_ATTACK,
+        "committed": true,
+        "cursor_before": 4,
+        "cursor_after": dead_view.cursor,
+        "halt": dead_view.halt,
+        "cu": base::units(&attacked)?,
+    });
     let state_before_use = dead.data(dead_state_signer.pubkey()).await?;
 
     // (b) the use press is refused 295 and commits nothing.
-    let press = [0u8, 0, 0, 0x01];
-    let deposit = dead.deposit_ix(4, &press);
+    let press = [0u8, 0, 0, sim2::BT_USE];
+    let deposit = dead.deposit_ix(5, &press);
     let deposited = dead
         .send(vec![deposit], &[&dead_authority], cu_limit())
         .await?;
     if deposited.result.is_err() {
         return Err(format!("dead-slot use deposit: {:?}", deposited.result).into());
     }
-    dead.cursor_before = 4;
+    dead.cursor_before = 5;
     let advance = dead.advance_ix(sim2::ADVANCE_STARVED, 1);
     let refused = dead
         .send(vec![advance], &[&dead_authority], cu_limit())
@@ -2939,7 +2971,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state_after_use = dead.data(dead_state_signer.pubkey()).await?;
     let view_after_use = dead.view().await?;
     if state_after_use != state_before_use
-        || view_after_use.cursor != 4
+        || view_after_use.cursor != 5
         || view_after_use.halt != 0
         || view_after_use.state_root != dead_view.state_root
     {
@@ -2994,6 +3026,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "committed_start_player_state": common::PST_DEAD,
         "why": "vanilla single-player has no use-to-respawn: G_Ticker calls G_DoReborn only for PST_REBORN, and in single player G_DoReborn sets gameaction = ga_loadlevel, which this profile halts on.  So the press cannot resurrect a run; the guard refuses it with its own code and the answer is RESET/9.",
         "dead_player_tics_commit": moved_cursor == 4,
+        "dead_player_attack": dead_attack,
         "init_cu": dead_init_cu,
         "move_batch_cu": base::units(&moved)?,
         "use_press_refused_with": restart_code,

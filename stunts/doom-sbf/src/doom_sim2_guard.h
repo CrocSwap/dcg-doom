@@ -44,8 +44,11 @@
 #define DOOM_SIM2_HALT_PAUSED 4
 #define DOOM_SIM2_HALT_DEMO_END 5
 #define DOOM_SIM2_REFUSE_COMMAND 232
+/* These mirror the pinned Doom d_event.h buttoncode_t values. */
+#define DOOM_SIM2_BT_ATTACK 0x01u
+#define DOOM_SIM2_BT_USE 0x02u
+#define DOOM_SIM2_BT_CHANGE 0x04u
 #define DOOM_SIM2_BT_SPECIAL 0x80u
-#define DOOM_SIM2_BT_USE 0x01u
 /* A dead player asked to restart.  Not a halt: the tic does not run, nothing
  * is committed, and the meta keeps whatever halt state it had. */
 #define DOOM_SIM2_REFUSE_RESTART 295
