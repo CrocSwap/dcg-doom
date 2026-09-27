@@ -20,7 +20,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::Message;
 use solana_program::hash::hashv;
-use solana_program_test::ProgramTest;
+use solana_program_test::{ProgramTest, ProgramTestBanksClientExt};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
