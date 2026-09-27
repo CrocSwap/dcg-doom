@@ -1,7 +1,7 @@
 #!/bin/sh
 # Reproducible build of the Doom SBF image from a named commit.
 #
-#   build-sbf-reproducible.sh <repo> <commit> <out-dir> <features> <target-root>
+#   build-sbf-reproducible.sh <repo> <commit> <out-dir> <features> <target-root> [--expect-sha256 <digest>]
 #
 # Review F2 (2026-09-21): the DOOM-SIM/1 image was built from uncommitted
 # (pre-rustfmt) source.  This wrapper only builds committed source:
@@ -27,8 +27,8 @@
 # directories and is deleted on success.
 set -eu
 
-if [ $# -ne 5 ]; then
-    echo "usage: $0 <repo> <commit> <out-dir> <features> <target-root>" >&2
+if [ $# -ne 5 ] && [ $# -ne 7 ]; then
+    echo "usage: $0 <repo> <commit> <out-dir> <features> <target-root> [--expect-sha256 <digest>]" >&2
     exit 2
 fi
 REPO=$1
@@ -36,6 +36,22 @@ COMMIT=$(git -C "$REPO" rev-parse --verify "$2^{commit}")
 OUT=$3
 FEATURES=$4
 TARGET_ROOT=$5
+EXPECTED_SHA256=
+if [ $# -eq 7 ]; then
+    if [ "$6" != "--expect-sha256" ]; then
+        echo "expected --expect-sha256 after <target-root>" >&2
+        exit 2
+    fi
+    EXPECTED_SHA256=$7
+    if [ "${#EXPECTED_SHA256}" -ne 64 ]; then
+        echo "--expect-sha256 must be 64 hexadecimal characters" >&2
+        exit 2
+    fi
+    case "$EXPECTED_SHA256" in
+        *[!0-9a-fA-F]*) echo "--expect-sha256 must be 64 hexadecimal characters" >&2; exit 2 ;;
+    esac
+    EXPECTED_SHA256=$(printf '%s' "$EXPECTED_SHA256" | tr 'A-F' 'a-f')
+fi
 GIT=${GIT:-git}
 SDK=${SBF_SDK_PATH:-/private/tmp/basanos-sbf-sdk-v151-20260920}
 SEED=${DOOM_UPSTREAM_SEED:?set DOOM_UPSTREAM_SEED to a clone containing a77dfb96}
@@ -113,6 +129,10 @@ if [ "$IMAGE1" != "$IMAGE2" ] || [ "$MANIFEST1" != "$MANIFEST2" ]; then
     echo "non-reproducible: image $IMAGE1 vs $IMAGE2, manifest $MANIFEST1 vs $MANIFEST2" >&2
     exit 4
 fi
+if [ -n "$EXPECTED_SHA256" ] && [ "$IMAGE1" != "$EXPECTED_SHA256" ]; then
+    echo "image SHA-256 mismatch: expected $EXPECTED_SHA256, got $IMAGE1" >&2
+    exit 4
+fi
 mv "$OUT/doom_sbf.1.so" "$OUT/doom_sbf.so"
 mv "$OUT/doom_ex2_source_manifest.1.json" "$OUT/doom_ex2_source_manifest.json"
 rm -f "$OUT/doom_sbf.2.so" "$OUT/doom_ex2_source_manifest.2.json"
@@ -141,6 +161,8 @@ sys.exit(1 if bad else 0)
 PY
 
 SIZE=$(wc -c < "$OUT/doom_sbf.so" | tr -d ' ')
+EXPECTED_JSON=null
+if [ -n "$EXPECTED_SHA256" ]; then EXPECTED_JSON="\"$EXPECTED_SHA256\""; fi
 cat >"$OUT/build-receipt.json" <<EOF
 {
   "commit": "$COMMIT",
@@ -148,6 +170,7 @@ cat >"$OUT/build-receipt.json" <<EOF
   "stunts_tree": "$STUNTS_TREE",
   "features": "$FEATURES",
   "image_sha256": "$IMAGE1",
+  "expected_sha256": $EXPECTED_JSON,
   "image_bytes": $SIZE,
   "manifest_sha256": "$MANIFEST1",
   "double_build_equal": true,

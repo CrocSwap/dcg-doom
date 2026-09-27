@@ -150,6 +150,10 @@ pub const BUFFER_BYTES: usize = BUFFER_HEADER_BYTES + BUFFER_CAPACITY * SLOT_BYT
 /// Leave the one-past-session value representable when INIT binds a capacity.
 pub const MAX_GAME_TIC: u32 = i32::MAX as u32;
 pub const SLOT_WRITTEN: u8 = 1;
+/// Doom `d_event.h` buttoncode_t bits; kept in sync with the shared C guard.
+pub const BT_ATTACK: u8 = 0x01;
+pub const BT_USE: u8 = 0x02;
+pub const BT_CHANGE: u8 = 0x04;
 pub const BT_SPECIAL: u8 = 0x80;
 
 pub fn buffer_bytes(capacity: usize) -> Option<usize> {

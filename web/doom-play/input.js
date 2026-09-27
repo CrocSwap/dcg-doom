@@ -26,11 +26,12 @@ export const MAX_INPUT_BYTES = INPUT_HEADER_BYTES + MAX_COMMANDS_PER_BATCH * COM
 // refuse it here too so a rejected batch never costs a round trip.
 export const BT_SPECIAL = 0x80;
 
-// Vanilla Doom button bits. The program only enforces the 0x80 rule; the rest
-// are the engine's own BT_* values.
+// Vanilla Doom d_event.h button bits. The program only enforces the 0x80 rule;
+// the rest are the engine's own BT_* values.
 export const BT_ATTACK = 0x01;
 export const BT_USE = 0x02;
-export const BT_SPEED = 0x04;
+export const BT_CHANGE = 0x04;
+export const BT_SPEED = BT_CHANGE;
 
 // Version 2 signs a key state, not an absolute tic or a pre-rendered command
 // batch. The relayer chooses the first free tic and the sender converts this
