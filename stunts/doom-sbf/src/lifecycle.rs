@@ -369,7 +369,7 @@ fn expected_render_account(
         Ok((snapshot, rsn3::SNAPSHOT_BYTES))
     } else {
         let flat = usize::from(index) - 4;
-        let buffer = 1 + (flat / 8) as u8;
+        let buffer = (flat / 8) as u8;
         let strip = (flat % 8) as u8;
         let (snapshot, _) = rsn3::buffered_snapshot_address(program, context, buffer)
             .ok_or_else(|| refuse(REFUSE_CLEAR))?;
