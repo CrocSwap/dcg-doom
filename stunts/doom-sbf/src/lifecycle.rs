@@ -361,7 +361,6 @@ fn init_placeholders(accounts: &[AccountInfo]) -> ProgramResult {
 
 fn process_begin(program: &Pubkey, accounts: &[AccountInfo], request: Request) -> ProgramResult {
     validate_base(program, accounts)?;
-    let (capacity, bump, rent_payer) = read_meta_bindings(program, accounts)?;
     if !accounts[META].is_writable || !accounts[BUFFER].is_writable {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -377,6 +376,9 @@ fn process_begin(program: &Pubkey, accounts: &[AccountInfo], request: Request) -
             return Err(refuse(REFUSE_PENDING));
         }
     }
+    // BEGIN zeroes SIM2 metadata. A retry of the same generation must match
+    // the continuation marker before trying to decode that now-zero metadata.
+    let (capacity, bump, rent_payer) = read_meta_bindings(program, accounts)?;
     init_placeholders(accounts)?;
     accounts[CONTEXT].try_borrow_mut_data()?[e2r::CONTEXT_CHECKPOINT_OFFSET
         ..e2r::CONTEXT_CHECKPOINT_OFFSET + e2r::CONTEXT_CHECKPOINT_BYTES]
