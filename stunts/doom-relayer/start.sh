@@ -28,9 +28,11 @@
 #    nothing reaches, and STRIP_CU_LIMIT defaults to 1,400,000 with it. Setting
 #    one without the other is the trap: 64/s at 740,000 CU loses every strip.
 #
-#  * the image. 2026-09-26 06:2x UTC the program was upgraded to the four-buffer
-#    image (out/runs/doom-4-buffers-20260926/, sha 4bb632e2..., 916,496 B) and
-#    the relayer followed it. That image made the snapshot name in
+#  * the image. 2026-09-27 the program is qualified for the in-place LIF/2
+#    reinitialise image (out/runs/doom-reinit-fix2-2026-09-27/, sha
+#    4bb1adf3..., 1,067,616 B) and the relayer must verify that exact image.
+#    This image adds batched E1M1 setup used by R15 REINIT.
+#    The earlier four-buffer image made the snapshot name in
 #    RENDER-BUFFERED mandatory: a zero name is refused as malformed, so a
 #    relayer whose `buffered_render_request` does not carry the account's own
 #    hash spends nine transactions a frame to be told 301. The hash below is the
@@ -179,8 +181,8 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --run-dir "$RD/out/$NAME" \
   --rpc-a "$rpc_a" --rpc-b "$rpc_b" \
   ${RPC_C:+--rpc-c "$RPC_C"} --send-pacer-rate ${SEND_RATE:-45} \
-  --image-sha256 4bb632e21d98f1dfbce8f54658c2b63d08c8a72b06a32107ea00d8a293658ba3 \
-  --image-bytes 916496 \
+  --image-sha256 4bb1adf3675e35c78f543cd1ecf96cfc097b3a34b6e3a7ca55793eb0b66aea75 \
+  --image-bytes 1067616 \
   --seconds "$SECONDS_LIMIT" --strip-rate "$STRIP_RATE" --render-buffers ${BUFFERS:-4} \
   --advance-tics ${ADV_TICS:-4} --advance-pipeline-depth ${ADV_PIPELINE_DEPTH:-4} --sweep-rate ${SWEEP_RATE:-8} \
   --input-tics-per-second 35 --spend-cap-fogo ${SPEND_CAP:-2} \
