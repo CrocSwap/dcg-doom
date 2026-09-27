@@ -686,10 +686,6 @@ fn close_pre_accounts(set: &LocalSet) -> Vec<AccountMeta> {
         accounts[8].is_writable = false;
         accounts.push(meta(set.rent_payer, true, false));
     }
-    accounts.extend(
-        (0..lifecycle::CLOSE_RENDER_BATCH)
-            .map(|index| meta(render_target(set, index), true, false)),
-    );
     accounts
 }
 
@@ -706,11 +702,9 @@ fn close_base_accounts(set: &LocalSet) -> Vec<AccountMeta> {
     accounts
 }
 
-fn close_render_batch_accounts(set: &LocalSet, phase: u8) -> Vec<AccountMeta> {
-    let first = usize::from(phase) * lifecycle::CLOSE_RENDER_BATCH;
-    let end = (first + lifecycle::CLOSE_RENDER_BATCH).min(lifecycle::CLOSE_RENDER_TARGETS);
+fn close_render_target_accounts(set: &LocalSet, index: usize) -> Vec<AccountMeta> {
     let mut accounts = close_base_accounts(set);
-    accounts.extend((first..end).map(|index| meta(render_target(set, index), true, false)));
+    accounts.push(meta(render_target(set, index), true, false));
     accounts
 }
 
@@ -769,7 +763,6 @@ async fn close_set(
     }
     let early_closed = [set.state, set.mirror, set.buffer, set.controller, set.frame]
         .into_iter()
-        .chain((0..lifecycle::CLOSE_RENDER_BATCH).map(|index| render_target(set, index)))
         .collect::<Vec<_>>();
     for key in early_closed {
         if let Some(account) = ctx.banks_client.get_account(key).await? {
@@ -779,17 +772,31 @@ async fn close_set(
         }
     }
     let mut phase_units = vec![close_pre_units];
-    for phase in 1..lifecycle::CLOSE_RESIZE_FIRST_PHASE as u8 {
-        let close_batch = Instruction {
-            program_id: program,
-            accounts: close_render_batch_accounts(set, phase),
-            data: lifecycle::encode_close_phase(phase).to_vec(),
-        };
-        let units = submit(ctx, close_batch, &[authority]).await?;
-        if units > CLOSE_CU_LIMIT {
-            return Err(format!("CLOSE/{phase} used {units} CU, over {CLOSE_CU_LIMIT}").into());
+    for index in 0..lifecycle::CLOSE_RENDER_TARGETS {
+        let phase = (index + 1) as u8;
+        let target = render_target(set, index);
+        for attempt in 0..=5 {
+            let close_target = Instruction {
+                program_id: program,
+                accounts: close_render_target_accounts(set, index),
+                data: lifecycle::encode_close_phase(phase).to_vec(),
+            };
+            let units = submit(ctx, close_target, &[authority]).await?;
+            if units > CLOSE_CU_LIMIT {
+                return Err(format!("CLOSE/{phase} used {units} CU, over {CLOSE_CU_LIMIT}").into());
+            }
+            phase_units.push(units);
+            let remaining = ctx.banks_client.get_account(target).await?;
+            if remaining.is_none_or(|account| account.owner != program) {
+                break;
+            }
+            if index >= 4
+                || attempt == 5
+                || remaining.is_some_and(|account| account.data.is_empty())
+            {
+                return Err(format!("CLOSE/{phase} did not finish target {target}").into());
+            }
         }
-        phase_units.push(units);
     }
     for phase in lifecycle::CLOSE_RESIZE_FIRST_PHASE as u8..lifecycle::CLOSE_FINAL_PHASE as u8 {
         let resize = Instruction {

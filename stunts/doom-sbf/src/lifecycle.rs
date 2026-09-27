@@ -30,15 +30,12 @@ pub const REFUSE_CLOSE: u32 = 325;
 
 const BASE_ACCOUNT_COUNT: usize = 15;
 pub const CLOSE_RENDER_TARGETS: usize = 36;
-pub const CLOSE_RENDER_BATCH: usize = 2;
-pub const CLOSE_RENDER_BATCH_COUNT: usize =
-    (CLOSE_RENDER_TARGETS + CLOSE_RENDER_BATCH - 1) / CLOSE_RENDER_BATCH;
-pub const CLOSE_RESIZE_FIRST_PHASE: u32 = CLOSE_RENDER_BATCH_COUNT as u32;
+pub const CLOSE_RESIZE_FIRST_PHASE: u32 = CLOSE_RENDER_TARGETS as u32 + 1;
 const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 256 * 1024;
 const CLOSE_CONTEXT_SHRINK_STEPS: usize =
     (resource_sbf::CONTEXT_BYTES + CLOSE_CONTEXT_SHRINK_CHUNK - 1) / CLOSE_CONTEXT_SHRINK_CHUNK;
-const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9 + CLOSE_RENDER_BATCH;
-const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10 + CLOSE_RENDER_BATCH;
+const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9;
+const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10;
 const CLOSE_BASE_SHARED_ACCOUNT_COUNT: usize = 4;
 const CLOSE_BASE_SEPARATE_ACCOUNT_COUNT: usize = 5;
 pub const CLOSE_FINAL_PHASE: u32 = CLOSE_RESIZE_FIRST_PHASE + CLOSE_CONTEXT_SHRINK_STEPS as u32 - 1;
@@ -905,41 +902,6 @@ fn close_marker_matches(
         && data[352..].iter().all(|byte| *byte == 0))
 }
 
-fn validate_render_batch(
-    program: &Pubkey,
-    context: &Pubkey,
-    accounts: &[AccountInfo],
-    render_start: usize,
-    first_index: usize,
-    count: usize,
-) -> ProgramResult {
-    let mut seen = Vec::with_capacity(count + render_start);
-    for account in accounts.iter().take(render_start) {
-        seen.push(*account.key);
-    }
-    for offset in 0..count {
-        let target = accounts
-            .get(render_start + offset)
-            .ok_or(refuse(REFUSE_ACCOUNTS))?;
-        let index = first_index + offset;
-        let (expected, bytes) = expected_render_account(program, context, index as u8)
-            .map_err(|_| refuse(REFUSE_CLOSE))?;
-        if target.key != &expected
-            || target.owner != program
-            || !target.is_writable
-            || target.data_len() != bytes
-            || seen.contains(target.key)
-        {
-            return Err(refuse(REFUSE_CLOSE));
-        }
-        seen.push(*target.key);
-    }
-    if seen.iter().collect::<std::collections::BTreeSet<_>>().len() != seen.len() {
-        return Err(refuse(REFUSE_ACCOUNTS));
-    }
-    Ok(())
-}
-
 fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     if accounts.len() < 9 {
         return Err(refuse(REFUSE_ACCOUNTS));
@@ -958,7 +920,6 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
     let authority = &accounts[8];
     let rent_payer = close_meta_payer(program, context, meta, authority)?;
     let shared_payer = authority.key == &rent_payer;
-    let render_start = if shared_payer { 9 } else { 10 };
     let expected_count = if shared_payer {
         CLOSE_PRE_SHARED_ACCOUNT_COUNT
     } else {
@@ -988,19 +949,7 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
         return Err(refuse(REFUSE_CLOSE));
     }
     drop(meta_data);
-    validate_render_batch(
-        program,
-        context.key,
-        accounts,
-        render_start,
-        0,
-        CLOSE_RENDER_BATCH,
-    )?;
-
     for index in [1usize, 2, 4, 5, 6] {
-        close_one(&accounts[index], payer)?;
-    }
-    for index in render_start..accounts.len() {
         close_one(&accounts[index], payer)?;
     }
     close_marker_write(
@@ -1010,16 +959,16 @@ fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> P
         meta.key,
         &rent_payer,
         1,
-        CLOSE_RENDER_BATCH,
+        0,
     )
 }
 
-fn process_close_render_batch<'a>(
+fn process_close_render_target<'a>(
     program: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     phase: u32,
 ) -> ProgramResult {
-    if phase == 0 || phase >= CLOSE_RENDER_BATCH_COUNT as u32 {
+    if phase == 0 || phase >= CLOSE_RESIZE_FIRST_PHASE {
         return Err(refuse(REFUSE_CLOSE));
     }
     if accounts.len() < 4 {
@@ -1032,11 +981,8 @@ fn process_close_render_batch<'a>(
     let rent_payer = close_meta_payer(program, context, meta, authority)?;
     let shared_payer = authority.key == &rent_payer;
     let render_start = if shared_payer { 4 } else { 5 };
-    let first_index = phase as usize * CLOSE_RENDER_BATCH;
-    let render_count = CLOSE_RENDER_TARGETS
-        .saturating_sub(first_index)
-        .min(CLOSE_RENDER_BATCH);
-    let expected_count = render_start + render_count;
+    let render_index = phase as usize - 1;
+    let expected_count = render_start + 1;
     if accounts.len() != expected_count || !distinct(accounts) {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -1049,23 +995,39 @@ fn process_close_render_batch<'a>(
             meta.key,
             &rent_payer,
             phase,
-            first_index,
+            render_index,
         )?
         || context.data_len() != resource_sbf::CONTEXT_BYTES
     {
         return Err(refuse(REFUSE_CLOSE));
     }
-    validate_render_batch(
-        program,
-        context.key,
-        accounts,
-        render_start,
-        first_index,
-        render_count,
-    )?;
-    for index in render_start..accounts.len() {
-        close_one(&accounts[index], payer)?;
+    let target = &accounts[render_start];
+    let (expected, expected_bytes) =
+        expected_render_account(program, context.key, render_index as u8)
+            .map_err(|_| refuse(REFUSE_CLOSE))?;
+    let target_len = target.data_len();
+    if target.key != &expected
+        || target.owner != program
+        || !target.is_writable
+        || target_len == 0
+        || target_len > expected_bytes
+        || (render_index >= 4 && target_len != expected_bytes)
+    {
+        return Err(refuse(REFUSE_CLOSE));
     }
+    if render_index < 4 && target_len > CLOSE_CONTEXT_SHRINK_CHUNK {
+        target.realloc(target_len - CLOSE_CONTEXT_SHRINK_CHUNK, false)?;
+        return close_marker_write(
+            continuation,
+            context.key,
+            authority.key,
+            meta.key,
+            &rent_payer,
+            phase,
+            render_index,
+        );
+    }
+    close_one(target, payer)?;
     close_marker_write(
         continuation,
         context.key,
@@ -1073,7 +1035,7 @@ fn process_close_render_batch<'a>(
         meta.key,
         &rent_payer,
         phase + 1,
-        first_index + render_count,
+        render_index + 1,
     )
 }
 
@@ -1189,8 +1151,8 @@ fn process_close<'a>(
 ) -> ProgramResult {
     match phase {
         0 => process_close_pre(program, accounts),
-        phase if (1..CLOSE_RENDER_BATCH_COUNT as u32).contains(&phase) => {
-            process_close_render_batch(program, accounts, phase)
+        phase if (1..CLOSE_RESIZE_FIRST_PHASE).contains(&phase) => {
+            process_close_render_target(program, accounts, phase)
         }
         phase if (CLOSE_RESIZE_FIRST_PHASE..CLOSE_FINAL_PHASE).contains(&phase) => {
             process_close_resize(program, accounts, phase)
