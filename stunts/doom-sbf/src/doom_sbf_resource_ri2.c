@@ -148,7 +148,7 @@ static void rsr_prof_emit(void)
 #define RI2_REINIT_VIEW_MAP_BATCHES (FINEANGLES / 2u / RI2_REINIT_VIEW_MAP_BATCH)
 #define RI2_REINIT_VIEW_X_BATCH 40u
 #define RI2_REINIT_VIEW_X_BATCHES ((SCREENWIDTH + 1u + RI2_REINIT_VIEW_X_BATCH - 1u) / RI2_REINIT_VIEW_X_BATCH)
-#define RI2_REINIT_VIEW_PHASES (2u * RI2_REINIT_VIEW_MAP_BATCHES + RI2_REINIT_VIEW_X_BATCHES + 2u)
+#define RI2_REINIT_VIEW_PHASES (2u * RI2_REINIT_VIEW_MAP_BATCHES + RI2_REINIT_VIEW_X_BATCHES + 4u)
 #define RI2_REINIT_FIELDOFVIEW 2048
 
 static const uint8_t ri2_wad_hash[32] = {
@@ -523,17 +523,27 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
         return 0;
     }
 
-    for (i = 0; i < viewheight; i++)
+    if (phase == 2u * RI2_REINIT_VIEW_MAP_BATCHES +
+                 RI2_REINIT_VIEW_X_BATCHES + 1u)
     {
-        dy = doom_i32_add(doom_i32_lshift(i - viewheight / 2, FRACBITS),
-                          FRACUNIT / 2);
-        dy = abs(dy);
-        yslope[i] = FixedDiv((viewwidth << detailshift) / 2 * FRACUNIT, dy);
+        for (i = 0; i < viewheight; i++)
+        {
+            dy = doom_i32_add(doom_i32_lshift(i - viewheight / 2, FRACBITS),
+                              FRACUNIT / 2);
+            dy = abs(dy);
+            yslope[i] = FixedDiv((viewwidth << detailshift) / 2 * FRACUNIT, dy);
+        }
+        return 0;
     }
-    for (i = 0; i < viewwidth; i++)
+    if (phase == 2u * RI2_REINIT_VIEW_MAP_BATCHES +
+                 RI2_REINIT_VIEW_X_BATCHES + 2u)
     {
-        cosadj = abs(finecosine[xtoviewangle[i] >> ANGLETOFINESHIFT]);
-        distscale[i] = FixedDiv(FRACUNIT, cosadj);
+        for (i = 0; i < viewwidth; i++)
+        {
+            cosadj = abs(finecosine[xtoviewangle[i] >> ANGLETOFINESHIFT]);
+            distscale[i] = FixedDiv(FRACUNIT, cosadj);
+        }
+        return 0;
     }
     for (i = 0; i < LIGHTLEVELS; i++)
     {
@@ -1711,12 +1721,13 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
     case 47: case 48: case 49: case 50: case 51: case 52: case 53: case 54:
     case 55: case 56: case 57:
     case 58: case 59: case 60: case 61: case 62: case 63: case 64: case 65:
+    case 66: case 67:
         if (ri2_reinit_execute_view_size_phase(phase - 39u))
             return RI2_REFUSE_RESOURCE;
         break;
-    case 66: P_InitSwitchList(); P_InitPicAnims(); break;
-    case 67: R_InitSprites(sprnames); break;
-    case 68:
+    case 68: P_InitSwitchList(); P_InitPicAnims(); break;
+    case 69: R_InitSprites(sprnames); break;
+    case 70:
         /* Mirror the source-matched RI1 new-game producer.  The players
          * array and playeringame[0] must be initialized before G_InitNew,
          * and demo_p remains bounded by the image's DEMO1 lump. */
