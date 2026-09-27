@@ -207,6 +207,46 @@ static void ri2_render_arrays_restore(const ri2_render_arrays_t *arrays, int lin
     free(arrays->sector_marks);
 }
 
+/* Reconstruct the renderer workspace after a later strip rebinds the same
+ * arena.  The workspace is allocated in this exact order after the dynamic
+ * state: one frame, then line flags, then sector stamps. */
+static int ri2_render_workspace_layout(
+    uint8_t *arena, unsigned long arena_limit, unsigned long dynamic_mark,
+    int line_count, int sector_count, uint8_t **frame_out,
+    ri2_render_arrays_t *arrays, unsigned long *end_out)
+{
+    unsigned long at;
+    if (!arena || !frame_out || !arrays || !end_out ||
+        line_count < 0 || sector_count < 0 || dynamic_mark > arena_limit ||
+        dynamic_mark > (~0ul - 15ul)) return -1;
+    at = (dynamic_mark + 15ul) & ~15ul;
+    if (at > arena_limit || RI2_FRAME_BYTES > arena_limit - at) return -1;
+    *frame_out = arena + at;
+    at += RI2_FRAME_BYTES;
+    if (at > (~0ul - 15ul)) return -1;
+    at = (at + 15ul) & ~15ul;
+    if (at > arena_limit) return -1;
+    arrays->line_flags = 0;
+    arrays->sector_marks = 0;
+    if (line_count) {
+        unsigned long bytes = (unsigned long)line_count * sizeof(short);
+        if (bytes > arena_limit - at) return -1;
+        arrays->line_flags = (short *)(arena + at);
+        at += bytes;
+    }
+    if (at > (~0ul - 15ul)) return -1;
+    at = (at + 15ul) & ~15ul;
+    if (at > arena_limit) return -1;
+    if (sector_count) {
+        unsigned long bytes = (unsigned long)sector_count * sizeof(int);
+        if (bytes > arena_limit - at) return -1;
+        arrays->sector_marks = (int *)(arena + at);
+        at += bytes;
+    }
+    *end_out = at;
+    return 0;
+}
+
 static void ri2_render_arrays_reset_sector_marks(int sector_count)
 {
     int i;
@@ -1782,13 +1822,19 @@ int doom_engine_rsn3_render_static(
     const uint8_t *header, unsigned long header_bytes,
     uint8_t *bootstrap, unsigned long bootstrap_bytes,
     const uint8_t *payload, unsigned long payload_bytes, uint32_t strip_id,
+    uint8_t *render_cache, unsigned long render_cache_bytes,
+    const uint8_t *snapshot_hash,
     uint8_t *strip_out, unsigned long strip_cap,
     unsigned long *arena_high_water_out)
 {
     uint8_t *frame;
     size_t strip_bytes = 40u * 200u;
-    unsigned long transient_mark;
-    int rc, y, x;
+    unsigned long transient_mark, base_mark, cache_dynamic_mark;
+    unsigned long cache_workspace_end, layout_end;
+    unsigned long arena_limit;
+    uint32_t cache_base32, cache_dynamic32, cache_workspace32;
+    int rc, y, x, cache_hit = 0, cache_write = 0;
+    uint8_t *expected_frame;
     ri2_render_saved_t ri2_saved;
     ri2_render_arrays_t ri2_arrays;
     RSR_PROF_RESET();
@@ -1800,7 +1846,7 @@ int doom_engine_rsn3_render_static(
      * itself in the log instead of arriving as one undifferentiated code. */
     if (!bootstrap) { RSR_REFUSE_NOTE(0xba0ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES) { RSR_REFUSE_NOTE(0xba1ul, (unsigned long)bootstrap_bytes, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
-    if (!payload || !strip_out) { RSR_REFUSE_NOTE(0xba2ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (!payload || !strip_out || !snapshot_hash || !render_cache || render_cache_bytes != 60u) { RSR_REFUSE_NOTE(0xba2ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (strip_cap != strip_bytes || strip_id >= 8u) { RSR_REFUSE_NOTE(0xba3ul, (unsigned long)strip_cap, (unsigned long)strip_id, 0ul); return RSR_REFUSE_LAYOUT; }
     if (((uintptr_t)bootstrap & 15u) != 0) { RSR_REFUSE_NOTE(0xba4ul, (unsigned long)(uintptr_t)bootstrap, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (rsr_rebind_layout(context, account_bytes, header, header_bytes)) { RSR_REFUSE_NOTE(0xba5ul, (unsigned long)account_bytes, (unsigned long)rsr_get32(header + 20), (unsigned long)sizeof(doom_ctx_t)); return RSR_REFUSE_LAYOUT; }
@@ -1813,11 +1859,47 @@ int doom_engine_rsn3_render_static(
         return RI2_REFUSE_ARENA;
     PROF_EXIT(DOOM_SBF_PROF_REBIND, 1);
     RI2_PHASE(1101);
+    arena_limit = ri2_split_arena_bytes(bootstrap_bytes);
     transient_mark = doom_sbf_arena_mark();
-    PROF_ENTER(DOOM_SBF_PROF_RSN3_APPLY, 1);
-    rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
-    PROF_EXIT(DOOM_SBF_PROF_RSN3_APPLY, 1);
-    if (rc) return rc;
+    if (!ri2_zero(render_cache, render_cache_bytes)) {
+        if (memcmp(render_cache, "DOOM-FC1", 8u) ||
+            rsn3_get32(render_cache + 8u) != 1u ||
+            rsn3_get32(render_cache + 12u) != 0u) return RSR_REFUSE_LAYOUT;
+        cache_base32 = rsn3_get32(render_cache + 48u);
+        cache_dynamic32 = rsn3_get32(render_cache + 52u);
+        cache_workspace32 = rsn3_get32(render_cache + 56u);
+        base_mark = (unsigned long)cache_base32;
+        cache_dynamic_mark = (unsigned long)cache_dynamic32;
+        cache_workspace_end = (unsigned long)cache_workspace32;
+        if (base_mark > cache_dynamic_mark || cache_dynamic_mark > cache_workspace_end ||
+            cache_workspace_end > arena_limit || transient_mark != cache_workspace_end ||
+            ri2_render_workspace_layout(bootstrap, arena_limit, cache_dynamic_mark,
+                DOOM_CTX->numlines, numsectors, &expected_frame, &ri2_arrays,
+                &layout_end) || layout_end != cache_workspace_end)
+            return RSR_REFUSE_LAYOUT;
+        if (!memcmp(render_cache + 16u, snapshot_hash, 32u)) {
+            cache_hit = 1;
+            transient_mark = cache_workspace_end;
+        } else {
+            if (!doom_sbf_arena_rewind(base_mark)) return RI2_REFUSE_ARENA;
+            transient_mark = base_mark;
+            memset(render_cache, 0, render_cache_bytes);
+        }
+    } else {
+        base_mark = transient_mark;
+    }
+    if (!cache_hit) {
+        PROF_ENTER(DOOM_SBF_PROF_RSN3_APPLY, 1);
+        rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
+        PROF_EXIT(DOOM_SBF_PROF_RSN3_APPLY, 1);
+        if (rc) return rc;
+        transient_mark = doom_sbf_arena_mark();
+        if (base_mark > transient_mark || transient_mark > arena_limit ||
+            transient_mark > 0xfffffffful || base_mark > 0xfffffffful)
+            return RI2_REFUSE_ARENA;
+        cache_dynamic_mark = transient_mark;
+        cache_write = 1;
+    }
     RI2_PHASE(1102);
     PROF_ENTER(DOOM_SBF_PROF_FRAME_SETUP, 1);
     /* One screen, not four.  This path publishes screens[0] and reads no
@@ -1829,8 +1911,20 @@ int doom_engine_rsn3_render_static(
      * spare pointers become zero rather than pointing past the allocation, so
      * a path that did reach one traps instead of writing through a stale
      * pointer. */
-    frame = (uint8_t *)calloc(1, RI2_FRAME_BYTES);
-    if (!frame) return RI2_REFUSE_OUTPUT;
+    if (cache_hit) {
+        frame = expected_frame;
+        /* Strips own disjoint columns in clipped mode.  Clearing only this
+         * strip preserves fresh-calloc behavior on a repeated strip while
+         * retaining pixels from other strips is harmless. */
+        for (y = 0; y < 200; y++) {
+            uint64_t *row = (uint64_t *)(frame + (size_t)y * 320u +
+                                         (size_t)strip_id * 40u);
+            for (x = 0; x < 5; x++) row[x] = 0;
+        }
+    } else {
+        frame = (uint8_t *)calloc(1, RI2_FRAME_BYTES);
+        if (!frame) return RI2_REFUSE_OUTPUT;
+    }
     screens[0] = frame; screens[1] = 0;
     screens[2] = 0;
     screens[3] = 0; screens[4] = 0;
@@ -1860,10 +1954,12 @@ int doom_engine_rsn3_render_static(
      * the line flags and sector stamps before the draw; the fixed per-strip
      * validcount is intentionally reused, so leaving those stamps behind
      * would suppress sprites on a repeat or later cursor. */
-    if (ri2_render_arrays_save(&ri2_arrays, DOOM_CTX->numlines, numsectors)) {
-        free(frame);
-        (void)doom_sbf_arena_rewind(transient_mark);
-        return RI2_REFUSE_OUTPUT;
+    if (!cache_hit) {
+        if (ri2_render_arrays_save(&ri2_arrays, DOOM_CTX->numlines, numsectors)) {
+            free(frame);
+            (void)doom_sbf_arena_rewind(transient_mark);
+            return RI2_REFUSE_OUTPUT;
+        }
     }
     ri2_render_begin(strip_id, &ri2_saved);
     ri2_render_arrays_reset_sector_marks(numsectors);
@@ -1894,9 +1990,24 @@ int doom_engine_rsn3_render_static(
                     src[(size_t)y * 80u + (size_t)x];
     }
     RI2_PHASE(1105);
+    if (cache_write) {
+        cache_workspace_end = doom_sbf_arena_mark();
+        if (ri2_render_workspace_layout(bootstrap, arena_limit, cache_dynamic_mark,
+                DOOM_CTX->numlines, numsectors, &expected_frame, &ri2_arrays,
+                &layout_end) || layout_end != cache_workspace_end ||
+            cache_workspace_end > 0xfffffffful)
+            return RI2_REFUSE_ARENA;
+        memcpy(render_cache, "DOOM-FC1", 8u);
+        rsn3_put32(render_cache + 8u, 1u);
+        rsn3_put32(render_cache + 12u, 0u);
+        memcpy(render_cache + 16u, snapshot_hash, 32u);
+        rsn3_put32(render_cache + 48u, (uint32_t)base_mark);
+        rsn3_put32(render_cache + 52u, (uint32_t)cache_dynamic_mark);
+        rsn3_put32(render_cache + 56u, (uint32_t)cache_workspace_end);
+    }
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
-    free(frame);
-    if (!doom_sbf_arena_rewind(transient_mark)) return RI2_REFUSE_ARENA;
+    if (!cache_write && !doom_sbf_arena_rewind(transient_mark)) return RI2_REFUSE_ARENA;
+    if (cache_write && !doom_sbf_arena_rewind(cache_workspace_end)) return RI2_REFUSE_ARENA;
     RI2_PHASE(1106);
     PROF_EXIT(DOOM_SBF_PROF_FIXED_POST, 0);
     RSR_PROF_EMIT();

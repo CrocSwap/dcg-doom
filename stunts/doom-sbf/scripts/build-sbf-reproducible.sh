@@ -78,7 +78,7 @@ mkdir -p "$SCRATCH"
 "$GIT" -C "$SCRATCH/doom-src" checkout --quiet --detach "$UPSTREAM"
 for patch in "$SRC"/stunts/doom-host/patches/*.patch; do
     case "$patch" in
-        *0005-doom-reentrant-strips.patch|*0008-doom-captured-controller-tick.patch|*0010-doom-controller-ingress-causality.patch|*0011-doom-controlled-reentry-pair-ingress.patch)
+        *0005-doom-reentrant-strips.patch|*0008-doom-captured-controller-tick.patch|*0010-doom-controller-ingress-causality.patch|*0011-doom-controlled-reentry-pair-ingress.patch|*0033-doom-frame-scoped-cache.patch)
             "$GIT" -C "$SCRATCH/doom-src" apply --unidiff-zero --recount "$patch" ;;
         *)
             "$GIT" -C "$SCRATCH/doom-src" apply "$patch" ;;
