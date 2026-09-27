@@ -31,13 +31,15 @@ pub const REFUSE_CLOSE: u32 = 325;
 const BASE_ACCOUNT_COUNT: usize = 15;
 const CLOSE_RENDER_BATCH: usize = 18;
 const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 512 * 1024;
+const CLOSE_CONTEXT_SHRINK_STEPS: usize =
+    (resource_sbf::CONTEXT_BYTES + CLOSE_CONTEXT_SHRINK_CHUNK - 1) / CLOSE_CONTEXT_SHRINK_CHUNK;
 const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9 + CLOSE_RENDER_BATCH;
 const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10 + CLOSE_RENDER_BATCH;
 const CLOSE_FINAL_SHARED_ACCOUNT_COUNT: usize = 4 + CLOSE_RENDER_BATCH;
 const CLOSE_FINAL_SEPARATE_ACCOUNT_COUNT: usize = 5 + CLOSE_RENDER_BATCH;
 const CLOSE_BASE_SHARED_ACCOUNT_COUNT: usize = 4;
 const CLOSE_BASE_SEPARATE_ACCOUNT_COUNT: usize = 5;
-const CLOSE_FINAL_PHASE: u32 = 8;
+pub const CLOSE_FINAL_PHASE: u32 = 1 + CLOSE_CONTEXT_SHRINK_STEPS as u32;
 const CLOSE_MAGIC: &[u8; 8] = b"DOOM-CL1";
 const CLOSE_VERSION: u32 = 1;
 const CLOSE_CONTEXT: usize = 16;
@@ -1093,7 +1095,7 @@ fn process_close_resize<'a>(
     accounts: &'a [AccountInfo<'a>],
     phase: u32,
 ) -> ProgramResult {
-    if !(2..=7).contains(&phase) {
+    if !(2..CLOSE_FINAL_PHASE).contains(&phase) {
         return Err(refuse(REFUSE_CLOSE));
     }
     let (context, meta, continuation, authority, _payer, rent_payer) =
@@ -1131,7 +1133,7 @@ fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) ->
     let (context, meta, continuation, authority, payer, rent_payer) =
         close_base_accounts(program, accounts)?;
     let expected_len = resource_sbf::CONTEXT_BYTES
-        .checked_sub(6 * CLOSE_CONTEXT_SHRINK_CHUNK)
+        .checked_sub((CLOSE_CONTEXT_SHRINK_STEPS - 1) * CLOSE_CONTEXT_SHRINK_CHUNK)
         .ok_or(refuse(REFUSE_CLOSE))?;
     if context.data_len() != expected_len
         || !close_marker_matches(
@@ -1269,10 +1271,8 @@ mod tests {
             .encode()
         )
         .is_err());
-        assert!(resource_sbf::CONTEXT_BYTES > 6 * CLOSE_CONTEXT_SHRINK_CHUNK);
-        assert_eq!(
-            resource_sbf::CONTEXT_BYTES - 6 * CLOSE_CONTEXT_SHRINK_CHUNK,
-            295_248
-        );
+        let final_context_bytes = resource_sbf::CONTEXT_BYTES
+            - (CLOSE_CONTEXT_SHRINK_STEPS - 1) * CLOSE_CONTEXT_SHRINK_CHUNK;
+        assert!((1..=CLOSE_CONTEXT_SHRINK_CHUNK).contains(&final_context_bytes));
     }
 }

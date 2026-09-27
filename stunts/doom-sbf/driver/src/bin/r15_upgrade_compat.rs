@@ -776,7 +776,7 @@ async fn close_set(
     };
     let close_middle_units = submit(ctx, close_middle, &[authority]).await?;
     let mut phase_units = vec![close_pre_units, close_middle_units];
-    for phase in 2..=7 {
+    for phase in 2..lifecycle::CLOSE_FINAL_PHASE as u8 {
         let resize = Instruction {
             program_id: program,
             accounts: close_base_accounts(set),
@@ -787,7 +787,7 @@ async fn close_set(
     let close_final = Instruction {
         program_id: program,
         accounts: close_base_accounts(set),
-        data: lifecycle::encode_close_phase(8).to_vec(),
+        data: lifecycle::encode_close_phase(lifecycle::CLOSE_FINAL_PHASE as u8).to_vec(),
     };
     phase_units.push(submit(ctx, close_final, &[authority]).await?);
     let payer_after = ctx
