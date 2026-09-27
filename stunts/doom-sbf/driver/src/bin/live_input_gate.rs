@@ -1074,8 +1074,16 @@ fn slice_frame(frame: &[u8], strip: usize) -> Vec<u8> {
         .flat_map(|row| {
             let start = row * 320 + strip * 40;
             frame[start..start + 40].iter().copied()
-        })
-        .collect()
+    })
+    .collect()
+}
+
+fn render_regression_cursor_sequence(frames: &[u32], step: u32) -> bool {
+    step > 0
+        && frames.len() >= 3
+        && frames
+            .windows(2)
+            .all(|pair| pair[0].checked_add(step) == Some(pair[1]))
 }
 
 fn differing_pixels(left: &[u8], right: &[u8]) -> usize {
@@ -1121,6 +1129,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut benchmark_only = false;
     let mut no_frame_artifacts = false;
     let mut worst_view_benchmark = false;
+    let mut render_repeat_regression = false;
     while let Some(flag) = args.next() {
         let mut value = || -> Result<String, Box<dyn Error>> {
             args.next()
@@ -1146,8 +1155,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 no_frame_artifacts = true;
                 worst_view_benchmark = true;
             }
+            "--render-repeat-regression" => {
+                benchmark_only = true;
+                no_frame_artifacts = false;
+                render_repeat_regression = true;
+            }
             other => return Err(format!("unknown flag {other}").into()),
         }
+    }
+    if render_repeat_regression
+        && !render_regression_cursor_sequence(&frames_at, advance_tics)
+    {
+        return Err(format!(
+            "--render-repeat-regression needs at least three ascending frame cursors exactly {advance_tics} tics apart"
+        )
+        .into());
     }
     if receipt.exists() && fs::read_dir(&receipt)?.next().is_some() {
         return Err("receipt directory is not empty".into());
@@ -1599,8 +1621,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Equal-to-RENDER plus RENDER-equal-to-host is equal-to-host.
             let probe_bytes = session.data(probe_key).await?;
             let probe_pixels = rsn3::validate_strip(&probe_bytes)?.pixels.to_vec();
-            let positive_equal =
-                probe_pixels == slice_frame(&reconstructed, usize::from(probe_strip));
+            let expected_probe_pixels =
+                slice_frame(&reconstructed, usize::from(probe_strip));
+            let positive_pixel_difference = probe_pixels
+                .iter()
+                .zip(&expected_probe_pixels)
+                .position(|(actual, expected)| actual != expected);
+            let positive_equal = positive_pixel_difference.is_none();
 
             let zero_name_ix = session.render_buffered_ix(
                     static_key,
@@ -1690,7 +1717,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "working_context_bytes_moved_by_the_frame": changed_offsets.len(),
                 "working_context_first_moved_offsets": changed_offsets.iter().take(16).collect::<Vec<_>>(),
             }));
-            if !replay_is_idempotent && !worst_view_benchmark {
+            if !replay_is_idempotent
+                && !worst_view_benchmark
+                && !render_repeat_regression
+            {
                 return Err(format!(
                     "re-rendering strip {probe_strip} at {last} did not reproduce the same static \
                      account bytes, so a render accumulated something"
@@ -1703,8 +1733,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             previous_snapshot_hash = Some(snapshot.snapshot_hash);
 
             if !positive_equal && !worst_view_benchmark {
+                let detail = positive_pixel_difference.map_or_else(
+                    || "pixel buffers have different lengths".to_owned(),
+                    |offset| {
+                        let x = offset % 40;
+                        let y = offset / 40;
+                        let frame_x = usize::from(probe_strip) * 40 + x;
+                        format!(
+                            "first pixel differs at strip offset {offset}, strip ({x},{y}), frame ({frame_x},{y}), frame byte {}, expected palette {}, got palette {}; the renderer trace points to the sprite pass because this colliding sector stamp skips R_ProjectSprite",
+                            y * 320 + frame_x,
+                            expected_probe_pixels[offset],
+                            probe_pixels[offset]
+                        )
+                    },
+                );
                 return Err(format!(
-                    "RENDER-BUFFERED positive control at {last} does not match the native strip"
+                    "RENDER-BUFFERED positive control at {last} does not match the native strip: {detail}"
                 )
                 .into());
             }
@@ -2318,6 +2362,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "tics": tics,
             "advance_tics_max": advance_tics,
             "sample_cursors": frames_at,
+            "repeat_regression": render_repeat_regression,
+            "repeat_regression_scope": if render_repeat_regression {
+                "same ProgramTest context; each cursor's first frame is compared to the host, and each buffered probe strip is rendered twice"
+            } else {
+                "benchmark sampling"
+            },
             "host_frame_byte_identity": render_rows.iter().map(|row| json!({
                 "cursor": row["cursor"],
                 "reassembled_equals_host": row["reassembled_equals_host"],
@@ -3222,4 +3272,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         receipt.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod render_repeat_regression_tests {
+    use super::render_regression_cursor_sequence;
+
+    #[test]
+    fn regression_requires_three_consecutive_snapshots() {
+        assert!(render_regression_cursor_sequence(&[500, 504, 508], 4));
+        assert!(!render_regression_cursor_sequence(&[500, 504], 4));
+        assert!(!render_regression_cursor_sequence(&[500, 508, 512], 4));
+        assert!(!render_regression_cursor_sequence(&[500, 504, 508], 0));
+    }
 }

@@ -129,24 +129,24 @@ static const uint8_t ri2_wad_hash[32] = {
     0x3b,0xf3,0x30,0x75,0xe8,0x59,0x72,0x18,0x16,0xf6,0x52,0xa5,0x26,0xca,0xc7,0x71
 };
 
-/* A render must not inherit the frame identity the committed state happens to
- * carry, and must not leave one behind.
+/* A render must not inherit or leave behind renderer stamps.
  *
- * `validcount` is a frame counter the renderer bumps once per R_SetupFrame,
- * and R_RenderBSPNode skips a subsector whose mark already equals it while
- * R_ProjectSprite skips any sector whose sector->validcount_m already equals
- * it -- those are the BSP's "this is already drawn and already lit" marks.
- * Both the counter and the per-sector marks are committed fields: ST1 encodes
- * `validcount` and every sector's `validcount_m`.  So a render that runs on the
- * decoded state inherits a counter that can equal the marks the last render
- * left in the state, and the subsector's walls, flats and sprites are then
- * dropped or lit from the previous draw.  The host strip harness has always
- * primed a fresh identity per strip (0x40000000 + id*2) for exactly this
- * reason, which is why the host is byte-exact where the chain is not from
- * identical C.
+ * `R_SetupFrame` increments `validcount`. During BSP traversal, R_AddSprites
+ * uses the resulting identity to make R_ProjectSprite visit a sector once;
+ * R_ProjectSprite returns immediately when `sector->validcount_m` already
+ * equals it. The static RSR/2 context survives transactions, while
+ * `ri2_render_begin` deliberately primes the same identity for a given strip
+ * id every time. Without restoring the sector marks, a second render of that
+ * strip (including the first render at a later cursor) reuses its old stamp
+ * and omits that sector's sprites from the masked/sprite pass.
  *
- * `fuzzpos` (R_DrawFuzzColumn), `validcount` and `framecount` are restored
- * afterwards, so a render cannot move the committed state it renders from.
+ * `line->flags` also changes during drawing: R_StoreWallRange sets ML_MAPPED.
+ * That bit is for the automap rather than pixel rendering, but it is still
+ * mutable account state, so restore it along with the sector stamps. The
+ * dynamic render path already snapshots these arrays before it encodes ST1;
+ * the persistent static path uses the same snapshot to make each render start
+ * from the same state. `fuzzpos`, `validcount` and `framecount` are restored
+ * as well.
  *
  * Ported from fadeno/doom-lowdetail-3 (commit 99b031726) with the spellings
  * that branch's follow-up commits settled on: the engine headers turn
@@ -170,13 +170,10 @@ static void ri2_render_end(const ri2_render_saved_t *saved)
     framecount = saved->saved_framecount;
 }
 
-/* The same rule for the two committed arrays a render writes besides the
- * counters: R_StoreWallRange sets ML_MAPPED (0x100) on every linedef whose
- * wall it draws, and R_ProjectSprite stamps sector->validcount_m.  ST1
- * encodes line->flags and sector->validcount_m, so a render that runs before
- * the encode would publish them.  The dynamic entry, which encodes after it
- * renders, snapshots both arrays and puts them back; the strip entries
- * publish no state and need no snapshot. */
+/* The two arrays a render writes besides the counters: R_StoreWallRange sets
+ * ML_MAPPED (0x100) on linedefs whose walls it draws, and R_ProjectSprite
+ * stamps sector->validcount_m. Both the dynamic entry and the persistent
+ * static entry snapshot and restore them. */
 typedef struct { short *line_flags; int *sector_marks; } ri2_render_arrays_t;
 
 static int ri2_render_arrays_save(ri2_render_arrays_t *arrays, int line_count, int sector_count)
@@ -1733,6 +1730,7 @@ int doom_engine_rsn3_render_static(
     unsigned long transient_mark;
     int rc, y, x;
     ri2_render_saved_t ri2_saved;
+    ri2_render_arrays_t ri2_arrays;
     RSR_PROF_RESET();
     RI2_PHASE(1100);
     PROF_ENTER(DOOM_SBF_PROF_FIXED_PRE, 0);
@@ -1798,15 +1796,19 @@ int doom_engine_rsn3_render_static(
     PROF_EXIT(DOOM_SBF_PROF_FRAME_SETUP, 1);
     PROF_EXIT(DOOM_SBF_PROF_FIXED_PRE, 0);
     RI2_PHASE(1103);
-    /* The static entry publishes no state, so it needs no array snapshot, but
-     * the frame identity it inherits is the static image's own: the counters
-     * and the per-sector marks are constant for the whole session, so a
-     * collision there would drop the same subsector's walls and sprites in
-     * every frame.  Priming removes the class the same way the host harness
-     * does; the restores keep the entry from moving the image's counters. */
+    /* The context is writable and persists across render transactions. Save
+     * the line flags and sector stamps before the draw; the fixed per-strip
+     * validcount is intentionally reused, so leaving those stamps behind
+     * would suppress sprites on a repeat or later cursor. */
+    if (ri2_render_arrays_save(&ri2_arrays, DOOM_CTX->numlines, numsectors)) {
+        free(frame);
+        (void)doom_sbf_arena_rewind(transient_mark);
+        return RI2_REFUSE_OUTPUT;
+    }
     ri2_render_begin(strip_id, &ri2_saved);
     R_RenderPlayerView(&players[displayplayer]);
     ri2_render_end(&ri2_saved);
+    ri2_render_arrays_restore(&ri2_arrays, DOOM_CTX->numlines, numsectors);
     RI2_PHASE(1104);
     PROF_ENTER(DOOM_SBF_PROF_FIXED_POST, 0);
     if (doom_sbf_arena_exhausted()) {
