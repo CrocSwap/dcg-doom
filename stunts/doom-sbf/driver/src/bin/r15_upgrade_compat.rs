@@ -119,7 +119,7 @@ fn check_layout(row: &Value) -> Result<(), Box<dyn Error>> {
             "accounts.authority" => Some(0),
             "accounts.buffer" => Some(sim2::BUFFER_BYTES),
             "accounts.context" | "static" => Some(rsr::ACCOUNT_BYTES),
-            "accounts.continuation" => Some(doom_sbf::continuation_split_sbf::CONTEXT_CONTINUATION_BYTES),
+            "accounts.continuation" => Some(doom_sbf::continuation_split_sbf::CONTINUATION_BYTES),
             "accounts.controller" => Some(doom_sbf::resource_sbf::CONTROLLER_BYTES),
             "accounts.frame" => Some(doom_sbf::resource_sbf::RI2_FRAME_BYTES),
             "accounts.mirror" => Some(doom_sbf::resource_sbf::MIRROR_BYTES),
