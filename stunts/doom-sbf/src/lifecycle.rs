@@ -861,7 +861,11 @@ fn close_marker_write(
     render_cursor: usize,
 ) -> ProgramResult {
     let mut data = continuation.try_borrow_mut_data()?;
-    data.fill(0);
+    // The continuation can still contain bytes from the old engine image.
+    // CLOSE never interprets that tail, and the final phase removes the whole
+    // account. Touch only this bounded marker instead of scanning or clearing
+    // the 256 KiB continuation on every close phase.
+    data[..MARKER_BYTES].fill(0);
     data[..8].copy_from_slice(CLOSE_MAGIC);
     put_u32(&mut data, 8, CLOSE_VERSION);
     put_u32(&mut data, 12, phase);
@@ -895,8 +899,7 @@ fn close_marker_matches(
         && data[CLOSE_AUTHORITY..CLOSE_AUTHORITY + 32] == authority.as_ref()[..]
         && data[CLOSE_META..CLOSE_META + 32] == meta.as_ref()[..]
         && data[CLOSE_PAYER..CLOSE_PAYER + 32] == payer.as_ref()[..]
-        && data[148..352].iter().all(|byte| *byte == 0)
-        && data[352..].iter().all(|byte| *byte == 0))
+        && data[148..MARKER_BYTES].iter().all(|byte| *byte == 0))
 }
 
 fn process_close_pre<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
