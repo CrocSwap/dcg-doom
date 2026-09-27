@@ -1499,7 +1499,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
             let mut strip_units = Vec::new();
             let mut strip_equal = 0usize;
-            let mut loop_counter_words: Vec<Vec<(usize, u32)>> = Vec::with_capacity(8);
             for strip_id in 0..8u8 {
                 let request = rsr::Request::render(strip_id, last, snapshot.snapshot_hash);
                 let ix = session.render_ix(static_key, snapshot_key, strip_id, request);
@@ -1512,17 +1511,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .into());
                 }
                 strip_units.push(base::units(&rendered)?);
-                let working = session.data(static_key).await?;
-                let expected_top = 0x4000_0000u32 | (u32::from(strip_id) << 27);
-                let counts: Vec<(usize, u32)> = working[..resource_sbf::CTX_STRUCT_BYTES]
-                    .chunks_exact(4)
-                    .enumerate()
-                    .filter_map(|(word_ix, bytes)| {
-                        let word = u32::from_le_bytes(bytes.try_into().ok()?);
-                        ((word & 0xf800_0000) == expected_top).then_some((word_ix * 4, word))
-                    })
-                    .collect();
-                loop_counter_words.push(counts);
                 let key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, strip_id).0;
                 let strip_bytes = session.data(key).await?;
                 let strip = rsn3::validate_strip(&strip_bytes)?;
@@ -1542,35 +1530,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &strip.pixels,
                 )?;
                 strips_written += 1;
-            }
-            let mut counter_offsets: Vec<usize> = loop_counter_words[0]
-                .iter()
-                .map(|(offset, _)| *offset)
-                .collect();
-            counter_offsets.retain(|offset| {
-                loop_counter_words.iter().all(|words| {
-                    words.iter().any(|(candidate, _)| candidate == offset)
-                })
-            });
-            if counter_offsets.len() != 1 {
-                return Err(format!(
-                    "seg-loop counter field at cursor {last}: {} offsets matched all strips",
-                    counter_offsets.len()
-                )
-                .into());
-            }
-            for (strip_id, words) in loop_counter_words.iter().enumerate() {
-                let counter_word = words
-                    .iter()
-                    .find(|(offset, _)| *offset == counter_offsets[0])
-                    .map(|(_, word)| *word)
-                    .ok_or("seg-loop counter word missing from strip")?;
-                let inside = counter_word & 0xfff;
-                let outside = (counter_word >> 12) & 0xfff;
-                fs::write(
-                    directory.join(format!("strip-{strip_id}.loop-counts.txt")),
-                    format!("offset={} inside={inside} outside={outside}\n", counter_offsets[0]),
-                )?;
             }
             fs::write(directory.join("chain-frame.fb1"), &reconstructed)?;
 
