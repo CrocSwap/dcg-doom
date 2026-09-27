@@ -144,6 +144,10 @@ static void rsr_prof_emit(void)
 #define RI2_REINIT_TEXTURE_BATCHES 8u
 #define RI2_REINIT_PATCH_BATCH 32u
 #define RI2_REINIT_PATCH_BATCHES 11u
+#define RI2_REINIT_VIEW_MAP_BATCH 512u
+#define RI2_REINIT_VIEW_MAP_BATCHES (FINEANGLES / 2u / RI2_REINIT_VIEW_MAP_BATCH)
+#define RI2_REINIT_VIEW_PHASES (2u * RI2_REINIT_VIEW_MAP_BATCHES + 3u)
+#define RI2_REINIT_FIELDOFVIEW 2048
 
 static const uint8_t ri2_wad_hash[32] = {
     0x1d,0x7d,0x43,0xbe,0x50,0x1e,0x67,0xd9,0x27,0xe4,0x15,0xe0,0xb8,0xf3,0xe2,0x9c,
@@ -405,6 +409,134 @@ static int ri2_reinit_textures_lookup_batch(uint32_t batch)
         texturetranslation = Z_Malloc((size_t)(numtextures + 1) * 4, PU_STATIC, 0);
         if (!texturetranslation) return RI2_REFUSE_ARENA;
         for (i = 0; i < numtextures; i++) texturetranslation[i] = i;
+    }
+    return 0;
+}
+
+static int ri2_reinit_execute_view_size_phase(uint32_t phase)
+{
+    fixed_t cosadj, dy, focallength;
+    int i, j, level, startmap, x, t, start, end;
+    if (phase >= RI2_REINIT_VIEW_PHASES) return RI2_REFUSE_RESOURCE;
+    if (phase == 0)
+    {
+        setsizeneeded = false;
+        if (setblocks == 11)
+        {
+            scaledviewwidth = SCREENWIDTH;
+            viewheight = SCREENHEIGHT;
+        }
+        else
+        {
+            scaledviewwidth = setblocks * 32;
+            viewheight = (setblocks * 168 / 10) & ~7;
+        }
+        detailshift = setdetail;
+        viewwidth = scaledviewwidth >> detailshift;
+        centery = viewheight / 2;
+        centerx = viewwidth / 2;
+        centerxfrac = centerx << FRACBITS;
+        centeryfrac = centery << FRACBITS;
+        projection = centerxfrac;
+        if (!detailshift)
+        {
+            colfunc = basecolfunc = R_DrawColumn;
+            fuzzcolfunc = R_DrawFuzzColumn;
+            transcolfunc = R_DrawTranslatedColumn;
+            spanfunc = R_DrawSpan;
+        }
+        else
+        {
+            colfunc = basecolfunc = R_DrawColumnLow;
+            fuzzcolfunc = R_DrawFuzzColumn;
+            transcolfunc = R_DrawTranslatedColumn;
+            spanfunc = R_DrawSpanLow;
+        }
+        R_InitBuffer(scaledviewwidth, viewheight);
+        pspritescale = FRACUNIT * viewwidth / SCREENWIDTH;
+        pspriteiscale = FRACUNIT * SCREENWIDTH / viewwidth;
+        for (i = 0; i < viewwidth; i++) screenheightarray[i] = viewheight;
+        return 0;
+    }
+    if (phase <= RI2_REINIT_VIEW_MAP_BATCHES)
+    {
+        focallength = FixedDiv(
+            centerxfrac,
+            finetangent[FINEANGLES / 4 + RI2_REINIT_FIELDOFVIEW / 2]);
+        start = (int)((phase - 1u) * RI2_REINIT_VIEW_MAP_BATCH);
+        end = start + (int)RI2_REINIT_VIEW_MAP_BATCH;
+        for (i = start; i < end; i++)
+        {
+            if (finetangent[i] > FRACUNIT * 2)
+                t = -1;
+            else if (finetangent[i] < -FRACUNIT * 2)
+                t = viewwidth + 1;
+            else
+            {
+                t = FixedMul(finetangent[i], focallength);
+                t = (centerxfrac - t + FRACUNIT - 1) >> FRACBITS;
+                if (t < -1) t = -1;
+                else if (t > viewwidth + 1) t = viewwidth + 1;
+            }
+            viewangletox[i] = t;
+        }
+        return 0;
+    }
+    if (phase == RI2_REINIT_VIEW_MAP_BATCHES + 1u)
+    {
+        for (x = 0; x <= viewwidth; x++)
+        {
+            i = 0;
+            while (viewangletox[i] > x) i++;
+            xtoviewangle[x] = (i << ANGLETOFINESHIFT) - ANG90;
+        }
+        return 0;
+    }
+    if (phase < 2u * RI2_REINIT_VIEW_MAP_BATCHES + 2u)
+    {
+        focallength = FixedDiv(
+            centerxfrac,
+            finetangent[FINEANGLES / 4 + RI2_REINIT_FIELDOFVIEW / 2]);
+        start = (int)((phase - RI2_REINIT_VIEW_MAP_BATCHES - 2u) *
+                      RI2_REINIT_VIEW_MAP_BATCH);
+        end = start + (int)RI2_REINIT_VIEW_MAP_BATCH;
+        for (i = start; i < end; i++)
+        {
+            t = FixedMul(finetangent[i], focallength);
+            t = centerx - t;
+            if (viewangletox[i] == -1)
+                viewangletox[i] = 0;
+            else if (viewangletox[i] == viewwidth + 1)
+                viewangletox[i] = viewwidth;
+        }
+        if (phase + 1u == 2u * RI2_REINIT_VIEW_MAP_BATCHES + 2u)
+            clipangle = xtoviewangle[0];
+        return 0;
+    }
+
+    for (i = 0; i < viewheight; i++)
+    {
+        dy = doom_i32_add(doom_i32_lshift(i - viewheight / 2, FRACBITS),
+                          FRACUNIT / 2);
+        dy = abs(dy);
+        yslope[i] = FixedDiv((viewwidth << detailshift) / 2 * FRACUNIT, dy);
+    }
+    for (i = 0; i < viewwidth; i++)
+    {
+        cosadj = abs(finecosine[xtoviewangle[i] >> ANGLETOFINESHIFT]);
+        distscale[i] = FixedDiv(FRACUNIT, cosadj);
+    }
+    for (i = 0; i < LIGHTLEVELS; i++)
+    {
+        startmap = ((LIGHTLEVELS - 1 - i) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
+        for (j = 0; j < MAXLIGHTSCALE; j++)
+        {
+            level = startmap - j * SCREENWIDTH /
+                    (viewwidth << detailshift) / 2;
+            if (level < 0) level = 0;
+            if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS - 1;
+            scalelight[i][j] = colormaps + level * 256;
+        }
     }
     return 0;
 }
@@ -1566,10 +1698,15 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
     case 36: R_InitLightTables(); break;
     case 37: R_InitSkyMap(); break;
     case 38: R_InitTranslationTables(); framecount = 0; break;
-    case 39: R_ExecuteSetViewSize(); break;
-    case 40: P_InitSwitchList(); P_InitPicAnims(); break;
-    case 41: R_InitSprites(sprnames); break;
-    case 42:
+    case 39: case 40: case 41: case 42: case 43: case 44: case 45: case 46:
+    case 47: case 48: case 49: case 50: case 51: case 52: case 53: case 54:
+    case 55: case 56: case 57:
+        if (ri2_reinit_execute_view_size_phase(phase - 39u))
+            return RI2_REFUSE_RESOURCE;
+        break;
+    case 58: P_InitSwitchList(); P_InitPicAnims(); break;
+    case 59: R_InitSprites(sprnames); break;
+    case 60:
         /* Mirror the source-matched RI1 new-game producer.  The players
          * array and playeringame[0] must be initialized before G_InitNew,
          * and demo_p remains bounded by the image's DEMO1 lump. */

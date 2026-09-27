@@ -24,7 +24,7 @@ pub const CLOSE: u8 = 4;
 pub const REQUEST_BYTES: usize = 24;
 pub const REINIT_WAD_STAGES: u32 = resource_sbf::WAD_ACCOUNT_COUNT as u32;
 pub const REINIT_RSR_STAGES: u32 = 6;
-pub const REINIT_PREPARE_STAGES: u32 = 43;
+pub const REINIT_PREPARE_STAGES: u32 = 61;
 pub const REINIT_GAME_STAGES: u32 = REINIT_PREPARE_STAGES + 1;
 pub const REINIT_FINALIZE_STAGES: u32 = 2;
 pub const REINIT_STEP_COUNT: u32 =
@@ -1252,7 +1252,7 @@ mod tests {
             .encode()
         )
         .is_err());
-        assert_eq!(REINIT_STEP_COUNT, 57);
+        assert_eq!(REINIT_STEP_COUNT, 75);
         assert_eq!(CLOSE_FINAL_PHASE, CLOSE_RENDER_TARGETS as u32 + 1);
     }
 }
