@@ -1,5 +1,5 @@
 diff --git a/linuxdoom-1.10/r_plane.c b/linuxdoom-1.10/r_plane.c
-index bcc087f..06d01b1 100644
+index bcc087f..d264e57 100644
 --- a/linuxdoom-1.10/r_plane.c
 +++ b/linuxdoom-1.10/r_plane.c
 @@ -131,6 +131,14 @@ R_MapPlane
@@ -60,8 +60,20 @@ index bcc087f..06d01b1 100644
  	    {
  		dc_yl = PL_TOP(pl,x);
  		dc_yh = PL_BOTTOM(pl,x);
+@@ -442,6 +469,11 @@ void R_DrawPlanes (void)
+ 	PL_TOP(pl,pl->minx-1) = 0xff;
+ 		
+ 	stop = pl->maxx + 1;
++	if (clip_mode && stop > clip_right)
++	{
++	    stop = clip_right;
++	    PL_TOP(pl,stop) = 0xff;
++	}
+ 
+ 	for (x=pl->minx ; x<= stop ; x++)
+ 	{
 diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
-index 82ed8fd..1dc59df 100644
+index 82ed8fd..8167332 100644
 --- a/linuxdoom-1.10/r_segs.c
 +++ b/linuxdoom-1.10/r_segs.c
 @@ -76,6 +76,15 @@ R_RenderMaskedSegRange
@@ -80,17 +92,32 @@ index 82ed8fd..1dc59df 100644
      
      // Calculate light table.
      // Use different light tables
-@@ -182,6 +191,7 @@ void R_RenderSegLoop (void)
+@@ -182,16 +191,32 @@ void R_RenderSegLoop (void)
      fixed_t		texturecolumn;
      int			top;
      int			bottom;
 +    int			draw_column;
++    int			loop_stopx;
++    int			clip_mode;
++    int			clip_right;
  
      /* After the declarations, not before them: PROF_ENTER expands to
       * ((void)0) outside a diagnostic-profile image, and a statement ahead of
-@@ -192,6 +202,10 @@ void R_RenderSegLoop (void)
+      * a declaration is not C90.  The interval is the same either way. */
+     PROF_ENTER(DOOM_SBF_PROF_SEG_LOOP, 2);
+ 
++    loop_stopx = rw_stopx;
++    clip_mode = (doom_render_fuzz_columns >> 30) & 3u;
++    if (clip_mode)
++    {
++	clip_right = (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u) + 40;
++	if (loop_stopx > clip_right) loop_stopx = clip_right;
++    }
++
+     //texturecolumn = 0;				// shut up compiler warning
  	
-     for ( ; rw_x < rw_stopx ; rw_x++)
+-    for ( ; rw_x < rw_stopx ; rw_x++)
++    for ( ; rw_x < loop_stopx ; rw_x++)
      {
 +	draw_column = !((doom_render_fuzz_columns >> 30) & 3u)
 +	    || (rw_x >= (int)(((doom_render_fuzz_columns >> 27) & 7u) * 40u)
@@ -99,7 +126,7 @@ index 82ed8fd..1dc59df 100644
  	// mark floor / ceiling areas
  	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
  
-@@ -233,7 +247,7 @@ void R_RenderSegLoop (void)
+@@ -233,7 +258,7 @@ void R_RenderSegLoop (void)
  	}
  	
  	// texturecolumn and lighting are independent of wall tiers
@@ -108,7 +135,7 @@ index 82ed8fd..1dc59df 100644
  	{
  	    // calculate texture offset
  	    angle = (rw_centerangle + xtoviewangle[rw_x])>>ANGLETOFINESHIFT;
-@@ -254,11 +268,14 @@ void R_RenderSegLoop (void)
+@@ -254,11 +279,14 @@ void R_RenderSegLoop (void)
  	if ((DOOM_CTX->midtexture))
  	{
  	    // single sided line
@@ -128,7 +155,7 @@ index 82ed8fd..1dc59df 100644
  	    ceilingclip[rw_x] = viewheight;
  	    floorclip[rw_x] = -1;
  	}
-@@ -276,11 +293,14 @@ void R_RenderSegLoop (void)
+@@ -276,11 +304,14 @@ void R_RenderSegLoop (void)
  
  		if (mid >= yl)
  		{
@@ -148,7 +175,7 @@ index 82ed8fd..1dc59df 100644
  		    ceilingclip[rw_x] = mid;
  		}
  		else
-@@ -305,12 +325,15 @@ void R_RenderSegLoop (void)
+@@ -305,12 +336,15 @@ void R_RenderSegLoop (void)
  		
  		if (mid <= yh)
  		{
@@ -170,7 +197,7 @@ index 82ed8fd..1dc59df 100644
  		    floorclip[rw_x] = mid;
  		}
  		else
-@@ -323,7 +346,7 @@ void R_RenderSegLoop (void)
+@@ -323,7 +357,7 @@ void R_RenderSegLoop (void)
  		    floorclip[rw_x] = yh+1;
  	    }
  			
@@ -179,7 +206,7 @@ index 82ed8fd..1dc59df 100644
  	    {
  		// save texturecol
  		//  for backdrawing of masked mid texture
-@@ -356,6 +379,9 @@ R_StoreWallRange
+@@ -356,6 +390,9 @@ R_StoreWallRange
      angle_t		distangle, offsetangle;
      fixed_t		vtop;
      int			lightnum;
@@ -189,7 +216,7 @@ index 82ed8fd..1dc59df 100644
  
      // don't overflow and crash
      if (ds_p == &drawsegs[MAXDRAWSEGS])
-@@ -389,6 +415,16 @@ R_StoreWallRange
+@@ -389,6 +426,16 @@ R_StoreWallRange
      ds_p->x2 = stop;
      ds_p->curline_m = curline;
      rw_stopx = stop+1;
@@ -206,7 +233,7 @@ index 82ed8fd..1dc59df 100644
      
      // calculate scale at both ends and step
      ds_p->scale1 = rw_scale = 
-@@ -583,8 +619,16 @@ R_StoreWallRange
+@@ -583,8 +630,16 @@ R_StoreWallRange
  	{
  	    // masked midtexture
  	    maskedtexture = true;
@@ -225,7 +252,7 @@ index 82ed8fd..1dc59df 100644
  	}
      }
      
-@@ -689,21 +733,24 @@ R_StoreWallRange
+@@ -689,21 +744,24 @@ R_StoreWallRange
      R_RenderSegLoop ();
  
      
@@ -259,7 +286,7 @@ index 82ed8fd..1dc59df 100644
      }
  
      if (maskedtexture && !(ds_p->silhouette&SIL_TOP))
-@@ -718,4 +765,3 @@ R_StoreWallRange
+@@ -718,4 +776,3 @@ R_StoreWallRange
      }
      ds_p++;
  }
