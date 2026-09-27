@@ -133,25 +133,6 @@ pub(crate) fn diagnostic_phase(phase: u64) {
     let _ = phase;
 }
 
-// Temporary local diagnostic hook used by the restart renderer check. It is
-// read-only and does not change context layout; production call sites do not
-// invoke it after the renderer diagnosis is complete.
-#[no_mangle]
-pub extern "C" fn doom_sbf_local_diag(phase: u64) {
-    solana_program::log::sol_log_64(
-        0x444f_4f4d_4c4f_434c,
-        phase,
-        solana_program::compute_units::sol_remaining_compute_units(),
-        0,
-        0,
-    );
-}
-
-#[no_mangle]
-pub extern "C" fn doom_sbf_local_diag_values(phase: u64, a: u64, b: u64, c: u64) {
-    solana_program::log::sol_log_64(0x444f_4f4d_4c4f_434c, phase, a, b, c);
-}
-
 unsafe extern "C" {
     fn doom_draw_columns(framebuffer: *mut u8, state: *mut u8);
     fn doom_draw_spans(framebuffer: *mut u8, state: *mut u8);

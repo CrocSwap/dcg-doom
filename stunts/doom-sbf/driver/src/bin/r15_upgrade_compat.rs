@@ -656,8 +656,7 @@ fn close_accounts(set: &LocalSet) -> Vec<AccountMeta> {
         meta(set.controller, true, false),
         meta(set.frame, true, false),
         meta(set.continuation, true, false),
-        meta(set.authority, false, true),
-        meta(set.authority, true, false),
+        meta(set.authority, true, true),
     ];
     accounts.extend(set.snapshots.iter().map(|key| meta(*key, true, false)));
     for strips in &set.strips {

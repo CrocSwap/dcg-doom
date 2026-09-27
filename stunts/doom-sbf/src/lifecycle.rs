@@ -29,7 +29,8 @@ pub const REFUSE_CLEAR: u32 = 324;
 pub const REFUSE_CLOSE: u32 = 325;
 
 const BASE_ACCOUNT_COUNT: usize = 15;
-const CLOSE_ACCOUNT_COUNT: usize = 46;
+const CLOSE_SHARED_PAYER_ACCOUNT_COUNT: usize = 45;
+const CLOSE_SEPARATE_PAYER_ACCOUNT_COUNT: usize = 46;
 const CONTEXT: usize = 0;
 const RESOURCE: usize = 1;
 const WAD_FIRST: usize = 2;
@@ -759,7 +760,7 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
 }
 
 fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    if accounts.len() != CLOSE_ACCOUNT_COUNT {
+    if accounts.len() < 9 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
     let context = &accounts[0];
@@ -771,7 +772,6 @@ fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let frame = &accounts[6];
     let continuation = &accounts[7];
     let authority = &accounts[8];
-    let payer = &accounts[9];
     if !authority.is_signer {
         return Err(refuse(REFUSE_AUTHORITY));
     }
@@ -784,7 +784,6 @@ fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         || !owned(program, controller, resource_sbf::CONTROLLER_BYTES, true)
         || !owned(program, frame, resource_sbf::RI2_FRAME_BYTES, true)
         || !owned(program, continuation, e2r::CONTINUATION_BYTES, true)
-        || !payer.is_writable
     {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -814,9 +813,31 @@ fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     } else {
         *authority.key
     };
-    if rent_payer == Pubkey::default() || payer.key != &rent_payer {
+    if rent_payer == Pubkey::default() {
         return Err(refuse(REFUSE_CLOSE));
     }
+    let shared_payer = authority.key == &rent_payer;
+    let render_start = if shared_payer { 9 } else { 10 };
+    let expected_count = if shared_payer {
+        CLOSE_SHARED_PAYER_ACCOUNT_COUNT
+    } else {
+        CLOSE_SEPARATE_PAYER_ACCOUNT_COUNT
+    };
+    if accounts.len() != expected_count {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let payer = if shared_payer {
+        if !authority.is_writable {
+            return Err(refuse(REFUSE_ACCOUNTS));
+        }
+        authority
+    } else {
+        let payer = &accounts[9];
+        if payer.key != &rent_payer || !payer.is_writable {
+            return Err(refuse(REFUSE_CLOSE));
+        }
+        payer
+    };
     let (expected_buffer_len, _) = buffer_bytes(&meta_data, sim2::M_CAPACITY)?;
     if buffer.data_len() != expected_buffer_len {
         return Err(refuse(REFUSE_CLOSE));
@@ -840,8 +861,11 @@ fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if seen.iter().collect::<std::collections::BTreeSet<_>>().len() != seen.len() {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
+    if seen.contains(payer.key) {
+        return Err(refuse(REFUSE_CLOSE));
+    }
     for index in 0..RENDER_BUFFER_COUNT {
-        let target = &accounts[10 + index];
+        let target = &accounts[render_start + index];
         let (expected, expected_bytes) = expected_render_account(program, context.key, index as u8)
             .map_err(|_| refuse(REFUSE_CLOSE))?;
         if target.key != &expected
@@ -855,7 +879,7 @@ fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         seen.push(*target.key);
     }
 
-    for account in accounts.iter().take(8).chain(accounts.iter().skip(10)) {
+    for account in accounts.iter().take(8).chain(accounts.iter().skip(render_start)) {
         let amount = account.lamports();
         let next = payer
             .lamports()

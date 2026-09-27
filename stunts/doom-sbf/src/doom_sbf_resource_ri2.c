@@ -43,9 +43,6 @@ extern int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32]);
 extern int DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_bytes);
 extern int DoomStateDecodeSplitPrepare(void);
 extern int DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes);
-extern void doom_sbf_local_diag(unsigned long phase);
-extern void doom_sbf_local_diag_values(unsigned long phase, unsigned long a,
-                                       unsigned long b, unsigned long c);
 
 #ifdef DOOM_SBF_PHASE_PROFILE
 extern void doom_sbf_phase_marker(unsigned long phase);
@@ -1859,7 +1856,6 @@ int doom_engine_rsn3_render_static(
     uint8_t *expected_frame;
     ri2_render_saved_t ri2_saved;
     ri2_render_arrays_t ri2_arrays;
-    doom_sbf_local_diag(1100ul);
     RSR_PROF_RESET();
     RI2_PHASE(1100);
     PROF_ENTER(DOOM_SBF_PROF_FIXED_PRE, 0);
@@ -1873,7 +1869,6 @@ int doom_engine_rsn3_render_static(
     if (strip_cap != strip_bytes || strip_id >= 8u) { RSR_REFUSE_NOTE(0xba3ul, (unsigned long)strip_cap, (unsigned long)strip_id, 0ul); return RSR_REFUSE_LAYOUT; }
     if (((uintptr_t)bootstrap & 15u) != 0) { RSR_REFUSE_NOTE(0xba4ul, (unsigned long)(uintptr_t)bootstrap, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (rsr_rebind_layout(context, account_bytes, header, header_bytes)) { RSR_REFUSE_NOTE(0xba5ul, (unsigned long)account_bytes, (unsigned long)rsr_get32(header + 20), (unsigned long)sizeof(doom_ctx_t)); return RSR_REFUSE_LAYOUT; }
-    doom_sbf_local_diag(11001ul);
     /* BUILD leaves cached lump metadata and renderer tables at the front of
      * this carrier.  Preserve its allocation cursor so the per-frame mobj
      * and framebuffer allocations cannot overwrite those static resources. */
@@ -1882,7 +1877,6 @@ int doom_engine_rsn3_render_static(
                                RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
     PROF_EXIT(DOOM_SBF_PROF_REBIND, 1);
-    doom_sbf_local_diag(11002ul);
     RI2_PHASE(1101);
     arena_limit = ri2_split_arena_bytes(bootstrap_bytes);
     transient_mark = doom_sbf_arena_mark();
@@ -1926,7 +1920,6 @@ int doom_engine_rsn3_render_static(
         cache_write = 1;
     }
     RI2_PHASE(1102);
-    doom_sbf_local_diag(1102ul);
     PROF_ENTER(DOOM_SBF_PROF_FRAME_SETUP, 1);
     /* One screen, not four.  This path publishes screens[0] and reads no
      * other: the drawers write dest = screens[0], R_DrawPlayerSprites uses
@@ -1976,31 +1969,23 @@ int doom_engine_rsn3_render_static(
     PROF_EXIT(DOOM_SBF_PROF_FRAME_SETUP, 1);
     PROF_EXIT(DOOM_SBF_PROF_FIXED_PRE, 0);
     RI2_PHASE(1103);
-    doom_sbf_local_diag(1103ul);
     /* The context is writable and persists across render transactions. Save
      * the line flags and sector stamps before the draw; the fixed per-strip
      * validcount is intentionally reused, so leaving those stamps behind
      * would suppress sprites on a repeat or later cursor. */
     if (!cache_hit) {
-        doom_sbf_local_diag_values(11031ul, (unsigned long)DOOM_CTX->numlines,
-                                   (unsigned long)numsectors, (unsigned long)(uintptr_t)lines);
         if (ri2_render_arrays_save(&ri2_arrays, DOOM_CTX->numlines, numsectors)) {
             free(frame);
             (void)doom_sbf_arena_rewind(transient_mark);
             return RI2_REFUSE_OUTPUT;
         }
-        doom_sbf_local_diag_values(11032ul, (unsigned long)(uintptr_t)sectors,
-                                   (unsigned long)(uintptr_t)players[displayplayer].mo,
-                                   (unsigned long)(uintptr_t)thinkercap.next);
     }
     ri2_render_begin(strip_id, &ri2_saved);
     ri2_render_arrays_reset_sector_marks(numsectors);
-    doom_sbf_local_diag(11033ul);
     R_RenderPlayerView(&players[displayplayer]);
     ri2_render_end(&ri2_saved);
     ri2_render_arrays_restore(&ri2_arrays, DOOM_CTX->numlines, numsectors);
     RI2_PHASE(1104);
-    doom_sbf_local_diag(1104ul);
     PROF_ENTER(DOOM_SBF_PROF_FIXED_POST, 0);
     if (doom_sbf_arena_exhausted()) {
         free(frame);
