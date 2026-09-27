@@ -789,10 +789,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bank.prefer_bpf(true);
     bank.set_compute_max_units(u64::from(COMPUTE_LIMIT));
     // Model the upgradeable-loader account pair because RSR REBUILD/4 checks
-    // that the executable and ProgramData account are loader-owned. `add_program`
-    // installs the ELF under the legacy loader and makes that authority gate
-    // impossible to exercise faithfully.
-    bank.add_upgradeable_program_to_genesis("doom_sbf", &program);
+    // that the executable and ProgramData account are loader-owned. ProgramTest's
+    // `add_program` installs the ELF under the legacy loader, so construct the
+    // upgradeable account pair directly with the same image and local authority.
+    let program_data = solana_program::bpf_loader_upgradeable::get_program_data_address(&program);
+    let elf = fs::read(&image)?;
+    let mut program_account_bytes = vec![0u8; 36];
+    program_account_bytes[..4].copy_from_slice(&2u32.to_le_bytes());
+    program_account_bytes[4..].copy_from_slice(program_data.as_ref());
+    bank.add_genesis_account(
+        program,
+        Account {
+            lamports: solana_program::rent::Rent::default()
+                .minimum_balance(program_account_bytes.len()),
+            data: program_account_bytes,
+            owner: solana_program::bpf_loader_upgradeable::id(),
+            executable: true,
+            rent_epoch: 0,
+        },
+    );
+    let mut program_data_bytes = vec![0u8; 45 + elf.len()];
+    program_data_bytes[..4].copy_from_slice(&3u32.to_le_bytes());
+    program_data_bytes[12] = 1;
+    program_data_bytes[13..45].copy_from_slice(local_authority.pubkey().as_ref());
+    program_data_bytes[45..].copy_from_slice(&elf);
+    bank.add_genesis_account(
+        program_data,
+        Account {
+            lamports: solana_program::rent::Rent::default()
+                .minimum_balance(program_data_bytes.len()),
+            data: program_data_bytes,
+            owner: solana_program::bpf_loader_upgradeable::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
 
     let mut templates = HashMap::new();
     let mut context_hash = String::new();
@@ -873,21 +904,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (reference, reference_context_signer) =
         add_fresh_reference(&mut bank, program, &set, &templates)?;
-    let program_data = solana_program::bpf_loader_upgradeable::get_program_data_address(&program);
-    let mut program_data_bytes = vec![0u8; 45];
-    program_data_bytes[..4].copy_from_slice(&3u32.to_le_bytes());
-    program_data_bytes[12] = 1;
-    program_data_bytes[13..45].copy_from_slice(local_authority.pubkey().as_ref());
-    bank.add_account(
-        program_data,
-        Account {
-            lamports: 1_000_000,
-            data: program_data_bytes,
-            owner: solana_program::bpf_loader_upgradeable::id(),
-            executable: false,
-            rent_epoch: 0,
-        },
-    );
     let mut ctx = bank.start_with_context().await;
     let static_rebuild_units = rebuild_static(
         &mut ctx,
