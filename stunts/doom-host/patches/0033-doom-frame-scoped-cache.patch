@@ -1,0 +1,13 @@
+--- a/linuxdoom-1.10/r_things.c
++++ b/linuxdoom-1.10/r_things.c
+@@ -387,0 +388 @@
++    int			lump;
+@@ -400 +401,7 @@
+-    patch = W_CacheLumpNum (vis->patch+firstspritelump, PU_CACHE);
++    lump = vis->patch + firstspritelump;
++    if ((unsigned)lump >= (unsigned)numlumps)
++	patch = W_CacheLumpNum (lump, PU_CACHE);
++    else if (lumpcache[lump])
++	patch = (patch_t *)lumpcache[lump];
++    else
++	patch = W_CacheLumpNum (lump, PU_CACHE);
