@@ -2163,6 +2163,7 @@ mod tests {
         meta[M_MIRROR..M_MIRROR + 32].copy_from_slice(mirror_key.as_ref());
         meta[M_BUFFER..M_BUFFER + 32].copy_from_slice(buffer_key.as_ref());
         meta[M_AUTHORITY..M_AUTHORITY + 32].copy_from_slice(signer.as_ref());
+        meta[M_RENT_PAYER..M_RENT_PAYER + 32].copy_from_slice(signer.as_ref());
         meta[M_STATE_ROOT..M_STATE_ROOT + 32].copy_from_slice(&root);
         meta[M_INPUT_CHAIN..M_INPUT_CHAIN + 32]
             .copy_from_slice(&chain_init(&context, 0));
