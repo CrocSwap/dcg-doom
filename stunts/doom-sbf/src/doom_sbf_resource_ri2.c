@@ -146,7 +146,9 @@ static void rsr_prof_emit(void)
 #define RI2_REINIT_PATCH_BATCHES 11u
 #define RI2_REINIT_VIEW_MAP_BATCH 512u
 #define RI2_REINIT_VIEW_MAP_BATCHES (FINEANGLES / 2u / RI2_REINIT_VIEW_MAP_BATCH)
-#define RI2_REINIT_VIEW_PHASES (2u * RI2_REINIT_VIEW_MAP_BATCHES + 3u)
+#define RI2_REINIT_VIEW_X_BATCH 40u
+#define RI2_REINIT_VIEW_X_BATCHES ((SCREENWIDTH + 1u + RI2_REINIT_VIEW_X_BATCH - 1u) / RI2_REINIT_VIEW_X_BATCH)
+#define RI2_REINIT_VIEW_PHASES (2u * RI2_REINIT_VIEW_MAP_BATCHES + RI2_REINIT_VIEW_X_BATCHES + 2u)
 #define RI2_REINIT_FIELDOFVIEW 2048
 
 static const uint8_t ri2_wad_hash[32] = {
@@ -482,9 +484,13 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
         }
         return 0;
     }
-    if (phase == RI2_REINIT_VIEW_MAP_BATCHES + 1u)
+    if (phase <= RI2_REINIT_VIEW_MAP_BATCHES + RI2_REINIT_VIEW_X_BATCHES)
     {
-        for (x = 0; x <= viewwidth; x++)
+        start = (int)((phase - RI2_REINIT_VIEW_MAP_BATCHES - 1u) *
+                      RI2_REINIT_VIEW_X_BATCH);
+        end = start + (int)RI2_REINIT_VIEW_X_BATCH;
+        if (end > viewwidth + 1) end = viewwidth + 1;
+        for (x = start; x < end; x++)
         {
             i = 0;
             while (viewangletox[i] > x) i++;
@@ -492,12 +498,14 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
         }
         return 0;
     }
-    if (phase < 2u * RI2_REINIT_VIEW_MAP_BATCHES + 2u)
+    if (phase < 2u * RI2_REINIT_VIEW_MAP_BATCHES +
+                    RI2_REINIT_VIEW_X_BATCHES + 1u)
     {
         focallength = FixedDiv(
             centerxfrac,
             finetangent[FINEANGLES / 4 + RI2_REINIT_FIELDOFVIEW / 2]);
-        start = (int)((phase - RI2_REINIT_VIEW_MAP_BATCHES - 2u) *
+        start = (int)((phase - RI2_REINIT_VIEW_MAP_BATCHES -
+                       RI2_REINIT_VIEW_X_BATCHES - 1u) *
                       RI2_REINIT_VIEW_MAP_BATCH);
         end = start + (int)RI2_REINIT_VIEW_MAP_BATCH;
         for (i = start; i < end; i++)
@@ -509,7 +517,8 @@ static int ri2_reinit_execute_view_size_phase(uint32_t phase)
             else if (viewangletox[i] == viewwidth + 1)
                 viewangletox[i] = viewwidth;
         }
-        if (phase + 1u == 2u * RI2_REINIT_VIEW_MAP_BATCHES + 2u)
+        if (phase + 1u == 2u * RI2_REINIT_VIEW_MAP_BATCHES +
+                           RI2_REINIT_VIEW_X_BATCHES + 1u)
             clipangle = xtoviewangle[0];
         return 0;
     }
@@ -1701,12 +1710,13 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
     case 39: case 40: case 41: case 42: case 43: case 44: case 45: case 46:
     case 47: case 48: case 49: case 50: case 51: case 52: case 53: case 54:
     case 55: case 56: case 57:
+    case 58: case 59: case 60: case 61: case 62: case 63: case 64: case 65:
         if (ri2_reinit_execute_view_size_phase(phase - 39u))
             return RI2_REFUSE_RESOURCE;
         break;
-    case 58: P_InitSwitchList(); P_InitPicAnims(); break;
-    case 59: R_InitSprites(sprnames); break;
-    case 60:
+    case 66: P_InitSwitchList(); P_InitPicAnims(); break;
+    case 67: R_InitSprites(sprnames); break;
+    case 68:
         /* Mirror the source-matched RI1 new-game producer.  The players
          * array and playeringame[0] must be initialized before G_InitNew,
          * and demo_p remains bounded by the image's DEMO1 lump. */
