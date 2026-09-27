@@ -163,6 +163,7 @@ struct LocalSet {
     frame: Pubkey,
     continuation: Pubkey,
     authority: Pubkey,
+    rent_payer: Pubkey,
     meta: Pubkey,
     buffer: Pubkey,
     snapshots: Vec<Pubkey>,
@@ -201,6 +202,7 @@ fn captured_set(identity: &Value, authority: Pubkey) -> Result<LocalSet, Box<dyn
         frame: role_address(identity, "frame")?,
         continuation: role_address(identity, "continuation")?,
         authority,
+        rent_payer: authority,
         meta: address(identity, "meta")?,
         buffer: role_address(identity, "buffer")?,
         snapshots,
@@ -306,6 +308,10 @@ fn add_fresh_reference(
     meta_data[sim2::M_BUFFER..sim2::M_BUFFER + 32].copy_from_slice(buffer.as_ref());
     meta_data[sim2::M_AUTHORITY..sim2::M_AUTHORITY + 32]
         .copy_from_slice(template_set.authority.as_ref());
+    if u32_at(&meta_data, 8) == sim2::META_VERSION {
+        meta_data[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32]
+            .copy_from_slice(template_set.authority.as_ref());
+    }
     meta_data[sim2::M_BUMP] = bump;
     let old_meta = copy_template(templates, template_set.meta)?;
     bank.add_account(meta, owned_account(program, old_meta.lamports, meta_data));
@@ -337,21 +343,25 @@ fn add_fresh_reference(
             );
         }
     }
-    Ok((LocalSet {
-        context,
-        resource: template_set.resource,
-        wads: template_set.wads.clone(),
-        state,
-        mirror,
-        controller,
-        frame,
-        continuation,
-        authority: template_set.authority,
-        meta,
-        buffer,
-        snapshots,
-        strips,
-    }, context_signer))
+    Ok((
+        LocalSet {
+            context,
+            resource: template_set.resource,
+            wads: template_set.wads.clone(),
+            state,
+            mirror,
+            controller,
+            frame,
+            continuation,
+            authority: template_set.authority,
+            rent_payer: template_set.authority,
+            meta,
+            buffer,
+            snapshots,
+            strips,
+        },
+        context_signer,
+    ))
 }
 
 async fn rebuild_static(
@@ -379,7 +389,10 @@ async fn rebuild_static(
         .await
         .map_err(|error| format!("local RSR/2 REBUILD/4 failed: {error}"))?];
     for cursor in 0..=rsr::BUILD_FINAL_CURSOR {
-        let mut accounts = vec![meta(static_key, true, false), meta(set.resource, false, false)];
+        let mut accounts = vec![
+            meta(static_key, true, false),
+            meta(set.resource, false, false),
+        ];
         if cursor < rsr::BUILD_WAD_CHUNKS {
             accounts.push(meta(set.wads[cursor as usize], false, false));
         }
@@ -388,9 +401,11 @@ async fn rebuild_static(
             accounts,
             data: rsr::Request::build_chunk(cursor).encode().to_vec(),
         };
-        units.push(submit(ctx, build, &[])
-            .await
-            .map_err(|error| format!("local RSR/2 BUILD/{cursor} failed: {error}"))?);
+        units.push(
+            submit(ctx, build, &[])
+                .await
+                .map_err(|error| format!("local RSR/2 BUILD/{cursor} failed: {error}"))?,
+        );
     }
     let rebuilt = account_data(ctx, static_key).await?;
     let header = &rebuilt[rsr::HEADER_OFFSET..rsr::HEADER_OFFSET + rsr::HEADER_BYTES];
@@ -455,9 +470,11 @@ async fn reinit(
         accounts: base_accounts(set),
         data: lifecycle::encode_begin().to_vec(),
     };
-    units.push(submit(ctx, begin, &[authority])
-        .await
-        .map_err(|error| format!("{label} REINIT BEGIN failed: {error}"))?);
+    units.push(
+        submit(ctx, begin, &[authority])
+            .await
+            .map_err(|error| format!("{label} REINIT BEGIN failed: {error}"))?,
+    );
     for index in 0..36u8 {
         let target = render_target(set, index as usize);
         let clear = Instruction {
@@ -465,9 +482,11 @@ async fn reinit(
             accounts: clear_render_accounts(set, target),
             data: lifecycle::encode_clear_render(index).to_vec(),
         };
-        units.push(submit(ctx, clear, &[authority])
-            .await
-            .map_err(|error| format!("{label} REINIT CLEAR_RENDER/{index} failed: {error}"))?);
+        units.push(
+            submit(ctx, clear, &[authority])
+                .await
+                .map_err(|error| format!("{label} REINIT CLEAR_RENDER/{index} failed: {error}"))?,
+        );
     }
     for phase in 1..=6u8 {
         let step = Instruction {
@@ -475,9 +494,11 @@ async fn reinit(
             accounts: base_accounts(set),
             data: lifecycle::encode_step(phase).to_vec(),
         };
-        units.push(submit(ctx, step, &[authority])
-            .await
-            .map_err(|error| format!("{label} REINIT STEP/{phase} failed: {error}"))?);
+        units.push(
+            submit(ctx, step, &[authority])
+                .await
+                .map_err(|error| format!("{label} REINIT STEP/{phase} failed: {error}"))?,
+        );
     }
     let view = sim2::MetaView::parse(&account_data(ctx, set.meta).await?)
         .ok_or_else(|| format!("{label} REINIT metadata failed to parse"))?;
@@ -562,9 +583,9 @@ async fn render_frame(
                 .encode()
                 .to_vec(),
         };
-        compute_units.push(submit(ctx, ix, &[])
-            .await
-            .map_err(|error| format!("RENDER-BUFFERED cursor {cursor} strip {strip} failed: {error}"))?);
+        compute_units.push(submit(ctx, ix, &[]).await.map_err(|error| {
+            format!("RENDER-BUFFERED cursor {cursor} strip {strip} failed: {error}")
+        })?);
         let rendered = account_data(ctx, set.strips[0][strip as usize]).await?;
         let strip_view = rsn3::validate_strip(&rendered)?;
         if strip_view.cursor != cursor || strip_view.strip_id != u32::from(strip) {
@@ -587,9 +608,11 @@ async fn render_frame(
             .encode()
             .to_vec(),
     };
-    compute_units.push(submit(ctx, replay, &[])
-        .await
-        .map_err(|error| format!("repeat RENDER-BUFFERED cursor {cursor} failed: {error}"))?);
+    compute_units.push(
+        submit(ctx, replay, &[])
+            .await
+            .map_err(|error| format!("repeat RENDER-BUFFERED cursor {cursor} failed: {error}"))?,
+    );
     let replay_strip = account_data(ctx, set.strips[0][0]).await?;
     if first_strip.as_deref() != Some(replay_strip.as_slice()) {
         return Err(format!("repeat RENDER-BUFFERED changed cursor {cursor} strip 0").into());
@@ -646,7 +669,7 @@ async fn advance_one(
         .map_err(|error| format!("ADVANCE at cursor {cursor} failed: {error}"))?)
 }
 
-fn close_accounts(set: &LocalSet) -> Vec<AccountMeta> {
+fn close_pre_accounts(set: &LocalSet) -> Vec<AccountMeta> {
     let mut accounts = vec![
         meta(set.context, true, false),
         meta(set.state, true, false),
@@ -658,10 +681,25 @@ fn close_accounts(set: &LocalSet) -> Vec<AccountMeta> {
         meta(set.continuation, true, false),
         meta(set.authority, true, true),
     ];
-    accounts.extend(set.snapshots.iter().map(|key| meta(*key, true, false)));
-    for strips in &set.strips {
-        accounts.extend(strips.iter().map(|key| meta(*key, true, false)));
+    if set.rent_payer != set.authority {
+        accounts[8].is_writable = false;
+        accounts.push(meta(set.rent_payer, true, false));
     }
+    accounts.extend((0..18).map(|index| meta(render_target(set, index), true, false)));
+    accounts
+}
+
+fn close_final_accounts(set: &LocalSet) -> Vec<AccountMeta> {
+    let mut accounts = vec![
+        meta(set.context, true, false),
+        meta(set.meta, true, false),
+        meta(set.continuation, true, false),
+        meta(set.authority, set.authority == set.rent_payer, true),
+    ];
+    if set.rent_payer != set.authority {
+        accounts.push(meta(set.rent_payer, true, false));
+    }
+    accounts.extend((18..36).map(|index| meta(render_target(set, index), true, false)));
     accounts
 }
 
@@ -670,7 +708,7 @@ async fn close_set(
     program: Pubkey,
     set: &LocalSet,
     authority: &Keypair,
-) -> Result<(u64, u64), Box<dyn Error>> {
+) -> Result<(u64, Vec<u64>), Box<dyn Error>> {
     let targets = [
         set.context,
         set.state,
@@ -705,19 +743,36 @@ async fn close_set(
     }
     let payer_before = ctx
         .banks_client
-        .get_account(set.authority)
+        .get_account(set.rent_payer)
         .await?
         .ok_or("CLOSE payer missing")?
         .lamports;
-    let close = Instruction {
+    let close_pre = Instruction {
         program_id: program,
-        accounts: close_accounts(set),
-        data: lifecycle::encode_close().to_vec(),
+        accounts: close_pre_accounts(set),
+        data: lifecycle::encode_close_phase(0).to_vec(),
     };
-    let units = submit(ctx, close, &[authority]).await?;
+    let close_pre_units = submit(ctx, close_pre, &[authority]).await?;
+    let early_closed = [set.state, set.mirror, set.buffer, set.controller, set.frame]
+        .into_iter()
+        .chain((0..18).map(|index| render_target(set, index)))
+        .collect::<Vec<_>>();
+    for key in early_closed {
+        if let Some(account) = ctx.banks_client.get_account(key).await? {
+            if account.owner == program || account.lamports != 0 || !account.data.is_empty() {
+                return Err(format!("CLOSE phase 0 left a live account {key}").into());
+            }
+        }
+    }
+    let close_final = Instruction {
+        program_id: program,
+        accounts: close_final_accounts(set),
+        data: lifecycle::encode_close_phase(1).to_vec(),
+    };
+    let close_final_units = submit(ctx, close_final, &[authority]).await?;
     let payer_after = ctx
         .banks_client
-        .get_account(set.authority)
+        .get_account(set.rent_payer)
         .await?
         .ok_or("CLOSE payer missing after close")?
         .lamports;
@@ -736,13 +791,13 @@ async fn close_set(
     }
     let double_close = Instruction {
         program_id: program,
-        accounts: close_accounts(set),
-        data: lifecycle::encode_close().to_vec(),
+        accounts: close_pre_accounts(set),
+        data: lifecycle::encode_close_phase(0).to_vec(),
     };
     if submit(ctx, double_close, &[authority]).await.is_ok() {
         return Err("double CLOSE unexpectedly succeeded".into());
     }
-    Ok((balance_before, units))
+    Ok((balance_before, vec![close_pre_units, close_final_units]))
 }
 
 #[tokio::main]
@@ -781,7 +836,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let local_authority = Keypair::new();
     let stranger = Keypair::new();
-    let set = captured_set(&identity, local_authority.pubkey())?;
+    let mut set = captured_set(&identity, local_authority.pubkey())?;
     env::set_var("BPF_OUT_DIR", image.parent().ok_or("image parent")?);
     env::set_var("SBF_OUT_DIR", image.parent().ok_or("image parent")?);
     let mut bank = ProgramTest::default();
@@ -827,6 +882,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut templates = HashMap::new();
     let mut context_hash = String::new();
     let mut static_header: Option<Vec<u8>> = None;
+    let captured_authority = role_address(&identity, "authority")?;
     for row in rows {
         let key = Pubkey::from_str(row["address"].as_str().ok_or("row address")?)?;
         if key == program {
@@ -837,6 +893,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if key == set.meta {
             data[sim2::M_AUTHORITY..sim2::M_AUTHORITY + 32]
                 .copy_from_slice(local_authority.pubkey().as_ref());
+            if u32_at(&data, 8) == sim2::META_VERSION {
+                let recorded_payer = Pubkey::new_from_array(
+                    data[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32]
+                        .try_into()
+                        .unwrap(),
+                );
+                if recorded_payer == captured_authority {
+                    data[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32]
+                        .copy_from_slice(local_authority.pubkey().as_ref());
+                    set.rent_payer = local_authority.pubkey();
+                } else {
+                    set.rent_payer = recorded_payer;
+                }
+            }
         }
         if key == set.buffer {
             data[sim2::B_AUTHORITY..sim2::B_AUTHORITY + 32]
@@ -929,12 +999,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if submit(&mut ctx, stranger_begin, &[&stranger]).await.is_ok() {
         return Err("stranger REINIT unexpectedly succeeded".into());
     }
-    let mut stranger_close_accounts = close_accounts(&set);
+    let mut stranger_close_accounts = close_pre_accounts(&set);
     stranger_close_accounts[8] = meta(stranger.pubkey(), false, true);
     let stranger_close = Instruction {
         program_id: program,
         accounts: stranger_close_accounts,
-        data: lifecycle::encode_close().to_vec(),
+        data: lifecycle::encode_close_phase(0).to_vec(),
     };
     if submit(&mut ctx, stranger_close, &[&stranger]).await.is_ok() {
         return Err("stranger CLOSE unexpectedly succeeded".into());
@@ -994,7 +1064,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let captured_zero_hash = hash(&pixels(&captured_zero)?);
     let captured_one_hash = hash(&pixels(&captured_one)?);
     println!(
-        "{{\"status\":\"measured\",\"capture\":\"{}\",\"captured_accounts\":{},\"fresh_fixture_accounts\":44,\"renderer_abi\":\"{}\",\"reinit_cu\":{:?},\"fresh_reinit_cu\":{:?},\"already_fresh_reinit_cu\":{:?},\"cursor0_pixels_equal\":true,\"cursor0_sha256\":\"{}\",\"cursor0_strips\":8,\"cursor0_repeat_render_byte_identical\":true,\"advance_from\":0,\"advance_to\":1,\"advance_cu\":{},\"fresh_advance_cu\":{},\"cursor1_pixels_equal\":true,\"cursor1_sha256\":\"{}\",\"cursor1_strips\":8,\"cursor1_repeat_render_byte_identical\":true,\"stranger_reinit_refused\":true,\"stranger_close_refused\":true,\"reinit_already_fresh_succeeded\":true,\"close_accounts\":44,\"close_refund_lamports\":{},\"close_refund_fogo\":{:.9},\"close_cu\":{},\"close_left_program_owned_accounts\":0,\"double_close_refused\":true,\"fresh_reference_refund_lamports\":{},\"fresh_reference_close_cu\":{}}}",
+        "{{\"status\":\"measured\",\"capture\":\"{}\",\"captured_accounts\":{},\"fresh_fixture_accounts\":44,\"renderer_abi\":\"{}\",\"reinit_cu\":{:?},\"fresh_reinit_cu\":{:?},\"already_fresh_reinit_cu\":{:?},\"cursor0_pixels_equal\":true,\"cursor0_sha256\":\"{}\",\"cursor0_strips\":8,\"cursor0_repeat_render_byte_identical\":true,\"advance_from\":0,\"advance_to\":1,\"advance_cu\":{},\"fresh_advance_cu\":{},\"cursor1_pixels_equal\":true,\"cursor1_sha256\":\"{}\",\"cursor1_strips\":8,\"cursor1_repeat_render_byte_identical\":true,\"stranger_reinit_refused\":true,\"stranger_close_refused\":true,\"reinit_already_fresh_succeeded\":true,\"close_accounts\":44,\"close_refund_lamports\":{},\"close_refund_fogo\":{:.9},\"close_cu\":{:?},\"close_left_program_owned_accounts\":0,\"double_close_refused\":true,\"fresh_reference_refund_lamports\":{},\"fresh_reference_close_cu\":{:?}}}",
         capture.display(), rows.len(), hash(&expected_abi), first_reinit_units, fresh_reinit_units,
         fresh_again_units, captured_zero_hash, advance_cu, fresh_advance_cu,
         captured_one_hash, captured_refund, captured_refund as f64 / 1_000_000_000.0,

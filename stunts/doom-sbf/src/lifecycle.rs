@@ -29,8 +29,17 @@ pub const REFUSE_CLEAR: u32 = 324;
 pub const REFUSE_CLOSE: u32 = 325;
 
 const BASE_ACCOUNT_COUNT: usize = 15;
-const CLOSE_SHARED_PAYER_ACCOUNT_COUNT: usize = 45;
-const CLOSE_SEPARATE_PAYER_ACCOUNT_COUNT: usize = 46;
+const CLOSE_RENDER_BATCH: usize = 18;
+const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9 + CLOSE_RENDER_BATCH;
+const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10 + CLOSE_RENDER_BATCH;
+const CLOSE_FINAL_SHARED_ACCOUNT_COUNT: usize = 4 + CLOSE_RENDER_BATCH;
+const CLOSE_FINAL_SEPARATE_ACCOUNT_COUNT: usize = 5 + CLOSE_RENDER_BATCH;
+const CLOSE_MAGIC: &[u8; 8] = b"DOOM-CL1";
+const CLOSE_VERSION: u32 = 1;
+const CLOSE_CONTEXT: usize = 16;
+const CLOSE_AUTHORITY: usize = 48;
+const CLOSE_META: usize = 80;
+const CLOSE_PAYER: usize = 112;
 const CONTEXT: usize = 0;
 const RESOURCE: usize = 1;
 const WAD_FIRST: usize = 2;
@@ -99,10 +108,14 @@ impl Request {
             return Err(refuse(REFUSE_MALFORMED));
         }
         let argument = u32_at(data, 16);
-        if (data[12] != CLEAR_RENDER && data[12] != STEP && argument != 0)
-            || (data[12] == CLEAR_RENDER && argument >= RENDER_BUFFER_COUNT as u32)
-            || (data[12] == STEP && !(1..=6).contains(&argument))
-        {
+        let valid_argument = match data[12] {
+            BEGIN => argument == 0,
+            CLEAR_RENDER => argument < RENDER_BUFFER_COUNT as u32,
+            STEP => (1..=6).contains(&argument),
+            CLOSE => argument <= 1,
+            _ => false,
+        };
+        if !valid_argument {
             return Err(refuse(REFUSE_MALFORMED));
         }
         Ok(Self {
@@ -759,7 +772,157 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
     }
 }
 
-fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn close_meta_payer(
+    program: &Pubkey,
+    context: &AccountInfo,
+    meta: &AccountInfo,
+    authority: &AccountInfo,
+) -> Result<Pubkey, ProgramError> {
+    if !owned(program, context, resource_sbf::CONTEXT_BYTES, true)
+        || !owned(program, meta, sim2::META_BYTES, true)
+        || !authority.is_signer
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let data = meta.try_borrow_data()?;
+    let version = u32_at(&data, 8);
+    if &data[..8] != b"SIM2META"
+        || data.len() != sim2::META_BYTES
+        || !matches!(version, sim2::VERSION | sim2::META_VERSION)
+        || data[sim2::M_CONTEXT..sim2::M_CONTEXT + 32] != context.key.as_ref()[..]
+        || data[sim2::M_AUTHORITY..sim2::M_AUTHORITY + 32] != authority.key.as_ref()[..]
+    {
+        return Err(refuse(REFUSE_CLOSE));
+    }
+    let (expected_meta, bump) = sim2::meta_address(program, context.key);
+    if meta.key != &expected_meta || data[sim2::M_BUMP] != bump {
+        return Err(refuse(REFUSE_CLOSE));
+    }
+    let payer = if version == sim2::META_VERSION {
+        Pubkey::new_from_array(
+            data[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32]
+                .try_into()
+                .unwrap(),
+        )
+    } else {
+        *authority.key
+    };
+    if payer == Pubkey::default() {
+        return Err(refuse(REFUSE_CLOSE));
+    }
+    Ok(payer)
+}
+
+fn close_payer<'a>(
+    accounts: &'a [AccountInfo<'a>],
+    authority_index: usize,
+    payer_index: usize,
+    rent_payer: &Pubkey,
+) -> Result<&'a AccountInfo<'a>, ProgramError> {
+    let authority = &accounts[authority_index];
+    if authority.key == rent_payer {
+        if !authority.is_writable {
+            return Err(refuse(REFUSE_ACCOUNTS));
+        }
+        Ok(authority)
+    } else {
+        let payer = accounts.get(payer_index).ok_or(refuse(REFUSE_ACCOUNTS))?;
+        if payer.key != rent_payer || !payer.is_writable {
+            return Err(refuse(REFUSE_CLOSE));
+        }
+        Ok(payer)
+    }
+}
+
+fn close_one(account: &AccountInfo, payer: &AccountInfo) -> ProgramResult {
+    let next = payer
+        .lamports()
+        .checked_add(account.lamports())
+        .ok_or(refuse(REFUSE_CLOSE))?;
+    **payer.try_borrow_mut_lamports()? = next;
+    **account.try_borrow_mut_lamports()? = 0;
+    account.realloc(0, false)?;
+    account.assign(&system_program::ID);
+    Ok(())
+}
+
+fn close_marker_write(
+    continuation: &AccountInfo,
+    context: &Pubkey,
+    authority: &Pubkey,
+    meta: &Pubkey,
+    payer: &Pubkey,
+) -> ProgramResult {
+    let mut data = continuation.try_borrow_mut_data()?;
+    data.fill(0);
+    data[..8].copy_from_slice(CLOSE_MAGIC);
+    put_u32(&mut data, 8, CLOSE_VERSION);
+    put_u32(&mut data, 12, 1);
+    for (offset, key) in [
+        (CLOSE_CONTEXT, context),
+        (CLOSE_AUTHORITY, authority),
+        (CLOSE_META, meta),
+        (CLOSE_PAYER, payer),
+    ] {
+        data[offset..offset + 32].copy_from_slice(key.as_ref());
+    }
+    Ok(())
+}
+
+fn close_marker_matches(
+    continuation: &AccountInfo,
+    context: &Pubkey,
+    authority: &Pubkey,
+    meta: &Pubkey,
+    payer: &Pubkey,
+) -> Result<bool, ProgramError> {
+    let data = continuation.try_borrow_data()?;
+    Ok(&data[..8] == CLOSE_MAGIC
+        && u32_at(&data, 8) == CLOSE_VERSION
+        && u32_at(&data, 12) == 1
+        && data[CLOSE_CONTEXT..CLOSE_CONTEXT + 32] == context.as_ref()[..]
+        && data[CLOSE_AUTHORITY..CLOSE_AUTHORITY + 32] == authority.as_ref()[..]
+        && data[CLOSE_META..CLOSE_META + 32] == meta.as_ref()[..]
+        && data[CLOSE_PAYER..CLOSE_PAYER + 32] == payer.as_ref()[..]
+        && data[144..352].iter().all(|byte| *byte == 0)
+        && data[352..].iter().all(|byte| *byte == 0))
+}
+
+fn validate_render_batch(
+    program: &Pubkey,
+    context: &Pubkey,
+    accounts: &[AccountInfo],
+    render_start: usize,
+    first_index: usize,
+) -> ProgramResult {
+    let mut seen = Vec::with_capacity(CLOSE_RENDER_BATCH + render_start);
+    for account in accounts.iter().take(render_start) {
+        seen.push(*account.key);
+    }
+    for offset in 0..CLOSE_RENDER_BATCH {
+        let target = accounts
+            .get(render_start + offset)
+            .ok_or(refuse(REFUSE_ACCOUNTS))?;
+        let index = first_index + offset;
+        let (expected, bytes) = expected_render_account(program, context, index as u8)
+            .map_err(|_| refuse(REFUSE_CLOSE))?;
+        if target.key != &expected
+            || target.owner != program
+            || !target.is_writable
+            || target.data_len() != bytes
+            || seen.contains(target.key)
+        {
+            return Err(refuse(REFUSE_CLOSE));
+        }
+        seen.push(*target.key);
+    }
+    if seen.iter().collect::<std::collections::BTreeSet<_>>().len() != seen.len() {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    Ok(())
+}
+
+fn process_close_pre(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if accounts.len() < 9 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
@@ -772,125 +935,121 @@ fn process_close(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let frame = &accounts[6];
     let continuation = &accounts[7];
     let authority = &accounts[8];
-    if !authority.is_signer {
-        return Err(refuse(REFUSE_AUTHORITY));
+    let rent_payer = close_meta_payer(program, context, meta, authority)?;
+    let shared_payer = authority.key == &rent_payer;
+    let render_start = if shared_payer { 9 } else { 10 };
+    let expected_count = if shared_payer {
+        CLOSE_PRE_SHARED_ACCOUNT_COUNT
+    } else {
+        CLOSE_PRE_SEPARATE_ACCOUNT_COUNT
+    };
+    if accounts.len() != expected_count || !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNTS));
     }
-    if !owned(program, context, resource_sbf::CONTEXT_BYTES, true)
-        || !owned(program, state, resource_sbf::STATE_MAX_BYTES, true)
+    let payer = close_payer(accounts, 8, 9, &rent_payer)?;
+    if !owned(program, state, resource_sbf::STATE_MAX_BYTES, true)
         || !owned(program, mirror, resource_sbf::MIRROR_BYTES, true)
-        || !owned(program, meta, sim2::META_BYTES, true)
-        || buffer.owner != program
-        || !buffer.is_writable
         || !owned(program, controller, resource_sbf::CONTROLLER_BYTES, true)
         || !owned(program, frame, resource_sbf::RI2_FRAME_BYTES, true)
         || !owned(program, continuation, e2r::CONTINUATION_BYTES, true)
+        || buffer.owner != program
+        || !buffer.is_writable
     {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
     let meta_data = meta.try_borrow_data()?;
-    let version = u32_at(&meta_data, 8);
-    if &meta_data[..8] != b"SIM2META"
-        || meta_data.len() != sim2::META_BYTES
-        || (version != sim2::VERSION && version != sim2::META_VERSION)
-        || meta_data[sim2::M_CONTEXT..sim2::M_CONTEXT + 32] != context.key.as_ref()[..]
+    let (expected_buffer_len, _) = buffer_bytes(&meta_data, sim2::M_CAPACITY)?;
+    if buffer.data_len() != expected_buffer_len
         || meta_data[sim2::M_STATE..sim2::M_STATE + 32] != state.key.as_ref()[..]
         || meta_data[sim2::M_MIRROR..sim2::M_MIRROR + 32] != mirror.key.as_ref()[..]
         || meta_data[sim2::M_BUFFER..sim2::M_BUFFER + 32] != buffer.key.as_ref()[..]
-        || meta_data[sim2::M_AUTHORITY..sim2::M_AUTHORITY + 32] != authority.key.as_ref()[..]
     {
         return Err(refuse(REFUSE_CLOSE));
     }
-    let (expected_meta, bump) = sim2::meta_address(program, context.key);
-    if meta.key != &expected_meta || meta_data[sim2::M_BUMP] != bump {
-        return Err(refuse(REFUSE_CLOSE));
-    }
-    let rent_payer = if version == sim2::META_VERSION {
-        Pubkey::new_from_array(
-            meta_data[sim2::M_RENT_PAYER..sim2::M_RENT_PAYER + 32]
-                .try_into()
-                .unwrap(),
-        )
-    } else {
-        *authority.key
-    };
-    if rent_payer == Pubkey::default() {
-        return Err(refuse(REFUSE_CLOSE));
-    }
-    let shared_payer = authority.key == &rent_payer;
-    let render_start = if shared_payer { 9 } else { 10 };
-    let expected_count = if shared_payer {
-        CLOSE_SHARED_PAYER_ACCOUNT_COUNT
-    } else {
-        CLOSE_SEPARATE_PAYER_ACCOUNT_COUNT
-    };
-    if accounts.len() != expected_count {
-        return Err(refuse(REFUSE_ACCOUNTS));
-    }
-    let payer = if shared_payer {
-        if !authority.is_writable {
-            return Err(refuse(REFUSE_ACCOUNTS));
-        }
-        authority
-    } else {
-        let payer = &accounts[9];
-        if payer.key != &rent_payer || !payer.is_writable {
-            return Err(refuse(REFUSE_CLOSE));
-        }
-        payer
-    };
-    let (expected_buffer_len, _) = buffer_bytes(&meta_data, sim2::M_CAPACITY)?;
-    if buffer.data_len() != expected_buffer_len {
-        return Err(refuse(REFUSE_CLOSE));
-    }
     drop(meta_data);
+    validate_render_batch(program, context.key, accounts, render_start, 0)?;
 
-    let targets = [
-        context,
-        state,
-        mirror,
-        meta,
-        buffer,
-        controller,
-        frame,
-        continuation,
-    ];
-    let mut seen = Vec::with_capacity(44);
-    for account in targets {
-        seen.push(*account.key);
+    for index in [1usize, 2, 4, 5, 6] {
+        close_one(&accounts[index], payer)?;
     }
-    if seen.iter().collect::<std::collections::BTreeSet<_>>().len() != seen.len() {
+    for index in render_start..accounts.len() {
+        close_one(&accounts[index], payer)?;
+    }
+    close_marker_write(
+        continuation,
+        context.key,
+        authority.key,
+        meta.key,
+        &rent_payer,
+    )
+}
+
+fn process_close_final(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    if accounts.len() < 4 {
         return Err(refuse(REFUSE_ACCOUNTS));
     }
-    if seen.contains(payer.key) {
+    let context = &accounts[0];
+    let meta = &accounts[1];
+    let continuation = &accounts[2];
+    let authority = &accounts[3];
+    let rent_payer = close_meta_payer(program, context, meta, authority)?;
+    let shared_payer = authority.key == &rent_payer;
+    let render_start = if shared_payer { 4 } else { 5 };
+    let expected_count = if shared_payer {
+        CLOSE_FINAL_SHARED_ACCOUNT_COUNT
+    } else {
+        CLOSE_FINAL_SEPARATE_ACCOUNT_COUNT
+    };
+    if accounts.len() != expected_count || !distinct(accounts) {
+        return Err(refuse(REFUSE_ACCOUNTS));
+    }
+    let payer = close_payer(accounts, 3, 4, &rent_payer)?;
+    if !owned(program, continuation, e2r::CONTINUATION_BYTES, true)
+        || !close_marker_matches(
+            continuation,
+            context.key,
+            authority.key,
+            meta.key,
+            &rent_payer,
+        )?
+    {
         return Err(refuse(REFUSE_CLOSE));
     }
-    for index in 0..RENDER_BUFFER_COUNT {
-        let target = &accounts[render_start + index];
-        let (expected, expected_bytes) = expected_render_account(program, context.key, index as u8)
+    let mut seen = vec![*context.key, *meta.key, *continuation.key];
+    for offset in 0..CLOSE_RENDER_BATCH {
+        let target = &accounts[render_start + offset];
+        let index = CLOSE_RENDER_BATCH + offset;
+        let (expected, bytes) = expected_render_account(program, context.key, index as u8)
             .map_err(|_| refuse(REFUSE_CLOSE))?;
         if target.key != &expected
             || target.owner != program
             || !target.is_writable
-            || target.data_len() != expected_bytes
+            || target.data_len() != bytes
             || seen.contains(target.key)
         {
             return Err(refuse(REFUSE_CLOSE));
         }
         seen.push(*target.key);
     }
-
-    for account in accounts.iter().take(8).chain(accounts.iter().skip(render_start)) {
-        let amount = account.lamports();
-        let next = payer
-            .lamports()
-            .checked_add(amount)
-            .ok_or(refuse(REFUSE_CLOSE))?;
-        **payer.try_borrow_mut_lamports()? = next;
-        **account.try_borrow_mut_lamports()? = 0;
-        account.realloc(0, false)?;
-        account.assign(&system_program::ID);
+    if seen.iter().collect::<std::collections::BTreeSet<_>>().len() != seen.len()
+        || seen.contains(payer.key)
+    {
+        return Err(refuse(REFUSE_ACCOUNTS));
     }
-    Ok(())
+    for index in render_start..accounts.len() {
+        close_one(&accounts[index], payer)?;
+    }
+    close_one(context, payer)?;
+    close_one(meta, payer)?;
+    close_one(continuation, payer)
+}
+
+fn process_close(program: &Pubkey, accounts: &[AccountInfo], phase: u32) -> ProgramResult {
+    match phase {
+        0 => process_close_pre(program, accounts),
+        1 => process_close_final(program, accounts),
+        _ => Err(refuse(REFUSE_MALFORMED)),
+    }
 }
 
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -899,7 +1058,7 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         BEGIN => process_begin(program, accounts),
         CLEAR_RENDER => process_clear_render(program, accounts, request),
         STEP => process_step(program, accounts, request),
-        CLOSE => process_close(program, accounts),
+        CLOSE => process_close(program, accounts, request.argument),
         _ => Err(refuse(REFUSE_MALFORMED)),
     }
 }
@@ -929,9 +1088,13 @@ pub fn encode_step(phase: u8) -> [u8; REQUEST_BYTES] {
 }
 
 pub fn encode_close() -> [u8; REQUEST_BYTES] {
+    encode_close_phase(0)
+}
+
+pub fn encode_close_phase(phase: u8) -> [u8; REQUEST_BYTES] {
     Request {
         operation: CLOSE,
-        argument: 0,
+        argument: u32::from(phase),
     }
     .encode()
 }
@@ -959,6 +1122,10 @@ mod tests {
                 operation: CLOSE,
                 argument: 0,
             },
+            Request {
+                operation: CLOSE,
+                argument: 1,
+            },
         ] {
             assert_eq!(Request::decode(&request.encode()).unwrap(), request);
         }
@@ -974,6 +1141,14 @@ mod tests {
             &Request {
                 operation: STEP,
                 argument: 7
+            }
+            .encode()
+        )
+        .is_err());
+        assert!(Request::decode(
+            &Request {
+                operation: CLOSE,
+                argument: 2
             }
             .encode()
         )
