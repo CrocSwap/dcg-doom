@@ -1730,13 +1730,17 @@ int doom_engine_rsn3_render_static(
     const uint8_t *header, unsigned long header_bytes,
     uint8_t *bootstrap, unsigned long bootstrap_bytes,
     const uint8_t *payload, unsigned long payload_bytes, uint32_t strip_id,
+    uint8_t *render_cache, unsigned long render_cache_bytes,
+    const uint8_t *snapshot_hash,
     uint8_t *strip_out, unsigned long strip_cap,
     unsigned long *arena_high_water_out)
 {
     uint8_t *frame;
     size_t strip_bytes = 40u * 200u;
-    unsigned long transient_mark;
-    int rc, y, x;
+    unsigned long transient_mark, base_mark, cache_dynamic_mark;
+    unsigned long arena_limit;
+    uint32_t cache_base32, cache_dynamic32;
+    int rc, y, x, cache_hit = 0, cache_write = 0;
     ri2_render_saved_t ri2_saved;
     ri2_render_arrays_t ri2_arrays;
     RSR_PROF_RESET();
@@ -1748,7 +1752,7 @@ int doom_engine_rsn3_render_static(
      * itself in the log instead of arriving as one undifferentiated code. */
     if (!bootstrap) { RSR_REFUSE_NOTE(0xba0ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (bootstrap_bytes < RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES) { RSR_REFUSE_NOTE(0xba1ul, (unsigned long)bootstrap_bytes, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
-    if (!payload || !strip_out) { RSR_REFUSE_NOTE(0xba2ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
+    if (!payload || !strip_out || !snapshot_hash || !render_cache || render_cache_bytes != 56u) { RSR_REFUSE_NOTE(0xba2ul, 0ul, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (strip_cap != strip_bytes || strip_id >= 8u) { RSR_REFUSE_NOTE(0xba3ul, (unsigned long)strip_cap, (unsigned long)strip_id, 0ul); return RSR_REFUSE_LAYOUT; }
     if (((uintptr_t)bootstrap & 15u) != 0) { RSR_REFUSE_NOTE(0xba4ul, (unsigned long)(uintptr_t)bootstrap, 0ul, 0ul); return RSR_REFUSE_LAYOUT; }
     if (rsr_rebind_layout(context, account_bytes, header, header_bytes)) { RSR_REFUSE_NOTE(0xba5ul, (unsigned long)account_bytes, (unsigned long)rsr_get32(header + 20), (unsigned long)sizeof(doom_ctx_t)); return RSR_REFUSE_LAYOUT; }
@@ -1761,11 +1765,40 @@ int doom_engine_rsn3_render_static(
         return RI2_REFUSE_ARENA;
     PROF_EXIT(DOOM_SBF_PROF_REBIND, 1);
     RI2_PHASE(1101);
+    arena_limit = ri2_split_arena_bytes(bootstrap_bytes);
     transient_mark = doom_sbf_arena_mark();
-    PROF_ENTER(DOOM_SBF_PROF_RSN3_APPLY, 1);
-    rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
-    PROF_EXIT(DOOM_SBF_PROF_RSN3_APPLY, 1);
-    if (rc) return rc;
+    if (!ri2_zero(render_cache, render_cache_bytes)) {
+        if (memcmp(render_cache, "DOOM-FC1", 8u) ||
+            rsn3_get32(render_cache + 8u) != 1u ||
+            rsn3_get32(render_cache + 12u) != 0u) return RSR_REFUSE_LAYOUT;
+        cache_base32 = rsn3_get32(render_cache + 48u);
+        cache_dynamic32 = rsn3_get32(render_cache + 52u);
+        base_mark = (unsigned long)cache_base32;
+        cache_dynamic_mark = (unsigned long)cache_dynamic32;
+        if (base_mark > cache_dynamic_mark || cache_dynamic_mark > arena_limit ||
+            transient_mark != cache_dynamic_mark) return RSR_REFUSE_LAYOUT;
+        if (!memcmp(render_cache + 16u, snapshot_hash, 32u)) {
+            cache_hit = 1;
+            transient_mark = cache_dynamic_mark;
+        } else {
+            if (!doom_sbf_arena_rewind(base_mark)) return RI2_REFUSE_ARENA;
+            transient_mark = base_mark;
+        }
+    } else {
+        base_mark = transient_mark;
+    }
+    if (!cache_hit) {
+        PROF_ENTER(DOOM_SBF_PROF_RSN3_APPLY, 1);
+        rc = rsn3_apply_dynamic(payload, (size_t)payload_bytes);
+        PROF_EXIT(DOOM_SBF_PROF_RSN3_APPLY, 1);
+        if (rc) return rc;
+        transient_mark = doom_sbf_arena_mark();
+        if (base_mark > transient_mark || transient_mark > arena_limit ||
+            transient_mark > 0xfffffffful || base_mark > 0xfffffffful)
+            return RI2_REFUSE_ARENA;
+        cache_dynamic_mark = transient_mark;
+        cache_write = 1;
+    }
     RI2_PHASE(1102);
     PROF_ENTER(DOOM_SBF_PROF_FRAME_SETUP, 1);
     /* One screen, not four.  This path publishes screens[0] and reads no
@@ -1842,6 +1875,14 @@ int doom_engine_rsn3_render_static(
                     src[(size_t)y * 80u + (size_t)x];
     }
     RI2_PHASE(1105);
+    if (cache_write) {
+        memcpy(render_cache, "DOOM-FC1", 8u);
+        rsn3_put32(render_cache + 8u, 1u);
+        rsn3_put32(render_cache + 12u, 0u);
+        memcpy(render_cache + 16u, snapshot_hash, 32u);
+        rsn3_put32(render_cache + 48u, (uint32_t)base_mark);
+        rsn3_put32(render_cache + 52u, (uint32_t)cache_dynamic_mark);
+    }
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();
     free(frame);
     if (!doom_sbf_arena_rewind(transient_mark)) return RI2_REFUSE_ARENA;

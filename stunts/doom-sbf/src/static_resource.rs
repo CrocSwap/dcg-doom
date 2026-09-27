@@ -24,6 +24,11 @@ pub const OP_RENDER_BUFFERED: u8 = 5;
 pub const OP_CLEAR: u8 = 6;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
+// The RSR/2 header already reserves [336..512]. Keep the account length and
+// every public header offset fixed; the first 56 reserved bytes are a volatile
+// renderer cache shared by strips that name the same RSN/3 snapshot.
+const RENDER_CACHE_OFFSET: usize = 336;
+const RENDER_CACHE_BYTES: usize = 56;
 pub const ROOTS_OFFSET: usize = 160;
 pub const ROOT_COUNT: usize = 32;
 pub const ROOT_BYTES: usize = ROOT_COUNT * 4;
@@ -1002,7 +1007,9 @@ fn validate_header(data: &[u8]) -> Result<([u8; 32], [u8; 32]), ProgramError> {
             != header[H_RESOURCE_HASH..H_RESOURCE_HASH + 32]
         || u64_at(header, H_BASE_ADDRESS) == 0
         || u64_at(header, H_BUILD_BASE) == 0
-        || header[336..HEADER_BYTES].iter().any(|byte| *byte != 0)
+        || header[RENDER_CACHE_OFFSET + RENDER_CACHE_BYTES..HEADER_BYTES]
+            .iter()
+            .any(|byte| *byte != 0)
         || header[ROOTS_OFFSET..ROOTS_OFFSET + ROOT_BYTES]
             .chunks_exact(4)
             .any(|raw| {
@@ -1268,6 +1275,8 @@ fn render_snapshot_to_strip(
     let bootstrap_len = bootstrap.len();
     let header_ptr = header.as_ptr();
     let header_len = header.len();
+    let render_cache_ptr = header[RENDER_CACHE_OFFSET..RENDER_CACHE_OFFSET + RENDER_CACHE_BYTES]
+        .as_mut_ptr();
     let mut arena_high_water = 0usize;
     crate::diagnostic_phase(1203);
     #[cfg(all(feature = "ctx-engine", target_os = "solana"))]
@@ -1282,6 +1291,9 @@ fn render_snapshot_to_strip(
             snapshot.payload.as_ptr(),
             snapshot.payload.len(),
             u32::from(strip_id),
+            render_cache_ptr,
+            RENDER_CACHE_BYTES,
+            snapshot.snapshot_hash.as_ptr(),
             strip_data[rsn3::STRIP_HEADER_BYTES..].as_mut_ptr(),
             rsn3::STRIP_PIXELS_BYTES,
             &mut arena_high_water,
@@ -1457,6 +1469,9 @@ unsafe extern "C" {
         payload: *const u8,
         payload_bytes: usize,
         strip_id: u32,
+        render_cache: *mut u8,
+        render_cache_bytes: usize,
+        snapshot_hash: *const u8,
         strip_out: *mut u8,
         strip_cap: usize,
         arena_high_water: *mut usize,
