@@ -142,15 +142,17 @@ static void rsr_prof_emit(void)
 #define RI2_NEWGAME_MAP 1
 #define RI2_REINIT_TEXTURE_BATCH 32u
 #define RI2_REINIT_TEXTURE_BATCHES 8u
+#define RI2_REINIT_PATCH_BATCH 32u
+#define RI2_REINIT_PATCH_BATCHES 11u
 
 static const uint8_t ri2_wad_hash[32] = {
     0x1d,0x7d,0x43,0xbe,0x50,0x1e,0x67,0xd9,0x27,0xe4,0x15,0xe0,0xb8,0xf3,0xe2,0x9c,
     0x3b,0xf3,0x30,0x75,0xe8,0x59,0x72,0x18,0x16,0xf6,0x52,0xa5,0x26,0xca,0xc7,0x71
 };
 
-/* The upstream R_InitTextures combines texture-definition parsing and every
- * texture lookup in one call. DOOM-LIF/2 persists its small cursor in the
- * bootstrap plan reserve, then runs parsing and R_GenerateLookup in fixed,
+/* The upstream R_InitTextures combines patch-name lookup, texture-definition
+ * parsing, and every texture lookup in one call. DOOM-LIF/2 persists its small
+ * cursor in the bootstrap plan reserve, then runs each loop in fixed,
  * ordered batches. This preserves the upstream loop order across bounded
  * instructions without enlarging doom_ctx_t or changing the RSR account ABI. */
 typedef struct
@@ -179,6 +181,7 @@ typedef struct
     uint32_t numtextures1;
     uint32_t numtextures2;
     uint32_t nummappatches;
+    uintptr_t names;
     uintptr_t maptex1;
     uintptr_t maptex2;
     uintptr_t patchlookup;
@@ -202,25 +205,19 @@ static int ri2_reinit_textures_begin(uint8_t *bootstrap,
     ri2_reinit_texture_state_t *state =
         ri2_reinit_texture_state(bootstrap, bootstrap_bytes);
     int *maptex, *maptex1, *maptex2, *patchlookup;
-    char name[9], *names, *name_p;
-    int i, nummappatches, numtextures1, numtextures2;
+    char *names;
+    int nummappatches, numtextures1, numtextures2;
 
     if (!state) return RI2_REFUSE_ARENA;
     memset(state, 0, sizeof(*state));
-    name[8] = 0;
     names = W_CacheLumpName("PNAMES", PU_STATIC);
     if (!names) return RI2_REFUSE_RESOURCE;
     nummappatches = LONG(*((int *)names));
-    if (nummappatches < 0 || nummappatches > 4096) return RI2_REFUSE_RESOURCE;
-    name_p = names + 4;
+    if (nummappatches < 0 ||
+        nummappatches > (int)(RI2_REINIT_PATCH_BATCH * RI2_REINIT_PATCH_BATCHES))
+        return RI2_REFUSE_RESOURCE;
     patchlookup = Z_Malloc((size_t)nummappatches * sizeof(*patchlookup), PU_STATIC, 0);
     if (!patchlookup) return RI2_REFUSE_ARENA;
-    for (i = 0; i < nummappatches; i++)
-    {
-        strncpy(name, name_p + i * 8, 8);
-        patchlookup[i] = W_CheckNumForName(name);
-    }
-    Z_Free(names);
 
     maptex = maptex1 = W_CacheLumpName("TEXTURE1", PU_STATIC);
     if (!maptex) return RI2_REFUSE_RESOURCE;
@@ -255,10 +252,43 @@ static int ri2_reinit_textures_begin(uint8_t *bootstrap,
     state->numtextures1 = (uint32_t)numtextures1;
     state->numtextures2 = (uint32_t)numtextures2;
     state->nummappatches = (uint32_t)nummappatches;
+    state->names = (uintptr_t)names;
     state->maptex1 = (uintptr_t)maptex1;
     state->maptex2 = (uintptr_t)maptex2;
     state->patchlookup = (uintptr_t)patchlookup;
     state->magic = RI2_REINIT_TEXTURE_STATE_MAGIC;
+    return 0;
+}
+
+static int ri2_reinit_patch_lookup_batch(uint8_t *bootstrap,
+                                         unsigned long bootstrap_bytes,
+                                         uint32_t batch)
+{
+    ri2_reinit_texture_state_t *state =
+        ri2_reinit_texture_state(bootstrap, bootstrap_bytes);
+    char name[9];
+    char *name_p;
+    int *patchlookup;
+    int start, end, i;
+    if (!state || state->magic != RI2_REINIT_TEXTURE_STATE_MAGIC ||
+        batch >= RI2_REINIT_PATCH_BATCHES || !state->names || !state->patchlookup)
+        return RI2_REFUSE_RESOURCE;
+    start = (int)(batch * RI2_REINIT_PATCH_BATCH);
+    end = start + (int)RI2_REINIT_PATCH_BATCH;
+    if (end > (int)state->nummappatches) end = (int)state->nummappatches;
+    name[8] = 0;
+    name_p = (char *)state->names + 4;
+    patchlookup = (int *)state->patchlookup;
+    for (i = start; i < end; i++)
+    {
+        strncpy(name, name_p + i * 8, 8);
+        patchlookup[i] = W_CheckNumForName(name);
+    }
+    if (batch + 1u == RI2_REINIT_PATCH_BATCHES)
+    {
+        Z_Free((void *)state->names);
+        state->names = 0;
+    }
     return 0;
 }
 
@@ -275,7 +305,7 @@ static int ri2_reinit_textures_parse_batch(uint8_t *bootstrap,
     int *maptex, *maptex1, *maptex2, *patchlookup, *directory;
     int i, j, start, end, numtextures1, nummappatches, maxoff;
 
-    if (!state || state->magic != RI2_REINIT_TEXTURE_STATE_MAGIC ||
+    if (!state || state->magic != RI2_REINIT_TEXTURE_STATE_MAGIC || state->names ||
         batch >= RI2_REINIT_TEXTURE_BATCHES)
         return RI2_REFUSE_RESOURCE;
     start = (int)(batch * RI2_REINIT_TEXTURE_BATCH);
@@ -1484,8 +1514,9 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
 /* REINIT's renderer and game bootstrap is split into independently durable
  * phases because R_InitTextures plus the following initialization exceeded
  * the deployed transaction budget as one call. Phase order is part of
- * DOOM-LIF/2: V_Init; texture-definition setup, eight parse batches, and
- * eight ordered lookup batches; the remaining R_InitData components;
+ * DOOM-LIF/2: V_Init; texture-definition setup, eleven PNAMES lookup batches,
+ * eight parse batches, and eight ordered texture lookup batches; the remaining
+ * R_InitData components;
  * R_InitPointToAngle; R_InitTables; R_SetViewSize; R_InitPlanes;
  * R_InitLightTables; R_InitSkyMap;
  * R_InitTranslationTables; R_ExecuteSetViewSize; P_InitSwitchList plus
@@ -1513,27 +1544,32 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
             return RI2_REFUSE_RESOURCE;
         break;
     case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9:
-        if (ri2_reinit_textures_parse_batch(bootstrap, bootstrap_bytes, phase - 2u))
+    case 10: case 11: case 12:
+        if (ri2_reinit_patch_lookup_batch(bootstrap, bootstrap_bytes, phase - 2u))
             return RI2_REFUSE_RESOURCE;
         break;
-    case 10: case 11: case 12: case 13: case 14: case 15: case 16: case 17:
-        if (ri2_reinit_textures_lookup_batch(phase - 10u))
+    case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20:
+        if (ri2_reinit_textures_parse_batch(bootstrap, bootstrap_bytes, phase - 13u))
             return RI2_REFUSE_RESOURCE;
         break;
-    case 18: R_InitFlats(); break;
-    case 19: R_InitSpriteLumps(); break;
-    case 20: R_InitColormaps(); break;
-    case 21: R_InitPointToAngle(); break;
-    case 22: R_InitTables(); break;
-    case 23: R_SetViewSize(screenblocks, detailLevel); break;
-    case 24: R_InitPlanes(); break;
-    case 25: R_InitLightTables(); break;
-    case 26: R_InitSkyMap(); break;
-    case 27: R_InitTranslationTables(); framecount = 0; break;
-    case 28: R_ExecuteSetViewSize(); break;
-    case 29: P_InitSwitchList(); P_InitPicAnims(); break;
-    case 30: R_InitSprites(sprnames); break;
-    case 31:
+    case 21: case 22: case 23: case 24: case 25: case 26: case 27: case 28:
+        if (ri2_reinit_textures_lookup_batch(phase - 21u))
+            return RI2_REFUSE_RESOURCE;
+        break;
+    case 29: R_InitFlats(); break;
+    case 30: R_InitSpriteLumps(); break;
+    case 31: R_InitColormaps(); break;
+    case 32: R_InitPointToAngle(); break;
+    case 33: R_InitTables(); break;
+    case 34: R_SetViewSize(screenblocks, detailLevel); break;
+    case 35: R_InitPlanes(); break;
+    case 36: R_InitLightTables(); break;
+    case 37: R_InitSkyMap(); break;
+    case 38: R_InitTranslationTables(); framecount = 0; break;
+    case 39: R_ExecuteSetViewSize(); break;
+    case 40: P_InitSwitchList(); P_InitPicAnims(); break;
+    case 41: R_InitSprites(sprnames); break;
+    case 42:
         /* Mirror the source-matched RI1 new-game producer.  The players
          * array and playeringame[0] must be initialized before G_InitNew,
          * and demo_p remains bounded by the image's DEMO1 lump. */
