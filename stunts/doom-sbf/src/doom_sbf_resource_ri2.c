@@ -1765,7 +1765,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_phase(
     uint8_t *context, uint8_t *bootstrap, unsigned long bootstrap_bytes,
     unsigned long *arena_high_water_out)
 {
-    if (phase >= 16u) return RI2_REFUSE_RESOURCE;
+    if (phase >= 37u) return RI2_REFUSE_RESOURCE;
     if (doom_ctx_guard(context)) return 199;
     if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
         ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
@@ -1777,7 +1777,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_phase(
         G_InitNewRI2Prepare((skill_t)RI2_NEWGAME_SKILL,
                             RI2_NEWGAME_EPISODE, RI2_NEWGAME_MAP);
     } else {
-        G_DoLoadLevelRI2Phase(phase);
+        if (G_DoLoadLevelRI2Phase(phase)) return RI2_REFUSE_RESOURCE;
     }
     if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();

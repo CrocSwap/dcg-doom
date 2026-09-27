@@ -1,6 +1,6 @@
 --- a/linuxdoom-1.10/p_setup.c
 +++ b/linuxdoom-1.10/p_setup.c
-@@ -670,6 +670,112 @@
+@@ -670,6 +670,162 @@
  
  
  
@@ -24,7 +24,50 @@
 +    return W_GetNumForName(lumpname);
 +}
 +
-+void P_SetupLevelRI2Phase(unsigned int phase, int episode, int map,
++#define RI2_SIDE_BATCH_SIZE 32
++#define RI2_SIDE_BATCH_COUNT 21
++
++static int P_LoadSideDefsRI2Phase(int lump, unsigned int batch)
++{
++    byte *data;
++    int i;
++    int start;
++    int end;
++    mapsidedef_t *msd;
++    side_t *sd;
++
++    if (batch == 0)
++    {
++        numsides = W_LumpLength(lump) / sizeof(mapsidedef_t);
++        if ((numsides + RI2_SIDE_BATCH_SIZE - 1) / RI2_SIDE_BATCH_SIZE !=
++            RI2_SIDE_BATCH_COUNT)
++            return -1;
++        sides = Z_Malloc(numsides * sizeof(side_t), PU_LEVEL, 0);
++        memset(sides, 0, numsides * sizeof(side_t));
++        return 0;
++    }
++    if (batch > RI2_SIDE_BATCH_COUNT) return -1;
++
++    data = W_CacheLumpNum(lump, PU_STATIC);
++    start = (batch - 1) * RI2_SIDE_BATCH_SIZE;
++    end = start + RI2_SIDE_BATCH_SIZE;
++    if (end > numsides) end = numsides;
++    msd = ((mapsidedef_t *)data) + start;
++    sd = sides + start;
++    for (i = start; i < end; i++, msd++, sd++)
++    {
++        sd->textureoffset = SHORT(msd->textureoffset) << FRACBITS;
++        sd->rowoffset = SHORT(msd->rowoffset) << FRACBITS;
++        sd->toptexture = R_TextureNumForName(msd->toptexture);
++        sd->bottomtexture = R_TextureNumForName(msd->bottomtexture);
++        sd->midtexture = R_TextureNumForName(msd->midtexture);
++        sd->sector = &sectors[SHORT(msd->sector)];
++    }
++    if (batch == RI2_SIDE_BATCH_COUNT) Z_Free(data);
++    return 0;
++}
++
++int P_SetupLevelRI2Phase(unsigned int phase, int episode, int map,
 +                          int playermask, skill_t skill)
 +{
 +    int lumpnum;
@@ -59,30 +102,36 @@
 +        break;
 +    case 4:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
-+        P_LoadSideDefs(lumpnum + ML_SIDEDEFS);
++        if (P_LoadSideDefsRI2Phase(lumpnum + ML_SIDEDEFS, 0)) return -1;
 +        break;
-+    case 5:
++    case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12:
++    case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20:
++    case 21: case 22: case 23: case 24: case 25:
++        lumpnum = P_RI2MapLump(episode, map, lumpname);
++        if (P_LoadSideDefsRI2Phase(lumpnum + ML_SIDEDEFS, phase - 4)) return -1;
++        break;
++    case 26:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
 +        P_LoadLineDefs(lumpnum + ML_LINEDEFS);
 +        break;
-+    case 6:
++    case 27:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
 +        P_LoadSubsectors(lumpnum + ML_SSECTORS);
 +        break;
-+    case 7:
++    case 28:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
 +        P_LoadNodes(lumpnum + ML_NODES);
 +        break;
-+    case 8:
++    case 29:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
 +        P_LoadSegs(lumpnum + ML_SEGS);
 +        break;
-+    case 9:
++    case 30:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
 +        rejectmatrix = W_CacheLumpNum(lumpnum + ML_REJECT, PU_LEVEL);
 +        P_GroupLines();
 +        break;
-+    case 10:
++    case 31:
 +        lumpnum = P_RI2MapLump(episode, map, lumpname);
 +        bodyqueslot = 0;
 +        deathmatch_p = deathmatchstarts;
@@ -95,18 +144,19 @@
 +                    G_DeathMatchSpawnPlayer(i);
 +                }
 +        break;
-+    case 11:
++    case 32:
 +        iquehead = iquetail = 0;
 +        P_SpawnSpecials();
 +        break;
-+    case 12:
++    case 33:
 +        if (precache) R_PrecacheLevel();
 +        break;
 +    default:
-+        break;
++        return -1;
 +    }
 +    (void)playermask;
 +    (void)skill;
++    return 0;
 +}
 +
 +
@@ -119,18 +169,18 @@
    skill_t	skill);
  
  // Called by startup code.
-+void P_SetupLevelRI2Phase (unsigned int phase, int episode, int map, int playermask, skill_t skill);
++int P_SetupLevelRI2Phase (unsigned int phase, int episode, int map, int playermask, skill_t skill);
 +
  void P_Init (void);
  
  #endif
 --- a/linuxdoom-1.10/g_game.c
 +++ b/linuxdoom-1.10/g_game.c
-@@ -419,6 +419,48 @@
+@@ -419,6 +419,53 @@
   
   
  //
-+void G_DoLoadLevelRI2Phase(unsigned int phase)
++int G_DoLoadLevelRI2Phase(unsigned int phase)
 +{
 +    int i;
 +    switch (phase)
@@ -153,7 +203,7 @@
 +            memset(players[i].frags, 0, sizeof(players[i].frags));
 +        }
 +        break;
-+    case 15:
++    case 36:
 +        displayplayer = DOOM_CTX->consoleplayer;
 +        starttime = I_GetTime();
 +        gameaction = ga_nothing;
@@ -166,16 +216,21 @@
 +        memset(joybuttons, 0, sizeof(joybuttons));
 +        break;
 +    default:
-+        if (phase >= 2 && phase <= 14)
-+            P_SetupLevelRI2Phase(phase - 2, gameepisode, gamemap, 0, gameskill);
++        if (phase >= 2 && phase <= 35)
++        {
++            if (P_SetupLevelRI2Phase(phase - 2, gameepisode, gamemap, 0, gameskill))
++                return -1;
++        }
++        else return -1;
 +        break;
 +    }
++    return 0;
 +}
 +
  // G_Responder  
  // Get info needed to make ticcmd_ts for the players.
  // 
-@@ -1278,7 +1320,7 @@
+@@ -1278,7 +1325,7 @@
  
  
  void
@@ -184,7 +239,7 @@
  ( skill_t	skill,
    int		episode,
    int		map ) 
-@@ -1394,9 +1436,16 @@
+@@ -1394,9 +1441,16 @@
  	    break;
  	} 
   
@@ -211,7 +266,7 @@
  
  void G_InitNew (skill_t skill, int episode, int map);
 +void G_InitNewRI2Prepare (skill_t skill, int episode, int map);
-+void G_DoLoadLevelRI2Phase (unsigned int phase);
++int G_DoLoadLevelRI2Phase (unsigned int phase);
  
  // Can be called by the startup code or M_Responder.
  // A normal game starts at map 1,
