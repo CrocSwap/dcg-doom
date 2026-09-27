@@ -589,16 +589,18 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
             let state = accounts[STATE].try_borrow_data()?;
             let mirror = accounts[MIRROR].try_borrow_data()?;
             let controller = accounts[CONTROLLER].try_borrow_data()?;
-            let wad_image = &context[resource_sbf::WAD_IMAGE_OFFSET
-                ..resource_sbf::WAD_IMAGE_OFFSET + resource_sbf::WAD_IMAGE_BYTES];
+            let wad_image_ptr = context
+                .as_ptr()
+                .wrapping_add(resource_sbf::WAD_IMAGE_OFFSET);
+            let wad_image_len = resource_sbf::WAD_IMAGE_BYTES;
             let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
             unsafe {
                 doom_engine_ex2_resource_sbf_ri2_split_setup(
                     context_ptr,
                     resource.as_ptr(),
                     resource.len(),
-                    wad_image.as_ptr(),
-                    wad_image.len(),
+                    wad_image_ptr,
+                    wad_image_len,
                     bootstrap_ptr,
                     bootstrap_len,
                     state.as_ptr(),
