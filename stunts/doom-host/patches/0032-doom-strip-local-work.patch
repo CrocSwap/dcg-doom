@@ -1,5 +1,5 @@
 diff --git a/linuxdoom-1.10/r_plane.c b/linuxdoom-1.10/r_plane.c
-index cc4ba2b..aa5f3fd 100644
+index bcc087f..06d01b1 100644
 --- a/linuxdoom-1.10/r_plane.c
 +++ b/linuxdoom-1.10/r_plane.c
 @@ -131,6 +131,14 @@ R_MapPlane
@@ -61,7 +61,7 @@ index cc4ba2b..aa5f3fd 100644
  		dc_yl = PL_TOP(pl,x);
  		dc_yh = PL_BOTTOM(pl,x);
 diff --git a/linuxdoom-1.10/r_segs.c b/linuxdoom-1.10/r_segs.c
-index 986a74b..34b4d93 100644
+index 82ed8fd..1dc59df 100644
 --- a/linuxdoom-1.10/r_segs.c
 +++ b/linuxdoom-1.10/r_segs.c
 @@ -76,6 +76,15 @@ R_RenderMaskedSegRange
@@ -80,13 +80,15 @@ index 986a74b..34b4d93 100644
      
      // Calculate light table.
      // Use different light tables
-@@ -181,11 +190,16 @@ void R_RenderSegLoop (void)
+@@ -182,6 +191,7 @@ void R_RenderSegLoop (void)
      fixed_t		texturecolumn;
      int			top;
      int			bottom;
 +    int			draw_column;
  
-     //texturecolumn = 0;				// shut up compiler warning
+     /* After the declarations, not before them: PROF_ENTER expands to
+      * ((void)0) outside a diagnostic-profile image, and a statement ahead of
+@@ -192,6 +202,10 @@ void R_RenderSegLoop (void)
  	
      for ( ; rw_x < rw_stopx ; rw_x++)
      {
@@ -97,7 +99,7 @@ index 986a74b..34b4d93 100644
  	// mark floor / ceiling areas
  	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
  
-@@ -227,7 +241,7 @@ void R_RenderSegLoop (void)
+@@ -233,7 +247,7 @@ void R_RenderSegLoop (void)
  	}
  	
  	// texturecolumn and lighting are independent of wall tiers
@@ -106,7 +108,7 @@ index 986a74b..34b4d93 100644
  	{
  	    // calculate texture offset
  	    angle = (rw_centerangle + xtoviewangle[rw_x])>>ANGLETOFINESHIFT;
-@@ -248,11 +262,14 @@ void R_RenderSegLoop (void)
+@@ -254,11 +268,14 @@ void R_RenderSegLoop (void)
  	if ((DOOM_CTX->midtexture))
  	{
  	    // single sided line
@@ -126,7 +128,7 @@ index 986a74b..34b4d93 100644
  	    ceilingclip[rw_x] = viewheight;
  	    floorclip[rw_x] = -1;
  	}
-@@ -270,11 +287,14 @@ void R_RenderSegLoop (void)
+@@ -276,11 +293,14 @@ void R_RenderSegLoop (void)
  
  		if (mid >= yl)
  		{
@@ -146,7 +148,7 @@ index 986a74b..34b4d93 100644
  		    ceilingclip[rw_x] = mid;
  		}
  		else
-@@ -299,12 +319,15 @@ void R_RenderSegLoop (void)
+@@ -305,12 +325,15 @@ void R_RenderSegLoop (void)
  		
  		if (mid <= yh)
  		{
@@ -168,7 +170,7 @@ index 986a74b..34b4d93 100644
  		    floorclip[rw_x] = mid;
  		}
  		else
-@@ -317,7 +340,7 @@ void R_RenderSegLoop (void)
+@@ -323,7 +346,7 @@ void R_RenderSegLoop (void)
  		    floorclip[rw_x] = yh+1;
  	    }
  			
@@ -177,7 +179,7 @@ index 986a74b..34b4d93 100644
  	    {
  		// save texturecol
  		//  for backdrawing of masked mid texture
-@@ -350,6 +373,9 @@ R_StoreWallRange
+@@ -356,6 +379,9 @@ R_StoreWallRange
      angle_t		distangle, offsetangle;
      fixed_t		vtop;
      int			lightnum;
@@ -187,7 +189,7 @@ index 986a74b..34b4d93 100644
  
      // don't overflow and crash
      if (ds_p == &drawsegs[MAXDRAWSEGS])
-@@ -383,6 +409,16 @@ R_StoreWallRange
+@@ -389,6 +415,16 @@ R_StoreWallRange
      ds_p->x2 = stop;
      ds_p->curline_m = curline;
      rw_stopx = stop+1;
@@ -204,7 +206,7 @@ index 986a74b..34b4d93 100644
      
      // calculate scale at both ends and step
      ds_p->scale1 = rw_scale = 
-@@ -577,8 +613,16 @@ R_StoreWallRange
+@@ -583,8 +619,16 @@ R_StoreWallRange
  	{
  	    // masked midtexture
  	    maskedtexture = true;
@@ -223,7 +225,7 @@ index 986a74b..34b4d93 100644
  	}
      }
      
-@@ -683,21 +727,24 @@ R_StoreWallRange
+@@ -689,21 +733,24 @@ R_StoreWallRange
      R_RenderSegLoop ();
  
      
@@ -257,13 +259,13 @@ index 986a74b..34b4d93 100644
      }
  
      if (maskedtexture && !(ds_p->silhouette&SIL_TOP))
-@@ -712,4 +759,3 @@ R_StoreWallRange
+@@ -718,4 +765,3 @@ R_StoreWallRange
      }
      ds_p++;
  }
 -
 diff --git a/linuxdoom-1.10/r_things.c b/linuxdoom-1.10/r_things.c
-index 5bfe993..7184867 100644
+index a959271..ec52172 100644
 --- a/linuxdoom-1.10/r_things.c
 +++ b/linuxdoom-1.10/r_things.c
 @@ -388,7 +388,15 @@ R_DrawVisSprite
@@ -297,7 +299,7 @@ index 5bfe993..7184867 100644
      {
  	texturecolumn = frac>>FRACBITS;
  #ifdef RANGECHECK
-@@ -835,8 +843,25 @@ void R_DrawSprite (vissprite_t* spr)
+@@ -841,9 +849,26 @@ void R_DrawSprite (vissprite_t* spr)
      fixed_t		scale;
      fixed_t		lowscale;
      int			silhouette;
@@ -307,6 +309,7 @@ index 5bfe993..7184867 100644
 +    int			clip_left;
 +    int			clip_right;
  		
+     DOOM_HOST_CENSUS_SPRITE();
 -    for (x = spr->x1 ; x<=spr->x2 ; x++)
 +    sprite_x1 = spr->x1;
 +    sprite_x2 = spr->x2;
@@ -324,9 +327,9 @@ index 5bfe993..7184867 100644
  	clipbot[x] = cliptop[x] = -2;
      
      // Scan drawsegs from end to start for obscuring segs.
-@@ -845,8 +870,8 @@ void R_DrawSprite (vissprite_t* spr)
-     for (ds=ds_p-1 ; ds >= drawsegs ; ds--)
+@@ -853,8 +878,8 @@ void R_DrawSprite (vissprite_t* spr)
      {
+ 	DOOM_HOST_CENSUS_CLIP_STEP();
  	// determine if the drawseg obscures the sprite
 -	if (ds->x1 > spr->x2
 -	    || ds->x2 < spr->x1
@@ -335,7 +338,7 @@ index 5bfe993..7184867 100644
  	    || (!ds->silhouette
  		&& !ds->maskedtexturecol_m) )
  	{
-@@ -854,8 +879,8 @@ void R_DrawSprite (vissprite_t* spr)
+@@ -862,8 +887,8 @@ void R_DrawSprite (vissprite_t* spr)
  	    continue;
  	}
  			
@@ -346,7 +349,7 @@ index 5bfe993..7184867 100644
  
  	if (ds->scale1 > ds->scale2)
  	{
-@@ -920,7 +945,7 @@ void R_DrawSprite (vissprite_t* spr)
+@@ -928,7 +953,7 @@ void R_DrawSprite (vissprite_t* spr)
      // all clipping has been performed, so draw the sprite
  
      // check for unclipped columns
@@ -355,7 +358,7 @@ index 5bfe993..7184867 100644
      {
  	if (clipbot[x] == -2)		
  	    clipbot[x] = viewheight;
-@@ -931,7 +956,7 @@ void R_DrawSprite (vissprite_t* spr)
+@@ -939,7 +964,7 @@ void R_DrawSprite (vissprite_t* spr)
  		
      mfloorclip = clipbot;
      mceilingclip = cliptop;
