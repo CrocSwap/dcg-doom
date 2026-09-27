@@ -25,10 +25,10 @@ pub const OP_CLEAR: u8 = 6;
 pub const REQUEST_BYTES: usize = 52;
 pub const HEADER_BYTES: usize = 512;
 // The RSR/2 header already reserves [336..512]. Keep the account length and
-// every public header offset fixed; the first 56 reserved bytes are a volatile
+// every public header offset fixed; the first 60 reserved bytes are a volatile
 // renderer cache shared by strips that name the same RSN/3 snapshot.
 const RENDER_CACHE_OFFSET: usize = 336;
-const RENDER_CACHE_BYTES: usize = 56;
+const RENDER_CACHE_BYTES: usize = 60;
 pub const ROOTS_OFFSET: usize = 160;
 pub const ROOT_COUNT: usize = 32;
 pub const ROOT_BYTES: usize = ROOT_COUNT * 4;
