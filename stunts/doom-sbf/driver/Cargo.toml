@@ -70,7 +70,7 @@ required-features = ["ctx-engine"]
 
 [[bin]]
 name = "r15_upgrade_compat"
-required-features = ["ctx-engine", "sim-transport"]
+required-features = ["ctx-engine"]
 
 [[bin]]
 name = "worst_view_census"
