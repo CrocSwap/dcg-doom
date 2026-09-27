@@ -19,6 +19,11 @@
 #include "g_game.h"
 #include "p_setup.h"
 #include "r_main.h"
+#include "r_data.h"
+#include "r_plane.h"
+#include "r_sky.h"
+#include "r_draw.h"
+#include "p_spec.h"
 #include "v_video.h"
 #include "w_wad.h"
 #include "z_zone.h"
@@ -40,6 +45,14 @@ extern int doom_sbf_arena_exhausted(void);
 extern unsigned long doom_sbf_arena_high_water(void);
 extern int doom_sbf_resource_import_graph(const uint8_t *image, unsigned long image_bytes);
 extern int doom_sbf_fill_pool(uint8_t *pool, const uint8_t wad_hash[32]);
+extern void R_InitTextures(void);
+extern void R_InitFlats(void);
+extern void R_InitSpriteLumps(void);
+extern void R_InitColormaps(void);
+extern void R_InitPointToAngle(void);
+extern void R_InitTables(void);
+extern void R_InitLightTables(void);
+extern void R_ExecuteSetViewSize(void);
 extern int DoomStateDecodeSplitPreflight(const uint8_t *image, size_t image_bytes);
 extern int DoomStateDecodeSplitPrepare(void);
 extern int DoomStateDecodeSplitParse(const uint8_t *image, size_t image_bytes);
@@ -1234,15 +1247,17 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup_continue(
     return 0;
 }
 
-/* REINIT/1 phase 4.  E2R's ordinary path reconstructs a pointer-bearing ST1
- * saved by the same image.  REINIT deliberately takes a different edge: after
- * the current RI2 image and WAD have been installed by split setup, start a
- * new E1M1 game from this image and leave a controller at gametic zero.  No
- * bytes from the old ST1 account are read here.  The resulting state is
- * encoded by split_finalize in the next bounded instruction. */
-int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
-    uint8_t *context, uint8_t *bootstrap, unsigned long bootstrap_bytes,
-    unsigned long *arena_high_water_out)
+/* REINIT's renderer and game bootstrap is split into independently durable
+ * phases because R_InitData's texture setup plus the following initialization
+ * exceeded the deployed transaction budget as one call.  Phase order is part
+ * of DOOM-LIF/2: V_Init; the four R_InitData components; R_InitPointToAngle;
+ * R_InitTables; R_SetViewSize; R_InitPlanes; R_InitLightTables; R_InitSkyMap;
+ * R_InitTranslationTables; R_ExecuteSetViewSize; P_InitSwitchList plus
+ * P_InitPicAnims; R_InitSprites; then DEMO1/player setup.  Every call rebinds
+ * the account-backed arena before using context pointers. */
+int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
+    uint32_t phase, uint8_t *context, uint8_t *bootstrap,
+    unsigned long bootstrap_bytes, unsigned long *arena_high_water_out)
 {
     int lump, demo_len;
     uint8_t *demo;
@@ -1254,27 +1269,44 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
         return RI2_REFUSE_ARENA;
 
-    /* Mirror the source-matched RI1 new-game producer.  In particular, the
-     * players array and playeringame[0] must be initialised before G_InitNew,
-     * and demo_p remains bounded by the image's DEMO1 lump. */
-    V_Init();
-    R_Init();
-    R_ExecuteSetViewSize();
-    P_Init();
-    lump = W_GetNumForName("DEMO1");
-    demo_len = W_LumpLength(lump);
-    if (demo_len < 17) return RI2_REFUSE_RESOURCE;
-    demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
-    defdemoname = "DEMO1";
-    demobuffer = demo;
-    demo_p = demo + 13;
-    demoend = demo + demo_len;
-    memset(players, 0, sizeof(players));
-    memset(playeringame, 0, sizeof(playeringame));
-    playeringame[0] = 1;
-    DOOM_CTX->consoleplayer = 0;
-    displayplayer = 0;
-    DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+    switch (phase)
+    {
+    case 0: V_Init(); break;
+    case 1: R_InitTextures(); break;
+    case 2: R_InitFlats(); break;
+    case 3: R_InitSpriteLumps(); break;
+    case 4: R_InitColormaps(); break;
+    case 5: R_InitPointToAngle(); break;
+    case 6: R_InitTables(); break;
+    case 7: R_SetViewSize(screenblocks, detailLevel); break;
+    case 8: R_InitPlanes(); break;
+    case 9: R_InitLightTables(); break;
+    case 10: R_InitSkyMap(); break;
+    case 11: R_InitTranslationTables(); framecount = 0; break;
+    case 12: R_ExecuteSetViewSize(); break;
+    case 13: P_InitSwitchList(); P_InitPicAnims(); break;
+    case 14: R_InitSprites(sprnames); break;
+    case 15:
+        /* Mirror the source-matched RI1 new-game producer.  The players
+         * array and playeringame[0] must be initialized before G_InitNew,
+         * and demo_p remains bounded by the image's DEMO1 lump. */
+        lump = W_GetNumForName("DEMO1");
+        demo_len = W_LumpLength(lump);
+        if (demo_len < 17) return RI2_REFUSE_RESOURCE;
+        demo = (uint8_t *)W_CacheLumpNum(lump, PU_STATIC);
+        defdemoname = "DEMO1";
+        demobuffer = demo;
+        demo_p = demo + 13;
+        demoend = demo + demo_len;
+        memset(players, 0, sizeof(players));
+        memset(playeringame, 0, sizeof(playeringame));
+        playeringame[0] = 1;
+        DOOM_CTX->consoleplayer = 0;
+        displayplayer = 0;
+        DoomControllerSetCapturedDemoBounds(demo, (size_t)demo_len);
+        break;
+    default: return RI2_REFUSE_RESOURCE;
+    }
 
     if (!ri2_split_arena_ok(bootstrap_bytes)) return RI2_REFUSE_ARENA;
     if (arena_high_water_out) *arena_high_water_out = doom_sbf_arena_high_water();

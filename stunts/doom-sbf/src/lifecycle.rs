@@ -24,7 +24,8 @@ pub const CLOSE: u8 = 4;
 pub const REQUEST_BYTES: usize = 24;
 pub const REINIT_WAD_STAGES: u32 = resource_sbf::WAD_ACCOUNT_COUNT as u32;
 pub const REINIT_RSR_STAGES: u32 = 6;
-pub const REINIT_GAME_STAGES: u32 = 2;
+pub const REINIT_PREPARE_STAGES: u32 = 16;
+pub const REINIT_GAME_STAGES: u32 = REINIT_PREPARE_STAGES + 1;
 pub const REINIT_FINALIZE_STAGES: u32 = 2;
 pub const REINIT_STEP_COUNT: u32 =
     REINIT_WAD_STAGES + REINIT_RSR_STAGES + REINIT_GAME_STAGES + REINIT_FINALIZE_STAGES;
@@ -504,7 +505,8 @@ unsafe extern "C" {
         header_bytes: usize,
         arena_high_water: *mut usize,
     ) -> i32;
-    fn doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
+    fn doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
+        phase: u32,
         context: *mut u8,
         bootstrap: *mut u8,
         bootstrap_bytes: usize,
@@ -668,8 +670,11 @@ fn process_step(program: &Pubkey, accounts: &[AccountInfo], request: Request) ->
             let mut context = accounts[CONTEXT].try_borrow_mut_data()?;
             let (context_ptr, bootstrap_ptr, bootstrap_len) = context_parts(&mut context)?;
             unsafe {
-                if request.argument == REINIT_WAD_STAGES + REINIT_RSR_STAGES + 1 {
-                    doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare(
+                if request.argument <= REINIT_WAD_STAGES + REINIT_RSR_STAGES + REINIT_PREPARE_STAGES
+                {
+                    let phase = request.argument - REINIT_WAD_STAGES - REINIT_RSR_STAGES - 1;
+                    doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
+                        phase,
                         context_ptr,
                         bootstrap_ptr,
                         bootstrap_len,
@@ -1247,7 +1252,7 @@ mod tests {
             .encode()
         )
         .is_err());
-        assert_eq!(REINIT_STEP_COUNT, 15);
+        assert_eq!(REINIT_STEP_COUNT, 30);
         assert_eq!(CLOSE_FINAL_PHASE, CLOSE_RENDER_TARGETS as u32 + 1);
     }
 }
