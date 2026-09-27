@@ -179,9 +179,9 @@ entrypoint!(transport_process_instruction);
 /// or input-buffer account. DOOM-RSN/2 may only write its separate snapshot
 /// PDA after validating the committed SIM2 cursor/root.
 #[cfg(feature = "sim-transport")]
-pub fn transport_process_instruction(
+pub fn transport_process_instruction<'a>(
     program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    accounts: &'a [AccountInfo<'a>],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let version = if instruction_data.len() >= 12 {
