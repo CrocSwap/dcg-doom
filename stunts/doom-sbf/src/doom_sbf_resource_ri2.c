@@ -32,8 +32,6 @@
 
 extern int doom_ctx_guard(const void *data);
 extern void doom_ctx_init(void);
-extern void doom_sbf_debug_values(unsigned long, unsigned long,
-                                  unsigned long, unsigned long, unsigned long);
 extern int doom_sbf_bind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
 extern int doom_sbf_rebind_arena(void *base, unsigned long bytes, unsigned long zone_bytes);
 extern unsigned long doom_sbf_arena_mark(void);
@@ -1088,13 +1086,6 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup(
         return RI2_REFUSE_IMAGE;
     RI2_PHASE(502); /* re-bound the authenticated RI2/2 plan */
 
-    doom_sbf_debug_values(1ul, (unsigned long)wad_image, wad_bytes,
-                          (unsigned long)sizeof(doom_ctx_t),
-                          (unsigned long)wad_image[0] |
-                          ((unsigned long)wad_image[1] << 8) |
-                          ((unsigned long)wad_image[2] << 16) |
-                          ((unsigned long)wad_image[3] << 24));
-
     memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
     doom_ctx_init();
     RI2_PHASE(510);
@@ -1108,12 +1099,6 @@ int doom_engine_ex2_resource_sbf_ri2_split_setup(
     RI2_PHASE(520);
     P_InitThinkers();
     RI2_PHASE(521);
-    doom_sbf_debug_values(2ul, (unsigned long)wad_image, wad_bytes,
-                          (unsigned long)sizeof(doom_ctx_t),
-                          (unsigned long)wad_image[0] |
-                          ((unsigned long)wad_image[1] << 8) |
-                          ((unsigned long)wad_image[2] << 16) |
-                          ((unsigned long)wad_image[3] << 24));
     W_InitAccountImage(wad_image, (int)wad_bytes);
     RI2_PHASE(522);
     if (!ri2_split_arena_ok(bootstrap_bytes))

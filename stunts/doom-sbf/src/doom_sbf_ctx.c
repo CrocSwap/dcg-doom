@@ -26,7 +26,6 @@ extern void sol_memset_(void *dst, uint8_t value, uint64_t n);
 #endif
 
 void doom_sbf_panic(void);
-void doom_sbf_i_error_log(const char *message);
 void *memcpy(void *dst, const void *src, size_t n);
 
 /* ------------------------------------------------------------------ */
@@ -323,7 +322,7 @@ void abort(void) { doom_sbf_panic(); }
  * a program that kept running after I_Error would commit half-built state. */
 void I_Error(char *error)
 {
-    doom_sbf_i_error_log(error);
+    (void)error;
     DOOM_CTX->doom_error_latched = 1;
     doom_sbf_panic();
 }
