@@ -766,7 +766,7 @@ async fn close_set(
         .collect::<Vec<_>>();
     for key in early_closed {
         if let Some(account) = ctx.banks_client.get_account(key).await? {
-            if account.owner == program || account.lamports != 0 || !account.data.is_empty() {
+            if account.owner == program || account.lamports != 0 {
                 return Err(format!("CLOSE phase 0 left a live account {key}").into());
             }
         }
@@ -775,45 +775,24 @@ async fn close_set(
     for index in 0..lifecycle::CLOSE_RENDER_TARGETS {
         let phase = (index + 1) as u8;
         let target = render_target(set, index);
-        for attempt in 0..=5 {
-            let close_target = Instruction {
-                program_id: program,
-                accounts: close_render_target_accounts(set, index),
-                data: lifecycle::encode_close_phase(phase).to_vec(),
-            };
-            let units = submit(ctx, close_target, &[authority]).await?;
-            if units > CLOSE_CU_LIMIT {
-                return Err(format!("CLOSE/{phase} used {units} CU, over {CLOSE_CU_LIMIT}").into());
-            }
-            phase_units.push(units);
-            let remaining = ctx.banks_client.get_account(target).await?;
-            if remaining
-                .as_ref()
-                .is_none_or(|account| account.owner != program)
-            {
-                break;
-            }
-            if index >= 4
-                || attempt == 5
-                || remaining
-                    .as_ref()
-                    .is_some_and(|account| account.data.is_empty())
-            {
-                return Err(format!("CLOSE/{phase} did not finish target {target}").into());
-            }
-        }
-    }
-    for phase in lifecycle::CLOSE_RESIZE_FIRST_PHASE as u8..lifecycle::CLOSE_FINAL_PHASE as u8 {
-        let resize = Instruction {
+        let close_target = Instruction {
             program_id: program,
-            accounts: close_base_accounts(set),
+            accounts: close_render_target_accounts(set, index),
             data: lifecycle::encode_close_phase(phase).to_vec(),
         };
-        let units = submit(ctx, resize, &[authority]).await?;
+        let units = submit(ctx, close_target, &[authority]).await?;
         if units > CLOSE_CU_LIMIT {
             return Err(format!("CLOSE/{phase} used {units} CU, over {CLOSE_CU_LIMIT}").into());
         }
         phase_units.push(units);
+        if ctx
+            .banks_client
+            .get_account(target)
+            .await?
+            .is_some_and(|account| account.owner == program || account.lamports != 0)
+        {
+            return Err(format!("CLOSE/{phase} left target {target} live").into());
+        }
     }
     let close_final = Instruction {
         program_id: program,
@@ -839,7 +818,7 @@ async fn close_set(
     }
     for key in &targets {
         if let Some(account) = ctx.banks_client.get_account(*key).await? {
-            if account.owner == program || account.lamports != 0 || !account.data.is_empty() {
+            if account.owner == program || account.lamports != 0 {
                 return Err(format!("CLOSE left a live account {key}").into());
             }
         }

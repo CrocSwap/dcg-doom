@@ -31,14 +31,11 @@ pub const REFUSE_CLOSE: u32 = 325;
 const BASE_ACCOUNT_COUNT: usize = 15;
 pub const CLOSE_RENDER_TARGETS: usize = 36;
 pub const CLOSE_RESIZE_FIRST_PHASE: u32 = CLOSE_RENDER_TARGETS as u32 + 1;
-const CLOSE_CONTEXT_SHRINK_CHUNK: usize = 256 * 1024;
-const CLOSE_CONTEXT_SHRINK_STEPS: usize =
-    (resource_sbf::CONTEXT_BYTES + CLOSE_CONTEXT_SHRINK_CHUNK - 1) / CLOSE_CONTEXT_SHRINK_CHUNK;
 const CLOSE_PRE_SHARED_ACCOUNT_COUNT: usize = 9;
 const CLOSE_PRE_SEPARATE_ACCOUNT_COUNT: usize = 10;
 const CLOSE_BASE_SHARED_ACCOUNT_COUNT: usize = 4;
 const CLOSE_BASE_SEPARATE_ACCOUNT_COUNT: usize = 5;
-pub const CLOSE_FINAL_PHASE: u32 = CLOSE_RESIZE_FIRST_PHASE + CLOSE_CONTEXT_SHRINK_STEPS as u32 - 1;
+pub const CLOSE_FINAL_PHASE: u32 = CLOSE_RESIZE_FIRST_PHASE;
 const CLOSE_MAGIC: &[u8; 8] = b"DOOM-CL1";
 const CLOSE_VERSION: u32 = 1;
 const CLOSE_CONTEXT: usize = 16;
@@ -849,7 +846,6 @@ fn close_one(account: &AccountInfo, payer: &AccountInfo) -> ProgramResult {
         .ok_or(refuse(REFUSE_CLOSE))?;
     **payer.try_borrow_mut_lamports()? = next;
     **account.try_borrow_mut_lamports()? = 0;
-    account.realloc(0, false)?;
     account.assign(&system_program::ID);
     Ok(())
 }
@@ -1009,23 +1005,9 @@ fn process_close_render_target<'a>(
     if target.key != &expected
         || target.owner != program
         || !target.is_writable
-        || target_len == 0
-        || target_len > expected_bytes
-        || (render_index >= 4 && target_len != expected_bytes)
+        || target_len != expected_bytes
     {
         return Err(refuse(REFUSE_CLOSE));
-    }
-    if render_index < 4 && target_len > CLOSE_CONTEXT_SHRINK_CHUNK {
-        target.realloc(target_len - CLOSE_CONTEXT_SHRINK_CHUNK, false)?;
-        return close_marker_write(
-            continuation,
-            context.key,
-            authority.key,
-            meta.key,
-            &rent_payer,
-            phase,
-            render_index,
-        );
     }
     close_one(target, payer)?;
     close_marker_write(
@@ -1077,56 +1059,10 @@ fn close_base_accounts<'a>(
     Ok((context, meta, continuation, authority, payer, rent_payer))
 }
 
-fn process_close_resize<'a>(
-    program: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    phase: u32,
-) -> ProgramResult {
-    if !(CLOSE_RESIZE_FIRST_PHASE..CLOSE_FINAL_PHASE).contains(&phase) {
-        return Err(refuse(REFUSE_CLOSE));
-    }
-    let (context, meta, continuation, authority, _payer, rent_payer) =
-        close_base_accounts(program, accounts)?;
-    let expected_len = resource_sbf::CONTEXT_BYTES
-        .checked_sub(
-            (phase as usize - CLOSE_RESIZE_FIRST_PHASE as usize) * CLOSE_CONTEXT_SHRINK_CHUNK,
-        )
-        .ok_or(refuse(REFUSE_CLOSE))?;
-    if context.data_len() != expected_len
-        || !close_marker_matches(
-            continuation,
-            context.key,
-            authority.key,
-            meta.key,
-            &rent_payer,
-            phase,
-            CLOSE_RENDER_TARGETS,
-        )?
-    {
-        return Err(refuse(REFUSE_CLOSE));
-    }
-    let new_len = expected_len
-        .checked_sub(CLOSE_CONTEXT_SHRINK_CHUNK)
-        .ok_or(refuse(REFUSE_CLOSE))?;
-    context.realloc(new_len, false)?;
-    close_marker_write(
-        continuation,
-        context.key,
-        authority.key,
-        meta.key,
-        &rent_payer,
-        phase + 1,
-        CLOSE_RENDER_TARGETS,
-    )
-}
-
 fn process_close_final<'a>(program: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     let (context, meta, continuation, authority, payer, rent_payer) =
         close_base_accounts(program, accounts)?;
-    let expected_len = resource_sbf::CONTEXT_BYTES
-        .checked_sub((CLOSE_CONTEXT_SHRINK_STEPS - 1) * CLOSE_CONTEXT_SHRINK_CHUNK)
-        .ok_or(refuse(REFUSE_CLOSE))?;
-    if context.data_len() != expected_len
+    if context.data_len() != resource_sbf::CONTEXT_BYTES
         || !close_marker_matches(
             continuation,
             context.key,
@@ -1153,9 +1089,6 @@ fn process_close<'a>(
         0 => process_close_pre(program, accounts),
         phase if (1..CLOSE_RESIZE_FIRST_PHASE).contains(&phase) => {
             process_close_render_target(program, accounts, phase)
-        }
-        phase if (CLOSE_RESIZE_FIRST_PHASE..CLOSE_FINAL_PHASE).contains(&phase) => {
-            process_close_resize(program, accounts, phase)
         }
         CLOSE_FINAL_PHASE => process_close_final(program, accounts),
         _ => Err(refuse(REFUSE_MALFORMED)),
@@ -1267,8 +1200,6 @@ mod tests {
             .encode()
         )
         .is_err());
-        let final_context_bytes = resource_sbf::CONTEXT_BYTES
-            - (CLOSE_CONTEXT_SHRINK_STEPS - 1) * CLOSE_CONTEXT_SHRINK_CHUNK;
-        assert!((1..=CLOSE_CONTEXT_SHRINK_CHUNK).contains(&final_context_bytes));
+        assert_eq!(CLOSE_FINAL_PHASE, CLOSE_RENDER_TARGETS as u32 + 1);
     }
 }
