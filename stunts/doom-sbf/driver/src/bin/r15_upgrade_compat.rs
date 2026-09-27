@@ -31,6 +31,28 @@ const COMPUTE_LIMIT: u32 = 1_400_000;
 const CLOSE_CU_LIMIT: u64 = 1_400_000;
 const REINIT_CU_TARGET: u64 = 1_200_000;
 const REINIT_GENERATION: u32 = 0x2026_0927;
+const RETAINED_RENDER_GATES: [(u32, &str); 5] = [
+    (
+        100,
+        "010b643cd575cef6578bdde95e6d26792c02ed5f608a08f1367d7f9574e1aa9b",
+    ),
+    (
+        200,
+        "dc7f0a0bd73646c3ea846c95b34c6beaaf8718a20fa0e56e89cb1a6a81b8ef8a",
+    ),
+    (
+        300,
+        "fe2452a3eda030977004f27cb9bb98318066c7036afd2a1869572ac77f6938eb",
+    ),
+    (
+        400,
+        "010b643cd575cef6578bdde95e6d26792c02ed5f608a08f1367d7f9574e1aa9b",
+    ),
+    (
+        500,
+        "aef0773f37945190f1d0e384a28d7d94ae60d705237a8620ef9a58f4c0ebc133",
+    ),
+];
 const RSR_ABI_DESCRIPTOR: &str = "DOOM-RSR/2|request=52|build=5-WAD-chunks+6-resumable-C-phases|operations=BUILD/0+RENDER/1+INIT/2+GROW/3+REBUILD/4+RENDER-BUFFERED/5+CLEAR/6|rebuild=4:accounts=program+static+programdata+authority+context+continuation:loader-authority+context-signer|clear=6:accounts=static:zeroes-header-refused-when-header-magic+version|each-tx<=1400000-target|account=DOOM_CTX+WAD+bootstrap|roots=u32-account-offsets|internal-pointers=pinned-DOOM_CTX-base|pin=WAD-SHA256+WAD-slice-SHA256+RI2-SHA256|dynamic=DOOM-RSN/3|account-provision=INIT+COMMUTATIVE-GROW/1|render=1:carries-snapshot-hash|refresh-render=5:buffer+strip+snapshot-hash:zero-name-refused-malformed:mismatched-name-refused-308";
 
 fn read_json(path: &PathBuf) -> Result<Value, Box<dyn Error>> {
@@ -540,6 +562,11 @@ async fn reinit(
         }
         println!("REINIT_CU label={label} stage=step-{phase:02} cu={step_units}");
         units.push(step_units);
+        let context_after_first_step = if phase == 1 {
+            Some(account_data(ctx, set.context).await?)
+        } else {
+            None
+        };
         let replay_units = submit(ctx, step, &[authority])
             .await
             .map_err(|error| format!("{label} REINIT STEP/{phase} replay failed: {error}"))?;
@@ -550,6 +577,50 @@ async fn reinit(
         }
         println!("REINIT_CU label={label} stage=step-{phase:02}-retry cu={replay_units}");
         units.push(replay_units);
+        if let Some(before) = context_after_first_step {
+            let after = account_data(ctx, set.context).await?;
+            if before != after {
+                return Err(format!("{label} repeated STEP/1 changed context bytes").into());
+            }
+            println!(
+                "REINIT_STEP_REPLAY_IDEMPOTENT label={label} step=1 context_sha256={}",
+                hash(&after)
+            );
+
+            let guarded_keys = [
+                set.context,
+                set.state,
+                set.mirror,
+                set.controller,
+                set.frame,
+                set.continuation,
+                set.meta,
+            ];
+            let mut before_partial_play = Vec::with_capacity(guarded_keys.len());
+            for key in guarded_keys {
+                before_partial_play.push((key, account_data(ctx, key).await?));
+            }
+            let refusal = advance_one(ctx, program, set, authority, 0).await;
+            let refusal = match refusal {
+                Ok(_) => {
+                    return Err(format!("{label} partial REINIT accepted play after STEP/1").into())
+                }
+                Err(error) => error.to_string(),
+            };
+            if refusal.contains("ComputationalBudgetExceeded") || refusal.contains("exceeded max") {
+                return Err(
+                    format!("{label} partial-play control exhausted compute: {refusal}").into(),
+                );
+            }
+            for (key, before) in before_partial_play {
+                if account_data(ctx, key).await? != before {
+                    return Err(
+                        format!("{label} partial-play refusal changed account {key}").into(),
+                    );
+                }
+            }
+            println!("REINIT_PARTIAL_PLAY_REFUSED label={label} after_step=1 state_unchanged=true");
+        }
     }
     let view = sim2::MetaView::parse(&account_data(ctx, set.meta).await?)
         .ok_or_else(|| format!("{label} REINIT metadata failed to parse"))?;
@@ -1149,6 +1220,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let fresh_one = render_frame(&mut ctx, program, static_key, &reference, 1).await?;
     if pixels(&captured_one)? != pixels(&fresh_one)? {
         return Err("REINIT cursor-1 pixels differ from the fresh context reference".into());
+    }
+
+    for cursor in 2..=500 {
+        advance_one(&mut ctx, program, &set, &local_authority, cursor - 1).await?;
+        advance_one(&mut ctx, program, &reference, &local_authority, cursor - 1).await?;
+        if let Some((_, expected_hash)) = RETAINED_RENDER_GATES
+            .iter()
+            .find(|(retained_cursor, _)| *retained_cursor == cursor)
+        {
+            let captured_frame = render_frame(&mut ctx, program, static_key, &set, cursor).await?;
+            let fresh_frame =
+                render_frame(&mut ctx, program, static_key, &reference, cursor).await?;
+            let captured_pixels = pixels(&captured_frame)?;
+            if captured_pixels != pixels(&fresh_frame)? {
+                return Err(format!("cursor {cursor} differs from fresh-context renderer").into());
+            }
+            let frame_hash = hash(&captured_pixels);
+            if frame_hash != *expected_hash {
+                return Err(format!(
+                    "cursor {cursor} frame SHA-256 {frame_hash} differs from retained gate {expected_hash}"
+                )
+                .into());
+            }
+            println!(
+                "RENDER_GATE capture={} cursor={} frame_sha256={} strips=8 repeat_strip0_byte_identical=true renderer=RENDER-BUFFERED/5",
+                capture.display(), cursor, frame_hash
+            );
+        }
     }
 
     let (captured_refund, captured_close_cu) =
