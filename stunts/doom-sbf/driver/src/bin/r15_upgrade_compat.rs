@@ -788,7 +788,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
     bank.set_compute_max_units(u64::from(COMPUTE_LIMIT));
-    bank.add_program("doom_sbf", program, None);
+    // Model the upgradeable-loader account pair because RSR REBUILD/4 checks
+    // that the executable and ProgramData account are loader-owned. `add_program`
+    // installs the ELF under the legacy loader and makes that authority gate
+    // impossible to exercise faithfully.
+    bank.add_upgradeable_program_to_genesis("doom_sbf", &program);
 
     let mut templates = HashMap::new();
     let mut context_hash = String::new();
