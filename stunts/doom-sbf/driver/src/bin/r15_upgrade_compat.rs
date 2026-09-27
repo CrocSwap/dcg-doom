@@ -20,7 +20,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::Message;
 use solana_program::hash::hashv;
-use solana_program_test::{ProgramTest, ProgramTestBanksClientExt};
+use solana_program_test::ProgramTest;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
@@ -92,11 +92,11 @@ async fn submit(
     // ProgramTest can return the same latest blockhash repeatedly while its
     // bank is idle. Replaying the same lifecycle instruction with that hash
     // would reproduce the transaction signature and be rejected as
-    // AlreadyProcessed before the program can demonstrate idempotency.
-    let blockhash = ctx
-        .banks_client
-        .get_new_latest_blockhash(&ctx.last_blockhash)
-        .await?;
+    // AlreadyProcessed before the program can demonstrate idempotency. A slot
+    // warp gives each submitted transaction a fresh, ordinary blockhash.
+    let next_slot = ctx.banks_client.get_slot().await? + 1;
+    ctx.warp_to_slot(next_slot)?;
+    let blockhash = ctx.last_blockhash;
     let instructions = [
         ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_LIMIT),
         instruction,
