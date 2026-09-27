@@ -484,7 +484,9 @@ async fn render_frame(
             .encode()
             .to_vec(),
     };
-    let mut compute_units = vec![submit(ctx, snapshot_ix, &[]).await?];
+    let mut compute_units = vec![submit(ctx, snapshot_ix, &[])
+        .await
+        .map_err(|error| format!("snapshot at cursor {cursor} failed: {error}"))?];
     let snapshot_data = account_data(ctx, snapshot).await?;
     let view = rsn3::validate_buffered_snapshot_for(&snapshot_data, 0)?;
     if view.cursor != cursor {
@@ -509,7 +511,9 @@ async fn render_frame(
                 .encode()
                 .to_vec(),
         };
-        compute_units.push(submit(ctx, ix, &[]).await?);
+        compute_units.push(submit(ctx, ix, &[])
+            .await
+            .map_err(|error| format!("RENDER-BUFFERED cursor {cursor} strip {strip} failed: {error}"))?);
         let rendered = account_data(ctx, set.strips[0][strip as usize]).await?;
         let strip_view = rsn3::validate_strip(&rendered)?;
         if strip_view.cursor != cursor || strip_view.strip_id != u32::from(strip) {
@@ -532,7 +536,9 @@ async fn render_frame(
             .encode()
             .to_vec(),
     };
-    compute_units.push(submit(ctx, replay, &[]).await?);
+    compute_units.push(submit(ctx, replay, &[])
+        .await
+        .map_err(|error| format!("repeat RENDER-BUFFERED cursor {cursor} failed: {error}"))?);
     let replay_strip = account_data(ctx, set.strips[0][0]).await?;
     if first_strip.as_deref() != Some(replay_strip.as_slice()) {
         return Err(format!("repeat RENDER-BUFFERED changed cursor {cursor} strip 0").into());
@@ -568,7 +574,9 @@ async fn advance_one(
             ],
             data: sim2::encode_deposit(cursor, &[0, 0, 0, 0]),
         };
-        submit(ctx, deposit, &[authority]).await?;
+        submit(ctx, deposit, &[authority])
+            .await
+            .map_err(|error| format!("input deposit at cursor {cursor} failed: {error}"))?;
     }
     let advance = Instruction {
         program_id: program,
@@ -582,7 +590,9 @@ async fn advance_one(
         ],
         data: sim2::encode_advance_starved(cursor, 1),
     };
-    submit(ctx, advance, &[authority]).await
+    submit(ctx, advance, &[authority])
+        .await
+        .map_err(|error| format!("ADVANCE at cursor {cursor} failed: {error}"))
 }
 
 fn close_accounts(set: &LocalSet) -> Vec<AccountMeta> {
@@ -838,6 +848,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let first_reinit_units = reinit(&mut ctx, program, &set, &local_authority, "captured").await?;
+    println!("captured REINIT complete at cursor 0");
     let fresh_reinit_units = reinit(
         &mut ctx,
         program,
@@ -846,6 +857,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "fresh reference",
     )
     .await?;
+    println!("fresh reference REINIT complete at cursor 0");
     // The user specifically requires REINIT to accept an already fresh game.
     let fresh_again_units = reinit(
         &mut ctx,
@@ -855,6 +867,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "already fresh",
     )
     .await?;
+    println!("repeat REINIT complete at cursor 0");
 
     let captured_zero = render_frame(&mut ctx, program, static_key, &set, 0).await?;
     let fresh_zero = render_frame(&mut ctx, program, static_key, &reference, 0).await?;
