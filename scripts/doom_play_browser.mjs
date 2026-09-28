@@ -167,6 +167,24 @@ try {
       };
     })()`);
 
+    if (
+      inputStarted
+      && !watchdogReported
+      && typeof state.pipelineError === "string"
+      && /(?:custom program error:\s*0x0*ec\b|(?:program )?error(?:\s+code)?\s*[:=]?\s*236\b|Custom\(\s*236\s*\))/i.test(state.pipelineError)
+    ) {
+      watchdogReported = true;
+      const sentence = "The Doom program returned error 236 while the session was running. Press Ctrl-C, then run scripts/doom_play.sh --repair to reinitialize R15 in place.";
+      await targetSocket.evaluate(`(() => {
+        const stage = document.querySelector('#stage-state');
+        const error = document.querySelector('#error');
+        if (stage) { stage.textContent = 'PROGRAM REFUSED'; stage.classList.add('bad'); }
+        if (error) { error.textContent = ${JSON.stringify(sentence)}; error.hidden = false; }
+      })()`);
+      console.error(sentence);
+      throw new Error(sentence);
+    }
+
     if (Date.now() >= nextHealthCheck && !relayReady) {
       nextHealthCheck = Date.now() + 250;
       try {
@@ -214,7 +232,7 @@ try {
       && /pipeline process is not running|session ended/i.test(state.pipelineError)
     ) {
       watchdogReported = true;
-      const sentence = "The testnet Doom relayer stopped before the chain cursor advanced. Press Ctrl-C and run scripts/doom_play.sh --repair to reinitialize R15.";
+      const sentence = "The testnet Doom relayer stopped before the chain cursor advanced. Press Ctrl-C and run scripts/doom_play.sh --repair if the context needs in-place recovery.";
       await targetSocket.evaluate(`(() => {
         const stage = document.querySelector('#stage-state');
         const error = document.querySelector('#error');
@@ -229,7 +247,7 @@ try {
         watchdogReported = true;
       } else {
         watchdogReported = true;
-        const sentence = "The game cursor did not move within 15 seconds of your first input. Press Ctrl-C and run scripts/doom_play.sh --repair to reinitialize R15.";
+        const sentence = "The game cursor did not move within 15 seconds of your first input. Press Ctrl-C and run scripts/doom_play.sh --repair if the context needs in-place recovery.";
         await targetSocket.evaluate(`(() => {
           const stage = document.querySelector('#stage-state');
           const error = document.querySelector('#error');
