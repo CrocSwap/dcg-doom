@@ -164,6 +164,9 @@ case "${BATCH_RENDER_SENDS:-0}" in
   1|true|TRUE|yes|YES|on|ON) batch_render_flags=(--batch-render-sends) ;;
   *) batch_render_flags=() ;;
 esac
+# Pass the relayer-only ADVANCE compute budget through to the Python sender.
+# The 520,000 default was measured on E1M1; later scripted play exhausted it.
+export ADVANCE_CU_LIMIT="${ADVANCE_CU_LIMIT:-520000}"
 if [ -n "${PRE_READ:-}" ] && [ "${PRE_READ}" != "0" ] \
    && [ "${#readback_flags[@]}" -eq 0 ]; then
   readback_flags=(--pre-read-snapshot)
