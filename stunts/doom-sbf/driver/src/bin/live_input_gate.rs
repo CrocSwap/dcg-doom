@@ -1035,6 +1035,10 @@ async fn run_reset_advance_repro(
     }
     let start_key = stage_start_account(session, start_state).await?;
     let authority = session.keys.authority.insecure_clone();
+    let initial_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
+    let stable_arena_used = initial_metrics["arena_used"]
+        .as_u64()
+        .ok_or("context arena-used metric is not an unsigned integer")?;
     let mut rows = Vec::with_capacity(iterations as usize);
     let mut refusals = Vec::new();
     let mut completed = 0u32;
@@ -1061,6 +1065,15 @@ async fn run_reset_advance_repro(
             .into());
         }
         let reset_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
+        if expected_refusal.is_none()
+            && reset_metrics["arena_used"].as_u64() != Some(stable_arena_used)
+        {
+            return Err(format!(
+                "RESET/9 cycle {cycle} retained decoder workspace: {:?} != {stable_arena_used}",
+                reset_metrics["arena_used"]
+            )
+            .into());
+        }
 
         session.cursor_before = view.cursor;
         let deposit_ix = session.deposit_ix(view.cursor, command);
@@ -1073,6 +1086,15 @@ async fn run_reset_advance_repro(
         let advance_code = custom_code(&advance);
         let advance_ok = advance.result.is_ok();
         let advance_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
+        if expected_refusal.is_none()
+            && advance_metrics["arena_used"].as_u64() != Some(stable_arena_used)
+        {
+            return Err(format!(
+                "ADVANCE/5 cycle {cycle} retained transient workspace: {:?} != {stable_arena_used}",
+                advance_metrics["arena_used"]
+            )
+            .into());
+        }
         rows.push(json!({
             "cycle": cycle,
             "reset_resets_count": view.resets,
@@ -1109,6 +1131,8 @@ async fn run_reset_advance_repro(
         "manifest_sha256": manifest_sha,
         "requested_cycles": iterations,
         "completed_advance_cycles": completed,
+        "stable_arena_used": stable_arena_used,
+        "arena_used_stable_throughout": expected_refusal.is_none(),
         "refusals": refusals,
         "allocator_offsets": {
             "arena_bytes": ARENA_BYTES_OFFSET,
@@ -1300,6 +1324,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     if reset_advance_repro == Some(0) {
         return Err("--reset-advance-repro must be positive".into());
+    }
+    if reset_advance_repro.is_some_and(|cycles| cycles < 40) && expected_reset_refusal.is_none() {
+        return Err("the no-refusal reset regression requires at least 40 cycles".into());
     }
     if expected_reset_refusal.is_some() && reset_advance_repro.is_none() {
         return Err("--expect-reset-refusal requires --reset-advance-repro".into());
