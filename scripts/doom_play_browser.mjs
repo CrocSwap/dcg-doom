@@ -140,8 +140,15 @@ try {
   let inputStarted = false;
   let inputStartedAt = 0;
   let watchStartCursor = 0;
+  let watchStartPaintedFrames = 0;
+  let watchStartFrameDigest = null;
   let watchdogReported = false;
   const pageDeadline = Date.now() + 20_000;
+  const relayBase = new URL(url).searchParams.get("relayer");
+  if (!relayBase) throw new Error("The Doom page URL has no relayer address; rerun scripts/doom_play.sh.");
+  const relayHealthUrl = new URL("/healthz", relayBase).href;
+  let relayReady = false;
+  let nextHealthCheck = 0;
   console.log("Doom is open in Chrome; joining the testnet session.");
 
   while (!stopRequested && chrome.exitCode === null) {
@@ -152,28 +159,71 @@ try {
         ready: Boolean(s), wallet: Boolean(s?.wallet), session: Boolean(s?.session),
         joinDisabled: Boolean(button?.disabled), hasJoin: Boolean(button),
         cursor: Number(s?.cursor ?? -1), frameCursor: Number(s?.lastFrame?.cursor ?? -1),
+        pipelineError: s?.lastError ?? null,
+        paintedFrames: Number(s?.paintedFrames ?? 0),
+        frameDigest: s?.lastFrame?.digest ?? null,
         error: document.querySelector('#error')?.textContent ?? '',
       };
     })()`);
 
-    if (!joinClicked && state.ready && state.wallet && state.hasJoin && !state.joinDisabled && !state.session) {
+    if (Date.now() >= nextHealthCheck && !relayReady) {
+      nextHealthCheck = Date.now() + 250;
+      try {
+        const response = await fetch(relayHealthUrl, {signal: AbortSignal.timeout(500)});
+        relayReady = response.ok;
+      } catch {
+        relayReady = false;
+      }
+    }
+    if (!joinClicked && relayReady && state.ready && state.wallet && state.hasJoin && !state.joinDisabled && !state.session) {
       joinClicked = true;
       await targetSocket.evaluate("document.querySelector('#join').click()");
     }
     if (!inputStarted && state.session) {
       inputStarted = true;
       inputStartedAt = Date.now();
-      watchStartCursor = Math.max(state.cursor, state.frameCursor);
+      watchStartCursor = state.cursor;
+      watchStartPaintedFrames = state.paintedFrames;
+      watchStartFrameDigest = state.frameDigest;
       await targetSocket.evaluate("dispatchEvent(new KeyboardEvent('keydown',{code:'ArrowUp',key:'ArrowUp',bubbles:true,cancelable:true}))");
       console.log("Doom joined; sending the opening move and watching for cursor progress.");
       keyTimer = setTimeout(() => {
         writeKeyUp(targetSocket);
       }, 9000);
     }
+    const progressObserved = inputStarted && (
+      state.cursor > watchStartCursor || (
+        state.paintedFrames > watchStartPaintedFrames
+        && state.frameCursor > 0
+        && state.frameDigest !== watchStartFrameDigest
+      )
+    );
+    if (
+      inputStarted
+      && !watchdogReported
+      && !progressObserved
+      && typeof state.pipelineError === "string"
+      && /pipeline process is not running|session ended/i.test(state.pipelineError)
+    ) {
+      watchdogReported = true;
+      const sentence = "The testnet Doom relayer stopped before the chain cursor advanced. Press Ctrl-C and run scripts/doom_play.sh --repair to reinitialize R15.";
+      await targetSocket.evaluate(`(() => {
+        const stage = document.querySelector('#stage-state');
+        const error = document.querySelector('#error');
+        if (stage) { stage.textContent = 'PIPELINE STOPPED'; stage.classList.add('bad'); }
+        if (error) { error.textContent = ${JSON.stringify(sentence)}; error.hidden = false; }
+      })()`);
+      console.error(sentence);
+      throw new Error(sentence);
+    }
     if (inputStarted && !watchdogReported && Date.now() - inputStartedAt >= 15_000) {
-      if (Math.max(state.cursor, state.frameCursor) > watchStartCursor) {
+      if (state.cursor > watchStartCursor || (
+        state.paintedFrames > watchStartPaintedFrames
+        && state.frameCursor > 0
+        && state.frameDigest !== watchStartFrameDigest
+      )) {
         watchdogReported = true;
-        console.log(`Doom is moving at cursor ${Math.max(state.cursor, state.frameCursor)}.`);
+        console.log(`Doom is moving at frame cursor ${Math.max(state.cursor, state.frameCursor)}.`);
       } else {
         watchdogReported = true;
         const sentence = "The game cursor did not move within 15 seconds of your first input. Press Ctrl-C and run scripts/doom_play.sh --repair to reinitialize R15.";
