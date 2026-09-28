@@ -31,7 +31,12 @@ export const BT_SPECIAL = 0x80;
 export const BT_ATTACK = 0x01;
 export const BT_USE = 0x02;
 export const BT_CHANGE = 0x04;
-export const BT_SPEED = BT_CHANGE;
+
+// Vanilla linuxdoom-1.10 g_game.c movement tables, preserved by the pinned
+// source's generated context initializer in patches/0007: forwardmove={25,50}
+// and sidemove={24,40}. G_BuildTiccmd selects index 1 while key_speed is down.
+export const FORWARD_MOVE = Object.freeze([25, 50]);
+export const SIDE_MOVE = Object.freeze([24, 40]);
 
 // Version 2 signs a key state, not an absolute tic or a pre-rendered command
 // batch. The relayer chooses the first free tic and the sender converts this
@@ -312,16 +317,17 @@ export function heldToCommands(keys, startTic, count) {
   const out = new Uint8Array(count * COMMAND_BYTES);
   for (let i = 0; i < count; i += 1) {
     const tic = startTic + i;
+    const speed = keys.run ? 1 : 0;
     // Doom's angleturn is counter-clockwise positive: G_BuildTiccmd subtracts
     // for key_right and adds for key_left, so left is +1 here.
     const turn = tic % TICCMD_HORIZONTAL === 0 ? (keys.left ? 1 : 0) - (keys.right ? 1 : 0) : 0;
     const command = ticcmd({
-      forward: (keys.forward ? 50 : 0) - (keys.back ? 50 : 0),
-      side: (keys.strafeRight ? 50 : 0) - (keys.strafeLeft ? 50 : 0),
+      forward: (keys.forward ? FORWARD_MOVE[speed] : 0) - (keys.back ? FORWARD_MOVE[speed] : 0),
+      side: (keys.strafeRight ? SIDE_MOVE[speed] : 0) - (keys.strafeLeft ? SIDE_MOVE[speed] : 0),
       // ticcmd takes the engine's angleturn, which is byte << 8, so one
       // direction step is +/-1024 and lands in byte 2 as 4 or 252.
       turn: turn * 1024,
-      buttons: (keys.attack ? BT_ATTACK : 0) | (keys.use ? BT_USE : 0) | (keys.run ? BT_SPEED : 0),
+      buttons: (keys.attack ? BT_ATTACK : 0) | (keys.use ? BT_USE : 0),
     });
     out.set(command, i * COMMAND_BYTES);
   }
