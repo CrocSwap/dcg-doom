@@ -7,6 +7,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import {readFileSync} from "node:fs";
 import {createPrivateKey, createPublicKey, sign as nodeSign, verify as nodeVerify} from "node:crypto";
 import {webcrypto} from "node:crypto";
 
@@ -22,7 +23,9 @@ import {
   BT_SPECIAL,
   BT_ATTACK,
   BT_USE,
-  BT_SPEED,
+  BT_CHANGE,
+  FORWARD_MOVE,
+  SIDE_MOVE,
   OFF_SLOT,
   OFF_FIRST_SEQ,
   OFF_CLIENT_SEQ,
@@ -45,6 +48,16 @@ import {
 } from "../input.js";
 
 const subtle = webcrypto.subtle;
+const PINNED_CONTEXT_PATCH = readFileSync(
+  new URL("../../../stunts/doom-host/patches/0007-doom-ctx-constant-address.patch", import.meta.url),
+  "utf8",
+);
+
+function pinnedDoomMovementTable(name) {
+  const match = PINNED_CONTEXT_PATCH.match(new RegExp(`doom_ctx_init_${name}\\[2\\] = \\{([^}]+)\\}`));
+  assert.ok(match, `pinned Doom context initializer includes ${name}`);
+  return match[1].split(",").map((value) => Number(value.trim()));
+}
 
 const BINDING = new Uint8Array(32).fill(7);
 const NOW = 1_800_000_000;
@@ -334,14 +347,26 @@ test("validation refuses BT_SPECIAL, which the program would refuse anyway", () 
   }
 });
 
-test("button bits are the vanilla BT_ values and 0x80 is not among them", () => {
+test("button bits are vanilla values and Shift does not set a button bit", () => {
   assert.equal(BT_ATTACK, 0x01);
   assert.equal(BT_USE, 0x02);
-  assert.equal(BT_SPEED, 0x04);
-  for (const bit of [BT_ATTACK, BT_USE, BT_SPEED]) {
+  assert.equal(BT_CHANGE, 0x04);
+  for (const bit of [BT_ATTACK, BT_USE, BT_CHANGE]) {
     assert.equal(bit & BT_SPECIAL, 0, `0x${bit.toString(16)} must not touch BT_SPECIAL`);
   }
-  assert.equal(BT_ATTACK | BT_USE | BT_SPEED, 0x07);
+  assert.deepEqual(Array.from(heldToCommands({run: true}, 0, 1)), [0, 0, 0, 0]);
+  assert.deepEqual(Array.from(heldToCommands({run: true, forward: true}, 0, 1)), [50, 0, 0, 0]);
+  assert.equal(heldToCommands({run: true}, 0, 1)[3] & BT_CHANGE, 0);
+});
+
+test("movement speeds match pinned Doom g_game.c tables and fit signed command bytes", () => {
+  // The pinned source is a77dfb96cb91780ca334d0d4cfd86957558007e0; patch
+  // 0007's generated context initializer carries its original movement arrays.
+  assert.deepEqual(FORWARD_MOVE, pinnedDoomMovementTable("forwardmove"));
+  assert.deepEqual(SIDE_MOVE, pinnedDoomMovementTable("sidemove"));
+  for (const value of [...FORWARD_MOVE, ...SIDE_MOVE]) {
+    assert.ok(value >= -128 && value <= 127, `${value} fits signed ticcmd movement byte`);
+  }
 });
 
 // ---------------------------------------------------------------- ticcmds
@@ -370,18 +395,24 @@ test("held keys become a per-tic command stream", () => {
   assert.ok(Array.from(none).every((byte) => byte === 0), "no keys held is a neutral command every tic");
 
   const forward = heldToCommands({forward: true}, 0, 4);
-  assert.deepEqual(Array.from(forward.subarray(0, 4)), [50, 0, 0, 0]);
-  assert.deepEqual(Array.from(forward.subarray(4, 8)), [50, 0, 0, 0], "forward is applied every tic");
+  assert.deepEqual(Array.from(forward.subarray(0, 4)), [25, 0, 0, 0]);
+  assert.deepEqual(Array.from(forward.subarray(4, 8)), [25, 0, 0, 0], "walk speed is applied every tic");
 
   const strafe = heldToCommands({strafeRight: true}, 0, 1);
-  assert.deepEqual(Array.from(strafe), [0, 50, 0, 0]);
+  assert.deepEqual(Array.from(strafe), [0, 24, 0, 0]);
   const strafeLeft = heldToCommands({strafeLeft: true}, 0, 1);
-  assert.deepEqual(Array.from(strafeLeft), [0, 206, 0, 0]);
+  assert.deepEqual(Array.from(strafeLeft), [0, 232, 0, 0]);
+  const runForward = heldToCommands({forward: true, run: true}, 0, 1);
+  assert.deepEqual(Array.from(runForward), [50, 0, 0, 0]);
+  const runStrafe = heldToCommands({strafeRight: true, run: true}, 0, 1);
+  assert.deepEqual(Array.from(runStrafe), [0, 40, 0, 0]);
+  const runStrafeLeft = heldToCommands({strafeLeft: true, run: true}, 0, 1);
+  assert.deepEqual(Array.from(runStrafeLeft), [0, 216, 0, 0]);
 
   const fire = heldToCommands({attack: true}, 0, 1);
   assert.deepEqual(Array.from(fire), [0, 0, 0, BT_ATTACK]);
   const all = heldToCommands({attack: true, use: true, run: true}, 0, 1);
-  assert.deepEqual(Array.from(all), [0, 0, 0, BT_ATTACK | BT_USE | BT_SPEED]);
+  assert.deepEqual(Array.from(all), [0, 0, 0, BT_ATTACK | BT_USE]);
 });
 
 test("turn is contributed on every fourth tic, as vanilla accumulates it", () => {
