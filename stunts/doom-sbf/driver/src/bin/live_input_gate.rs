@@ -90,6 +90,11 @@ const E2R_PHASES: u32 = 8;
 /// measured rather than assumed.  It is the highest buffer inside the count,
 /// because that is the one the deployed two-buffer program refused outright.
 const PROVISIONED_BUFFER: u8 = 3;
+// Generated diagnostic DOOM_CTX layout, shared by the production and
+// diagnostic prefixes. The diagnostic profile appends its phase accumulator.
+const ARENA_BYTES_OFFSET: usize = 294_640;
+const ARENA_USED_OFFSET: usize = 294_648;
+const ARENA_HIGH_WATER_OFFSET: usize = 294_672;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/live_input_gate.rs"
@@ -110,6 +115,24 @@ fn meta(key: Pubkey, writable: bool, signer: bool) -> AccountMeta {
 
 fn i32_at(bytes: &[u8], offset: usize) -> i32 {
     i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn arena_metrics(context: &[u8]) -> Result<serde_json::Value, Box<dyn Error>> {
+    if context.len() < ARENA_HIGH_WATER_OFFSET + 8 {
+        return Err("context account is too short for allocator metrics".into());
+    }
+    let bytes = u64_at(context, ARENA_BYTES_OFFSET);
+    let used = u64_at(context, ARENA_USED_OFFSET);
+    Ok(json!({
+        "arena_bytes": bytes,
+        "arena_used": used,
+        "arena_remaining": bytes.saturating_sub(used),
+        "arena_high_water": u64_at(context, ARENA_HIGH_WATER_OFFSET),
+    }))
 }
 
 fn custom_code(result: &BanksTransactionResultWithMetadata) -> Option<u32> {
@@ -994,6 +1017,114 @@ async fn stage_start_account(
     Ok(key)
 }
 
+/// Repeatedly run the production RESET/9 and one-tic ADVANCE/5 wires against
+/// the retained SBF image, recording the persistent arena after both calls.
+async fn run_reset_advance_repro(
+    session: &mut Session,
+    start_state: &[u8],
+    staged_start: &[u8],
+    command: &[u8],
+    iterations: u32,
+    expected_refusal: Option<u32>,
+    image_sha: &str,
+    manifest_sha: &str,
+    receipt: &PathBuf,
+) -> Result<(), Box<dyn Error>> {
+    if command.len() != 4 {
+        return Err("reset reproduction command must be one ticcmd".into());
+    }
+    let start_key = stage_start_account(session, start_state).await?;
+    let authority = session.keys.authority.insecure_clone();
+    let mut rows = Vec::with_capacity(iterations as usize);
+    let mut refusals = Vec::new();
+    let mut completed = 0u32;
+
+    for cycle in 1..=iterations {
+        let reset_ix = session.reset_ix(start_key.pubkey(), sim2::RESET_START_STATE, false);
+        let reset = session.send(vec![reset_ix], &[&authority], cu_limit()).await?;
+        if reset.result.is_err() {
+            return Err(format!("RESET/9 cycle {cycle}: {:?}", reset.result).into());
+        }
+        let view = session.view().await?;
+        if view.resets != cycle || view.cursor != 0 {
+            return Err(format!(
+                "RESET/9 cycle {cycle} recorded resets={} cursor={}",
+                view.resets, view.cursor
+            )
+            .into());
+        }
+        let reset_state = session.data(session.keys.state.pubkey()).await?;
+        if reset_state != staged_start {
+            return Err(format!(
+                "RESET/9 cycle {cycle} did not restore byte-identical ST1"
+            )
+            .into());
+        }
+        let reset_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
+
+        session.cursor_before = view.cursor;
+        let deposit_ix = session.deposit_ix(view.cursor, command);
+        let deposited = session.send(vec![deposit_ix], &[&authority], cu_limit()).await?;
+        if deposited.result.is_err() {
+            return Err(format!("DEPOSIT before cycle {cycle}: {:?}", deposited.result).into());
+        }
+        let advance_ix = session.advance_ix(sim2::ADVANCE_STARVED, 1);
+        let advance = session.send(vec![advance_ix], &[&authority], cu_limit()).await?;
+        let advance_code = custom_code(&advance);
+        let advance_ok = advance.result.is_ok();
+        let advance_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
+        rows.push(json!({
+            "cycle": cycle,
+            "reset_resets_count": view.resets,
+            "reset_state_sha256": base::sha(&reset_state),
+            "reset_arena": reset_metrics,
+            "advance_ok": advance_ok,
+            "advance_refusal_code": advance_code,
+            "advance_arena": advance_metrics,
+        }));
+        if !advance_ok {
+            refusals.push(json!({"cycle": cycle, "code": advance_code}));
+            if expected_refusal != advance_code {
+                return Err(format!(
+                    "ADVANCE/5 cycle {cycle} refused with {advance_code:?}, expected {:?}: {:?}",
+                    expected_refusal, advance.result
+                )
+                .into());
+            }
+            break;
+        }
+        completed += 1;
+    }
+
+    if expected_refusal.is_some() && refusals.is_empty() {
+        return Err(format!(
+            "expected ADVANCE/5 refusal {:?} did not occur in {iterations} cycles",
+            expected_refusal
+        )
+        .into());
+    }
+    let summary = json!({
+        "gate": "offline DOOM-SIM/2 RESET/9 plus ADVANCE/5 allocator reproduction",
+        "image_sha256": image_sha,
+        "manifest_sha256": manifest_sha,
+        "requested_cycles": iterations,
+        "completed_advance_cycles": completed,
+        "refusals": refusals,
+        "allocator_offsets": {
+            "arena_bytes": ARENA_BYTES_OFFSET,
+            "arena_used": ARENA_USED_OFFSET,
+            "arena_high_water": ARENA_HIGH_WATER_OFFSET,
+        },
+        "rows": rows,
+    });
+    common::write_json(&receipt.join("reset-advance-repro.json"), &summary)?;
+    println!(
+        "RESET/9 allocator reproduction: {completed}/{iterations} ADVANCE cycles completed, refusals={refusals:?}, receipt={}",
+        receipt.display()
+    );
+    Ok(())
+}
+
 /// What the host ingress does with an ST1 image: `Err(rc)` from the import, a
 /// tic that ran with a consumed command (0), or a tic that ran with an
 /// unconsumed one (238, the DOOM-CI3 receipt reading zero).
@@ -1110,7 +1241,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = env::args().collect();
     let mut args = argv.iter().skip(1).cloned();
     let image = PathBuf::from(args.next().ok_or(
-        "usage: live_input_gate IMAGE IMAGE_SHA MANIFEST MANIFEST_SHA CAPTURE RESOURCE CONTROLLER RECEIPT [--profile NAME] [--tics N] [--advance-tics N] [--frames-at a,b,c] [--starve-state-cursor N] [--worst-view-benchmark]",
+        "usage: live_input_gate IMAGE IMAGE_SHA MANIFEST MANIFEST_SHA CAPTURE RESOURCE CONTROLLER RECEIPT [--profile NAME] [--tics N] [--advance-tics N] [--frames-at a,b,c] [--starve-state-cursor N] [--worst-view-benchmark] [--reset-advance-repro N] [--expect-reset-refusal CODE]",
     )?)
     .canonicalize()?;
     let expected_image = args.next().ok_or("missing image SHA")?;
@@ -1130,6 +1261,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut no_frame_artifacts = false;
     let mut worst_view_benchmark = false;
     let mut render_repeat_regression = false;
+    let mut reset_advance_repro = None;
+    let mut expected_reset_refusal = None;
     while let Some(flag) = args.next() {
         let mut value = || -> Result<String, Box<dyn Error>> {
             args.next()
@@ -1160,8 +1293,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 no_frame_artifacts = false;
                 render_repeat_regression = true;
             }
+            "--reset-advance-repro" => reset_advance_repro = Some(value()?.parse::<u32>()?),
+            "--expect-reset-refusal" => expected_reset_refusal = Some(value()?.parse::<u32>()?),
             other => return Err(format!("unknown flag {other}").into()),
         }
+    }
+    if reset_advance_repro == Some(0) {
+        return Err("--reset-advance-repro must be positive".into());
+    }
+    if expected_reset_refusal.is_some() && reset_advance_repro.is_none() {
+        return Err("--expect-reset-refusal requires --reset-advance-repro".into());
     }
     if render_repeat_regression
         && !render_regression_cursor_sequence(&frames_at, advance_tics)
@@ -1313,6 +1454,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         capacity,
     )
     .await?;
+    if let Some(iterations) = reset_advance_repro {
+        return run_reset_advance_repro(
+            &mut session,
+            &capture_data.state,
+            &capture_data.state_account(),
+            neutral.get(..4).ok_or("neutral input profile is empty")?,
+            iterations,
+            expected_reset_refusal,
+            &expected_image,
+            &expected_manifest,
+            &receipt,
+        )
+        .await;
+    }
     // The input chain is seeded with the context key SIM/2 INIT binds, so the
     // gate compares the chain the program actually commits.
     let mut chain = sim2::chain_init(&session.keys.context.pubkey(), first_tic);
