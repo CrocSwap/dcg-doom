@@ -160,6 +160,10 @@ case "${READBACK:-overlap}" in
   pre-read) readback_flags=(--pre-read-snapshot) ;;
   *) echo "READBACK must be serial, pre-read or overlap" >&2; exit 2 ;;
 esac
+case "${BATCH_RENDER_SENDS:-0}" in
+  1|true|TRUE|yes|YES|on|ON) batch_render_flags=(--batch-render-sends) ;;
+  *) batch_render_flags=() ;;
+esac
 if [ -n "${PRE_READ:-}" ] && [ "${PRE_READ}" != "0" ] \
    && [ "${#readback_flags[@]}" -eq 0 ]; then
   readback_flags=(--pre-read-snapshot)
@@ -208,5 +212,6 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --atomic-live-inputs \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   ${readback_flags[@]+"${readback_flags[@]}"} \
+  ${batch_render_flags[@]+"${batch_render_flags[@]}"} \
   ${STRIPS_BEHIND_SNAPSHOT:+--strips-behind-snapshot} \
   --reset-start-account "${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}"

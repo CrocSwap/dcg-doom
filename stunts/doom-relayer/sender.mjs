@@ -497,6 +497,7 @@ export class PipelineSender {
     // reachable through `argv()`, and a flag that is not built here is a
     // flag the pipeline has never seen.
     if (options.stripsBehindSnapshot) argv.push("--strips-behind-snapshot");
+    if (options.batchRenderSends) argv.push("--batch-render-sends");
     argv.push("--spend-cap-fogo", String(options.spendCapFogo ?? 10));
     return argv;
   }

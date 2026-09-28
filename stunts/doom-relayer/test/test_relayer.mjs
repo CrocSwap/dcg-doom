@@ -1483,6 +1483,19 @@ test("the early-strip switch reaches the pipeline, and is off by default", () =>
   assert.equal(parsed.get("pre-read-snapshot"), "1");
 });
 
+test("the strip batch switch reaches the pipeline and is parsed as a switch", () => {
+  const argv = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    batchRenderSends: true,
+  }).argv();
+  assert.ok(argv.includes("--batch-render-sends"));
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  assert.ok(!plain.includes("--batch-render-sends"));
+  const parsed = parseArgs(["node", "server.mjs", "--batch-render-sends", "--pre-read-snapshot"]);
+  assert.equal(parsed.get("batch-render-sends"), "1");
+  assert.equal(parsed.get("pre-read-snapshot"), "1");
+});
+
 test("a third node and a send rate reach the pipeline's argv", () => {
   // The frame's own send cost is 8 / (rate x endpoints) seconds, and both halves
   // were unreachable: `argv()` is the only place a chain-mode flag becomes a
