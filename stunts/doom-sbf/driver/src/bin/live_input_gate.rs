@@ -1023,6 +1023,7 @@ async fn run_reset_advance_repro(
     session: &mut Session,
     start_state: &[u8],
     staged_start: &[u8],
+    start_mirror: &[u8],
     command: &[u8],
     iterations: u32,
     expected_refusal: Option<u32>,
@@ -1050,10 +1051,15 @@ async fn run_reset_advance_repro(
             return Err(format!("RESET/9 cycle {cycle}: {:?}", reset.result).into());
         }
         let view = session.view().await?;
-        if view.resets != cycle || view.cursor != 0 {
+        if view.resets != cycle
+            || view.cursor != 0
+            || view.state_root != view.start_root
+        {
             return Err(format!(
-                "RESET/9 cycle {cycle} recorded resets={} cursor={}",
-                view.resets, view.cursor
+                "RESET/9 cycle {cycle} recorded resets={} cursor={} start_root_match={}",
+                view.resets,
+                view.cursor,
+                view.state_root == view.start_root
             )
             .into());
         }
@@ -1061,6 +1067,13 @@ async fn run_reset_advance_repro(
         if reset_state != staged_start {
             return Err(format!(
                 "RESET/9 cycle {cycle} did not restore byte-identical ST1"
+            )
+            .into());
+        }
+        let reset_mirror = session.data(session.keys.mirror.pubkey()).await?;
+        if reset_mirror != start_mirror {
+            return Err(format!(
+                "RESET/9 cycle {cycle} did not restore byte-identical MP1"
             )
             .into());
         }
@@ -1099,6 +1112,7 @@ async fn run_reset_advance_repro(
             "cycle": cycle,
             "reset_resets_count": view.resets,
             "reset_state_sha256": base::sha(&reset_state),
+            "reset_mirror_sha256": base::sha(&reset_mirror),
             "reset_arena": reset_metrics,
             "advance_ok": advance_ok,
             "advance_refusal_code": advance_code,
@@ -1486,6 +1500,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &mut session,
             &capture_data.state,
             &capture_data.state_account(),
+            &capture_data.mirror,
             neutral.get(..4).ok_or("neutral input profile is empty")?,
             iterations,
             expected_reset_refusal,
