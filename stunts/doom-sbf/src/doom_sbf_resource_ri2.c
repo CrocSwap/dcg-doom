@@ -2057,8 +2057,11 @@ int doom_sbf_sim2_reset(
      * decoder workspace after it commits (or refuses). */
     transient_mark = doom_sbf_arena_mark();
     if (DoomStateDecode(state, (size_t)state_len)) {
+        /* Decode's arena-exhaustion latch must be sampled before rewind,
+         * which clears it along with the temporary decoder workspace. */
+        int exhausted = doom_sbf_arena_exhausted();
         if (!doom_sbf_arena_rewind(transient_mark)) return 239;
-        return 232;
+        return exhausted ? 239 : 232;
     }
     if (!doom_sbf_arena_rewind(transient_mark)) return 239;
     RI2_PHASE(931);
