@@ -7,7 +7,7 @@ import {spawn} from "node:child_process";
 import {mkdir} from "node:fs/promises";
 import {setTimeout as delay} from "node:timers/promises";
 
-const [url, profileDir, debugPortText, chromePath, headlessText = "0"] = process.argv.slice(2);
+const [url, profileDir, debugPortText, chromePath, headlessText = "0", playStartedAtText = ""] = process.argv.slice(2);
 const debugPort = Number(debugPortText);
 if (!url || !profileDir || !Number.isInteger(debugPort) || !chromePath) {
   throw new Error("usage: doom_play_browser.mjs URL PROFILE DEBUG_PORT CHROME [HEADLESS]");
@@ -142,6 +142,7 @@ try {
   let watchStartCursor = 0;
   let watchStartPaintedFrames = 0;
   let watchStartFrameDigest = null;
+  let movementReported = false;
   let watchdogReported = false;
   const pageDeadline = Date.now() + 20_000;
   const relayBase = new URL(url).searchParams.get("relayer");
@@ -198,6 +199,13 @@ try {
         && state.frameDigest !== watchStartFrameDigest
       )
     );
+    if (progressObserved && !movementReported) {
+      movementReported = true;
+      const sinceLauncher = Number(playStartedAtText) > 0
+        ? `, ${((Date.now() - Number(playStartedAtText)) / 1000).toFixed(2)}s after launcher start`
+        : "";
+      console.log(`Doom is moving at frame cursor ${Math.max(state.cursor, state.frameCursor)}${sinceLauncher}.`);
+    }
     if (
       inputStarted
       && !watchdogReported
@@ -217,13 +225,8 @@ try {
       throw new Error(sentence);
     }
     if (inputStarted && !watchdogReported && Date.now() - inputStartedAt >= 15_000) {
-      if (state.cursor > watchStartCursor || (
-        state.paintedFrames > watchStartPaintedFrames
-        && state.frameCursor > 0
-        && state.frameDigest !== watchStartFrameDigest
-      )) {
+      if (movementReported || progressObserved) {
         watchdogReported = true;
-        console.log(`Doom is moving at frame cursor ${Math.max(state.cursor, state.frameCursor)}.`);
       } else {
         watchdogReported = true;
         const sentence = "The game cursor did not move within 15 seconds of your first input. Press Ctrl-C and run scripts/doom_play.sh --repair to reinitialize R15.";
@@ -237,9 +240,10 @@ try {
       }
     }
     if (!inputStarted && Date.now() >= pageDeadline) {
+      const details = `page ready: ${state.ready}, burner wallet: ${state.wallet}, join button: ${state.hasJoin}, join disabled: ${state.joinDisabled}, relayer health: ${relayReady}`;
       const sentence = state.error
-        ? `The Doom page could not join: ${state.error}. Press Ctrl-C and rerun scripts/doom_play.sh.`
-        : "The Doom page did not join a testnet session within 20 seconds; press Ctrl-C and rerun scripts/doom_play.sh.";
+        ? `The Doom page could not join: ${state.error} (${details}). Press Ctrl-C and rerun scripts/doom_play.sh.`
+        : `The Doom page did not join a testnet session within 20 seconds (${details}); press Ctrl-C and rerun scripts/doom_play.sh.`;
       console.error(sentence);
       throw new Error(sentence);
     }
