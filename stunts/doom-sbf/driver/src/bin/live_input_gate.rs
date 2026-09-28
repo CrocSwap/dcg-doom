@@ -90,11 +90,13 @@ const E2R_PHASES: u32 = 8;
 /// measured rather than assumed.  It is the highest buffer inside the count,
 /// because that is the one the deployed two-buffer program refused outright.
 const PROVISIONED_BUFFER: u8 = 3;
-// Generated diagnostic DOOM_CTX layout, shared by the production and
-// diagnostic prefixes. The diagnostic profile appends its phase accumulator.
+// Generated DOOM_CTX field offsets, shared by the production and diagnostic
+// prefixes. They are checked against the arena length and allocator
+// invariants below; the diagnostic profile appends its phase accumulator.
 const ARENA_BYTES_OFFSET: usize = 294_640;
 const ARENA_USED_OFFSET: usize = 294_648;
 const ARENA_HIGH_WATER_OFFSET: usize = 294_672;
+const EXPECTED_ARENA_BYTES: u64 = 1_835_008;
 const DRIVER_SOURCE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/bin/live_input_gate.rs"
@@ -127,11 +129,24 @@ fn arena_metrics(context: &[u8]) -> Result<serde_json::Value, Box<dyn Error>> {
     }
     let bytes = u64_at(context, ARENA_BYTES_OFFSET);
     let used = u64_at(context, ARENA_USED_OFFSET);
+    let high_water = u64_at(context, ARENA_HIGH_WATER_OFFSET);
+    if bytes != EXPECTED_ARENA_BYTES {
+        return Err(format!(
+            "context arena at offsets {ARENA_BYTES_OFFSET}/{ARENA_USED_OFFSET}/{ARENA_HIGH_WATER_OFFSET} has {bytes} bytes, expected {EXPECTED_ARENA_BYTES}"
+        )
+        .into());
+    }
+    if used > high_water || high_water > bytes {
+        return Err(format!(
+            "context arena metrics violate used <= high_water <= bytes: {used} <= {high_water} <= {bytes}"
+        )
+        .into());
+    }
     Ok(json!({
         "arena_bytes": bytes,
         "arena_used": used,
         "arena_remaining": bytes.saturating_sub(used),
-        "arena_high_water": u64_at(context, ARENA_HIGH_WATER_OFFSET),
+        "arena_high_water": high_water,
     }))
 }
 
@@ -1017,8 +1032,101 @@ async fn stage_start_account(
     Ok(key)
 }
 
-/// Repeatedly run the production RESET/9 and one-tic ADVANCE/5 wires against
-/// the retained SBF image, recording the persistent arena after both calls.
+/// A committed pair of account images and root after a sequence of ADVANCEs.
+struct ResetAdvanceSnapshot {
+    cursor: u32,
+    root: [u8; 32],
+    state: Vec<u8>,
+    mirror: Vec<u8>,
+    arena: serde_json::Value,
+}
+
+async fn reset_advance_once(
+    session: &mut Session,
+    authority: &Keypair,
+    cursor: u32,
+    command: &[u8],
+    label: &str,
+) -> Result<(serde_json::Value, Option<u32>), Box<dyn Error>> {
+    session.cursor_before = cursor;
+    let deposit_ix = session.deposit_ix(cursor, command);
+    let deposit = session
+        .send(vec![deposit_ix], &[authority], cu_limit())
+        .await?;
+    if deposit.result.is_err() {
+        return Err(format!("{label} DEPOSIT at cursor {cursor}: {:?}", deposit.result).into());
+    }
+    let advance_ix = session.advance_ix(sim2::ADVANCE_STARVED, 1);
+    let advance = session
+        .send(vec![advance_ix], &[authority], cu_limit())
+        .await?;
+    let refusal_code = custom_code(&advance);
+    if advance.result.is_err() && refusal_code.is_none() {
+        return Err(format!("{label} ADVANCE/5 at cursor {cursor}: {:?}", advance.result).into());
+    }
+    if advance.result.is_err() {
+        return Ok((
+            json!({
+                "cursor_before": cursor,
+                "cursor_after": null,
+                "compute_units": base::units(&advance)?,
+                "refusal_code": refusal_code,
+            }),
+            refusal_code,
+        ));
+    }
+    let view = session.view().await?;
+    if view.cursor != cursor + 1 || view.halt != 0 {
+        return Err(format!(
+            "{label} ADVANCE/5 from {cursor} left cursor={} halt={}",
+            view.cursor, view.halt
+        )
+        .into());
+    }
+    let context = session.data(session.keys.context.pubkey()).await?;
+    Ok((
+        json!({
+            "cursor_before": cursor,
+            "cursor_after": view.cursor,
+            "compute_units": base::units(&advance)?,
+            "arena": arena_metrics(&context)?,
+        }),
+        None,
+    ))
+}
+
+async fn reset_advance_snapshot(
+    session: &mut Session,
+    expected_cursor: u32,
+    label: &str,
+) -> Result<ResetAdvanceSnapshot, Box<dyn Error>> {
+    let view = session.view().await?;
+    if view.cursor != expected_cursor || view.halt != 0 {
+        return Err(format!(
+            "{label} snapshot cursor={} halt={}, expected cursor {expected_cursor}",
+            view.cursor, view.halt
+        )
+        .into());
+    }
+    let state = session.data(session.keys.state.pubkey()).await?;
+    let mirror = session.data(session.keys.mirror.pubkey()).await?;
+    let (_, computed_root) = sim2::verified_state_root(&state, &mirror)
+        .map_err(|e| format!("{label} ST1/MP1 root: {e:?}"))?;
+    if view.state_root != computed_root {
+        return Err(format!("{label} metadata root does not match ST1/MP1").into());
+    }
+    let context = session.data(session.keys.context.pubkey()).await?;
+    Ok(ResetAdvanceSnapshot {
+        cursor: view.cursor,
+        root: view.state_root,
+        state,
+        mirror,
+        arena: arena_metrics(&context)?,
+    })
+}
+
+/// Run a no-reset reference and repeated production RESET/9 plus two distinct
+/// ADVANCE/5 instructions per cycle against the retained SBF image.
 async fn run_reset_advance_repro(
     session: &mut Session,
     start_state: &[u8],
@@ -1035,7 +1143,6 @@ async fn run_reset_advance_repro(
         return Err("reset reproduction command must be one ticcmd".into());
     }
     let start_key = stage_start_account(session, start_state).await?;
-    let authority = session.keys.authority.insecure_clone();
     let initial_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
     let stable_arena_used = initial_metrics["arena_used"]
         .as_u64()
@@ -1044,17 +1151,35 @@ async fn run_reset_advance_repro(
     let mut refusals = Vec::new();
     let mut completed = 0u32;
 
-    for cycle in 1..=iterations {
+    let authority = session.keys.authority.insecure_clone();
+    let mut no_reset_advances = Vec::with_capacity(2);
+    for cursor in 0..2 {
+        let (advance, refusal) =
+            reset_advance_once(session, &authority, cursor, command, "no-reset reference").await?;
+        if refusal.is_some() {
+            return Err(format!("no-reset reference unexpectedly refused with {refusal:?}").into());
+        }
+        no_reset_advances.push(advance);
+    }
+    let no_reset = reset_advance_snapshot(session, 2, "no-reset reference").await?;
+    if no_reset.arena["arena_used"].as_u64() != Some(stable_arena_used) {
+        return Err(format!(
+            "no-reset reference retained transient workspace: {:?} != {stable_arena_used}",
+            no_reset.arena["arena_used"]
+        )
+        .into());
+    }
+
+    'cycles: for cycle in 1..=iterations {
         let reset_ix = session.reset_ix(start_key.pubkey(), sim2::RESET_START_STATE, false);
-        let reset = session.send(vec![reset_ix], &[&authority], cu_limit()).await?;
+        let reset = session
+            .send(vec![reset_ix], &[&authority], cu_limit())
+            .await?;
         if reset.result.is_err() {
             return Err(format!("RESET/9 cycle {cycle}: {:?}", reset.result).into());
         }
         let view = session.view().await?;
-        if view.resets != cycle
-            || view.cursor != 0
-            || view.state_root != view.start_root
-        {
+        if view.resets != cycle || view.cursor != 0 || view.state_root != view.start_root {
             return Err(format!(
                 "RESET/9 cycle {cycle} recorded resets={} cursor={} start_root_match={}",
                 view.resets,
@@ -1065,17 +1190,11 @@ async fn run_reset_advance_repro(
         }
         let reset_state = session.data(session.keys.state.pubkey()).await?;
         if reset_state != staged_start {
-            return Err(format!(
-                "RESET/9 cycle {cycle} did not restore byte-identical ST1"
-            )
-            .into());
+            return Err(format!("RESET/9 cycle {cycle} did not restore byte-identical ST1").into());
         }
         let reset_mirror = session.data(session.keys.mirror.pubkey()).await?;
         if reset_mirror != start_mirror {
-            return Err(format!(
-                "RESET/9 cycle {cycle} did not restore byte-identical MP1"
-            )
-            .into());
+            return Err(format!("RESET/9 cycle {cycle} did not restore byte-identical MP1").into());
         }
         let reset_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
         if expected_refusal.is_none()
@@ -1088,47 +1207,79 @@ async fn run_reset_advance_repro(
             .into());
         }
 
-        session.cursor_before = view.cursor;
-        let deposit_ix = session.deposit_ix(view.cursor, command);
-        let deposited = session.send(vec![deposit_ix], &[&authority], cu_limit()).await?;
-        if deposited.result.is_err() {
-            return Err(format!("DEPOSIT before cycle {cycle}: {:?}", deposited.result).into());
+        let mut advance_rows = Vec::with_capacity(2);
+        for cursor in 0..2 {
+            let (advance_row, refusal) = reset_advance_once(
+                session,
+                &authority,
+                cursor,
+                command,
+                &format!("RESET/9 cycle {cycle}"),
+            )
+            .await?;
+            if let Some(code) = refusal {
+                if expected_refusal != Some(code) {
+                    return Err(format!(
+                        "ADVANCE/5 cycle {cycle} tic {cursor} refused with {code}, expected {:?}",
+                        expected_refusal
+                    )
+                    .into());
+                }
+                refusals.push(json!({"cycle": cycle, "cursor": cursor, "code": code}));
+                advance_rows.push(advance_row);
+                rows.push(json!({
+                    "cycle": cycle,
+                    "reset_resets_count": view.resets,
+                    "reset_state_sha256": base::sha(&reset_state),
+                    "reset_mirror_sha256": base::sha(&reset_mirror),
+                    "reset_arena": reset_metrics,
+                    "advance_instruction_count": advance_rows.len(),
+                    "advances": advance_rows,
+                    "post_advance_root": null,
+                    "post_advance_state_sha256": null,
+                    "post_advance_mirror_sha256": null,
+                    "matches_no_reset_reference": null,
+                }));
+                break 'cycles;
+            }
+            if expected_refusal.is_none()
+                && advance_row["arena"]["arena_used"].as_u64() != Some(stable_arena_used)
+            {
+                return Err(format!(
+                    "ADVANCE/5 cycle {cycle} tic {cursor} retained transient workspace: {:?} != {stable_arena_used}",
+                    advance_row["arena"]["arena_used"]
+                )
+                .into());
+            }
+            advance_rows.push(advance_row);
         }
-        let advance_ix = session.advance_ix(sim2::ADVANCE_STARVED, 1);
-        let advance = session.send(vec![advance_ix], &[&authority], cu_limit()).await?;
-        let advance_code = custom_code(&advance);
-        let advance_ok = advance.result.is_ok();
-        let advance_metrics = arena_metrics(&session.data(session.keys.context.pubkey()).await?)?;
-        if expected_refusal.is_none()
-            && advance_metrics["arena_used"].as_u64() != Some(stable_arena_used)
-        {
+        let post_advance =
+            reset_advance_snapshot(session, 2, &format!("RESET/9 cycle {cycle}")).await?;
+        let matches_no_reset = post_advance.root == no_reset.root
+            && post_advance.state == no_reset.state
+            && post_advance.mirror == no_reset.mirror;
+        if expected_refusal.is_none() && !matches_no_reset {
             return Err(format!(
-                "ADVANCE/5 cycle {cycle} retained transient workspace: {:?} != {stable_arena_used}",
-                advance_metrics["arena_used"]
+                "RESET/9 cycle {cycle} post-advance root or ST1/MP1 differs from the no-reset reference"
             )
             .into());
         }
+        let advance_metrics = post_advance.arena.clone();
         rows.push(json!({
             "cycle": cycle,
             "reset_resets_count": view.resets,
             "reset_state_sha256": base::sha(&reset_state),
             "reset_mirror_sha256": base::sha(&reset_mirror),
             "reset_arena": reset_metrics,
-            "advance_ok": advance_ok,
-            "advance_refusal_code": advance_code,
+            "advance_instruction_count": advance_rows.len(),
+            "advances": advance_rows,
+            "post_advance_cursor": post_advance.cursor,
+            "post_advance_root": common::hex(&post_advance.root),
+            "post_advance_state_sha256": base::sha(&post_advance.state),
+            "post_advance_mirror_sha256": base::sha(&post_advance.mirror),
+            "matches_no_reset_reference": matches_no_reset,
             "advance_arena": advance_metrics,
         }));
-        if !advance_ok {
-            refusals.push(json!({"cycle": cycle, "code": advance_code}));
-            if expected_refusal != advance_code {
-                return Err(format!(
-                    "ADVANCE/5 cycle {cycle} refused with {advance_code:?}, expected {:?}: {:?}",
-                    expected_refusal, advance.result
-                )
-                .into());
-            }
-            break;
-        }
         completed += 1;
     }
 
@@ -1143,8 +1294,20 @@ async fn run_reset_advance_repro(
         "gate": "offline DOOM-SIM/2 RESET/9 plus ADVANCE/5 allocator reproduction",
         "image_sha256": image_sha,
         "manifest_sha256": manifest_sha,
+        "driver_source_sha256": base::sha(DRIVER_SOURCE),
         "requested_cycles": iterations,
         "completed_advance_cycles": completed,
+        "advances_per_reset_cycle": 2,
+        "no_reset_reference": {
+            "advance_instruction_count": no_reset_advances.len(),
+            "cursor": no_reset.cursor,
+            "state_root": common::hex(&no_reset.root),
+            "state_sha256": base::sha(&no_reset.state),
+            "mirror_sha256": base::sha(&no_reset.mirror),
+            "arena": no_reset.arena,
+            "advances": no_reset_advances,
+        },
+        "all_cycles_match_no_reset_reference": rows.iter().all(|row| row["matches_no_reset_reference"] == true),
         "stable_arena_used": stable_arena_used,
         "arena_used_stable_throughout": expected_refusal.is_none(),
         "refusals": refusals,
@@ -1152,12 +1315,13 @@ async fn run_reset_advance_repro(
             "arena_bytes": ARENA_BYTES_OFFSET,
             "arena_used": ARENA_USED_OFFSET,
             "arena_high_water": ARENA_HIGH_WATER_OFFSET,
+            "expected_arena_bytes": EXPECTED_ARENA_BYTES,
         },
         "rows": rows,
     });
     common::write_json(&receipt.join("reset-advance-repro.json"), &summary)?;
     println!(
-        "RESET/9 allocator reproduction: {completed}/{iterations} ADVANCE cycles completed, refusals={refusals:?}, receipt={}",
+        "RESET/9 allocator reproduction: {completed}/{iterations} two-ADVANCE cycles completed, refusals={refusals:?}, receipt={}",
         receipt.display()
     );
     Ok(())
