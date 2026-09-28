@@ -2045,12 +2045,22 @@ int doom_sbf_sim2_reset(
     uint8_t *context, const uint8_t *state, unsigned long state_len,
     uint8_t *mirror_out, unsigned long mirror_cap)
 {
+    unsigned long transient_mark;
     RI2_PHASE(930);
     if (doom_ctx_guard(context)) return 199;
     if (!ri2_state_shape(state, (size_t)state_len) ||
         !mirror_out || mirror_cap < RI2_MIRROR_BYTES) return 232;
     if (doom_sbf_arena_exhausted()) return 239;
-    if (DoomStateDecode(state, (size_t)state_len)) return 232;
+    /* DoomStateDecode allocates a temporary plan and shadow tables through
+     * malloc. On SBF those use the context's monotonic arena and free is a
+     * no-op. The decoded thinker graph lives in the zone, so rewind only the
+     * decoder workspace after it commits (or refuses). */
+    transient_mark = doom_sbf_arena_mark();
+    if (DoomStateDecode(state, (size_t)state_len)) {
+        if (!doom_sbf_arena_rewind(transient_mark)) return 239;
+        return 232;
+    }
+    if (!doom_sbf_arena_rewind(transient_mark)) return 239;
     RI2_PHASE(931);
     if (doom_sbf_arena_exhausted()) return 239;
     /* fill_pool clears the whole 64 KiB pool before writing its header and
