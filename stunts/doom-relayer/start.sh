@@ -139,6 +139,22 @@ STRIP_RATE=${3:-64}
 REPO=${RELAYER_REPO:-$RD}
 PIN=${PIN:-$REPO/scripts/doom_relayer_deploy.json}
 PY=${PY:-/home/ec2-user/basanos-main/.venv/bin/python}
+
+# PROFILE=fast selects the best measured useful-picture run. These are
+# operator settings, not new defaults; explicit per-setting environment values
+# still take precedence, and the plain start.sh defaults remain unchanged.
+case "${PROFILE:-}" in
+  "") ;;
+  fast)
+    BUFFERS=${BUFFERS:-4}
+    SEND_RATE=${SEND_RATE:-60}
+    MIN_CURSOR_STEP=${MIN_CURSOR_STEP:-6}
+    ADVANCE_CU_LIMIT=${ADVANCE_CU_LIMIT:-1400000}
+    BATCH_RENDER_SENDS=${BATCH_RENDER_SENDS:-0}
+    ;;
+  *) echo "PROFILE must be empty or fast" >&2; exit 2 ;;
+esac
+
 # The release image is copied to the host beside the relayer. Derive its
 # identity from those exact bytes unless the operator supplies the digest and
 # size from the retained build receipt. This keeps the source pin independent
@@ -160,6 +176,13 @@ case "${READBACK:-overlap}" in
   pre-read) readback_flags=(--pre-read-snapshot) ;;
   *) echo "READBACK must be serial, pre-read or overlap" >&2; exit 2 ;;
 esac
+case "${BATCH_RENDER_SENDS:-0}" in
+  1|true|TRUE|yes|YES|on|ON) batch_render_flags=(--batch-render-sends) ;;
+  *) batch_render_flags=() ;;
+esac
+# Pass the relayer-only ADVANCE compute budget through to the Python sender.
+# The 520,000 default was measured on E1M1; later scripted play exhausted it.
+export ADVANCE_CU_LIMIT="${ADVANCE_CU_LIMIT:-520000}"
 if [ -n "${PRE_READ:-}" ] && [ "${PRE_READ}" != "0" ] \
    && [ "${#readback_flags[@]}" -eq 0 ]; then
   readback_flags=(--pre-read-snapshot)
@@ -208,5 +231,6 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --atomic-live-inputs \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   ${readback_flags[@]+"${readback_flags[@]}"} \
+  ${batch_render_flags[@]+"${batch_render_flags[@]}"} \
   ${STRIPS_BEHIND_SNAPSHOT:+--strips-behind-snapshot} \
   --reset-start-account "${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}"

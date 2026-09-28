@@ -1143,6 +1143,7 @@ const CHAIN_FLAGS = new Set([
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
   "render", "reset-start-account", "frame-deadline-seconds", "rpc-lag-drop-slots",
   "rpc-lag-check-seconds", "min-cursor-step-tics", "render-pool-workers",
+  "batch-render-sends",
 ]);
 
 // Chain-mode flags that are switches rather than values. They are listed rather
@@ -1151,7 +1152,7 @@ const CHAIN_FLAGS = new Set([
 // the first to the *text* of the second and then skip it, so the second would
 // never reach the pipeline and the session would quietly run the serial path
 // while the runbook said otherwise.
-const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot", "atomic-live-inputs"]);
+const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot", "atomic-live-inputs", "batch-render-sends"]);
 
 export function parseArgs(argv) {
   const args = new Map();
@@ -1223,6 +1224,7 @@ if (isMain()) {
     // The early-strip experiment. Off by default; the receipt carries the
     // refusal rate, which is the number that decides whether it can ever be on.
     stripsBehindSnapshot: args.get("strips-behind-snapshot") != null,
+    batchRenderSends: args.get("batch-render-sends") != null,
   });
   const relayer = createRelayer({
     network,

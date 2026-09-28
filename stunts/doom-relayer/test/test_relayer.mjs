@@ -6,8 +6,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import {spawnSync} from "node:child_process";
 import {webcrypto} from "node:crypto";
-import {readFileSync} from "node:fs";
+import {chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
+import {fileURLToPath} from "node:url";
 
 import {encodeInput, heldToCommands, MAX_COMMANDS_PER_BATCH, BT_ATTACK, BT_SPECIAL} from "../../../web/doom-play/input.js";
 import {createRelayer, createServer, parseArgs, API_VERSION} from "../server.mjs";
@@ -998,6 +1002,73 @@ test("every flag start.sh passes reaches the child, including the reset account"
   assert.equal(argv[argv.indexOf("--rpc-lag-check-seconds") + 1], "10");
 });
 
+function captureStartSettings(profile) {
+  const temporary = mkdtempSync(join(tmpdir(), "doom-start-profile-"));
+  const host = join(temporary, "host");
+  const bin = join(temporary, "bin");
+  const image = join(host, "image", "doom_sbf.so");
+  const fakePython = join(bin, "python");
+  const fakeNode = join(bin, "node");
+  const argsCapture = join(temporary, "argv.txt");
+  const limitCapture = join(temporary, "advance-limit.txt");
+  try {
+    mkdirSync(join(host, "image"), {recursive: true});
+    mkdirSync(bin, {recursive: true});
+    writeFileSync(image, "test image bytes");
+    writeFileSync(fakePython, "#!/bin/sh\nexit 0\n");
+    writeFileSync(fakeNode, [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$@" > "$ARGV_CAPTURE"',
+      'printf \'%s\\n\' "${ADVANCE_CU_LIMIT-}" > "$LIMIT_CAPTURE"',
+      "exit 0",
+      "",
+    ].join("\n"));
+    chmodSync(fakePython, 0o755);
+    chmodSync(fakeNode, 0o755);
+
+    const env = {...process.env};
+    for (const name of ["PROFILE", "BUFFERS", "SEND_RATE", "MIN_CURSOR_STEP", "ADVANCE_CU_LIMIT", "BATCH_RENDER_SENDS"]) {
+      delete env[name];
+    }
+    Object.assign(env, {
+      PROFILE: profile,
+      RELAYER_DIR: host,
+      RELAYER_REPO: fileURLToPath(new URL("../../../", import.meta.url)),
+      PIN: join(temporary, "deploy-pin.json"),
+      PY: fakePython,
+      IMAGE: image,
+      KEYS_DIR: join(temporary, "keys"),
+      PATH: `${bin}:${process.env.PATH}`,
+      ARGV_CAPTURE: argsCapture,
+      LIMIT_CAPTURE: limitCapture,
+    });
+    const start = fileURLToPath(new URL("../start.sh", import.meta.url));
+    const result = spawnSync("bash", [start, "profile-test", "10"], {encoding: "utf8", env});
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const args = readFileSync(argsCapture, "utf8").trim().split("\n");
+    return {args, advanceCuLimit: readFileSync(limitCapture, "utf8").trim()};
+  } finally {
+    rmSync(temporary, {recursive: true, force: true});
+  }
+}
+
+test("PROFILE=fast selects the best measured settings and plain defaults stay unchanged", () => {
+  const fast = captureStartSettings("fast");
+  const value = (args, flag) => args[args.indexOf(flag) + 1];
+  assert.equal(value(fast.args, "--render-buffers"), "4");
+  assert.equal(value(fast.args, "--send-pacer-rate"), "60");
+  assert.equal(value(fast.args, "--min-cursor-step-tics"), "6");
+  assert.equal(fast.advanceCuLimit, "1400000");
+  assert.ok(!fast.args.includes("--batch-render-sends"));
+
+  const plain = captureStartSettings("");
+  assert.equal(value(plain.args, "--render-buffers"), "4");
+  assert.equal(value(plain.args, "--send-pacer-rate"), "45");
+  assert.equal(value(plain.args, "--min-cursor-step-tics"), "8");
+  assert.equal(plain.advanceCuLimit, "520000");
+  assert.ok(!plain.args.includes("--batch-render-sends"));
+});
+
 test("the session answer names the buffer holding the latest complete frame", async () => {
   // The child reads a frame back before it counts it, so it knows which buffer
   // is whole; the viewer reads eight strip accounts that land in eight
@@ -1480,6 +1551,19 @@ test("the early-strip switch reaches the pipeline, and is off by default", () =>
   // for it gets the pipeline's flag rather than the next token.
   const parsed = parseArgs(["node", "server.mjs", "--strips-behind-snapshot", "--pre-read-snapshot"]);
   assert.equal(parsed.get("strips-behind-snapshot"), "1");
+  assert.equal(parsed.get("pre-read-snapshot"), "1");
+});
+
+test("the strip batch switch reaches the pipeline and is parsed as a switch", () => {
+  const argv = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run",
+    batchRenderSends: true,
+  }).argv();
+  assert.ok(argv.includes("--batch-render-sends"));
+  const plain = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json", runDir: "/run"}).argv();
+  assert.ok(!plain.includes("--batch-render-sends"));
+  const parsed = parseArgs(["node", "server.mjs", "--batch-render-sends", "--pre-read-snapshot"]);
+  assert.equal(parsed.get("batch-render-sends"), "1");
   assert.equal(parsed.get("pre-read-snapshot"), "1");
 });
 
