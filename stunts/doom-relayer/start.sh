@@ -180,6 +180,52 @@ case "${BATCH_RENDER_SENDS:-0}" in
   1|true|TRUE|yes|YES|on|ON) batch_render_flags=(--batch-render-sends) ;;
   *) batch_render_flags=() ;;
 esac
+public_flags=()
+case "${PUBLIC_MODE:-0}" in
+  0|false|FALSE|no|NO|off|OFF) ;;
+  1|true|TRUE|yes|YES|on|ON)
+    SPEND_CAP=${SPEND_CAP:-300}
+    LOCK_DIR=/tmp/doom-play-maintenance.lock
+    if [ "$(cat "$LOCK_DIR/owner" 2>/dev/null || true)" != "doom-public:$NAME" ]; then
+      echo "public mode requires this run to own Tokyo's Doom maintenance lock" >&2
+      exit 3
+    fi
+    running=$(pgrep -f '[s]tunts/doom-relayer/server.mjs|[d]oom_relayer_server.py --run-dir' || true)
+    if [ -n "$running" ]; then
+      echo "a Doom relayer is already running; public mode will not start beside it (PIDs: $running)" >&2
+      exit 3
+    fi
+    EXPECTED_PUBLIC_IMAGE=7d3b63efee0bbbb9926c45dac4db51aaf033fd7f3d61ef33162de6f8c4d1b130
+    if [ "$IMAGE_SHA" != "$EXPECTED_PUBLIC_IMAGE" ]; then
+      echo "public mode requires the pinned 7d3b63ef R15 image; found $IMAGE_SHA" >&2
+      exit 2
+    fi
+    PUBLIC_STATE_PATH=${PUBLIC_STATE_PATH:-$RD/out/public-mode/public-state.json}
+    PUBLIC_MAX_VIEWERS=${PUBLIC_MAX_VIEWERS:-200}
+    PUBLIC_ESTIMATE_HORIZON=${PUBLIC_ESTIMATE_HORIZON:-600}
+    PUBLIC_ROLLOVER_THRESHOLD=${PUBLIC_ROLLOVER_THRESHOLD:-57344}
+    PUBLIC_LOCK_OWNER=${PUBLIC_LOCK_OWNER:-doom-public:$NAME}
+    PUBLIC_CORS_ORIGIN=${PUBLIC_CORS_ORIGIN:?PUBLIC_CORS_ORIGIN must be the exact static page origin}
+    if [ "$PUBLIC_LOCK_OWNER" != "doom-public:$NAME" ]; then
+      echo "public lock owner must match this run name" >&2
+      exit 2
+    fi
+    if ! "$PY" -c 'import sys; c=float(sys.argv[1]); v=int(sys.argv[2]); h=int(sys.argv[3]); t=int(sys.argv[4]); sys.exit(0 if 0<c<=300 and 1<=v<=200 and 1<=h<=604800 and 1<=t<65536 else 1)' \
+      "${SPEND_CAP:-2}" "$PUBLIC_MAX_VIEWERS" "$PUBLIC_ESTIMATE_HORIZON" "$PUBLIC_ROLLOVER_THRESHOLD"; then
+      echo "public mode requires a spend cap in (0, 300], 1..200 viewers, a positive estimate horizon, and rollover threshold 1..65535" >&2
+      exit 2
+    fi
+    if ! "$PY" -c 'import sys; from urllib.parse import urlsplit; u=urlsplit(sys.argv[1]); ok=(u.scheme=="https" and bool(u.hostname) and not u.path and not u.query and not u.fragment) or (u.scheme=="http" and u.hostname=="127.0.0.1" and bool(u.port) and not u.path and not u.query and not u.fragment); sys.exit(0 if ok else 1)' "$PUBLIC_CORS_ORIGIN"; then
+      echo "public CORS origin must be an HTTPS origin (loopback HTTP is allowed for local tests)" >&2
+      exit 2
+    fi
+    public_flags=(--public-mode --public-state "$PUBLIC_STATE_PATH" --public-max-viewers "$PUBLIC_MAX_VIEWERS" \
+      --estimate-horizon-seconds "$PUBLIC_ESTIMATE_HORIZON" --cors-origin "$PUBLIC_CORS_ORIGIN" \
+      --public-rollover-threshold "$PUBLIC_ROLLOVER_THRESHOLD" --public-lock-owner "$PUBLIC_LOCK_OWNER" \
+      --stage-cap-script "$RD/scripts/stage_cap.sh" --r14-keys-dir "${R14_KEYS_DIR:-/home/ec2-user/doom-keys/r14-page}")
+    ;;
+  *) echo "PUBLIC_MODE must be 0 or 1" >&2; exit 2 ;;
+esac
 # Pass the relayer-only ADVANCE compute budget through to the Python sender.
 # The 520,000 default was measured on E1M1; later scripted play exhausted it.
 export ADVANCE_CU_LIMIT="${ADVANCE_CU_LIMIT:-520000}"
@@ -232,5 +278,6 @@ exec node "$RD/stunts/doom-relayer/server.mjs" \
   --rpc-lag-drop-slots ${RPC_LAG_DROP:-512} --rpc-lag-check-seconds ${RPC_LAG_CHECK:-10} \
   ${readback_flags[@]+"${readback_flags[@]}"} \
   ${batch_render_flags[@]+"${batch_render_flags[@]}"} \
+  ${public_flags[@]+"${public_flags[@]}"} \
   ${STRIPS_BEHIND_SNAPSHOT:+--strips-behind-snapshot} \
   --reset-start-account "${RESET_START_ACCOUNT:-9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1}"

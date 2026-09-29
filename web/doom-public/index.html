@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Watch one shared Doom game. Take control when it is your turn.">
+  <meta name="color-scheme" content="dark">
+  <title>Doom Public Mode</title>
+  <link rel="stylesheet" href="./public.css">
+</head>
+<body>
+  <header>
+    <div class="brand">BASANOS <span>//</span> DOOM TESTNET</div>
+    <div class="network">ONE SHARED GAME · FOGO TESTNET</div>
+  </header>
+
+  <main>
+    <section class="game panel">
+      <div class="game-head">
+        <h1>DOOM</h1>
+        <div class="live"><i></i><span id="connection">CONNECTING</span></div>
+      </div>
+      <div class="screen">
+        <canvas id="screen" width="320" height="200" aria-label="Latest complete Doom frame"></canvas>
+        <div id="banner" class="banner" role="status">Joining the shared game…</div>
+      </div>
+      <div class="status-grid">
+        <div><span>PLAYING</span><strong id="playing">—</strong></div>
+        <div><span>YOUR TURN</span><strong id="turn">—</strong></div>
+        <div><span>IDLE TIMER</span><strong id="idle">—</strong></div>
+        <div><span>VIEWERS</span><strong id="viewers">—</strong></div>
+        <div><span>FRAME</span><strong id="frame">—</strong></div>
+        <div><span>PUBLIC RUN SPEND</span><strong id="spend">—</strong></div>
+      </div>
+      <div class="turn-row">
+        <span id="place">Joining…</span>
+        <button id="take-control" type="button" hidden>TAKE CONTROL · 5s</button>
+        <button id="join" type="button">JOIN GAME</button>
+      </div>
+    </section>
+
+    <aside class="panel side">
+      <h2>CONTROLS</h2>
+      <p class="always">Controls stay visible while you watch.</p>
+      <div class="controls">
+        <div><kbd>↑</kbd> / <kbd>W</kbd><span>Move forward</span></div>
+        <div><kbd>↓</kbd> / <kbd>S</kbd><span>Move backward</span></div>
+        <div><kbd>←</kbd> / <kbd>A</kbd><span>Turn left</span></div>
+        <div><kbd>→</kbd> / <kbd>D</kbd><span>Turn right</span></div>
+        <div><kbd>Q</kbd> / <kbd>E</kbd><span>Strafe left / right</span></div>
+        <div><kbd>Space</kbd> / <kbd>F</kbd><span>Fire</span></div>
+        <div><kbd>R</kbd><span>Use / open doors</span></div>
+        <div><kbd>Shift</kbd><span>Run</span></div>
+        <div><kbd>—</kbd><span>Weapon switch is not mapped</span></div>
+      </div>
+      <div class="touch-controls" aria-label="Touch controls">
+        <button data-key="forward" aria-label="Move forward">▲</button>
+        <button data-key="left" aria-label="Turn left">◀</button>
+        <button data-key="right" aria-label="Turn right">▶</button>
+        <button data-key="back" aria-label="Move backward">▼</button>
+        <button data-key="strafeLeft" aria-label="Strafe left">Q</button>
+        <button data-key="strafeRight" aria-label="Strafe right">E</button>
+        <button data-key="attack" aria-label="Fire">FIRE</button>
+        <button data-key="use" aria-label="Use or open">USE</button>
+        <button data-key="run" aria-label="Run">RUN</button>
+      </div>
+      <p class="help">The first visitor plays. After 60 seconds without input, the game pauses and offers control to spectators for five seconds each.</p>
+      <div id="error" class="error" role="alert" hidden></div>
+    </aside>
+  </main>
+  <script type="module" src="./public.js"></script>
+</body>
+</html>
