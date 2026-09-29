@@ -257,6 +257,47 @@ test("chain mode is wired, and refuses to start without keys or a script", async
   assert.match(PIPELINE_REQUIREMENTS.transport, /JSON lines/);
 });
 
+test("a completed public rollover requires a fresh child execution resume", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "doom-rollover-resume-"));
+  const script = join(directory, "pipeline.mjs");
+  writeFileSync(script, `
+    import {createInterface} from "node:readline";
+    console.log(JSON.stringify({event:"started"}));
+    const input = createInterface({input:process.stdin});
+    input.on("line", (line) => {
+      const request = JSON.parse(line);
+      console.log(JSON.stringify({id:request.id, ok:true, resumed:request.op === "resume"}));
+      if (request.op === "trigger-rollover") {
+        setTimeout(() => console.log(JSON.stringify({event:"rollover_complete", cursor:0})), 50);
+      }
+      if (request.op === "stop") process.exit(0);
+    });
+  `);
+  let resolveRollover;
+  const rollover = new Promise((resolve) => { resolveRollover = resolve; });
+  const sender = new PipelineSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    python: process.execPath,
+    script,
+    runDir: directory,
+    onEvent: (event) => { if (event.event === "rollover_complete") resolveRollover(event); },
+  });
+  try {
+    await sender.start();
+    sender.executionResumed = true;
+    await sender.request({op: "trigger-rollover"});
+    await rollover;
+    assert.equal(sender.executionResumed, false);
+    assert.deepEqual(await sender.resume(), {id: 4, ok: true, resumed: true});
+    assert.equal(sender.executionResumed, true);
+  } finally {
+    await sender.close();
+    rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 // ---------------------------------------------------------------- API
 
 test("GET /healthz reports the pool and the mode", async () => {
@@ -1067,6 +1108,10 @@ test("PROFILE=fast selects the best measured settings and plain defaults stay un
   assert.equal(value(plain.args, "--min-cursor-step-tics"), "8");
   assert.equal(plain.advanceCuLimit, "520000");
   assert.ok(!plain.args.includes("--batch-render-sends"));
+
+  const publicLauncher = readFileSync(new URL("../../../scripts/doom_public.sh", import.meta.url), "utf8");
+  assert.match(publicLauncher, /ADV_TICS=6 ADV_PIPELINE_DEPTH=1/);
+  assert.doesNotMatch(publicLauncher, /ADVANCE_PIPELINE_DEPTH=1/);
 });
 
 test("the session answer names the buffer holding the latest complete frame", async () => {
@@ -1593,4 +1638,20 @@ test("a third node and a send rate reach the pipeline's argv", () => {
     rpcA: "http://fast:8899", rpcB: "",
   }).argv();
   assert.equal(singleNode[singleNode.indexOf("--rpc-b") + 1], "");
+});
+
+test("a pipeline key state wakes an idle SIGSTOP before waiting for its reply", async () => {
+  const sender = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json"});
+  const calls = [];
+  sender.osPaused = true;
+  sender.child = {kill(signal) { calls.push(signal); }};
+  sender.request = async (message) => {
+    calls.push(message.op);
+    return {accepted: 1, accepted_from: 12, cursor: 12, gametic: 12};
+  };
+
+  const result = await sender.keyState({slot: "chain-r15", keyMask: 1});
+  assert.deepEqual(calls, ["SIGCONT", "key_state"]);
+  assert.equal(sender.osPaused, false);
+  assert.equal(result.acceptedFrom, 12);
 });
