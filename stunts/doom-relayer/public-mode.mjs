@@ -464,10 +464,11 @@ export class PublicMode {
         const network = NETWORKS[this.relayer.networkName];
         const reader = new ChainReader({network: this.relayer.networkName});
         const wad = new WadImageReader({
-          readSlice: async (address, offset, length) => {
-            const bytes = await reader.getAccount(address, {offset, length});
-            return bytes?.subarray(network.doom.wadHeaderBytes) ?? null;
-          },
+          // WadImageReader already offsets past each DOOM-WC1 account header
+          // when it asks for a slice. Return the RPC dataSlice unchanged, as
+          // the existing Doom page does, or the second header skip truncates
+          // the first slice to zero bytes.
+          readSlice: (address, offset, length) => reader.getAccount(address, {offset, length}),
           accounts: network.doom.wadAccounts,
           accountBytes: network.doom.wadAccountBytes,
           headerBytes: network.doom.wadHeaderBytes,
