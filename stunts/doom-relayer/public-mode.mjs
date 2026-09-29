@@ -4,9 +4,40 @@
 import {randomBytes, randomUUID} from "node:crypto";
 import {dirname} from "node:path";
 import {existsSync, mkdirSync, readFileSync, renameSync, writeFileSync} from "node:fs";
+import {isIP} from "node:net";
 
 const ADJECTIVES = ["Amber", "Brisk", "Cosmic", "Daring", "Electric", "Fuzzy", "Golden", "Lucky", "Neon", "Quiet", "Rapid", "Silver", "Turbo", "Velvet"];
 const NOUNS = ["Baron", "Cacodemon", "Comet", "Imp", "Marine", "Mancubus", "Pixel", "Ranger", "Revenant", "Rocket", "Skull", "Spectre", "Trooper", "Wad"];
+
+function ipv6Prefix64(address) {
+  let normalized = address.toLowerCase();
+  if (normalized.includes(".")) {
+    const colon = normalized.lastIndexOf(":");
+    const octets = normalized.slice(colon + 1).split(".").map(Number);
+    const high = ((octets[0] << 8) | octets[1]).toString(16);
+    const low = ((octets[2] << 8) | octets[3]).toString(16);
+    normalized = `${normalized.slice(0, colon + 1)}${high}:${low}`;
+  }
+  const [leftText, rightText = ""] = normalized.split("::");
+  const left = leftText ? leftText.split(":") : [];
+  const right = rightText ? rightText.split(":") : [];
+  const expanded = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
+  return expanded.slice(0, 4)
+    .map((group) => parseInt(group, 16).toString(16).padStart(4, "0"))
+    .join(":");
+}
+
+export function publicJoinIpKey(clientIp) {
+  const value = String(clientIp ?? "unknown").trim();
+  if (isIP(value) === 6) return `ipv6/64:${ipv6Prefix64(value)}`;
+  return value.toLowerCase();
+}
+
+export function installPublicStateFlushHandlers(publicMode, processLike = process) {
+  const flush = () => publicMode?.flush();
+  for (const signal of ["SIGINT", "SIGTERM"]) processLike.on(signal, flush);
+  processLike.on("exit", flush);
+}
 
 export class PublicModeError extends Error {
   constructor(message, status = 400, code = "public_mode_error") {
@@ -121,9 +152,9 @@ export class PublicMode {
     this.#writePersistedState();
   }
 
-  #writePersistedState() {
+  #writePersistedState(force = false) {
     if (!this.statePath) return;
-    if (Date.now() - this.lastPersistAt < 1000) {
+    if (!force && Date.now() - this.lastPersistAt < 1000) {
       this.#persist();
       return;
     }
@@ -132,6 +163,14 @@ export class PublicMode {
     writeFileSync(temporary, `${JSON.stringify(this.run)}\n`, {mode: 0o600});
     renameSync(temporary, this.statePath);
     this.lastPersistAt = Date.now();
+  }
+
+  flush() {
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    this.#writePersistedState(true);
   }
 
   #token() {
@@ -181,6 +220,7 @@ export class PublicMode {
     if (typeof publicKey !== "string" || !/^[0-9a-f]{64}$/i.test(publicKey)) {
       throw new PublicModeError("publicKey must be 32 bytes of hex", 400, "bad_public_key");
     }
+    clientIp = publicJoinIpKey(clientIp);
     const existing = [...this.clients.values()].find((client) => client.publicKey === publicKey);
     const joinsFromIp = [...this.clients.values()].filter((client) => client.clientIp === clientIp && client !== existing).length;
     if (!existing && joinsFromIp >= this.maxJoinsPerIp) {
@@ -565,6 +605,7 @@ export class PublicMode {
     this.timer = null;
     for (const stream of [...this.streams.values()]) stream.close();
     this.streams.clear();
+    this.flush();
   }
 
   async palette() {
