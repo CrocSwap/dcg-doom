@@ -65,10 +65,12 @@ token routes validate the token before queueing work. A missing or expired
 token receives `401`, and the page rejoins with its saved burner key.
 
 One public event stream is allowed per token, with a 200-stream process cap. A
-new valid stream for the same token closes the old one. If a frame write hits
-backpressure, that stream is dropped and its frame subscription is released.
-The public state file coalesces updates and writes at most once per second,
-including when frames arrive several times per second.
+new valid stream for the same token closes the old one. When Node reports write
+backpressure, the relayer keeps the accepted frame, coalesces state updates, and
+queues up to four more frames. It drops the stream and releases its frame
+subscription only if that bounded frame queue fills. The public state file
+coalesces updates and writes at most once per second, including when frames
+arrive several times per second.
 
 In public mode, closing the relayer pipe or its stdout stops the Python sender.
 Owner `doom_play.sh` sessions keep their existing pipe-close behavior. A failed

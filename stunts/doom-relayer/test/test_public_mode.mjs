@@ -160,13 +160,16 @@ test("empty lobby pauses, next accepted input resumes, death text and fanout sur
     };
     try {
       await readUntil('"phase":"paused"');
+      const largeStrip = Buffer.alloc(12_288, 0x5a).toString("base64");
       const event = {
         event: "frame", frame_index: 77, cursor: 88, gametic: 88,
-        strip_accounts_b64: Array.from({length: 8}, (_, index) => Buffer.from(`strip-${index}`).toString("base64")),
+        strip_accounts_b64: Array.from({length: 8}, () => largeStrip),
       };
       relayer.onFrame(event);
       await readUntil('"frame_index":77');
       assert.match(text, /event: frame/);
+      assert.equal(relayer.publicMode.streams.size, 1, "a normal frame-sized write can drain without dropping the browser stream");
+      assert.equal(relayer.subscriptions.size, 1, "the frame subscription remains active while the response drains");
       relayer.publicMode.onPipelineEvent({event: "death"});
       const death = await call("GET", `/v1/public/state?token=${encodeURIComponent(rejoined.token)}`);
       assert.equal(death.body.death_message, "You died. Press R to respawn.");
@@ -309,7 +312,7 @@ test("review probes: bad stream tokens return 401, public routes cannot end the 
   });
 });
 
-test("review probe: one stream per token, a global cap, and slow clients are dropped", async () => {
+test("review probe: one stream per token, a global cap, normal frame backpressure drains, and slow clients are bounded", async () => {
   await publicServer({maxViewers: 3, maxStreams: 1}, async ({relayer, call, base}) => {
     const firstClient = await browser();
     const first = (await call("POST", "/v1/public/join", {publicKey: firstClient.publicKey}, undefined, "203.0.113.10")).body;
@@ -327,13 +330,18 @@ test("review probe: one stream per token, a global cap, and slow clients are dro
     assert.equal(capped.status, 429, "the global stream cap is enforced");
     await capped.body.cancel();
 
-    relayer.onFrame({
+    const largeStrip = Buffer.alloc(12_288, 0x5a).toString("base64");
+    const frame = (frame_index) => ({
       event: "frame",
-      frame_index: 1,
-      strip_accounts_b64: Array.from({length: 8}, () => Buffer.alloc(12_288).toString("base64")),
+      frame_index,
+      strip_accounts_b64: Array.from({length: 8}, () => largeStrip),
     });
-    assert.equal(relayer.publicMode.streams.size, 0, "a write that hits backpressure drops the slow stream");
-    assert.equal(relayer.subscriptions.size, 0, "dropping a slow stream releases its frame subscription");
+    relayer.onFrame(frame(1));
+    assert.equal(relayer.publicMode.streams.size, 1, "one frame-sized write queues normally under backpressure");
+    assert.equal(relayer.subscriptions.size, 1, "the slow stream retains its frame subscription while the queue drains");
+    for (let index = 2; index <= 12 && relayer.publicMode.streams.size > 0; index += 1) relayer.onFrame(frame(index));
+    assert.equal(relayer.publicMode.streams.size, 0, "a sustained slow client is dropped when its bounded frame queue fills");
+    assert.equal(relayer.subscriptions.size, 0, "dropping a sustained slow stream releases its frame subscription");
     await replacement.body.cancel().catch(() => {});
     await original.body.cancel().catch(() => {});
   });

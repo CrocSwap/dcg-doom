@@ -33,6 +33,7 @@ export const API_VERSION = "doom-relayer/1";
 
 const JSON_LIMIT = 64 * 1024;
 const SESSION_TTL_MS = 45 * 60 * 1000;
+const MAX_QUEUED_PUBLIC_STREAM_FRAMES = 4;
 
 // The page is served from a different origin than the relayer, so every
 // response carries CORS headers and OPTIONS is answered. The default is any
@@ -1096,10 +1097,16 @@ const ROUTES = [
     let stopFrame = () => {};
     let frames = null;
     let releaseStream = () => {};
+    let backpressured = false;
+    let pendingState = null;
+    const pendingFrames = [];
     const close = () => {
       if (closed) return;
       closed = true;
       if (keepAlive !== null) clearInterval(keepAlive);
+      response.removeListener("drain", drain);
+      pendingState = null;
+      pendingFrames.length = 0;
       stopState();
       stopFrame();
       frames?.close();
@@ -1110,14 +1117,42 @@ const ROUTES = [
     frames = relayer.subscribeFrames({since});
     const write = (chunk) => {
       if (closed || response.destroyed) return false;
+      if (backpressured) {
+        pendingState = chunk;
+        return true;
+      }
       if (!response.write(chunk)) {
-        close();
-        return false;
+        backpressured = true;
+        response.once("drain", drain);
       }
       return true;
     };
+    const drain = () => {
+      if (closed) return;
+      backpressured = false;
+      if (pendingState !== null) {
+        const state = pendingState;
+        pendingState = null;
+        write(state);
+      }
+      while (!closed && !backpressured && pendingFrames.length > 0) {
+        write(pendingFrames.shift());
+      }
+    };
     const writeState = () => write(`event: state\ndata: ${JSON.stringify(relayer.publicMode.state(token))}\n\n`);
-    const writeFrame = (record) => write(`event: frame\nid: ${record.frame_index ?? ""}\ndata: ${JSON.stringify(record)}\n\n`);
+    const writeFrame = (record) => {
+      const chunk = `event: frame\nid: ${record.frame_index ?? ""}\ndata: ${JSON.stringify(record)}\n\n`;
+      if (closed || response.destroyed) return false;
+      if (backpressured) {
+        if (pendingFrames.length >= MAX_QUEUED_PUBLIC_STREAM_FRAMES) {
+          close();
+          return false;
+        }
+        pendingFrames.push(chunk);
+        return true;
+      }
+      return write(chunk);
+    };
     stopState = relayer.publicMode.subscribe(token, writeState);
     stopFrame = frames.add(writeFrame);
     response.on("close", close);
@@ -1134,7 +1169,9 @@ const ROUTES = [
     for (const record of frames.pending) {
       if (!writeFrame(record)) break;
     }
-    if (!closed) keepAlive = setInterval(() => write(": keep-alive\n\n"), 15_000);
+    if (!closed) keepAlive = setInterval(() => {
+      if (!backpressured) write(": keep-alive\n\n");
+    }, 15_000);
     return RAW_RESPONSE;
   }, stream: true},
   {method: "POST", pattern: /^\/v1\/sessions$/, handler: async (relayer, request) => {
