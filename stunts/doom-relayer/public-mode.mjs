@@ -21,6 +21,8 @@ export class PublicMode {
     relayer,
     statePath = null,
     maxViewers = 200,
+    maxJoinsPerIp = 4,
+    maxStreams = 200,
     idleMs = 60_000,
     offerMs = 5_000,
     heartbeatMs = 15_000,
@@ -29,10 +31,13 @@ export class PublicMode {
     now = () => Date.now(),
     random = Math.random,
     onRolloverFailure = null,
+    onPipelineFailure = null,
   }) {
     this.relayer = relayer;
     this.statePath = statePath;
     this.maxViewers = maxViewers;
+    this.maxJoinsPerIp = maxJoinsPerIp;
+    this.maxStreams = maxStreams;
     this.idleMs = idleMs;
     this.offerMs = offerMs;
     this.heartbeatMs = heartbeatMs;
@@ -41,7 +46,12 @@ export class PublicMode {
     this.now = now;
     this.random = random;
     this.onRolloverFailure = onRolloverFailure;
+    this.onPipelineFailure = onPipelineFailure;
     this.clients = new Map();
+    this.streams = new Map();
+    this.joinQueue = Promise.resolve();
+    this.lastPersistAt = 0;
+    this.persistTimer = null;
     this.activeToken = null;
     this.offerToken = null;
     this.offerUntil = null;
@@ -54,6 +64,7 @@ export class PublicMode {
     this.pipelineStopped = false;
     this.rollingOver = false;
     this.rolloverFailureHandled = false;
+    this.pipelineFailureHandled = false;
     this.listeners = new Set();
     this.lastStatusJson = "";
     this.run = this.#loadState();
@@ -92,10 +103,35 @@ export class PublicMode {
 
   #persist() {
     if (!this.statePath) return;
+    const elapsed = Date.now() - this.lastPersistAt;
+    if (elapsed < 1000) {
+      if (this.persistTimer === null) {
+        this.persistTimer = setTimeout(() => {
+          this.persistTimer = null;
+          this.#persist();
+        }, 1000 - elapsed);
+        this.persistTimer.unref?.();
+      }
+      return;
+    }
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    this.#writePersistedState();
+  }
+
+  #writePersistedState() {
+    if (!this.statePath) return;
+    if (Date.now() - this.lastPersistAt < 1000) {
+      this.#persist();
+      return;
+    }
     mkdirSync(dirname(this.statePath), {recursive: true, mode: 0o700});
     const temporary = `${this.statePath}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(this.run)}\n`, {mode: 0o600});
     renameSync(temporary, this.statePath);
+    this.lastPersistAt = Date.now();
   }
 
   #token() {
@@ -113,15 +149,43 @@ export class PublicMode {
     return client;
   }
 
+  requireToken(token) {
+    this.#client(token);
+    return token;
+  }
+
+  claimStream(token, close) {
+    this.#client(token);
+    this.streams.get(token)?.close();
+    if (this.streams.size >= this.maxStreams) {
+      throw new PublicModeError(`public stream limit reached (${this.maxStreams})`, 429, "stream_cap");
+    }
+    const entry = {close};
+    this.streams.set(token, entry);
+    return () => {
+      if (this.streams.get(token) === entry) this.streams.delete(token);
+    };
+  }
+
   #active() {
     return this.activeToken ? this.clients.get(this.activeToken) ?? null : null;
   }
 
-  async join({publicKey}) {
+  join(options) {
+    const run = this.joinQueue.then(() => this.#join(options), () => this.#join(options));
+    this.joinQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async #join({publicKey, clientIp = "unknown"}) {
     if (typeof publicKey !== "string" || !/^[0-9a-f]{64}$/i.test(publicKey)) {
       throw new PublicModeError("publicKey must be 32 bytes of hex", 400, "bad_public_key");
     }
     const existing = [...this.clients.values()].find((client) => client.publicKey === publicKey);
+    const joinsFromIp = [...this.clients.values()].filter((client) => client.clientIp === clientIp && client !== existing).length;
+    if (!existing && joinsFromIp >= this.maxJoinsPerIp) {
+      throw new PublicModeError(`this IP already has ${this.maxJoinsPerIp} public joins`, 429, "ip_join_cap");
+    }
     if (!existing && this.clients.size >= this.maxViewers) {
       throw new PublicModeError(`public mode is full (${this.maxViewers} viewers)`, 429, "viewer_cap");
     }
@@ -129,9 +193,10 @@ export class PublicMode {
     let client;
     if (existing) {
       const oldToken = existing.token;
+      this.streams.get(oldToken)?.close();
       const token = this.#token();
       this.clients.delete(oldToken);
-      client = {...existing, token, heartbeatAt: this.now()};
+      client = {...existing, token, clientIp, heartbeatAt: this.now()};
       this.clients.set(token, client);
       if (this.activeToken === oldToken) {
         this.activeToken = token;
@@ -142,7 +207,7 @@ export class PublicMode {
       if (this.offeredThisRound.delete(oldToken)) this.offeredThisRound.add(token);
     } else {
       const token = this.#token();
-      client = {token, publicKey: publicKey.toLowerCase(), nickname: this.#nickname(), joinedAt: this.now(), heartbeatAt: this.now(), inputTimes: []};
+      client = {token, publicKey: publicKey.toLowerCase(), clientIp, nickname: this.#nickname(), joinedAt: this.now(), heartbeatAt: this.now(), inputTimes: []};
       this.clients.set(token, client);
       if (!this.relayer.publicSession) {
         const created = await this.relayer.createSession({publicKey: client.publicKey});
@@ -185,6 +250,7 @@ export class PublicMode {
 
   async leave(token) {
     const client = this.#client(token);
+    this.streams.get(token)?.close();
     this.clients.delete(token);
     this.offeredThisRound.delete(token);
     if (this.offerToken === token) {
@@ -308,6 +374,7 @@ export class PublicMode {
     let changed = false;
     for (const [token, client] of this.clients) {
       if (now - client.heartbeatAt > this.heartbeatMs * 2) {
+        this.streams.get(token)?.close();
         this.clients.delete(token);
         this.offeredThisRound.delete(token);
         if (this.offerToken === token) {
@@ -401,6 +468,12 @@ export class PublicMode {
       if (Number(event.spend_fogo) >= this.spendCapFogo) this.capReached = true;
       this.paused = true;
       this.#changed();
+      if (event.event === "failed" && !this.pipelineFailureHandled) {
+        this.pipelineFailureHandled = true;
+        void Promise.resolve(this.onPipelineFailure?.(event)).catch((error) => {
+          this.relayer.log(`public pipeline failure cleanup failed: ${error.message}`);
+        });
+      }
     }
     if (event.event === "started") {
       const baseline = event.payer_fogo ?? event.preflight?.payer_fogo;
@@ -490,6 +563,8 @@ export class PublicMode {
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    for (const stream of [...this.streams.values()]) stream.close();
+    this.streams.clear();
   }
 
   async palette() {

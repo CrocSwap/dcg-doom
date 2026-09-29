@@ -55,6 +55,30 @@ turn, Q/E strafe, Space/F fire, R use/open, and Shift run. Weapon switching is
 not mapped by the current demo. The death banner says exactly “You died. Press
 R to respawn.”
 
+Public-mode admission is bounded to four live joins per client IP, using
+Cloudflare's `CF-Connecting-IP` header when present and the socket address
+otherwise. A browser reconnect for the same burner replaces its old token and
+does not use another join slot. Public mode rejects every `/v1/sessions` route
+and `/v1/slots` before they can enter the relayer's serialized request queue.
+Unauthenticated health/configuration reads and joins also bypass that queue;
+token routes validate the token before queueing work. A missing or expired
+token receives `401`, and the page rejoins with its saved burner key.
+
+One public event stream is allowed per token, with a 200-stream process cap. A
+new valid stream for the same token closes the old one. If a frame write hits
+backpressure, that stream is dropped and its frame subscription is released.
+The public state file coalesces updates and writes at most once per second,
+including when frames arrive several times per second.
+
+In public mode, closing the relayer pipe or its stdout stops the Python sender.
+Owner `doom_play.sh` sessions keep their existing pipe-close behavior. A failed
+public RESET/9 attempt gets one retry after a one-second back-off. If the first
+attempt wrote its pre-submit checkpoint, the retry resumes readback instead of
+submitting the reset again; otherwise it reruns preflight. A tic-sender RPC
+failure gets one retry after the same back-off, using the finalized cursor and
+a fresh payer-cap check. A second failure stops the run and displays the stopped
+message. These are bounded recovery paths, not a week-long uptime result.
+
 ## Tokyo commands
 
 `scripts/doom_public.sh start` requires `DOOM_PUBLIC_ORIGIN` to be the exact

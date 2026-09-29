@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import {mkdtempSync, readFileSync, rmSync, statSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {webcrypto} from "node:crypto";
 
 import {encodeInput, signingPayload} from "../../../web/doom-play/input.js";
@@ -32,13 +35,15 @@ async function inputPayload(client, session, token, clientSeq = 1) {
   };
 }
 
-async function publicServer({maxViewers = 200, inputLimitPerSecond = 12, idleMs = 60_000, offerMs = 5_000} = {}, work) {
+async function publicServer({maxViewers = 200, maxStreams = 200, publicStatePath = null, inputLimitPerSecond = 12, idleMs = 60_000, offerMs = 5_000} = {}, work) {
   let now = 1_000_000;
   const relayer = createRelayer({
     mode: "mock",
     network: "testnet",
     publicMode: true,
+    publicStatePath,
     publicMaxViewers: maxViewers,
+    publicMaxStreams: maxStreams,
     publicSpendCapFogo: 300,
     publicNow: () => now,
     publicRandom: () => 0,
@@ -55,12 +60,13 @@ async function publicServer({maxViewers = 200, inputLimitPerSecond = 12, idleMs 
   const server = createServer(relayer, {corsOrigin: "https://doom.example"});
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const call = async (method, path, body = undefined, origin = undefined) => {
+  const call = async (method, path, body = undefined, origin = undefined, clientIp = "198.51.100.1") => {
     const response = await fetch(`${base}${path}`, {
       method,
       headers: {
         ...(body === undefined ? {} : {"content-type": "application/json"}),
         ...(origin ? {origin} : {}),
+        ...(clientIp ? {"cf-connecting-ip": clientIp} : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -78,8 +84,9 @@ test("six simulated browsers share one game, rotate five-second offers, and acce
   await publicServer({}, async ({relayer, call, setNow, getNow}) => {
     const clients = await Promise.all(Array.from({length: 6}, () => browser()));
     const joined = [];
-    for (const client of clients) {
-      const result = await call("POST", "/v1/public/join", {publicKey: client.publicKey}, "https://doom.example");
+    for (let index = 0; index < clients.length; index += 1) {
+      const client = clients[index];
+      const result = await call("POST", "/v1/public/join", {publicKey: client.publicKey}, "https://doom.example", `198.51.100.${index + 1}`);
       assert.equal(result.status, 200);
       joined.push(result.body);
     }
@@ -172,8 +179,10 @@ test("empty lobby pauses, next accepted input resumes, death text and fanout sur
       assert.equal(relayer.publicMode.paused, true);
       relayer.publicMode.onPipelineEvent({event: "finished", spend_fogo: 0.5});
       const stopped = await call("GET", `/v1/public/state?token=${encodeURIComponent(rejoined.token)}`);
-      assert.equal(stopped.body.phase, "stopped");
-      assert.match(stopped.body.pause_message, /session has stopped/);
+      assert.equal(stopped.status, 401, "leaving revokes the old public token");
+      const renewed = await call("POST", "/v1/public/join", {publicKey: client.publicKey});
+      assert.equal(renewed.body.state.phase, "stopped");
+      assert.match(renewed.body.state.pause_message, /session has stopped/);
     } finally {
       controller.abort();
     }
@@ -255,6 +264,118 @@ test("a failed rollover stops the shared session and invokes failure cleanup onc
     assert.equal(refused.body.code, "pipeline_stopped");
     assert.equal(cleanupCalls, 1);
   });
+});
+
+test("review probes: bad stream tokens return 401, public routes cannot end the game, and unauthenticated calls bypass the sender queue", async () => {
+  await publicServer({}, async ({relayer, call, base}) => {
+    const player = await browser();
+    const joined = (await call("POST", "/v1/public/join", {publicKey: player.publicKey})).body;
+    let releaseQueue;
+    const blocked = relayer.serialise(() => new Promise((resolve) => { releaseQueue = resolve; }));
+    await new Promise((resolve) => setImmediate(resolve));
+    try {
+      const badStream = await call("GET", "/v1/public/stream?token=bogus");
+      assert.equal(badStream.status, 401);
+      assert.equal(badStream.body.code, "unknown_public_session");
+      assert.equal((await call("GET", "/healthz")).status, 200, "a bad stream token does not crash the process");
+      for (const path of ["/v1/config", "/healthz"]) {
+        const response = await call("GET", path);
+        assert.equal(response.status, 200);
+        assert.ok(!JSON.stringify(response.body).includes(player.publicKey), `${path} does not expose a player's burner key`);
+      }
+
+      const denied = [
+        await call("POST", "/v1/sessions", {publicKey: player.publicKey}),
+        await call("GET", `/v1/sessions/${encodeURIComponent(joined.session.id)}`),
+        await call("POST", `/v1/sessions/${encodeURIComponent(joined.session.id)}/input`, {message: "bad", signature: "bad"}),
+        await call("GET", `/v1/sessions/${encodeURIComponent(joined.session.id)}/frame`),
+        await call("GET", `/v1/sessions/${encodeURIComponent(joined.session.id)}/frames`),
+        await call("POST", `/v1/sessions/${encodeURIComponent(joined.session.id)}/render`),
+        await call("DELETE", `/v1/sessions/${encodeURIComponent(joined.session.id)}`),
+        await call("GET", "/v1/slots"),
+        await call("POST", "/v1/public/heartbeat", {token: "bogus"}),
+      ];
+      assert.ok(denied.every((result) => result.status === 404 || result.status === 401));
+      assert.equal(denied.at(-2).status, 404, "/v1/slots is disabled in public mode");
+      assert.equal(denied.at(-1).status, 401, "invalid tokens are rejected before entering the queue");
+      const second = await browser();
+      const secondJoin = await call("POST", "/v1/public/join", {publicKey: second.publicKey});
+      assert.equal(secondJoin.status, 200, "joining does not wait behind the serialized sender queue");
+    } finally {
+      releaseQueue();
+      await blocked;
+    }
+    assert.equal((await call("GET", `/v1/public/state?token=${encodeURIComponent(joined.token)}`)).body.phase, "paused");
+  });
+});
+
+test("review probe: one stream per token, a global cap, and slow clients are dropped", async () => {
+  await publicServer({maxViewers: 3, maxStreams: 1}, async ({relayer, call, base}) => {
+    const firstClient = await browser();
+    const first = (await call("POST", "/v1/public/join", {publicKey: firstClient.publicKey}, undefined, "203.0.113.10")).body;
+    const open = async (token) => fetch(`${base}/v1/public/stream?token=${encodeURIComponent(token)}`);
+    const original = await open(first.token);
+    assert.equal(original.status, 200);
+    const replacement = await open(first.token);
+    assert.equal(replacement.status, 200, "a valid new stream replaces the old stream for this token");
+    assert.equal(relayer.publicMode.streams.size, 1);
+    assert.equal(relayer.subscriptions.size, 1, "the replaced frame subscription is removed");
+
+    const secondClient = await browser();
+    const second = (await call("POST", "/v1/public/join", {publicKey: secondClient.publicKey}, undefined, "203.0.113.11")).body;
+    const capped = await open(second.token);
+    assert.equal(capped.status, 429, "the global stream cap is enforced");
+    await capped.body.cancel();
+
+    relayer.onFrame({
+      event: "frame",
+      frame_index: 1,
+      strip_accounts_b64: Array.from({length: 8}, () => Buffer.alloc(12_288).toString("base64")),
+    });
+    assert.equal(relayer.publicMode.streams.size, 0, "a write that hits backpressure drops the slow stream");
+    assert.equal(relayer.subscriptions.size, 0, "dropping a slow stream releases its frame subscription");
+    await replacement.body.cancel().catch(() => {});
+    await original.body.cancel().catch(() => {});
+  });
+});
+
+test("review probe: Cloudflare client IPs are capped at four live joins and rejoining the same key replaces its token", async () => {
+  await publicServer({}, async ({call}) => {
+    const firstClient = await browser();
+    const first = await call("POST", "/v1/public/join", {publicKey: firstClient.publicKey}, undefined, "203.0.113.20");
+    assert.equal(first.status, 200);
+    const rejoined = await call("POST", "/v1/public/join", {publicKey: firstClient.publicKey}, undefined, "203.0.113.20");
+    assert.equal(rejoined.status, 200);
+    assert.notEqual(first.body.token, rejoined.body.token);
+    const staleHeartbeat = await call("POST", "/v1/public/heartbeat", {token: first.body.token}, undefined, "203.0.113.20");
+    assert.equal(staleHeartbeat.status, 401, "a token replaced by rejoin is rejected immediately");
+    for (let index = 0; index < 3; index += 1) {
+      const client = await browser();
+      assert.equal((await call("POST", "/v1/public/join", {publicKey: client.publicKey}, undefined, "203.0.113.20")).status, 200);
+    }
+    const fifth = await browser();
+    const capped = await call("POST", "/v1/public/join", {publicKey: fifth.publicKey}, undefined, "203.0.113.20");
+    assert.equal(capped.status, 429);
+    assert.equal(capped.body.code, "ip_join_cap");
+  });
+});
+
+test("public run state is persisted at most once per second while retaining the newest frame", async () => {
+  const root = mkdtempSync(join(tmpdir(), "doom-public-state-"));
+  const statePath = join(root, "public-state.json");
+  try {
+    await publicServer({publicStatePath: statePath}, async ({relayer}) => {
+      const initialWrite = statSync(statePath).mtimeMs;
+      relayer.publicMode.onFrame({frame_index: 1});
+      relayer.publicMode.onFrame({frame_index: 2});
+      assert.equal(statSync(statePath).mtimeMs, initialWrite, "frame updates inside the first second do not rewrite state synchronously");
+      await new Promise((resolve) => setTimeout(resolve, 1_050));
+      assert.equal(JSON.parse(readFileSync(statePath, "utf8")).last_frame.frame_index, 2);
+      assert.ok(statSync(statePath).mtimeMs > initialWrite);
+    });
+  } finally {
+    rmSync(root, {recursive: true, force: true});
+  }
 });
 
 test("viewer cap, input rate limit, CORS, and shared-page restrictions are enforced", async () => {

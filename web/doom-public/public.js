@@ -54,7 +54,12 @@ async function api(path, {method = "GET", body = null} = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error ?? `relayer returned ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(payload.error ?? `relayer returned ${response.status}`);
+    error.status = response.status;
+    error.code = payload.code ?? null;
+    throw error;
+  }
   return payload;
 }
 
@@ -66,6 +71,25 @@ function showError(message) {
 function clearError() {
   ui.error.hidden = true;
   ui.error.textContent = "";
+}
+
+function rejoinAfterUnauthorized(error) {
+  if (error?.status !== 401 || joining || !token) return false;
+  eventSource?.close();
+  eventSource = null;
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  token = null;
+  session = null;
+  publicState = null;
+  clientSeq = 0;
+  sessionStorage.removeItem("doom-public.token");
+  ui.join.disabled = false;
+  ui.connection.textContent = "REJOINING";
+  ui.connection.parentElement.classList.remove("online");
+  showError("Your browser session expired. Rejoining the game…");
+  void join();
+  return true;
 }
 
 function drawBanner(message, kind = "") {
@@ -181,7 +205,9 @@ async function join() {
     clearError();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = setInterval(() => {
-      if (token) void api("/v1/public/heartbeat", {method:"POST", body:{token}}).catch((error) => showError(error.message));
+      if (token) void api("/v1/public/heartbeat", {method:"POST", body:{token}}).catch((error) => {
+        if (!rejoinAfterUnauthorized(error)) showError(error.message);
+      });
     }, 10_000);
   } catch (error) {
     showError(error.message);
@@ -217,7 +243,7 @@ async function sendInput() {
     clearError();
   } catch (error) {
     if (error.message.includes("rate limit")) inputPending = true;
-    showError(error.message);
+    if (!rejoinAfterUnauthorized(error)) showError(error.message);
   } finally {
     inputBusy = false;
     if (inputPending || Object.values(held).some(Boolean)) scheduleInput();
@@ -285,7 +311,7 @@ ui.take.addEventListener("click", async () => {
   try {
     await api("/v1/public/offer/accept", {method:"POST", body:{token}});
     clearError();
-  } catch (error) { showError(error.message); }
+  } catch (error) { if (!rejoinAfterUnauthorized(error)) showError(error.message); }
 });
 
 window.addEventListener("pagehide", () => {
