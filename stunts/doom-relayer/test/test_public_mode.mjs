@@ -197,6 +197,66 @@ test("public spend is grouped by UTC hour and the cap changes the shared banner"
   });
 });
 
+test("a successful rollover pauses input, clears the cursor, and keeps the same browser in control", async () => {
+  await publicServer({}, async ({relayer, call}) => {
+    const player = await browser();
+    const spectator = await browser();
+    const joined = (await call("POST", "/v1/public/join", {publicKey: player.publicKey})).body;
+    const watching = (await call("POST", "/v1/public/join", {publicKey: spectator.publicKey})).body;
+    const slot = relayer.publicSession.slot;
+    slot.cursor = 513;
+    slot.gametic = 513;
+    slot.nextSeq = 520;
+    relayer.publicMode.onPipelineEvent({event: "rollover_start", segment: 1, from_cursor: 512, capacity: 65_536});
+
+    const during = await call("GET", `/v1/public/state?token=${encodeURIComponent(joined.token)}`);
+    assert.equal(during.body.phase, "rolling_over");
+    assert.equal(during.body.rolling_over, true);
+    assert.equal(during.body.is_player, true, "the active browser keeps its turn");
+    assert.equal(during.body.pause_message, "New game starting…");
+    const blocked = await call("POST", "/v1/public/input", await inputPayload(player, joined.session, joined.token));
+    assert.equal(blocked.status, 503);
+    assert.equal(blocked.body.code, "rollover_in_progress");
+
+    relayer.publicMode.onPipelineEvent({event: "rollover_complete", segment: 1, cursor: 0});
+    assert.equal(slot.cursor, 0);
+    assert.equal(slot.gametic, 0);
+    assert.equal(slot.nextSeq, 0);
+    const after = await call("GET", `/v1/public/state?token=${encodeURIComponent(joined.token)}`);
+    assert.equal(after.body.rolling_over, false);
+    assert.equal(after.body.is_player, true);
+    assert.equal(after.body.phase, "paused", "the same player can reopen the sender with the next input");
+    assert.equal(watching.state.is_player, false);
+    const resumed = await call("POST", "/v1/public/input", await inputPayload(player, joined.session, joined.token, 2));
+    assert.equal(resumed.status, 200);
+
+    const html = await (await import("node:fs/promises")).readFile(new URL("../../../web/doom-public/index.html", import.meta.url), "utf8");
+    assert.match(html, /Controls stay visible while you watch\./);
+    assert.match(html, /class="controls"/);
+  });
+});
+
+test("a failed rollover stops the shared session and invokes failure cleanup once", async () => {
+  await publicServer({}, async ({relayer, call}) => {
+    const player = await browser();
+    const joined = (await call("POST", "/v1/public/join", {publicKey: player.publicKey})).body;
+    let cleanupCalls = 0;
+    relayer.publicMode.onRolloverFailure = async () => { cleanupCalls += 1; };
+    relayer.publicMode.onPipelineEvent({event: "rollover_start", segment: 1, from_cursor: 512, capacity: 65_536});
+    relayer.publicMode.onPipelineEvent({event: "rollover_failed", segment: 1, error: "RESET readback timed out"});
+    relayer.publicMode.onPipelineEvent({event: "failed", error: "public rollover failed"});
+
+    const stopped = await call("GET", `/v1/public/state?token=${encodeURIComponent(joined.token)}`);
+    assert.equal(stopped.body.phase, "stopped");
+    assert.equal(stopped.body.rolling_over, false);
+    assert.match(stopped.body.pause_message, /session has stopped/);
+    const refused = await call("POST", "/v1/public/input", await inputPayload(player, joined.session, joined.token));
+    assert.equal(refused.status, 503);
+    assert.equal(refused.body.code, "pipeline_stopped");
+    assert.equal(cleanupCalls, 1);
+  });
+});
+
 test("viewer cap, input rate limit, CORS, and shared-page restrictions are enforced", async () => {
   await publicServer({maxViewers: 2, inputLimitPerSecond: 1}, async ({call}) => {
     const first = await browser();

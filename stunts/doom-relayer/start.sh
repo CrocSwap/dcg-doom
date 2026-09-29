@@ -203,10 +203,16 @@ case "${PUBLIC_MODE:-0}" in
     PUBLIC_STATE_PATH=${PUBLIC_STATE_PATH:-$RD/out/public-mode/public-state.json}
     PUBLIC_MAX_VIEWERS=${PUBLIC_MAX_VIEWERS:-200}
     PUBLIC_ESTIMATE_HORIZON=${PUBLIC_ESTIMATE_HORIZON:-600}
+    PUBLIC_ROLLOVER_THRESHOLD=${PUBLIC_ROLLOVER_THRESHOLD:-57344}
+    PUBLIC_LOCK_OWNER=${PUBLIC_LOCK_OWNER:-doom-public:$NAME}
     PUBLIC_CORS_ORIGIN=${PUBLIC_CORS_ORIGIN:?PUBLIC_CORS_ORIGIN must be the exact static page origin}
-    if ! "$PY" -c 'import sys; c=float(sys.argv[1]); v=int(sys.argv[2]); h=int(sys.argv[3]); sys.exit(0 if 0<c<=300 and 1<=v<=200 and 1<=h<=604800 else 1)' \
-      "${SPEND_CAP:-2}" "$PUBLIC_MAX_VIEWERS" "$PUBLIC_ESTIMATE_HORIZON"; then
-      echo "public mode requires a spend cap in (0, 300], 1..200 viewers, and a positive estimate horizon" >&2
+    if [ "$PUBLIC_LOCK_OWNER" != "doom-public:$NAME" ]; then
+      echo "public lock owner must match this run name" >&2
+      exit 2
+    fi
+    if ! "$PY" -c 'import sys; c=float(sys.argv[1]); v=int(sys.argv[2]); h=int(sys.argv[3]); t=int(sys.argv[4]); sys.exit(0 if 0<c<=300 and 1<=v<=200 and 1<=h<=604800 and 1<=t<65536 else 1)' \
+      "${SPEND_CAP:-2}" "$PUBLIC_MAX_VIEWERS" "$PUBLIC_ESTIMATE_HORIZON" "$PUBLIC_ROLLOVER_THRESHOLD"; then
+      echo "public mode requires a spend cap in (0, 300], 1..200 viewers, a positive estimate horizon, and rollover threshold 1..65535" >&2
       exit 2
     fi
     if ! "$PY" -c 'import sys; from urllib.parse import urlsplit; u=urlsplit(sys.argv[1]); ok=(u.scheme=="https" and bool(u.hostname) and not u.path and not u.query and not u.fragment) or (u.scheme=="http" and u.hostname=="127.0.0.1" and bool(u.port) and not u.path and not u.query and not u.fragment); sys.exit(0 if ok else 1)' "$PUBLIC_CORS_ORIGIN"; then
@@ -214,7 +220,9 @@ case "${PUBLIC_MODE:-0}" in
       exit 2
     fi
     public_flags=(--public-mode --public-state "$PUBLIC_STATE_PATH" --public-max-viewers "$PUBLIC_MAX_VIEWERS" \
-      --estimate-horizon-seconds "$PUBLIC_ESTIMATE_HORIZON" --cors-origin "$PUBLIC_CORS_ORIGIN")
+      --estimate-horizon-seconds "$PUBLIC_ESTIMATE_HORIZON" --cors-origin "$PUBLIC_CORS_ORIGIN" \
+      --public-rollover-threshold "$PUBLIC_ROLLOVER_THRESHOLD" --public-lock-owner "$PUBLIC_LOCK_OWNER" \
+      --stage-cap-script "$RD/scripts/stage_cap.sh" --r14-keys-dir "${R14_KEYS_DIR:-/home/ec2-user/doom-keys/r14-page}")
     ;;
   *) echo "PUBLIC_MODE must be 0 or 1" >&2; exit 2 ;;
 esac

@@ -28,6 +28,7 @@ export class PublicMode {
     spendCapFogo = 300,
     now = () => Date.now(),
     random = Math.random,
+    onRolloverFailure = null,
   }) {
     this.relayer = relayer;
     this.statePath = statePath;
@@ -39,6 +40,7 @@ export class PublicMode {
     this.spendCapFogo = spendCapFogo;
     this.now = now;
     this.random = random;
+    this.onRolloverFailure = onRolloverFailure;
     this.clients = new Map();
     this.activeToken = null;
     this.offerToken = null;
@@ -50,6 +52,8 @@ export class PublicMode {
     this.paused = true;
     this.capReached = false;
     this.pipelineStopped = false;
+    this.rollingOver = false;
+    this.rolloverFailureHandled = false;
     this.listeners = new Set();
     this.lastStatusJson = "";
     this.run = this.#loadState();
@@ -223,6 +227,7 @@ export class PublicMode {
     const client = this.#client(token);
     if (this.capReached) throw new PublicModeError("the public run spend cap has been reached", 402, "spend_cap_reached");
     if (this.pipelineStopped) throw new PublicModeError("the shared game session has stopped", 503, "pipeline_stopped");
+    if (this.rollingOver) throw new PublicModeError("the shared game is starting a new game; retry in a moment", 503, "rollover_in_progress");
     if (client.token !== this.activeToken || this.offerToken) {
       throw new PublicModeError("only the current player may send input", 403, "not_current_player");
     }
@@ -353,6 +358,40 @@ export class PublicMode {
   }
 
   onPipelineEvent(event) {
+    if (event.event === "rollover_start") {
+      this.rollingOver = true;
+      this.paused = true;
+      this.#changed();
+    }
+    if (event.event === "rollover_complete") {
+      this.rollingOver = false;
+      this.paused = true;
+      this.lastInputAt = this.now();
+      const slot = this.relayer.publicSession?.slot;
+      if (slot) {
+        slot.cursor = 0;
+        slot.gametic = 0;
+        slot.nextSeq = 0;
+        slot.stagingFrontier = 0;
+        slot.writableFrontier = 0;
+        slot.writableFloor = 0;
+        slot.producerNextCursor = 0;
+        slot.producer = null;
+        slot.inputFate = null;
+        slot.pipeline = null;
+      }
+      this.#changed();
+    }
+    if (event.event === "rollover_failed") {
+      this.rollingOver = false;
+      this.pipelineStopped = true;
+      this.paused = true;
+      this.#changed();
+      if (!this.rolloverFailureHandled) {
+        this.rolloverFailureHandled = true;
+        void this.onRolloverFailure?.(event);
+      }
+    }
     if (event.event === "death") {
       this.deathUntil = this.now() + 15_000;
       this.#changed();
@@ -400,7 +439,7 @@ export class PublicMode {
     const ownPlace = client?.token === this.activeToken ? null : spectatorList.findIndex((entry) => entry.token === token) + 1;
     const offered = this.offerToken ? this.clients.get(this.offerToken) : null;
     const idleRemaining = this.lastInputAt === null ? this.idleMs : Math.max(0, this.idleMs - (now - this.lastInputAt));
-    const pausedReason = this.capReached ? "cap" : this.pipelineStopped ? "stopped" : !active ? "empty" : this.paused ? "idle" : null;
+    const pausedReason = this.capReached ? "cap" : this.pipelineStopped ? "stopped" : this.rollingOver ? "rollover" : !active ? "empty" : this.paused ? "idle" : null;
     return {
       viewers: clients.length,
       max_viewers: this.maxViewers,
@@ -409,10 +448,11 @@ export class PublicMode {
       idle_seconds: Math.ceil(idleRemaining / 1000),
       offer: offered ? {nickname: offered.nickname, seconds: Math.max(0, Math.ceil((this.offerUntil - now) / 1000)), mine: offered.token === token} : null,
       spectator_place: !client || client.token === this.activeToken ? null : ownPlace,
-      phase: this.capReached ? "cap_reached" : this.pipelineStopped ? "stopped" : offered ? (offered.token === token ? "offer" : "offer_rotation") : active ? (this.paused ? "paused" : "playing") : "empty",
-      paused: this.paused || this.capReached,
+      phase: this.capReached ? "cap_reached" : this.pipelineStopped ? "stopped" : this.rollingOver ? "rolling_over" : offered ? (offered.token === token ? "offer" : "offer_rotation") : active ? (this.paused ? "paused" : "playing") : "empty",
+      paused: this.paused || this.capReached || this.rollingOver,
       paused_reason: pausedReason,
-      pause_message: this.capReached ? "Public run spend cap reached. The game is paused." : this.pipelineStopped ? "The shared game session has stopped. Please try again later." : this.paused ? "Paused — press any key / take control to play" : null,
+      rolling_over: this.rollingOver,
+      pause_message: this.capReached ? "Public run spend cap reached. The game is paused." : this.pipelineStopped ? "The shared game session has stopped. Please try again later." : this.rollingOver ? "New game starting…" : this.paused ? "Paused — press any key / take control to play" : null,
       death_message: this.deathUntil && this.deathUntil > now ? "You died. Press R to respawn." : null,
       spend_fogo: Number(this.run.spend_fogo ?? 0),
       spend_cap_fogo: this.spendCapFogo,

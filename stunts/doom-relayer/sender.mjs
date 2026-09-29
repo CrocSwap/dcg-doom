@@ -436,6 +436,13 @@ export class PipelineSender {
     if (options.imageBytes) argv.push("--image-bytes", String(options.imageBytes));
     if (options.seconds) argv.push("--seconds", String(options.seconds));
     if (options.startPaused) argv.push("--start-paused");
+    if (options.publicMode) {
+      argv.push("--public-mode");
+      argv.push("--public-rollover-threshold", String(options.publicRolloverThreshold ?? 57_344));
+      argv.push("--public-maintenance-lock-owner", options.publicMaintenanceLockOwner);
+      argv.push("--stage-cap-script", options.stageCapScript);
+      argv.push("--r14-keys-dir", options.r14KeysDir);
+    }
     if (options.estimateHorizonSeconds !== undefined && options.estimateHorizonSeconds !== null) {
       argv.push("--estimate-horizon-seconds", String(options.estimateHorizonSeconds));
     }

@@ -12,7 +12,7 @@
 
 import {createServer as createHttpServer} from "node:http";
 import {createPublicKey, verify as nodeVerify} from "node:crypto";
-import {readFileSync} from "node:fs";
+import {readFileSync, rmSync, rmdirSync} from "node:fs";
 
 import {toHex} from "../../web/doom-play/strip.js";
 
@@ -1239,6 +1239,7 @@ const CHAIN_FLAGS = new Set([
   "send-pacer-rate",
   "image-sha256", "image-bytes", "seconds", "strip-rate", "render-buffers",
   "estimate-horizon-seconds", "payer-baseline-lamports", "public-state", "public-max-viewers",
+  "public-rollover-threshold", "public-lock-owner", "stage-cap-script", "r14-keys-dir",
   "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
   "render", "reset-start-account", "frame-deadline-seconds", "rpc-lag-drop-slots",
@@ -1302,6 +1303,11 @@ if (isMain()) {
     rpcB: args.get("rpc-b") ?? undefined,
     rpcC: args.get("rpc-c") ?? undefined,
     sendPacerRate: args.get("send-pacer-rate") ?? undefined,
+    publicMode: args.has("public-mode"),
+    publicRolloverThreshold: args.get("public-rollover-threshold") ? Number(args.get("public-rollover-threshold")) : undefined,
+    publicMaintenanceLockOwner: args.get("public-lock-owner") ?? undefined,
+    stageCapScript: args.get("stage-cap-script") ?? undefined,
+    r14KeysDir: args.get("r14-keys-dir") ?? undefined,
     imageSha256: args.get("image-sha256") ?? undefined,
     imageBytes: args.get("image-bytes") ? Number(args.get("image-bytes")) : undefined,
     startPaused: args.has("start-paused") || args.has("public-mode"),
@@ -1355,6 +1361,32 @@ if (isMain()) {
   // accident.
   const host = args.get("host") ?? "127.0.0.1";
   let stopping = false;
+  let rolloverFailureStopping = false;
+  if (relayer.publicMode) {
+    relayer.publicMode.onRolloverFailure = async () => {
+      if (rolloverFailureStopping) return;
+      rolloverFailureStopping = true;
+      const owner = args.get("public-lock-owner") ?? "";
+      const lockDir = "/tmp/doom-play-maintenance.lock";
+      // Let the SSE stopped state reach both browsers before dropping streams.
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      relayer.publicMode.stop();
+      try { await relayer.sender.close(); } catch (error) { logger(`failed rollover sender close: ${error.message}`); }
+      server.close();
+      server.closeAllConnections?.();
+      try {
+        if (readFileSync(`${lockDir}/owner`, "utf8").trim() === owner && owner.startsWith("doom-public:")) {
+          for (const name of ["owner", "run_name", "created_utc"]) rmSync(`${lockDir}/${name}`, {force: true});
+          rmdirSync(lockDir);
+        } else {
+          logger("failed rollover left the maintenance lock untouched because its owner changed");
+        }
+      } catch (error) {
+        logger(`failed rollover could not release its maintenance lock: ${error.message}`);
+      }
+      process.exit(1);
+    };
+  }
   const shutdown = async (signal) => {
     if (stopping) return;
     stopping = true;

@@ -29,6 +29,7 @@ let heartbeatTimer = null;
 let inputTimer = null;
 let inputBusy = false;
 let inputPending = false;
+let inputPendingDuringRollover = false;
 let lastInputAt = 0;
 let painted = 0;
 const pointerKeys = new Map();
@@ -74,6 +75,7 @@ function drawBanner(message, kind = "") {
 }
 
 function renderState(value) {
+  const wasRollingOver = Boolean(publicState?.rolling_over);
   publicState = value;
   ui.connection.textContent = "LIVE · SHARED VIEW";
   ui.connection.parentElement.classList.add("online");
@@ -96,6 +98,10 @@ function renderState(value) {
   else if (value.offer?.mine) drawBanner(`Your turn is ready. Take control within ${value.offer.seconds} seconds.`);
   else if (!painted) drawBanner("Waiting for the first pushed picture…");
   else drawBanner(null);
+  if (wasRollingOver && !value.rolling_over && value.is_player && (inputPendingDuringRollover || Object.values(held).some(Boolean))) {
+    inputPendingDuringRollover = false;
+    scheduleInput();
+  }
 }
 
 function paint(frame) {
@@ -188,7 +194,7 @@ async function join() {
 }
 
 async function sendInput() {
-  if (!session || !token || !wallet || !publicState?.is_player || inputBusy) return;
+  if (!session || !token || !wallet || !publicState?.is_player || publicState?.rolling_over || inputBusy) return;
   inputBusy = true;
   inputPending = false;
   clientSeq += 1;
@@ -219,6 +225,10 @@ async function sendInput() {
 }
 
 function scheduleInput() {
+  if (publicState?.rolling_over) {
+    inputPendingDuringRollover = true;
+    return;
+  }
   if (!publicState?.is_player) return;
   inputPending = true;
   if (inputTimer !== null) return;
