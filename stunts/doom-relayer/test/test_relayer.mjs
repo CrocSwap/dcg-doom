@@ -257,6 +257,47 @@ test("chain mode is wired, and refuses to start without keys or a script", async
   assert.match(PIPELINE_REQUIREMENTS.transport, /JSON lines/);
 });
 
+test("a completed public rollover requires a fresh child execution resume", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "doom-rollover-resume-"));
+  const script = join(directory, "pipeline.mjs");
+  writeFileSync(script, `
+    import {createInterface} from "node:readline";
+    console.log(JSON.stringify({event:"started"}));
+    const input = createInterface({input:process.stdin});
+    input.on("line", (line) => {
+      const request = JSON.parse(line);
+      console.log(JSON.stringify({id:request.id, ok:true, resumed:request.op === "resume"}));
+      if (request.op === "trigger-rollover") {
+        setTimeout(() => console.log(JSON.stringify({event:"rollover_complete", cursor:0})), 50);
+      }
+      if (request.op === "stop") process.exit(0);
+    });
+  `);
+  let resolveRollover;
+  const rollover = new Promise((resolve) => { resolveRollover = resolve; });
+  const sender = new PipelineSender({
+    mode: "chain",
+    keysDir: "/keys",
+    payerKey: "/payer.json",
+    python: process.execPath,
+    script,
+    runDir: directory,
+    onEvent: (event) => { if (event.event === "rollover_complete") resolveRollover(event); },
+  });
+  try {
+    await sender.start();
+    sender.executionResumed = true;
+    await sender.request({op: "trigger-rollover"});
+    await rollover;
+    assert.equal(sender.executionResumed, false);
+    assert.deepEqual(await sender.resume(), {id: 4, ok: true, resumed: true});
+    assert.equal(sender.executionResumed, true);
+  } finally {
+    await sender.close();
+    rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 // ---------------------------------------------------------------- API
 
 test("GET /healthz reports the pool and the mode", async () => {

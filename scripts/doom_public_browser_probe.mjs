@@ -340,5 +340,12 @@ try {
   if (!preserveBrowsers) {
     await stopBrowsers();
     if (stageName !== "complete") rmSync(persistentProfiles, {recursive: true, force: true});
+  } else {
+    // The Chrome processes live across active stages, but the probe process
+    // should not. Keep the browsers and release their DevTools sockets here.
+    for (const {child, cdp} of browsers) {
+      cdp?.close();
+      child?.unref?.();
+    }
   }
 }

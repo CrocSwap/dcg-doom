@@ -607,6 +607,10 @@ export class PipelineSender {
       return;
     }
     if (message.event === "started" || message.event === "finished" || message.event) {
+      // A public rollover clears the child's execution gate after RESET/9.
+      // The next accepted input must send `resume` again, even though this
+      // sender already resumed the original session.
+      if (message.event === "rollover_complete") this.executionResumed = false;
       this.onEvent?.(message);
       this.log(`[pipeline] ${JSON.stringify(message)}`);
       for (const [id, waiter] of this.pending) {
