@@ -116,7 +116,7 @@ async function launch(port, index) {
     "--no-first-run", "--no-default-browser-check", "--headless=new", "--no-sandbox",
     "--disable-gpu", "--disable-dev-shm-usage", "--remote-debugging-address=127.0.0.1",
     `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, "about:blank",
-  ], {stdio: "ignore"});
+  ], {stdio: "ignore", detached: true});
   browsers.push({child, cdp: null});
   if (stageName !== "complete") {
     mkdirSync(persistentProfiles, {recursive: true});

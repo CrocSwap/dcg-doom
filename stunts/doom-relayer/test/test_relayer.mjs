@@ -1108,6 +1108,10 @@ test("PROFILE=fast selects the best measured settings and plain defaults stay un
   assert.equal(value(plain.args, "--min-cursor-step-tics"), "8");
   assert.equal(plain.advanceCuLimit, "520000");
   assert.ok(!plain.args.includes("--batch-render-sends"));
+
+  const publicLauncher = readFileSync(new URL("../../../scripts/doom_public.sh", import.meta.url), "utf8");
+  assert.match(publicLauncher, /ADV_TICS=6 ADV_PIPELINE_DEPTH=1/);
+  assert.doesNotMatch(publicLauncher, /ADVANCE_PIPELINE_DEPTH=1/);
 });
 
 test("the session answer names the buffer holding the latest complete frame", async () => {
