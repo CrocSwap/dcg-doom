@@ -184,6 +184,7 @@ public_flags=()
 case "${PUBLIC_MODE:-0}" in
   0|false|FALSE|no|NO|off|OFF) ;;
   1|true|TRUE|yes|YES|on|ON)
+    SPEND_CAP=${SPEND_CAP:-300}
     LOCK_DIR=/tmp/doom-play-maintenance.lock
     if [ "$(cat "$LOCK_DIR/owner" 2>/dev/null || true)" != "doom-public:$NAME" ]; then
       echo "public mode requires this run to own Tokyo's Doom maintenance lock" >&2

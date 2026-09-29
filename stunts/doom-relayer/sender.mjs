@@ -753,6 +753,14 @@ export class PipelineSender {
 
   async keyState({slot, keyMask}) {
     if (this.closed) throw new SenderError("the pipeline process is not running", "pipeline_exited");
+    // An idle public lobby SIGSTOPs the Python child so it cannot keep sending
+    // transactions. Wake it before writing the next key state: a stopped child
+    // cannot read the command, and waiting for its reply before calling resume
+    // would deadlock the first input after an idle pause.
+    if (this.osPaused) {
+      this.child.kill("SIGCONT");
+      this.osPaused = false;
+    }
     const reply = await this.request({op: "key_state", key_mask: keyMask});
     this.status = {...this.status, ...reply};
     return {

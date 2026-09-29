@@ -1594,3 +1594,19 @@ test("a third node and a send rate reach the pipeline's argv", () => {
   }).argv();
   assert.equal(singleNode[singleNode.indexOf("--rpc-b") + 1], "");
 });
+
+test("a pipeline key state wakes an idle SIGSTOP before waiting for its reply", async () => {
+  const sender = new PipelineSender({mode: "chain", keysDir: "/keys", payerKey: "/payer.json"});
+  const calls = [];
+  sender.osPaused = true;
+  sender.child = {kill(signal) { calls.push(signal); }};
+  sender.request = async (message) => {
+    calls.push(message.op);
+    return {accepted: 1, accepted_from: 12, cursor: 12, gametic: 12};
+  };
+
+  const result = await sender.keyState({slot: "chain-r15", keyMask: 1});
+  assert.deepEqual(calls, ["SIGCONT", "key_state"]);
+  assert.equal(sender.osPaused, false);
+  assert.equal(result.acceptedFrom, 12);
+});
