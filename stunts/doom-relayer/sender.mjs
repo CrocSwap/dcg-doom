@@ -388,6 +388,11 @@ export class PipelineSender {
     this.status = null;
     this.closed = false;
     this.onFrame = options.onFrame ?? null;
+    this.onEvent = options.onEvent ?? null;
+    this.onProgress = options.onProgress ?? null;
+    this.osPaused = false;
+    this.executionResumed = !options.startPaused;
+    this.closing = false;
     this.startedAt = null;
     // Checked here rather than at the first input, so a relayer pointed at the
     // wrong tree says so while it is starting instead of after a player has
@@ -430,6 +435,13 @@ export class PipelineSender {
     if (options.imageSha256) argv.push("--image-sha256", options.imageSha256);
     if (options.imageBytes) argv.push("--image-bytes", String(options.imageBytes));
     if (options.seconds) argv.push("--seconds", String(options.seconds));
+    if (options.startPaused) argv.push("--start-paused");
+    if (options.estimateHorizonSeconds !== undefined && options.estimateHorizonSeconds !== null) {
+      argv.push("--estimate-horizon-seconds", String(options.estimateHorizonSeconds));
+    }
+    if (options.payerBaselineLamports !== undefined && options.payerBaselineLamports !== null) {
+      argv.push("--payer-baseline-lamports", String(options.payerBaselineLamports));
+    }
     argv.push(options.render === false ? "--no-render" : "--render");
     argv.push("--render-buffers", String(options.renderBuffers ?? 1));
     argv.push("--strip-rate", String(options.stripRate ?? 16));
@@ -538,6 +550,28 @@ export class PipelineSender {
     return this.hello;
   }
 
+  async resume() {
+    if (this.closed || !this.child) throw new SenderError("the pipeline process is not running", "pipeline_exited");
+    if (this.osPaused) {
+      this.child.kill("SIGCONT");
+      this.osPaused = false;
+      return {ok: true, resumed: true};
+    }
+    if (!this.executionResumed) {
+      const reply = await this.request({op: "resume"});
+      this.executionResumed = true;
+      return reply;
+    }
+    return {ok: true, resumed: true};
+  }
+
+  async pause() {
+    if (this.closed || !this.child || this.osPaused || !this.executionResumed) return {ok: true, paused: true};
+    this.child.kill("SIGSTOP");
+    this.osPaused = true;
+    return {ok: true, paused: true};
+  }
+
   #onLine(line) {
     if (!line.trim()) return;
     let message;
@@ -558,6 +592,7 @@ export class PipelineSender {
     }
     if (message.event === "progress") {
       this.status = message;
+      this.onProgress?.(message);
       return;
     }
     if (message.event === "frame") {
@@ -565,6 +600,7 @@ export class PipelineSender {
       return;
     }
     if (message.event === "started" || message.event === "finished" || message.event) {
+      this.onEvent?.(message);
       this.log(`[pipeline] ${JSON.stringify(message)}`);
       for (const [id, waiter] of this.pending) {
         if (waiter.event === message.event) {
@@ -848,8 +884,12 @@ export class PipelineSender {
   }
 
   async close() {
-    if (!this.child || this.closed) return;
-    this.closed = true;
+    if (!this.child || this.closed || this.closing) return;
+    this.closing = true;
+    if (this.osPaused) {
+      this.child.kill("SIGCONT");
+      this.osPaused = false;
+    }
     try {
       // The documented stop: the child writes its receipt, then exits.
       await this.request({op: "stop"}, {timeoutMs: 5_000});
@@ -867,6 +907,7 @@ export class PipelineSender {
       });
     });
     await exited;
+    this.closed = true;
     this.child?.stdin?.end();
   }
 }

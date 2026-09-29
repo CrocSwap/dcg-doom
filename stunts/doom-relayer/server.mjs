@@ -12,6 +12,7 @@
 
 import {createServer as createHttpServer} from "node:http";
 import {createPublicKey, verify as nodeVerify} from "node:crypto";
+import {readFileSync} from "node:fs";
 
 import {toHex} from "../../web/doom-play/strip.js";
 
@@ -26,6 +27,7 @@ import {
 import {DEFAULT_NETWORK, NETWORKS, requireNetwork, explorerTransaction} from "../../web/doom-play/network.js";
 import {SlotPool, PoolError, SLOT_STATE, makeSlot} from "./pool.mjs";
 import {createSender, SenderError} from "./sender.mjs";
+import {PublicMode, PublicModeError} from "./public-mode.mjs";
 
 export const API_VERSION = "doom-relayer/1";
 
@@ -140,6 +142,12 @@ export class Relayer {
     ticsPerFrame = 16,
     advanceTics = 4,
     inputLeadTics = 96,
+    publicMode = false,
+    publicStatePath = null,
+    publicMaxViewers = 200,
+    publicSpendCapFogo = 300,
+    publicNow = undefined,
+    publicRandom = undefined,
   } = {}) {
     this.networkName = network;
     this.network = NETWORKS[network];
@@ -163,6 +171,7 @@ export class Relayer {
     this.sender = sender ?? createSender({mode});
     this.pool = pool ?? new SlotPool({slots: []});
     this.sessions = new Map();
+    this.publicSession = null;
     this.startedAt = Date.now();
     this.stats = {sessionsCreated: 0, sessionsEnded: 0, inputsAccepted: 0, inputsRejected: 0, ticsLanded: 0, framesRendered: 0};
     this.promise = Promise.resolve();
@@ -181,6 +190,18 @@ export class Relayer {
     // stopped pushing" has to be a number on the receipt, not a quiet gap.
     this.framesWithoutBytes = 0;
     this.sender.onFrame = (frame) => this.onFrame(frame);
+    this.publicMode = publicMode ? new PublicMode({
+      relayer: this,
+      statePath: publicStatePath,
+      maxViewers: publicMaxViewers,
+      spendCapFogo: publicSpendCapFogo,
+      now: publicNow,
+      random: publicRandom,
+    }) : null;
+    if (this.publicMode) {
+      this.sender.onEvent = (event) => this.publicMode.onPipelineEvent(event);
+      this.sender.onProgress = (event) => this.publicMode.onPipelineEvent(event);
+    }
     // Mock mode is synchronous and self-contained: the synthetic slots are what
     // the page is developed against. Chain mode has to ask a process what
     // context it is driving, so that waits for init().
@@ -223,6 +244,7 @@ export class Relayer {
     for (const subscription of this.subscriptions) {
       for (const listener of subscription.listeners) listener(record);
     }
+    this.publicMode?.onFrame(record);
     return record;
   }
 
@@ -261,28 +283,29 @@ export class Relayer {
   // is seeded from what it reports rather than from synthetic mock addresses.
   // In mock mode the constructor has already done it and this is a no-op.
   async init() {
-    if (this.pool.size || !this.sender.background) return this;
-    const slot = await this.sender.provisionSlot({network: this.networkName, label: null});
-    this.pool.slots.push(makeSlot({
-      slot: 0,
-      label: slot.label,
-      context: slot.context,
-      meta: slot.meta,
-      inputBuffer: slot.inputBuffer,
-      state: slot.state,
-      mirror: slot.mirror,
-      authority: slot.authority,
-      snapshot: slot.snapshot,
-      strips: slot.strips,
-      inputCapacity: slot.inputCapacity,
-    }));
-    const record = this.pool.slots[0];
-    record.cursor = slot.cursor ?? 0;
-    record.gametic = slot.gametic ?? 0;
-    // A context resumes where it stopped, so the player's first batch is
-    // staged at the chain's cursor, not at zero.
-    record.nextSeq = slot.nextSeq ?? 0;
-    this.log(`slot 0 is context ${record.accounts.context} at cursor ${record.cursor} of ${record.inputCapacity}`);
+    if (!this.pool.size && this.sender.background) {
+      const slot = await this.sender.provisionSlot({network: this.networkName, label: null});
+      this.pool.slots.push(makeSlot({
+        slot: 0,
+        label: slot.label,
+        context: slot.context,
+        meta: slot.meta,
+        inputBuffer: slot.inputBuffer,
+        state: slot.state,
+        mirror: slot.mirror,
+        authority: slot.authority,
+        snapshot: slot.snapshot,
+        strips: slot.strips,
+        inputCapacity: slot.inputCapacity,
+      }));
+      const record = this.pool.slots[0];
+      record.cursor = slot.cursor ?? 0;
+      record.gametic = slot.gametic ?? 0;
+      record.nextSeq = slot.nextSeq ?? 0;
+      record.latestFrame = slot.latestFrame ?? null;
+      this.log(`slot 0 is context ${record.accounts.context} at cursor ${record.cursor} of ${record.inputCapacity}`);
+    }
+    this.publicMode?.start();
     return this;
   }
 
@@ -547,7 +570,7 @@ export class Relayer {
       error.code = "unknown_session";
       throw error;
     }
-    if (Date.now() - session.lastSeenAt > SESSION_TTL_MS) {
+    if (!session.public && Date.now() - session.lastSeenAt > SESSION_TTL_MS) {
       const error = new Error(`session ${sessionId} expired after ${SESSION_TTL_MS / 60000} minutes of silence`);
       error.status = 410;
       error.code = "session_expired";
@@ -559,7 +582,7 @@ export class Relayer {
 
   // The core path: verify the player's signature, check the batch against the
   // slot's rules, then deposit and advance on chain.
-  async postInput(sessionId, {message, signature, publicKey}) {
+  async postInput(sessionId, {message, signature, publicKey}, {publicToken = null} = {}) {
     const postReceivedAtMs = Date.now();
     const session = this.getSession(sessionId);
     if (session.state !== "playing") {
@@ -569,6 +592,7 @@ export class Relayer {
       throw error;
     }
     const slot = session.slot;
+    if (this.publicMode) this.publicMode.assertCanInput(publicToken, publicKey, {rateLimit: false});
     let decoded;
     try {
       decoded = decodeInput(message);
@@ -630,9 +654,11 @@ export class Relayer {
         error.code = "batch_refused";
         throw error;
       }
+      this.publicMode?.notePendingInput(publicToken);
       let result;
       try {
         result = await this.sender.keyState({slot: slot.label, keyMask: decoded.keyMask});
+        if (this.publicMode) await this.publicMode.resumeForInput(publicToken);
       } catch (error) {
         this.stats.inputsRejected += 1;
         throw error;
@@ -642,6 +668,7 @@ export class Relayer {
       slot.producerNextCursor = result.producerNextCursor ?? slot.producerNextCursor;
       slot.pipeline = result.pipeline ?? slot.pipeline;
       this.stats.inputsAccepted += 1;
+      this.publicMode?.noteAcceptedInput(publicToken);
       return {
         ok: true,
         accepted: 1,
@@ -981,6 +1008,7 @@ const ROUTES = [
       held: relayer.frameStream.size,
       subscribers: relayer.subscriptions.size,
     },
+    public: relayer.publicMode ? relayer.publicMode.state() : null,
   })},
   {method: "GET", pattern: /^\/v1\/config$/, handler: async (relayer) => ({
     api: API_VERSION,
@@ -993,7 +1021,77 @@ const ROUTES = [
     pool: relayer.pool.summary(),
     slots: relayer.pool.list(),
   })},
+  {method: "POST", pattern: /^\/v1\/public\/join$/, handler: async (relayer, request) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    return relayer.publicMode.join(await readJson(request));
+  }},
+  {method: "GET", pattern: /^\/v1\/public\/state$/, handler: async (relayer, request) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    return relayer.publicMode.state(new URL(request.url, "http://relayer.invalid").searchParams.get("token"));
+  }},
+  {method: "POST", pattern: /^\/v1\/public\/heartbeat$/, handler: async (relayer, request) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    return relayer.publicMode.heartbeat((await readJson(request)).token);
+  }},
+  {method: "POST", pattern: /^\/v1\/public\/offer\/accept$/, handler: async (relayer, request) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    return relayer.publicMode.acceptOffer((await readJson(request)).token);
+  }},
+  {method: "POST", pattern: /^\/v1\/public\/input$/, handler: async (relayer, request) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    const body = await readJson(request);
+    const message = fromBase64(body.message, "message");
+    const signature = fromBase64(body.signature, "signature");
+    if (message.length > 64 + MAX_COMMANDS_PER_BATCH * COMMAND_BYTES) {
+      throw new PublicModeError("message is longer than a full batch", 400, "message_too_long");
+    }
+    const client = relayer.publicMode.assertCanInput(body.token, body.publicKey);
+    if (!relayer.publicSession) throw new PublicModeError("the shared game session is not ready", 503, "game_not_ready");
+    return relayer.postInput(relayer.publicSession.id, {message, signature, publicKey: client.publicKey}, {publicToken: body.token});
+  }},
+  {method: "DELETE", pattern: /^\/v1\/public\/leave$/, handler: async (relayer, request) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    return relayer.publicMode.leave(new URL(request.url, "http://relayer.invalid").searchParams.get("token"));
+  }},
+  {method: "GET", pattern: /^\/v1\/public\/palette$/, handler: async (relayer) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    return {palette: await relayer.publicMode.palette()};
+  }},
+  {method: "GET", pattern: /^\/v1\/public\/stream$/, handler: async (relayer, request, _params, response, {corsOrigin}) => {
+    if (!relayer.publicMode) throw new PublicModeError("public mode is disabled", 404, "public_mode_disabled");
+    const url = new URL(request.url, "http://relayer.invalid");
+    const token = url.searchParams.get("token");
+    relayer.publicMode.state(token);
+    const sinceText = url.searchParams.get("since");
+    const since = sinceText === null ? null : Number(sinceText);
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+      ...corsHeaders(corsOrigin),
+    });
+    response.write("retry: 1000\n\n");
+    const frames = relayer.subscribeFrames({since});
+    const writeState = () => response.write(`event: state\ndata: ${JSON.stringify(relayer.publicMode.state(token))}\n\n`);
+    const writeFrame = (record) => response.write(`event: frame\nid: ${record.frame_index ?? ""}\ndata: ${JSON.stringify(record)}\n\n`);
+    const stopState = relayer.publicMode.subscribe(token, writeState);
+    const stopFrame = frames.add(writeFrame);
+    writeState();
+    for (const record of frames.pending) writeFrame(record);
+    const keepAlive = setInterval(() => response.write(": keep-alive\n\n"), 15_000);
+    const close = () => {
+      clearInterval(keepAlive);
+      stopState();
+      stopFrame();
+      frames.close();
+    };
+    response.on("close", close);
+    request.on("error", close);
+    return RAW_RESPONSE;
+  }, stream: true},
   {method: "POST", pattern: /^\/v1\/sessions$/, handler: async (relayer, request) => {
+    if (relayer.publicMode) throw new PublicModeError("use the public lobby", 404, "public_mode_only");
     const body = await readJson(request);
     return relayer.createSession({publicKey: body.publicKey ?? null, requestedSlot: body.slot ?? null});
   }},
@@ -1007,6 +1105,7 @@ const ROUTES = [
     return {id: session.id, slot: session.slot.slot, state: session.state, ...relayer.status(session.slot)};
   }},
   {method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/input$/, handler: async (relayer, request, [sessionId]) => {
+    if (relayer.publicMode) throw new PublicModeError("use the public lobby input route", 403, "public_mode_only");
     const body = await readJson(request);
     const message = fromBase64(body.message, "message");
     const signature = fromBase64(body.signature, "signature");
@@ -1063,7 +1162,7 @@ const ROUTES = [
       stopListening();
       subscription.close();
     };
-    request.on("close", close);
+    response.on("close", close);
     request.on("error", close);
     return RAW_RESPONSE;
   }, stream: true},
@@ -1098,7 +1197,7 @@ export function createServer(relayer, {onLog = null, corsOrigin = "*"} = {}) {
     const dispatch = (work) => (route.stream ? work() : relayer.serialise(work));
     void dispatch(async () => {
       try {
-        const payload = await route.handler(relayer, request, params, response);
+        const payload = await route.handler(relayer, request, params, response, {corsOrigin});
         if (payload === RAW_RESPONSE) {
           onLog?.(`${request.method} ${url.pathname} stream`);
           return;
@@ -1139,6 +1238,7 @@ const CHAIN_FLAGS = new Set([
   "keys-dir", "payer-key", "python", "script", "run-dir", "rpc-a", "rpc-b", "rpc-c",
   "send-pacer-rate",
   "image-sha256", "image-bytes", "seconds", "strip-rate", "render-buffers",
+  "estimate-horizon-seconds", "payer-baseline-lamports", "public-state", "public-max-viewers",
   "advance-tics", "advance-pipeline-depth", "sweep-rate", "input-tics-per-second",
   "input-stage-lead-tics", "start-cursor", "spend-cap-fogo", "payer-reserve-fogo",
   "render", "reset-start-account", "frame-deadline-seconds", "rpc-lag-drop-slots",
@@ -1152,7 +1252,7 @@ const CHAIN_FLAGS = new Set([
 // the first to the *text* of the second and then skip it, so the second would
 // never reach the pipeline and the session would quietly run the serial path
 // while the runbook said otherwise.
-const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot", "atomic-live-inputs", "batch-render-sends"]);
+const BOOLEAN_CHAIN_FLAGS = new Set(["pre-read-snapshot", "overlap-readback", "strips-behind-snapshot", "atomic-live-inputs", "batch-render-sends", "start-paused", "public-mode"]);
 
 export function parseArgs(argv) {
   const args = new Map();
@@ -1182,8 +1282,14 @@ if (isMain()) {
   const mode = args.get("mode") ?? "mock";
   const port = Number(args.get("port") ?? 8787);
   const network = args.get("network") ?? DEFAULT_NETWORK;
+  const spendCapFogo = Number(args.get("spend-cap-fogo") ?? (args.has("public-mode") ? 300 : 10));
   requireNetwork(network, ["doom.program"]);
   const logger = (...parts) => console.error(new Date().toISOString(), ...parts);
+  const publicStatePath = args.get("public-state") ?? null;
+  let publicRun = {};
+  if (args.get("public-mode") && publicStatePath) {
+    try { publicRun = JSON.parse(readFileSync(publicStatePath, "utf8")); } catch { publicRun = {}; }
+  }
   const sender = createSender({
     mode,
     logger,
@@ -1198,6 +1304,9 @@ if (isMain()) {
     sendPacerRate: args.get("send-pacer-rate") ?? undefined,
     imageSha256: args.get("image-sha256") ?? undefined,
     imageBytes: args.get("image-bytes") ? Number(args.get("image-bytes")) : undefined,
+    startPaused: args.has("start-paused") || args.has("public-mode"),
+    estimateHorizonSeconds: args.get("estimate-horizon-seconds") ? Number(args.get("estimate-horizon-seconds")) : undefined,
+    payerBaselineLamports: publicRun.payer_baseline_lamports ?? (args.get("payer-baseline-lamports") ? Number(args.get("payer-baseline-lamports")) : null),
     seconds: args.get("seconds") ? Number(args.get("seconds")) : undefined,
     stripRate: args.get("strip-rate") ? Number(args.get("strip-rate")) : undefined,
     renderBuffers: args.get("render-buffers") ? Number(args.get("render-buffers")) : undefined,
@@ -1207,7 +1316,7 @@ if (isMain()) {
     inputTicsPerSecond: args.get("input-tics-per-second") ? Number(args.get("input-tics-per-second")) : undefined,
     inputStageLeadTics: args.get("input-stage-lead-tics") ? Number(args.get("input-stage-lead-tics")) : undefined,
     startCursor: args.get("start-cursor") ? Number(args.get("start-cursor")) : undefined,
-    spendCapFogo: args.get("spend-cap-fogo") ? Number(args.get("spend-cap-fogo")) : undefined,
+    spendCapFogo,
     payerReserveFogo: args.get("payer-reserve-fogo") ? Number(args.get("payer-reserve-fogo")) : undefined,
     resetStartAccount: args.get("reset-start-account") ?? undefined,
     atomicLiveInputs: args.get("atomic-live-inputs") != null,
@@ -1234,6 +1343,10 @@ if (isMain()) {
     sender,
     advanceTics: args.get("advance-tics") ? Number(args.get("advance-tics")) : 4,
     inputLeadTics: args.get("input-lead-tics") ? Number(args.get("input-lead-tics")) : 96,
+    publicMode: args.has("public-mode"),
+    publicStatePath,
+    publicMaxViewers: args.get("public-max-viewers") ? Number(args.get("public-max-viewers")) : 200,
+    publicSpendCapFogo: spendCapFogo,
   });
   const corsOrigin = args.get("cors-origin") ?? "*";
   const server = createServer(relayer, {onLog: (line) => logger(line), corsOrigin});
@@ -1246,6 +1359,7 @@ if (isMain()) {
     if (stopping) return;
     stopping = true;
     logger(`${signal}: stopping; the pipeline writes its receipt before it exits`);
+    relayer.publicMode?.stop();
     server.close();
     try {
       await relayer.sender.close();
