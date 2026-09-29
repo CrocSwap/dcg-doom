@@ -23,15 +23,22 @@ node --test stunts/doom-relayer/test/test_public_mode.mjs
 node --test stunts/doom-relayer/test/test_relayer.mjs
 ```
 
-For a live browser measurement through an existing loopback tunnel, use two
-isolated Chrome profiles. The active test duration is capped at 60 seconds; the
-script releases input, waits for the 60-second idle pause, and compares the
-relayer's reported spend before and after ten paused seconds.
+For live measurements through an existing loopback tunnel, use two isolated
+Chrome profiles. `active` starts them and `continue` reconnects to the same
+profiles; each active stage is limited to 23 seconds. `idle` waits for the
+60-second pause, `snapshot` reports the two pages' frame arrival timestamps,
+and `cleanup` stops only the Chrome processes recorded for that profile. These
+short stages keep browser work below the 90-second stage cap.
 
 ```sh
-node scripts/doom_public_browser_probe.mjs \
-  'http://127.0.0.1:18000/doom-public/?relayer=http%3A%2F%2F127.0.0.1%3A18787' \
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' 30
+PAGE='http://127.0.0.1:18000/doom-public/index.html?relayer=http://127.0.0.1:18787'
+CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+PROFILE=out/runs/doom-public-browser-probe/sample
+node scripts/doom_public_browser_probe.mjs "$PAGE" "$CHROME" 23 19221 19222 "$PROFILE" active
+node scripts/doom_public_browser_probe.mjs "$PAGE" "$CHROME" 23 19221 19222 "$PROFILE" continue
+node scripts/doom_public_browser_probe.mjs "$PAGE" "$CHROME" 5 19221 19222 "$PROFILE" idle
+node scripts/doom_public_browser_probe.mjs "$PAGE" "$CHROME" 5 19221 19222 "$PROFILE" snapshot
+node scripts/doom_public_browser_probe.mjs "$PAGE" "$CHROME" 5 19221 19222 "$PROFILE" cleanup
 ```
 
 The first visitor becomes the player. The relayer gives browsers random bearer
@@ -112,21 +119,68 @@ The Tokyo service stays loopback-bound; TLS terminates at Cloudflare Tunnel.
 
 ## Capacity and evidence limits
 
-Measured R15 evidence reports a 65,536-tic input capacity for its existing
-buffer. At the measured 29.377 engine tics per second in the 2026-09-28 send
-pipeline run, that implies roughly 37 minutes of continuous active engine time
-before the buffer is exhausted. This is an estimate from those two recorded
-values, not a measured public-mode uptime. Idle pauses do not advance that
-buffer. This implementation preserves the chain game state across a relayer
-restart, but does not automatically REINIT or replace an exhausted context; the
-seven-day process-duration setting must not be read as seven days of continuous
-play. When the sender exits, the page displays that the session stopped. A
-longer-lived game needs an owner-approved context rollover plan within the same
-spend cap.
+**Measured:** the existing R15 input buffer holds 65,536 tics. The 2026-09-28
+send-pipeline run measured 29.377 engine tics per second, which estimates about
+37 minutes of continuous active play before that buffer fills. This is a
+capacity estimate from those two measurements, not a measured public-mode
+uptime. Idle pauses do not advance the cursor.
+
+**Designed:** public mode starts a new segment at cursor 57,344 by default,
+leaving 8,192 tics of input capacity for the rollover. At 29.377 tics per
+second, that margin estimates about 279 seconds (4 minutes 39 seconds). Set
+`DOOM_PUBLIC_ROLLOVER_THRESHOLD` lower for a short test. When either the chain
+cursor or writable frontier reaches the threshold, the relayer stops the sender
+and drains the frame pipeline, runs RESET/9 through `scripts/stage_cap.sh` with a
+90-second cap, and verifies cursor zero plus an empty staged-input body on both
+RPCs. It then clears producer state, starts a fresh frame pipeline, and waits
+for the same player's next input. The page shows “New game starting…” during
+the reset. RESET/9 re-seeds the existing context from its sealed start state,
+so each rollover starts a new game; this path does not REINIT, REBUILD R15, or
+upgrade the program.
+If RESET/9 or either readback fails, the public session is marked stopped, the
+sender is closed, and the process releases the maintenance lock only when it
+still owns that lock.
+
+**Measured on testnet, 2026-09-29:** two rollover stages at the lowered
+512-tic threshold each started from cursor 512. Their 90-second-capped stages
+took 7.619 and 7.061 seconds and each RESET/9 fee was 5,000 lamports. Both
+RPCs read back cursor zero and a zeroed staged-input body; reset counts advanced
+43→44 and 44→45. Two real Chrome pages remained attached, and the same player
+continued into the new segment. The first deployed attempt reset the context
+successfully but stayed at the child's new execution gate; its zero-picture
+result is retained as
+`out/runs/doom-public-mode-2-2026-09-29/rollover-browser-active2.json`; its run
+receipt is
+`out/runs/doom-public-mode-2-2026-09-29/rollover-first/relayer-session.json`.
+The sender now requests a fresh resume after `rollover_complete`; the two
+successful rollovers and their run receipt are under
+`out/runs/doom-public-mode-2-2026-09-29/rollover-fixed/`. Simulated-browser
+tests cover both success and failure cleanup. A failed live RESET/9 was not
+deliberately triggered, and this short test does not establish week-long
+reliability.
+
+**Measured once on testnet with two real Chrome pages:** eight 23-second active
+stages totaled 184.013 seconds and delivered 715 distinct player pictures, or
+3.886 pictures per second. The comparison reference is 3.354 pictures per
+second, so this sample was 15.8% higher. Both used the `PROFILE=fast` settings
+from `scripts/doom_play.sh`: four render buffers, send rate 60, strip rate 64,
+minimum cursor step 6, six-tic advances, and pipeline depth 1. The public
+launcher had been passing the wrong depth variable and silently ran at depth 4;
+it now passes the same depth 1 setting. Across 1,241 matching picture indexes,
+player-to-spectator fanout measured 54 ms median, 163 ms p95, and 179 ms max.
+This is one testnet sample, not a public-service performance guarantee. Its
+browser and frame-arrival receipts are under
+`out/runs/doom-public-mode-2-2026-09-29/`.
 
 The default payer cap is hard-checked against the persisted original payer
 balance in the Python sender, which polls every five seconds while active. A
 small amount of already-submitted transaction fees can land between balance
 polls; this behavior is bounded by in-flight sends but has not been proven as a
 mathematically exact on-chain spend ceiling. Keep live tests at or below the
-explicit 2 FOGO demo cap and verify the payer balance after stopping.
+explicit 2 FOGO demo cap and verify the payer balance after stopping. In the
+same testnet run, the final session receipt reported 635.915923542 FOGO, then a
+fresh finalized RPC read after stop reported 635.915911786 FOGO; the 11,756
+lamport decrease is consistent with a late landing from an already-submitted
+transaction. That finalized balance was unchanged after 60 seconds. The
+post-stop minute measured zero additional spend; it does not rule out fees
+settling between the stop receipt and the first independent balance read.

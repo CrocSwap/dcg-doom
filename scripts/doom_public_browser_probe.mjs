@@ -3,19 +3,19 @@
 // The pages and their burner keys stay local; only their signed inputs reach
 // the supplied relayer URL.
 import {spawn} from "node:child_process";
-import {mkdirSync, mkdtempSync, rmSync} from "node:fs";
+import {mkdirSync, rmSync} from "node:fs";
 import {createServer as createNetServer} from "node:net";
 import {dirname, join, resolve} from "node:path";
 import {setTimeout as delay} from "node:timers/promises";
 import {fileURLToPath} from "node:url";
 
-const [pageUrl, chromePath, durationText = "30", portOneText = "19221", portTwoText = "19222", profileParent = "out/runs/doom-public-browser-probe", stageName = "complete"] = process.argv.slice(2);
+const [pageUrl, chromePath, durationText = "23", portOneText = "19221", portTwoText = "19222", profileParent = "out/runs/doom-public-browser-probe", stageName = "active"] = process.argv.slice(2);
 const durationSeconds = Number(durationText);
 const ports = [Number(portOneText), Number(portTwoText)];
-const supportedStages = new Set(["complete", "active", "continue", "idle", "cleanup"]);
-const maxDuration = stageName === "complete" ? 60 : 23;
+const supportedStages = new Set(["active", "continue", "idle", "snapshot", "cleanup"]);
+const maxDuration = 23;
 if (!pageUrl || !chromePath || !Number.isInteger(durationSeconds) || durationSeconds < 5 || durationSeconds > maxDuration || ports.some((port) => !Number.isInteger(port) || port < 1024 || port > 65535) || !supportedStages.has(stageName)) {
-  throw new Error("usage: doom_public_browser_probe.mjs PAGE_URL CHROME [ACTIVE_SECONDS 5..60] [DEBUG_PORT_1] [DEBUG_PORT_2] [PROFILE_PARENT] [complete|active|continue|idle|cleanup]");
+  throw new Error("usage: doom_public_browser_probe.mjs PAGE_URL CHROME [STAGE_SECONDS 5..23] [DEBUG_PORT_1] [DEBUG_PORT_2] [PROFILE_PARENT] [active|continue|idle|snapshot|cleanup]");
 }
 const relayBase = new URL(pageUrl).searchParams.get("relayer");
 if (!relayBase) throw new Error("PAGE_URL needs ?relayer=http://127.0.0.1:PORT");
@@ -23,7 +23,6 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const profileRoot = resolve(repoRoot, profileParent);
 mkdirSync(profileRoot, {recursive: true});
 const persistentProfiles = join(profileRoot, "persistent-chrome-profiles");
-const temporaryProfiles = stageName === "complete" ? mkdtempSync(join(profileRoot, "chrome-profiles-")) : persistentProfiles;
 if (stageName === "active") {
   for (let index = 1; index <= 2; index += 1) {
     const pidPath = join(persistentProfiles, `browser-${index}.pid`);
@@ -37,7 +36,7 @@ if (stageName === "active") {
   }
   rmSync(persistentProfiles, {recursive: true, force: true});
 }
-if (stageName !== "complete") mkdirSync(persistentProfiles, {recursive: true});
+mkdirSync(persistentProfiles, {recursive: true});
 const browsers = [];
 let browserStopPromise = null;
 let preserveBrowsers = false;
@@ -87,8 +86,8 @@ class Cdp {
   close() { this.socket.close(); }
 }
 
-async function connect(port, index) {
-  const deadline = Date.now() + 8_000;
+async function connect(port, index, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs;
   let target = null;
   while (Date.now() < deadline) {
     try {
@@ -111,18 +110,15 @@ async function launch(port, index) {
     portProbe.once("error", rejectPort);
     portProbe.listen(port, "127.0.0.1", () => portProbe.close(resolvePort));
   }).catch(() => { throw new Error(`Chrome debug port ${port} is already in use; refusing to attach to an unrelated browser`); });
-  const profile = join(temporaryProfiles, `browser-${index}`);
+  const profile = join(persistentProfiles, `browser-${index}`);
   const child = spawn(chromePath, [
     "--no-first-run", "--no-default-browser-check", "--headless=new", "--no-sandbox",
     "--disable-gpu", "--disable-dev-shm-usage", "--remote-debugging-address=127.0.0.1",
     `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, "about:blank",
   ], {stdio: "ignore", detached: true});
   browsers.push({child, cdp: null});
-  if (stageName !== "complete") {
-    mkdirSync(persistentProfiles, {recursive: true});
-    const {writeFileSync} = await import("node:fs");
-    writeFileSync(join(persistentProfiles, `browser-${index}.pid`), `${child.pid}\n`, {mode: 0o600});
-  }
+  const {writeFileSync} = await import("node:fs");
+  writeFileSync(join(persistentProfiles, `browser-${index}.pid`), `${child.pid}\n`, {mode: 0o600});
   const deadline = Date.now() + 12_000;
   let target = null;
   while (Date.now() < deadline && child.exitCode === null) {
@@ -205,9 +201,7 @@ async function stopBrowsers() {
     const timer = setTimeout(() => { child.kill("SIGKILL"); resolveExit(); }, 3_000);
     child.once("exit", () => { clearTimeout(timer); resolveExit(); });
   })));
-  if (stageName === "complete") {
-    rmSync(temporaryProfiles, {recursive: true, force: true});
-  } else {
+  {
     const {readFileSync, existsSync} = await import("node:fs");
     const {spawnSync} = await import("node:child_process");
     const tracked = [];
@@ -245,16 +239,18 @@ process.once("SIGINT", () => { void stopBrowsers().finally(() => process.exit(13
 process.once("SIGTERM", () => { void stopBrowsers().finally(() => process.exit(143)); });
 
 try {
-  const attachExisting = stageName === "continue" || stageName === "idle" || stageName === "cleanup";
-  const playerCdp = attachExisting ? await connect(ports[0], 1) : await launch(ports[0], 1);
+  const attachExisting = stageName === "continue" || stageName === "idle" || stageName === "snapshot" || stageName === "cleanup";
+  const attachTimeoutMs = 5_000;
+  const playerCdp = attachExisting ? await connect(ports[0], 1, attachTimeoutMs) : await launch(ports[0], 1);
   if (attachExisting) browsers.push({child: {exitCode: 0, signalCode: null}, cdp: playerCdp});
   else browsers.at(-1).cdp = playerCdp;
-  const preserveTurnCheck = stageName === "active" || stageName === "continue" || stageName === "complete";
-  const player = await waitFor(playerCdp, (state) => Boolean(state.token) && (!preserveTurnCheck || state.turn === "YOU"), "player browser session");
-  const spectatorCdp = attachExisting ? await connect(ports[1], 2) : await launch(ports[1], 2);
+  const preserveTurnCheck = stageName === "active" || stageName === "continue";
+  const sessionTimeoutMs = attachExisting ? 4_000 : 15_000;
+  const player = await waitFor(playerCdp, (state) => Boolean(state.token) && (!preserveTurnCheck || state.turn === "YOU"), "player browser session", sessionTimeoutMs);
+  const spectatorCdp = attachExisting ? await connect(ports[1], 2, attachTimeoutMs) : await launch(ports[1], 2);
   if (attachExisting) browsers.push({child: {exitCode: 0, signalCode: null}, cdp: spectatorCdp});
   else browsers.at(-1).cdp = spectatorCdp;
-  const spectator = await waitFor(spectatorCdp, (state) => Boolean(state.token) && (!preserveTurnCheck || state.turn === "SPECTATING"), "spectator browser session");
+  const spectator = await waitFor(spectatorCdp, (state) => Boolean(state.token) && (!preserveTurnCheck || state.turn === "SPECTATING"), "spectator browser session", sessionTimeoutMs);
   if (stageName === "cleanup") {
     console.log(JSON.stringify({stage: stageName, player: player.nickname, spectator: spectator.nickname}));
     preserveBrowsers = false;
@@ -268,6 +264,16 @@ try {
     }
     if (!paused || paused.paused_reason !== "idle") throw new Error("the active session did not report its idle pause within 62 seconds");
     console.log(JSON.stringify({stage: stageName, player: player.nickname, spectator: spectator.nickname, public_state: paused}, null, 2));
+    preserveBrowsers = true;
+  } else if (stageName === "snapshot") {
+    console.log(JSON.stringify({
+      stage: stageName,
+      player: player.nickname,
+      spectator: spectator.nickname,
+      player_frames: player.frames,
+      spectator_frames: spectator.frames,
+      public_state: await publicState(player.token),
+    }, null, 2));
     preserveBrowsers = true;
   } else {
   await playerCdp.evaluate(`dispatchEvent(new KeyboardEvent("keydown", {code:"ArrowUp", key:"ArrowUp", bubbles:true, cancelable:true}))`);
@@ -284,20 +290,6 @@ try {
   await delay(durationSeconds * 1000);
   const activeEndMs = Date.now();
   await playerCdp.evaluate(`dispatchEvent(new KeyboardEvent("keyup", {code:"ArrowUp", key:"ArrowUp", bubbles:true, cancelable:true})); dispatchEvent(new KeyboardEvent("keyup", {code:"ShiftLeft", key:"Shift", bubbles:true, cancelable:true}))`);
-
-  let beforePause = null;
-  let afterPause = null;
-  if (stageName === "complete") {
-    const pauseDeadline = Date.now() + 75_000;
-    while (Date.now() < pauseDeadline) {
-      const state = await publicState(player.token);
-      if (state.paused_reason === "idle") { beforePause = state; break; }
-      await delay(1_000);
-    }
-    if (!beforePause) throw new Error("the active session did not report an idle pause within 75 seconds");
-    await delay(10_000);
-    afterPause = await publicState(player.token);
-  }
 
   const playerAfter = await pageState(playerCdp);
   const spectatorAfter = await pageState(spectatorCdp);
@@ -324,14 +316,8 @@ try {
       max: delays.length ? Math.max(...delays) : null,
     },
     stage: stageName,
-    idle_pause: afterPause ? {
-      phase: afterPause.phase,
-      paused_reason: afterPause.paused_reason,
-      spend_before_fogo: beforePause.spend_fogo,
-      spend_after_fogo: afterPause.spend_fogo,
-      delta_fogo: Number((afterPause.spend_fogo - beforePause.spend_fogo).toFixed(9)),
-    } : null,
-    final_public_state: afterPause ?? await publicState(player.token),
+    idle_pause: null,
+    final_public_state: await publicState(player.token),
   };
   console.log(JSON.stringify(result, null, 2));
   preserveBrowsers = stageName === "active" || stageName === "continue";
@@ -339,7 +325,7 @@ try {
 } finally {
   if (!preserveBrowsers) {
     await stopBrowsers();
-    if (stageName !== "complete") rmSync(persistentProfiles, {recursive: true, force: true});
+    rmSync(persistentProfiles, {recursive: true, force: true});
   } else {
     // The Chrome processes live across active stages, but the probe process
     // should not. Keep the browsers and release their DevTools sockets here.
