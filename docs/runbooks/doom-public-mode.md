@@ -101,6 +101,24 @@ scripts/doom_public.sh status
 scripts/doom_public.sh stop
 ```
 
+`DOOM_PUBLIC_ESTIMATE_HORIZON` defaults to 600 seconds. It sets the active
+window used by the conservative fee preflight; it does not change the process
+duration from `DOOM_PUBLIC_SECONDS` or the live payer-balance cap. The estimate
+includes a priority-fee bound that grows faster than linearly with the window,
+so a low cap can reject the default horizon before the session starts. For
+example, a 1 FOGO test cap was estimated above the cap at 600 seconds. With the
+current public send settings, 450 seconds estimates about 0.91 FOGO; set
+`DOOM_PUBLIC_ESTIMATE_HORIZON=450` for that test and confirm the start receipt's
+estimate is below the remaining cap:
+
+```sh
+DOOM_PUBLIC_SPEND_CAP=1 DOOM_PUBLIC_ESTIMATE_HORIZON=450 \
+  DOOM_PUBLIC_ORIGIN=https://basanos-doom-public.pages.dev scripts/doom_public.sh start
+```
+
+The estimate is a preflight bound, not a promise that the run will use that
+amount.
+
 Start refuses to run when the owner launcher, another relayer, or any Tokyo
 maintenance lock is present. Stop verifies the public lock and exact run
 directory before signaling its process, then requires zero Tokyo Doom relayers

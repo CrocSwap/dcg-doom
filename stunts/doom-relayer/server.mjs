@@ -11,6 +11,7 @@
 // Buildless, no dependencies, node >= 20.
 
 import {createServer as createHttpServer} from "node:http";
+import {isIP} from "node:net";
 import {createPublicKey, verify as nodeVerify} from "node:crypto";
 import {readFileSync, rmSync, rmdirSync} from "node:fs";
 
@@ -27,9 +28,18 @@ import {
 import {DEFAULT_NETWORK, NETWORKS, requireNetwork, explorerTransaction} from "../../web/doom-play/network.js";
 import {SlotPool, PoolError, SLOT_STATE, makeSlot} from "./pool.mjs";
 import {createSender, SenderError} from "./sender.mjs";
-import {PublicMode, PublicModeError} from "./public-mode.mjs";
+import {installPublicStateFlushHandlers, PublicMode, PublicModeError} from "./public-mode.mjs";
 
 export const API_VERSION = "doom-relayer/1";
+
+export function assertPublicLoopbackHost(host, publicMode) {
+  if (!publicMode) return;
+  const ipv4Loopback = isIP(host) === 4 && Number(host.split(".")[0]) === 127;
+  const ipv6Loopback = isIP(host) === 6 && host.toLowerCase() === "::1";
+  if (!ipv4Loopback && !ipv6Loopback) {
+    throw new Error("public mode requires --host to be a loopback IP address (127.0.0.0/8 or ::1)");
+  }
+}
 
 const JSON_LIMIT = 64 * 1024;
 const SESSION_TTL_MS = 45 * 60 * 1000;
@@ -1382,6 +1392,8 @@ export function parseArgs(argv) {
 if (isMain()) {
   const args = parseArgs(process.argv);
   const mode = args.get("mode") ?? "mock";
+  const host = args.get("host") ?? "127.0.0.1";
+  assertPublicLoopbackHost(host, args.has("public-mode"));
   const port = Number(args.get("port") ?? 8787);
   const network = args.get("network") ?? DEFAULT_NETWORK;
   const spendCapFogo = Number(args.get("spend-cap-fogo") ?? (args.has("public-mode") ? 300 : 10));
@@ -1455,12 +1467,12 @@ if (isMain()) {
     publicMaxViewers: args.get("public-max-viewers") ? Number(args.get("public-max-viewers")) : 200,
     publicSpendCapFogo: spendCapFogo,
   });
+  installPublicStateFlushHandlers(relayer.publicMode);
   const corsOrigin = args.get("cors-origin") ?? "*";
   const server = createServer(relayer, {onLog: (line) => logger(line), corsOrigin});
   // The listen address is named rather than left to node, because the relayer
   // is reached through an SSH tunnel and must not be on every interface by
   // accident.
-  const host = args.get("host") ?? "127.0.0.1";
   let stopping = false;
   let publicFailureStopping = false;
   const releaseOwnedPublicLock = (owner) => {

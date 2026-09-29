@@ -1,12 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import {spawnSync} from "node:child_process";
 import {mkdtempSync, readFileSync, rmSync, statSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
+import {fileURLToPath} from "node:url";
 import {webcrypto} from "node:crypto";
+import {EventEmitter} from "node:events";
 
 import {encodeInput, signingPayload} from "../../../web/doom-play/input.js";
-import {createRelayer, createServer} from "../server.mjs";
+import {assertPublicLoopbackHost, createRelayer, createServer} from "../server.mjs";
+import {installPublicStateFlushHandlers} from "../public-mode.mjs";
 
 const subtle = webcrypto.subtle;
 
@@ -133,6 +137,76 @@ test("six simulated browsers share one game, rotate five-second offers, and acce
     assert.equal(state.body.is_player, true);
     assert.equal(relayer.publicMode.state(joined[0].token).is_player, false);
   });
+});
+
+test("public join limits group IPv6 clients by canonical /64", async () => {
+  await publicServer({}, async ({call}) => {
+    const addresses = [
+      "2001:db8:1234:5678::1",
+      "2001:0db8:1234:5678:ffff::2",
+      "2001:db8:1234:5678:abcd::3",
+      "2001:db8:1234:5678:0:0:0:4",
+    ];
+    for (const address of addresses) {
+      const client = await browser();
+      assert.equal((await call("POST", "/v1/public/join", {publicKey: client.publicKey}, undefined, address)).status, 200);
+    }
+    const fifth = await browser();
+    const denied = await call("POST", "/v1/public/join", {publicKey: fifth.publicKey}, undefined, "2001:db8:1234:5678:eeee::5");
+    assert.equal(denied.status, 429, "a fifth address in the same IPv6 /64 shares the join cap");
+    const otherSubnet = await browser();
+    const allowed = await call("POST", "/v1/public/join", {publicKey: otherSubnet.publicKey}, undefined, "2001:db8:1234:5679::1");
+    assert.equal(allowed.status, 200, "another /64 receives its own join cap");
+  });
+});
+
+test("public mode accepts only explicit loopback listen addresses", () => {
+  assert.doesNotThrow(() => assertPublicLoopbackHost("127.0.0.1", true));
+  assert.doesNotThrow(() => assertPublicLoopbackHost("127.24.3.9", true));
+  assert.doesNotThrow(() => assertPublicLoopbackHost("::1", true));
+  for (const host of ["0.0.0.0", "192.0.2.1", "::", "localhost"]) {
+    assert.throws(() => assertPublicLoopbackHost(host, true), /loopback IP address/);
+  }
+  assert.doesNotThrow(() => assertPublicLoopbackHost("0.0.0.0", false));
+
+  const serverPath = fileURLToPath(new URL("../server.mjs", import.meta.url));
+  const refused = spawnSync(process.execPath, [serverPath, "--mode", "mock", "--public-mode", "--host", "0.0.0.0"], {encoding: "utf8"});
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /public mode requires --host to be a loopback IP address/);
+});
+
+test("public state flush bypasses throttling on stop, signals, and normal process exit", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "doom-public-flush-"));
+  const path = join(temporary, "state.json");
+  try {
+    await publicServer({publicStatePath: path}, async ({relayer}) => {
+      relayer.publicMode.lastPersistAt = Date.now();
+      relayer.publicMode.onPipelineEvent({event: "progress", spend_fogo: 0.125, cursor: 8});
+      assert.notEqual(JSON.parse(readFileSync(path, "utf8")).spend_fogo, 0.125, "progress is still throttled before flush");
+
+      const processLike = new EventEmitter();
+      installPublicStateFlushHandlers(relayer.publicMode, processLike);
+      processLike.emit("SIGINT");
+      assert.equal(JSON.parse(readFileSync(path, "utf8")).spend_fogo, 0.125, "SIGINT writes the throttled update");
+
+      relayer.publicMode.lastPersistAt = Date.now();
+      relayer.publicMode.onPipelineEvent({event: "progress", spend_fogo: 0.1875, cursor: 12});
+      processLike.emit("SIGTERM");
+      assert.equal(JSON.parse(readFileSync(path, "utf8")).spend_fogo, 0.1875, "SIGTERM writes the throttled update");
+
+      relayer.publicMode.lastPersistAt = Date.now();
+      relayer.publicMode.onPipelineEvent({event: "progress", spend_fogo: 0.25, cursor: 16});
+      processLike.emit("exit");
+      assert.equal(JSON.parse(readFileSync(path, "utf8")).spend_fogo, 0.25, "normal exit writes the throttled update");
+
+      relayer.publicMode.lastPersistAt = Date.now();
+      relayer.publicMode.onPipelineEvent({event: "progress", spend_fogo: 0.3125, cursor: 20});
+      relayer.publicMode.stop();
+      assert.equal(JSON.parse(readFileSync(path, "utf8")).spend_fogo, 0.3125, "stop writes the throttled update immediately");
+    });
+  } finally {
+    rmSync(temporary, {recursive: true, force: true});
+  }
 });
 
 test("empty lobby pauses, next accepted input resumes, death text and fanout survive the HTTP stream", async () => {
