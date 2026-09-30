@@ -599,6 +599,14 @@ fn render_doom_view(
                         &mut payload_len,
                     )
                 };
+                #[cfg(all(feature = "sbf", target_os = "solana"))]
+                if rc != 0 {
+                    solana_program::msg!(
+                        "doom initialization engine phase {} refused with rc={}",
+                        phase_index,
+                        rc
+                    );
+                }
                 engine_error(rc)?;
                 if payload_len > rsn3::MAX_PAYLOAD_BYTES {
                     return Err(KernelError::InvalidInput);
