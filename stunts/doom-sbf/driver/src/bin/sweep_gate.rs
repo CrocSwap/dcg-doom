@@ -603,10 +603,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut profile = false;
     let mut expected_golden = None;
     let mut allow_rebased_start = false;
+    let mut skip_legacy_rsn2 = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--profile" => profile = true,
             "--allow-rebased-start" => allow_rebased_start = true,
+            "--skip-legacy-rsn2" => skip_legacy_rsn2 = true,
             "--tics" => tics = args.next().ok_or("--tics value")?.parse()?,
             "--expected-golden" => {
                 expected_golden = Some(PathBuf::from(args.next().ok_or("--expected-golden path")?))
@@ -1703,83 +1705,86 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "snapshot_committed_cursor".into(),
         serde_json::json!({"ok":true,"cursor":view.cursor,"cu":base::units(&result)?}),
     );
-    // DOOM-RSN/2 initialization and write are exercised on the same real
-    // SIM2 state produced by the preceding DEPOSIT/ADVANCE instructions.
-    let init_snapshot = gate.init_render_snapshot_ix();
-    let init_result = gate.send(vec![init_snapshot], &[]).await?;
-    if init_result.result.is_err() {
-        return Err(format!("render snapshot init {:?}", init_result.result).into());
-    }
-    let snapshot_key = gate.render_snapshot_address();
-    let init_lamports = gate
-        .ctx
-        .banks_client
-        .get_account(snapshot_key)
-        .await?
-        .ok_or("render snapshot PDA missing after init")?
-        .lamports;
-    let durable_before_snapshot = gate.durable().await?;
-    let write_snapshot = gate.write_render_snapshot_ix(view.cursor, &view.state_root);
-    let write_result = gate.send(vec![write_snapshot], &[]).await?;
-    if write_result.result.is_err() {
-        return Err(format!(
-            "render snapshot at committed cursor {:?}",
-            write_result.result
+    if !skip_legacy_rsn2 {
+        // DOOM-RSN/2 initialization and write are exercised on the same real
+        // SIM2 state produced by the preceding DEPOSIT/ADVANCE instructions.
+        let init_snapshot = gate.init_render_snapshot_ix();
+        let init_result = gate.send(vec![init_snapshot], &[]).await?;
+        if init_result.result.is_err() {
+            return Err(format!("render snapshot init {:?}", init_result.result).into());
+        }
+        let snapshot_key = gate.render_snapshot_address();
+        let init_lamports = gate
+            .ctx
+            .banks_client
+            .get_account(snapshot_key)
+            .await?
+            .ok_or("render snapshot PDA missing after init")?
+            .lamports;
+        let durable_before_snapshot = gate.durable().await?;
+        let write_snapshot = gate.write_render_snapshot_ix(view.cursor, &view.state_root);
+        let write_result = gate.send(vec![write_snapshot], &[]).await?;
+        if write_result.result.is_err() {
+            return Err(format!(
+                "render snapshot at committed cursor {:?}",
+                write_result.result
+            )
+            .into());
+        }
+        let snapshot_bytes = gate.data(snapshot_key).await?;
+        let snapshot = render_snapshot::validate_snapshot(&snapshot_bytes)?;
+        let state_bytes = gate.data(state_kp.pubkey()).await?;
+        if snapshot.cursor != view.cursor
+            || snapshot.state_root != view.state_root
+            || snapshot.state.as_ref() != &state_bytes[..snapshot.state_len]
+            || gate.durable().await? != durable_before_snapshot
+        {
+            return Err("render snapshot differs from the committed SIM2 state".into());
+        }
+        controls.insert(
+            "render_snapshot_committed_cursor".into(),
+            serde_json::json!({
+                "ok": true,
+                "cursor": snapshot.cursor,
+                "gametic": snapshot.gametic,
+                "state_len": snapshot.state_len,
+                "snapshot_bytes": snapshot_bytes.len(),
+                "snapshot_hash": hex(&snapshot.snapshot_hash),
+                "snapshot_rent_lamports": init_lamports,
+                "init_cu": base::units(&init_result)?,
+                "write_cu": base::units(&write_result)?,
+                "tic_accounts_unchanged": true
+            }),
+        );
+        let committed_snapshot = snapshot_bytes;
+        let stale_render_snapshot =
+            gate.write_render_snapshot_ix(view.cursor - 1, &view.state_root);
+        refused(
+            &mut gate,
+            &mut controls,
+            "render_snapshot_stale_cursor",
+            sim2::REFUSE_SNAPSHOT,
+            vec![stale_render_snapshot],
+            &[],
         )
-        .into());
-    }
-    let snapshot_bytes = gate.data(snapshot_key).await?;
-    let snapshot = render_snapshot::validate_snapshot(&snapshot_bytes)?;
-    let state_bytes = gate.data(state_kp.pubkey()).await?;
-    if snapshot.cursor != view.cursor
-        || snapshot.state_root != view.state_root
-        || snapshot.state.as_ref() != &state_bytes[..snapshot.state_len]
-        || gate.durable().await? != durable_before_snapshot
-    {
-        return Err("render snapshot differs from the committed SIM2 state".into());
-    }
-    controls.insert(
-        "render_snapshot_committed_cursor".into(),
-        serde_json::json!({
-            "ok": true,
-            "cursor": snapshot.cursor,
-            "gametic": snapshot.gametic,
-            "state_len": snapshot.state_len,
-            "snapshot_bytes": snapshot_bytes.len(),
-            "snapshot_hash": hex(&snapshot.snapshot_hash),
-            "snapshot_rent_lamports": init_lamports,
-            "init_cu": base::units(&init_result)?,
-            "write_cu": base::units(&write_result)?,
-            "tic_accounts_unchanged": true
-        }),
-    );
-    let committed_snapshot = snapshot_bytes;
-    let stale_render_snapshot = gate.write_render_snapshot_ix(view.cursor - 1, &view.state_root);
-    refused(
-        &mut gate,
-        &mut controls,
-        "render_snapshot_stale_cursor",
-        sim2::REFUSE_SNAPSHOT,
-        vec![stale_render_snapshot],
-        &[],
-    )
-    .await?;
-    if gate.data(snapshot_key).await? != committed_snapshot {
-        return Err("stale render snapshot request changed the committed snapshot".into());
-    }
-    let wrong_render_snapshot =
-        gate.write_render_snapshot_ix(view.cursor, &oracle.tics[0].state_root);
-    refused(
-        &mut gate,
-        &mut controls,
-        "render_snapshot_wrong_root",
-        sim2::REFUSE_SNAPSHOT,
-        vec![wrong_render_snapshot],
-        &[],
-    )
-    .await?;
-    if gate.data(snapshot_key).await? != committed_snapshot {
-        return Err("wrong-root render snapshot request changed the committed snapshot".into());
+        .await?;
+        if gate.data(snapshot_key).await? != committed_snapshot {
+            return Err("stale render snapshot request changed the committed snapshot".into());
+        }
+        let wrong_render_snapshot =
+            gate.write_render_snapshot_ix(view.cursor, &oracle.tics[0].state_root);
+        refused(
+            &mut gate,
+            &mut controls,
+            "render_snapshot_wrong_root",
+            sim2::REFUSE_SNAPSHOT,
+            vec![wrong_render_snapshot],
+            &[],
+        )
+        .await?;
+        if gate.data(snapshot_key).await? != committed_snapshot {
+            return Err("wrong-root render snapshot request changed the committed snapshot".into());
+        }
     }
     let stale = gate.snapshot_ix(view.cursor - 1, &view.state_root);
     refused(
@@ -2141,6 +2146,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
         "render": {
             "abi": "DOOM-RENDER-SNAPSHOT/3",
+            "legacy_rsn2_skipped": skip_legacy_rsn2,
             "cursor": view.cursor,
             "state_root": hex(&view.state_root),
             "snapshot": snapshot_golden,
@@ -2301,6 +2307,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "manifest_source_tree": manifest_json["source_tree"],
             "diagnostic_profile_run": profile,
             "allow_rebased_start": allow_rebased_start,
+            "skip_legacy_rsn2": skip_legacy_rsn2,
             "retained_gate_a_roots_match": retained_gate_a_roots_match,
             "first_retained_root_mismatch_tic": retained_root_mismatch,
             "command_line": argv,
