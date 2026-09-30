@@ -542,7 +542,9 @@ pub fn process_instruction<'a>(
         accounts,
         instruction_data,
         &kernel,
-        doom_sbf::transport_process_instruction,
+        |program_id, accounts, instruction_data| {
+            doom_sbf::transport_process_instruction(program_id, accounts, instruction_data)
+        },
     )
 }
 
