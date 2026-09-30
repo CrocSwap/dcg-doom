@@ -49,6 +49,7 @@ const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
 const ZERO_BUFFER: Pubkey = Pubkey::new_from_array([0xb1; 32]);
 const DECOY_META: Pubkey = Pubkey::new_from_array([0xb2; 32]);
 const STAGE_CHUNK: usize = 900;
+const RENDER_COMPUTE_LIMIT: u32 = 30_000_000;
 const HOLD: [u32; 2] = [37, 555];
 const PHASE_MAGIC: &str = "0x444f4f4d50484153";
 const SIM_TRANSPORT_E2R_VERSION: u32 = 5;
@@ -148,11 +149,21 @@ impl Gate {
         instructions: Vec<Instruction>,
         signers: &[&Keypair],
     ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
+        self.send_with_compute_limit(base::NORMAL_LIMIT, instructions, signers)
+            .await
+    }
+
+    async fn send_with_compute_limit(
+        &mut self,
+        compute_limit: u32,
+        instructions: Vec<Instruction>,
+        signers: &[&Keypair],
+    ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
         // A unique compute-unit price per transaction keeps otherwise
         // identical sweeps distinct; it does not change the compute limit.
         self.nonce += 1;
         let mut all = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(base::NORMAL_LIMIT),
+            ComputeBudgetInstruction::set_compute_unit_limit(compute_limit),
             ComputeBudgetInstruction::set_compute_unit_price(self.nonce),
         ];
         all.extend(instructions);
@@ -714,7 +725,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
-    bank.set_compute_max_units(base::NORMAL_LIMIT as u64);
+    bank.set_compute_max_units(RENDER_COMPUTE_LIMIT as u64);
     bank.add_program("doom_sbf", base::PROGRAM, None);
     bank.add_account(
         keys.context.pubkey(),
@@ -1921,7 +1932,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // --- RSN/3 committed-state rendering ---------------------------------------
     let snapshot_key = rsn3::snapshot_address(&base::PROGRAM, &gate.keys.context.pubkey()).0;
     let snapshot_ix = gate.render_snapshot_v3_ix(view.cursor, &view.state_root);
-    let snapshot_result = gate.send(vec![snapshot_ix], &[]).await?;
+    let snapshot_result = gate
+        .send_with_compute_limit(RENDER_COMPUTE_LIMIT, vec![snapshot_ix], &[])
+        .await?;
     if snapshot_result.result.is_err() {
         return Err(format!("RSN/3 snapshot {:?}", snapshot_result.result).into());
     }
@@ -1947,7 +1960,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut render_controls = serde_json::Map::new();
     for strip_id in 0..8u8 {
         let ix = gate.render_strip_v3_ix(snapshot_key, strip_id, view.cursor, snapshot_hash);
-        let result = gate.send(vec![ix], &[]).await?;
+        let result = gate
+            .send_with_compute_limit(RENDER_COMPUTE_LIMIT, vec![ix], &[])
+            .await?;
         if result.result.is_err() {
             return Err(format!("RSN/3 strip {strip_id}: {:?}", result.result).into());
         }
@@ -1982,7 +1997,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }));
         strip_compute.push(serde_json::json!({
             "strip_id": strip_id,
-            "requested_cu_limit": base::NORMAL_LIMIT,
+            "requested_cu_limit": RENDER_COMPUTE_LIMIT,
             "consumed_cu": base::units(&result)?,
         }));
     }
@@ -2083,7 +2098,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "profile": "DOOM-RSN/3 standalone SBF under local ProgramTest prefer_bpf(true)",
             "cursor": view.cursor,
             "state_root": hex(&view.state_root),
-            "requested_cu_limit": base::NORMAL_LIMIT,
+            "requested_cu_limit": RENDER_COMPUTE_LIMIT,
             "snapshot_consumed_cu": base::units(&snapshot_result)?,
             "strip_compute": strip_compute,
             "snapshot_hash": hex(&snapshot_hash),
