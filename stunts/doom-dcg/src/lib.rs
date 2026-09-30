@@ -990,6 +990,14 @@ impl StatefulKernel for DoomKernel {
                             || mirror_len != state[2].data.len()
                             || frame_len != RENDER_PIXEL_BYTES
                         {
+                            #[cfg(all(feature = "sbf", target_os = "solana"))]
+                            solana_program::msg!(
+                                "doom finalization rejected rc={} state={} mirror={} frame={}",
+                                finalize_rc,
+                                state_len,
+                                mirror_len,
+                                frame_len
+                            );
                             return Err(KernelError::Refused);
                         }
                         let publish_rc = doom_sbf_sim2_publish(
