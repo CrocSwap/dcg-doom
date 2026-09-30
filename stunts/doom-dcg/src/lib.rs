@@ -178,6 +178,9 @@ pub static DOOM_DCG_APPLICATION_MANIFEST: ApplicationManifest = ApplicationManif
     application_id: APPLICATION_ID,
     version: APPLICATION_VERSION,
     kernels: &KERNELS,
+    optimistic_replays: &[],
+    legacy_forms: &[],
+    require_legacy_form_binding: false,
 };
 
 /// Retain the existing Doom SVM entrypoint in the composed image. It still
