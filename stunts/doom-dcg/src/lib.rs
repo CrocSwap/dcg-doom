@@ -862,6 +862,11 @@ impl StatefulKernel for DoomKernel {
         commitment: &[u8; 32],
         state: &mut [StateSpanMut<'_>],
     ) -> Result<usize, KernelError> {
+        #[cfg(all(feature = "sbf", target_os = "solana"))]
+        if phase.cursor == 9_912_320 {
+            solana_program::msg!("doom final tail callback enter");
+            solana_program::log::sol_log_compute_units();
+        }
         if let Err(error) = Self::validate_spans(state) {
             #[cfg(all(feature = "sbf", target_os = "solana"))]
             solana_program::msg!("doom init state spans rejected");
@@ -877,6 +882,11 @@ impl StatefulKernel for DoomKernel {
             solana_program::msg!("doom init resource bundle rejected");
             error
         })?;
+        #[cfg(all(feature = "sbf", target_os = "solana"))]
+        if phase.cursor == 9_912_320 {
+            solana_program::msg!("doom final tail resource parsed");
+            solana_program::log::sol_log_compute_units();
+        }
         let context = self.context_ptr()?;
         if context != state[0].data.as_mut_ptr() {
             #[cfg(all(feature = "sbf", target_os = "solana"))]
@@ -1034,6 +1044,11 @@ impl StatefulKernel for DoomKernel {
         {
             let _ = (phase, bundle);
             return Err(KernelError::Refused);
+        }
+        #[cfg(all(feature = "sbf", target_os = "solana"))]
+        if phase.cursor == 9_912_320 {
+            solana_program::msg!("doom final tail callback done");
+            solana_program::log::sol_log_compute_units();
         }
         Ok(count)
     }
