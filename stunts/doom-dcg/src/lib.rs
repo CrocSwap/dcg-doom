@@ -537,15 +537,13 @@ pub fn process_instruction<'a>(
     instruction_data: &[u8],
 ) -> solana_program::entrypoint::ProgramResult {
     let kernel = DoomKernel::default();
-    dcg_program::stateful::process_with_kernel_or_else(
-        program_id,
-        accounts,
-        instruction_data,
-        &kernel,
-        |program_id, accounts, instruction_data| {
-            doom_sbf::transport_process_instruction(program_id, accounts, instruction_data)
-        },
-    )
+    if instruction_data.first().is_some_and(|tag| {
+        (dcg_program::stateful::TAG_OPEN_SESSION..=dcg_program::stateful::TAG_ANCHOR).contains(tag)
+    }) {
+        dcg_program::stateful::process_with_kernel(program_id, accounts, instruction_data, &kernel)
+    } else {
+        doom_sbf::transport_process_instruction(program_id, accounts, instruction_data)
+    }
 }
 
 #[cfg(feature = "sbf")]
