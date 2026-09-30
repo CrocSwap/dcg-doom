@@ -308,6 +308,12 @@ impl DoomKernel {
         if pointer as usize == DOOM_CONTEXT_ADDRESS {
             Ok(())
         } else {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!(
+                "doom context address got={} expected={}",
+                pointer as usize,
+                DOOM_CONTEXT_ADDRESS
+            );
             Err(KernelError::Refused)
         }
     }
@@ -694,7 +700,11 @@ impl StatefulKernel for DoomKernel {
     }
 
     fn bind_invocation_state(&self, spans: &mut [StateSpanMut<'_>]) -> Result<(), KernelError> {
-        Self::validate_spans(spans)?;
+        if let Err(error) = Self::validate_spans(spans) {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom bind state spans rejected");
+            return Err(error);
+        }
         let address = spans[0].data_address();
         if address.is_null() {
             return Err(KernelError::Refused);
@@ -807,14 +817,25 @@ impl StatefulKernel for DoomKernel {
         commitment: &[u8; 32],
         state: &mut [StateSpanMut<'_>],
     ) -> Result<usize, KernelError> {
-        Self::validate_spans(state)?;
-        let bundle = if phase.cursor == 0 {
-            self.validate_resources(resources, commitment)?
+        if let Err(error) = Self::validate_spans(state) {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom init state spans rejected");
+            return Err(error);
+        }
+        let bundle = (if phase.cursor == 0 {
+            self.validate_resources(resources, commitment)
         } else {
-            self.parse_resources(resources, commitment)?
-        };
+            self.parse_resources(resources, commitment)
+        })
+        .map_err(|error| {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom init resource bundle rejected");
+            error
+        })?;
         let context = self.context_ptr()?;
         if context != state[0].data.as_mut_ptr() {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom init context pointer differs from primary span");
             return Err(KernelError::Refused);
         }
         Self::require_context_address(context)?;
