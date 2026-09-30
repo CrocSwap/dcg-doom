@@ -602,9 +602,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut seed = 0x5eed_d00d_2026_0922u64;
     let mut profile = false;
     let mut expected_golden = None;
+    let mut allow_rebased_start = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--profile" => profile = true,
+            "--allow-rebased-start" => allow_rebased_start = true,
             "--tics" => tics = args.next().ok_or("--tics value")?.parse()?,
             "--expected-golden" => {
                 expected_golden = Some(PathBuf::from(args.next().ok_or("--expected-golden path")?))
@@ -668,7 +670,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bump,
     };
 
-    // Oracle in this process, tied to gate (a)'s retained per-tic roots.
+    // Oracle in this process.  By default it must start at gate (a)'s exact
+    // captured state; an explicitly rebased start still has to match the
+    // retained four-byte DEMO1 command tape exactly.
     let oracle = common::sequential_oracle(&capture_data, &commands, &keys.context.pubkey())?;
     if oracle.frame.len() != resource_sbf::RI2_FRAME_BYTES {
         return Err(format!(
@@ -694,7 +698,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if let Some(i) = (0..tics).find(|&i| retained_roots[i] != hex(&oracle.tics[i].state_root)) {
+    let retained_root_mismatch =
+        (0..tics).find(|&i| retained_roots[i] != hex(&oracle.tics[i].state_root));
+    if let Some(i) = retained_root_mismatch.filter(|_| !allow_rebased_start) {
         return Err(format!(
             "in-process oracle differs from the retained gate-(a) oracle at seq {i}: retained {} computed {}",
             retained_roots[i],
@@ -702,6 +708,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let retained_gate_a_roots_match = retained_root_mismatch.is_none();
 
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
@@ -2114,6 +2121,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "capture_profile": "captured DEMO1",
             "tics": tics,
             "commands_sha256": base::sha(&commands),
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
             "resource_sha256": base::sha(&capture_data.resource),
             "wad_payload_sha256": capture_data.wad_payload_sha256,
             "wad_accounts": wad_accounts,
@@ -2129,6 +2137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "final_state_root": hex(&view.state_root),
             "final_st1_account_sha256": base::sha(&final_state),
             "final_mp1_sha256": base::sha(&final_mirror),
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
         },
         "render": {
             "abi": "DOOM-RENDER-SNAPSHOT/3",
@@ -2275,6 +2284,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "final_input_chain": hex(&view.input_chain),
             "final_st1_account_sha256": base::sha(&final_state),
             "final_mp1_sha256": base::sha(&final_mirror),
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
             "oracle_equal_every_running_sweep": true,
             "tic_reserve_cu": sim2::TIC_RESERVE_CU,
             "publish_reserve_cu": sim2::PUBLISH_RESERVE_CU,
@@ -2290,6 +2300,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "manifest_sha256": base::sha(&manifest_bytes),
             "manifest_source_tree": manifest_json["source_tree"],
             "diagnostic_profile_run": profile,
+            "allow_rebased_start": allow_rebased_start,
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
+            "first_retained_root_mismatch_tic": retained_root_mismatch,
             "command_line": argv,
             "capture": capture.display().to_string(),
             "resource_sha256": base::sha(&capture_data.resource),
