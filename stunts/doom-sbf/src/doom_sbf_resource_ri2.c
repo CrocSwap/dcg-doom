@@ -2269,7 +2269,10 @@ int doom_engine_rsn3_build_static_phase(
         if (r2_v2_preflight(resource, (size_t)resource_bytes, sections, plan))
             return RI2_REFUSE_IMAGE;
         RI2_PHASE(1001);
-        memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+        /* DCG created this primary state account as zeroed data, then copied
+         * the WAD image into its reserved range in bounded initialization
+         * phases.  Clearing the full 9.7 MB context here both exceeds one SVM
+         * instruction budget and destroys that already-committed WAD image. */
         doom_ctx_init();
         if (!doom_sbf_bind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
                                  RI2_ZONE_BYTES)) return RI2_REFUSE_ARENA;
