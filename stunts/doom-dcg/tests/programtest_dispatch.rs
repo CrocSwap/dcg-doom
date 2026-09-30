@@ -27,7 +27,7 @@ const RESOURCE: Pubkey = Pubkey::new_from_array(RESOURCE_KEY);
 const WRONG_RESOURCE: Pubkey = Pubkey::new_from_array([0xd1; 32]);
 const SYSTEM: Pubkey = system_program::ID;
 const STATE_LENGTHS: [u32; 3] = [ENGINE_CONTEXT_BYTES, ST1_ACCOUNT_BYTES, MP1_ACCOUNT_BYTES];
-const STREAM_CAPACITY: u32 = 1_024;
+const STREAM_CAPACITY: u32 = 512;
 const COMMAND_WIDTH: usize = 4;
 const WRITE_BATCH: usize = 8;
 const RESOURCE_GROW_BATCH: usize = 8;
@@ -830,17 +830,19 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let stream_cu = send(&mut context, create_stream(payer, session), &[], Ok(())).await;
     let state_create_cu = send(&mut context, create_state(payer, session), &[], Ok(())).await;
 
-    let write_ops = (0..1_000)
-        .map(|seq| write_input(authority.pubkey(), session, seq, command_at(seq as usize)))
-        .collect::<Vec<_>>();
-    let mut input_write_cu = Vec::new();
-    let mut input_write_instruction_cu = Vec::new();
-    for batch in write_ops.chunks(WRITE_BATCH) {
-        let (transaction_cu, instruction_cu) =
-            send_many(&mut context, batch.to_vec(), &[&authority]).await;
-        input_write_cu.push(transaction_cu);
-        input_write_instruction_cu.extend(instruction_cu);
-    }
+    // Keep the ring backlog within its 512-slot allocation. Commands are
+    // written up to each next ADVANCE batch rather than filling the whole
+    // 1,000-command stream before the engine has consumed any slots.
+    let first_write_cu = send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0, command_at(0)),
+        &[&authority],
+        Ok(()),
+    )
+    .await;
+    let mut input_write_cu = vec![first_write_cu];
+    let mut input_write_instruction_cu = vec![first_write_cu];
+    let mut written = 1u32;
 
     // These two failures happen against the actual unsealed session and before
     // its first initialization phase. The failed transactions roll back.
@@ -925,6 +927,25 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     for boundary in golden["sim2"]["sweep_boundaries"].as_array().unwrap() {
         let target = boundary["cursor"].as_u64().unwrap() as u32;
         while cursor < target {
+            let write_target = target.min(cursor.saturating_add(8));
+            while written < write_target {
+                let end = (written + WRITE_BATCH as u32).min(write_target);
+                let batch = (written..end)
+                    .map(|sequence| {
+                        write_input(
+                            authority.pubkey(),
+                            session,
+                            sequence,
+                            command_at(sequence as usize),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let (transaction_cu, instruction_cu) =
+                    send_many(&mut context, batch, &[&authority]).await;
+                input_write_cu.push(transaction_cu);
+                input_write_instruction_cu.extend(instruction_cu);
+                written = end;
+            }
             let steps = (target - cursor).min(8) as u8;
             let cu = send(
                 &mut context,
