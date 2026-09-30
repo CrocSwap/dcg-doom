@@ -6,7 +6,8 @@
 
 use dcg_program::{hash::sha256, kernel::Kernel, stateful as sw, stateful::v3};
 use doom_dcg::{
-    DoomKernel, DOOM_KERNEL_ID, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V3, MP1_ACCOUNT_BYTES,
+    DoomKernel, DOOM_KERNEL_ID, DOOM_RESOURCE_COMMITMENT, ENGINE_CONTEXT_BYTES,
+    MODE_CONSENSUS_V3, MP1_ACCOUNT_BYTES,
     RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES, ST1_ACCOUNT_BYTES, STATE_SCHEMA,
     STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS, V3_SNAPSHOT_ABI, V3_STRIP_ABIS,
     V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
@@ -820,6 +821,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let payer = context.payer.pubkey();
     let session = session_pda(&authority.pubkey(), 17);
     let resource_commitment = resource_root(&resource);
+    assert_eq!(resource_commitment, DOOM_RESOURCE_COMMITMENT);
     let open_cu = send(
         &mut context,
         open_session(payer, authority.pubkey(), 17, RESOURCE, resource_commitment),
@@ -899,6 +901,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let mut init_phase_cu = Vec::new();
     for phase_index in 0..phase_count {
         let cursor = phase_index * 16_384;
+        eprintln!("running Doom initialization cursor {cursor}");
         let cu = send(
             &mut context,
             run_initialization(authority.pubkey(), session, cursor, None),

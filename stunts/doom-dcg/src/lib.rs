@@ -238,6 +238,15 @@ pub const DOOM_WAD_DIGEST: [u8; 32] = [
     0x3b, 0xf3, 0x30, 0x75, 0xe8, 0x59, 0x72, 0x18, 0x16, 0xf6, 0x52, 0xa5, 0x26, 0xca, 0xc7, 0x71,
 ];
 
+/// DCG chunk-Merkle root for the pinned RI2/WAD resource. The sealed resource
+/// account authenticates every uploaded chunk against this value, so the
+/// callback can check the whole resource in constant time instead of hashing
+/// 4.4 MB again inside one SVM instruction.
+pub const DOOM_RESOURCE_COMMITMENT: [u8; 32] = [
+    0x79, 0x57, 0xe6, 0x82, 0x77, 0x22, 0x8c, 0x3d, 0xbc, 0x04, 0x4e, 0x53, 0xc5, 0x2a, 0x04, 0xab,
+    0x10, 0x78, 0x53, 0x5e, 0x63, 0x93, 0x0a, 0x08, 0xee, 0x39, 0x8b, 0x25, 0x5a, 0xad, 0xe1, 0x12,
+];
+
 /// RI2 v4 resource image digest from the retained SIM/2 renderer golden.
 pub const DOOM_RI2_DIGEST: [u8; 32] = [
     0xa8, 0xa7, 0x16, 0xed, 0xc7, 0x9b, 0x58, 0xc4, 0x33, 0xfd, 0xbe, 0xde, 0xfc, 0x6b, 0xe8, 0x42,
@@ -299,7 +308,12 @@ impl DoomKernel {
             );
             return Err(KernelError::Refused);
         }
-        DoomResourceBundle::decode(resource.data)
+        if *commitment != DOOM_RESOURCE_COMMITMENT {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom resource commitment mismatch");
+            return Err(KernelError::InvalidInput);
+        }
+        DoomResourceBundle::decode_shape(resource.data)
     }
 
     fn parse_resources<'a>(
