@@ -1,0 +1,29 @@
+[package]
+name = "doom-dcg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-only"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+sbf = ["dep:doom-sbf", "doom-sbf/sim-transport"]
+
+[dependencies]
+dcg-program = { path = "../../dcg-repo/crates/dcg-program", default-features = false, features = ["no-entrypoint", "revision-8"] }
+doom-sbf = { path = "../doom-sbf", default-features = false, optional = true }
+solana-program = "=2.3.0"
+
+[patch.crates-io]
+curve25519-dalek = { path = "../../dcg-repo/crates/dcg-program/vendor" }
+
+[profile.fasttest]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
