@@ -84,6 +84,7 @@ const BOOTSTRAP_ARENA_OFFSET: usize = BOOTSTRAP_OFFSET + RSR_HEADER_BYTES;
 const BOOTSTRAP_ARENA_BYTES: usize = BOOTSTRAP_BYTES - RSR_HEADER_BYTES;
 const RENDER_CACHE_BYTES: usize = 60;
 const RENDER_PIXEL_BYTES: usize = 40 * 200;
+const RENDER_FRAME_BYTES: usize = 320 * 200;
 const STRIP_CACHE_BYTES: u32 = STRIP_BYTES * 8;
 const RENDER_TEMP_BYTES: u32 = RENDER_CACHE_BYTES as u32 + RENDER_PIXEL_BYTES as u32;
 pub const V3_VIEW_WORKSPACE_BYTES: u32 = SNAPSHOT_BYTES + STRIP_CACHE_BYTES + RENDER_TEMP_BYTES;
@@ -988,7 +989,7 @@ impl StatefulKernel for DoomKernel {
                             || state_len < 64
                             || state_len > state[1].data.len()
                             || mirror_len != state[2].data.len()
-                            || frame_len != RENDER_PIXEL_BYTES
+                            || frame_len != RENDER_FRAME_BYTES
                         {
                             #[cfg(all(feature = "sbf", target_os = "solana"))]
                             solana_program::msg!(
