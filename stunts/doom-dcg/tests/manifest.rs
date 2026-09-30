@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use dcg_program::kernel::{Kernel, KernelError, ManifestRunError, StatefulKernel};
+use dcg_program::kernel::{Kernel, KernelError, ManifestError, ManifestRunError, StatefulKernel};
 use doom_dcg::{
     validate_manifest, DoomRenderStripKernel, DoomSimStepKernel, DoomSnapshotKernel,
     DOOM_DCG_APPLICATION_MANIFEST, MODE_CONSENSUS_V1, RENDER_STRIP, SIM_ENGINE_STATE_BUNDLE_BYTES,
@@ -9,8 +9,11 @@ use doom_dcg::{
 };
 
 #[test]
-fn application_manifest_registers_the_three_doom_kernels_in_consensus_mode() {
-    validate_manifest().expect("manifest is structurally valid");
+fn application_manifest_registers_the_three_doom_kernels_but_rejects_unbounded_compute() {
+    assert_eq!(
+        validate_manifest(),
+        Err(ManifestError::InvalidComputeLimit(SIM_KERNEL_ID))
+    );
     assert_eq!(
         DOOM_DCG_APPLICATION_MANIFEST.application_id,
         b"basanos-doom/1"
