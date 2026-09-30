@@ -182,10 +182,20 @@ pub struct DoomResourceBundle<'a> {
 
 impl<'a> DoomResourceBundle<'a> {
     pub fn decode(bytes: &'a [u8]) -> Result<Self, KernelError> {
-        let bundle = Self::decode_shape(bytes)?;
-        if dcg_program::hash::sha256(&[bundle.ri2]) != DOOM_RI2_DIGEST
-            || dcg_program::hash::sha256(&[bundle.wad]) != DOOM_WAD_DIGEST
-        {
+        let bundle = Self::decode_shape(bytes).map_err(|error| {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom resource envelope shape rejected len={}", bytes.len());
+            error
+        })?;
+        let ri2_matches = dcg_program::hash::sha256(&[bundle.ri2]) == DOOM_RI2_DIGEST;
+        let wad_matches = dcg_program::hash::sha256(&[bundle.wad]) == DOOM_WAD_DIGEST;
+        if !ri2_matches || !wad_matches {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!(
+                "doom resource digest mismatch ri2={} wad={}",
+                ri2_matches,
+                wad_matches
+            );
             return Err(KernelError::InvalidInput);
         }
         Ok(bundle)
@@ -201,6 +211,8 @@ impl<'a> DoomResourceBundle<'a> {
             || u32_at(bytes, 24) as usize != WAD_IMAGE_BYTES
             || bytes[28..32] != [0; 4]
         {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom outer resource header rejected len={}", bytes.len());
             return Err(KernelError::InvalidInput);
         }
         let ri2_end = RESOURCE_HEADER_BYTES + RI2_RESOURCE_BYTES;
@@ -211,6 +223,8 @@ impl<'a> DoomResourceBundle<'a> {
             || u32_at(ri2, 16) as usize != RI2_RESOURCE_BYTES
             || ri2[72..104] != DOOM_WAD_DIGEST
         {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!("doom inner RI2 header rejected");
             return Err(KernelError::InvalidInput);
         }
         Ok(Self { ri2, wad })
@@ -265,8 +279,24 @@ impl DoomKernel {
         };
         // The callback sees the program-owned sealed resource-copy PDA, not
         // the external source key supplied at open-session time.
-        if resource.schema != RESOURCE_SCHEMA || resource.owner == [0; 32] || *commitment == [0; 32]
-        {
+        if resource.schema != RESOURCE_SCHEMA {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!(
+                "doom resource schema rejected got={}:{} expected={}:{}",
+                resource.schema.id,
+                resource.schema.version,
+                RESOURCE_SCHEMA.id,
+                RESOURCE_SCHEMA.version
+            );
+            return Err(KernelError::Refused);
+        }
+        if resource.owner == [0; 32] || *commitment == [0; 32] {
+            #[cfg(all(feature = "sbf", target_os = "solana"))]
+            solana_program::msg!(
+                "doom resource owner/commitment rejected owner_zero={} commitment_zero={}",
+                resource.owner == [0; 32],
+                *commitment == [0; 32]
+            );
             return Err(KernelError::Refused);
         }
         DoomResourceBundle::decode(resource.data)

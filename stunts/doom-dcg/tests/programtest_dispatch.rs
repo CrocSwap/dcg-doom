@@ -867,6 +867,14 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         resource_upload_cu,
         resource_upload_instruction_cu,
     ) = upload_sealed_resource(&mut context, &authority, session, RESOURCE, &resource).await;
+    let copied_resource = context
+        .banks_client
+        .get_account(resource_pda(&session))
+        .await
+        .unwrap()
+        .expect("sealed program-owned resource copy");
+    assert_eq!(copied_resource.data.len(), 128 + RESOURCE_BYTES);
+    assert_eq!(&copied_resource.data[128..], resource.as_slice());
     let (state_grow_cu, state_grow_instruction_cu) = grow_state_spans(&mut context, session).await;
     let begin_init_cu = send(
         &mut context,
