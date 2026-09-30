@@ -2,10 +2,10 @@
 
 use dcg_program::kernel::{KernelError, StatefulKernel};
 use doom_dcg::{
-    validate_manifest, DoomKernel, DoomResourceBundle, DOOM_DCG_APPLICATION_MANIFEST,
-    DOOM_KERNEL_ID, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V2, MP1_ACCOUNT_BYTES, RESOURCE_BYTES,
-    RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES, ST1_ACCOUNT_BYTES, STATE_BYTES, STATE_SCHEMA,
-    STRIP_BYTES,
+    validate_manifest, DoomKernel, DoomResourceBundle, DOOM_CONTEXT_ADDRESS,
+    DOOM_DCG_APPLICATION_MANIFEST, DOOM_KERNEL_ID, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V2,
+    MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
+    ST1_ACCOUNT_BYTES, STATE_BYTES, STATE_SCHEMA, STRIP_BYTES,
 };
 
 #[test]
@@ -37,6 +37,7 @@ fn application_manifest_pins_one_composite_v2_doom_kernel() {
     assert_eq!(RESOURCE_BYTES, 4_457_108);
     assert_eq!(RESOURCE_KEY, [0xd0; 32]);
     assert_eq!(RESOURCE_SCHEMA.version, 1);
+    assert_eq!(DOOM_CONTEXT_ADDRESS, 0x400000060);
 }
 
 #[test]

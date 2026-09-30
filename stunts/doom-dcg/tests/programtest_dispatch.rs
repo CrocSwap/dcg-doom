@@ -5,7 +5,7 @@
 
 use dcg_program::{hash::sha256, stateful as sw, stateful::v2};
 use doom_dcg::{DOOM_KERNEL_ID, RESOURCE_KEY, RESOURCE_SCHEMA};
-use solana_account::Account;
+use solana_account::{Account, AccountSharedData};
 use solana_instruction::{account_meta::AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_program::{pubkey::Pubkey, system_program};
@@ -28,6 +28,10 @@ fn session_pda(authority: &Pubkey, id: u64) -> Pubkey {
 
 fn stream_pda(session: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"dcg-input-v2", session.as_ref()], &PROGRAM).0
+}
+
+fn state_pda(session: &Pubkey, index: u8) -> Pubkey {
+    Pubkey::find_program_address(&[b"dcg-state-v2", session.as_ref(), &[index]], &PROGRAM).0
 }
 
 fn instruction(tag: u8, payload: Vec<u8>, accounts: Vec<AccountMeta>) -> Instruction {
@@ -84,9 +88,9 @@ fn create_stream(payer: Pubkey, session: Pubkey) -> Instruction {
     )
 }
 
-fn write_input(writer: Pubkey, session: Pubkey) -> Instruction {
+fn write_input(writer: Pubkey, session: Pubkey, sequence: u32) -> Instruction {
     let mut payload = vec![v2::WIRE_VERSION];
-    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&sequence.to_le_bytes());
     payload.push(4);
     payload.extend_from_slice(&[0, 0, 0, 0]);
     instruction(
@@ -96,6 +100,62 @@ fn write_input(writer: Pubkey, session: Pubkey) -> Instruction {
             AccountMeta::new_readonly(writer, true),
             AccountMeta::new(session, false),
             AccountMeta::new(stream_pda(&session), false),
+        ],
+    )
+}
+
+fn advance(actor: Pubkey, session: Pubkey, stream: Pubkey, expected_cursor: u32) -> Instruction {
+    let mut payload = vec![v2::WIRE_VERSION];
+    payload.extend_from_slice(&expected_cursor.to_le_bytes());
+    payload.push(1);
+    instruction(
+        sw::TAG_ADVANCE,
+        payload,
+        vec![
+            AccountMeta::new_readonly(actor, true),
+            AccountMeta::new(session, false),
+            AccountMeta::new(stream, false),
+        ],
+    )
+}
+
+fn close_live_stream(session: Pubkey, stream: Pubkey, refund: Pubkey) -> Instruction {
+    instruction(
+        sw::TAG_CLOSE_ACCOUNT,
+        vec![v2::WIRE_VERSION, v2::KIND_STREAM],
+        vec![
+            AccountMeta::new(session, false),
+            AccountMeta::new(stream, false),
+            AccountMeta::new(refund, false),
+        ],
+    )
+}
+
+fn create_one_byte_state(payer: Pubkey, session: Pubkey, state: Pubkey) -> Instruction {
+    let mut payload = vec![v2::WIRE_VERSION, 1];
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    instruction(
+        sw::TAG_CREATE_STATE,
+        payload,
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(session, false),
+            AccountMeta::new_readonly(RESOURCE, false),
+            AccountMeta::new(state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    )
+}
+
+fn initialize_state(authority: Pubkey, session: Pubkey, state: Pubkey) -> Instruction {
+    instruction(
+        sw::TAG_CREATE_STATE,
+        vec![v2::WIRE_VERSION, v2::STATE_OP_INITIALIZE],
+        vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new(session, false),
+            AccountMeta::new_readonly(RESOURCE, false),
+            AccountMeta::new(state, false),
         ],
     )
 }
@@ -162,8 +222,8 @@ async fn start_sbf() -> ProgramTestContext {
 #[tokio::test(flavor = "multi_thread")]
 async fn composed_sbf_dispatches_v2_and_preserves_wrong_authority_refusal() {
     let mut context = start_sbf().await;
-    let authority = Keypair::new();
-    let stranger = Keypair::new();
+    let authority = Keypair::new_from_array([0x17; 32]);
+    let stranger = Keypair::new_from_array([0x55; 32]);
     let session = session_pda(&authority.pubkey(), 17);
     let payer = context.payer.pubkey();
 
@@ -177,14 +237,75 @@ async fn composed_sbf_dispatches_v2_and_preserves_wrong_authority_refusal() {
     let stream_cu = send(&mut context, create_stream(payer, session), &[], Ok(())).await;
     let wrong_authority_cu = send(
         &mut context,
-        write_input(stranger.pubkey(), session),
+        write_input(stranger.pubkey(), session, 0),
         &[&stranger],
         Err(v2::REFUSAL_AUTHORITY),
     )
     .await;
+    let authorized_write_cu = send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0),
+        &[&authority],
+        Ok(()),
+    )
+    .await;
+    let duplicate_input_cu = send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0),
+        &[&authority],
+        Err(v2::REFUSAL_DUPLICATE_SLOT),
+    )
+    .await;
+    let stale_cursor_cu = send(
+        &mut context,
+        advance(authority.pubkey(), session, stream_pda(&session), 1),
+        &[&authority],
+        Err(v2::REFUSAL_CURSOR),
+    )
+    .await;
+    let live_close_cu = send(
+        &mut context,
+        close_live_stream(session, stream_pda(&session), authority.pubkey()),
+        &[],
+        Err(v2::REFUSAL_LIVE),
+    )
+    .await;
+    let state = state_pda(&session, 0);
+    let create_state_cu = send(
+        &mut context,
+        create_one_byte_state(payer, session, state),
+        &[],
+        Ok(()),
+    )
+    .await;
+    let mut malformed_state = context
+        .banks_client
+        .get_account(state)
+        .await
+        .unwrap()
+        .expect("state account created");
+    malformed_state.data[76..78].copy_from_slice(&2u16.to_le_bytes());
+    context.set_account(&state, &AccountSharedData::from(malformed_state));
+    let wrong_state_version_cu = send(
+        &mut context,
+        initialize_state(authority.pubkey(), session, state),
+        &[&authority],
+        Err(v2::REFUSAL_STATE),
+    )
+    .await;
 
     eprintln!(
-        "doom-dcg ProgramTest dispatch CU: open={open_cu} stream={stream_cu} wrong-authority={wrong_authority_cu}"
+        "doom-dcg ProgramTest dispatch CU: open={open_cu} stream={stream_cu} wrong-authority={wrong_authority_cu} authorized-write={authorized_write_cu} duplicate-input={duplicate_input_cu} stale-cursor={stale_cursor_cu} close-live={live_close_cu} create-state={create_state_cu} wrong-state-version={wrong_state_version_cu}"
     );
-    assert!(open_cu > 0 && stream_cu > 0 && wrong_authority_cu > 0);
+    assert!(
+        open_cu > 0
+            && stream_cu > 0
+            && wrong_authority_cu > 0
+            && authorized_write_cu > 0
+            && duplicate_input_cu > 0
+            && stale_cursor_cu > 0
+            && live_close_cu > 0
+            && create_state_cu > 0
+            && wrong_state_version_cu > 0
+    );
 }
