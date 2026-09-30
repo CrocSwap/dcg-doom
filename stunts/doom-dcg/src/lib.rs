@@ -1208,13 +1208,7 @@ pub fn process_instruction<'a>(
     accounts: &'a [solana_program::account_info::AccountInfo<'a>],
     instruction_data: &[u8],
 ) -> solana_program::entrypoint::ProgramResult {
-    if instruction_data.len() >= 7
-        && instruction_data.get(2)
-            == Some(&dcg_program::stateful::v3::STATE_OP_RUN_INITIALIZE)
-        && u32_at(instruction_data, 3) == 9_912_320
-    {
-        solana_program::msg!("doom process entry at final initialization cursor");
-    }
+    solana_program::msg!("doom process entry");
     let kernel = DoomKernel::default();
     dcg_program::stateful::v3::process_with_kernel(program_id, accounts, instruction_data, &kernel)
 }
