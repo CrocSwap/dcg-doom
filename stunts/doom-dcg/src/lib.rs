@@ -199,9 +199,9 @@ pub fn validate_manifest() -> Result<(), dcg_program::kernel::ManifestError> {
 // does not yet expose an app-owned SVM entrypoint which can route its kernels.
 #[cfg(feature = "sbf")]
 #[no_mangle]
-pub fn doom_dcg_existing_doom_processor(
+pub fn doom_dcg_existing_doom_processor<'a>(
     program_id: &solana_program::pubkey::Pubkey,
-    accounts: &[solana_program::account_info::AccountInfo],
+    accounts: &'a [solana_program::account_info::AccountInfo<'a>],
     instruction_data: &[u8],
 ) -> solana_program::entrypoint::ProgramResult {
     doom_sbf::transport_process_instruction(program_id, accounts, instruction_data)
