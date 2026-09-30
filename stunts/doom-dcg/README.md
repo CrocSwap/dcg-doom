@@ -1,19 +1,24 @@
-# Doom on DCG v1: round-3 adapter seam
+# Doom on DCG stateful v2
 
-This crate pins the app-owned `ApplicationManifest` and registers the Doom sim
-step, render snapshot, and render-strip kernels as version-1 stateful kernels
-that advertise only DCG consensus mode. It depends on the extracted DCG crate
-by path at `../../dcg-repo/crates/dcg-program` and reuses `stunts/doom-sbf` by
-path. The local `dcg-repo` checkout must be at commit
-`5c2de34c12e2c766d3d38a5d8b893d35d1ed5695`.
+This crate composes one DCG stateful-v2 kernel with Doom's existing
+DOOM-SIM/2 transport handlers under one SVM entrypoint. The session binds the
+`basanos-doom-v2` kernel identity, schema `DOOM/1`, four-byte indexed commands,
+and the snapshot plus eight strip view ABIs. Build input is the ignored,
+read-only `dcg-repo/` checkout at `4d1446f`.
 
-The registrations are intentionally fail-closed. DCG v1 supplies the pure byte
-traits and static manifest, but it has no app-owned SVM dispatcher, no
-authenticated multi-account spans in the kernel call, and no Doom input-stream
-or engine-state account binding. The manifest therefore declares the intended
-ports and state schemas, while every kernel execution method returns
-`KernelError::Refused`. The linked SBF image keeps the existing DOOM-SIM/2
-transport entrypoint; its SVM handlers are not calls through the DCG kernels.
+The current adapter is an explicit integration shim, not a working Doom port.
+The kernel authenticates the resource account and captures the invocation
+state address, then refuses engine access if it is not the fixed
+`DOOM_CTX=0x400000060` address required by the pinned 0007 engine. V2 state
+spans arrive after the authority, session, and stream accounts, so they do not
+have that address. V2 render callbacks also receive read-only state only; they
+do not receive the committed RI2/WAD resource or a workspace account. See the
+round-5 experiment record for the proposals and the measured limits.
 
-Build details, ProgramTest evidence, compute comparisons, and the designed gap
-list are in `docs/experiments/doom-dcg-r3-adapter-2026-09-30.md`.
+The no-entrypoint feature is enabled only for the composed `doom-dcg` image.
+The standalone `doom-sbf` production profile keeps its existing transport
+entrypoint when that feature is off.
+
+`scripts/pack-dcg-resource.py` packs the retained RI2 image and the five
+header-stripped WAD chunks into the v2 single-resource account envelope. The
+input artifacts and packed output belong under ignored `out/`, not Git.

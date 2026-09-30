@@ -19,6 +19,10 @@ crate-type = ["cdylib", "lib"]
 # static data is rejected by the loader.
 [features]
 default = []
+# Allow an app-owned dispatcher (such as doom-dcg) to link the Doom handlers
+# without exporting a second Solana entrypoint.  This is packaging-only and
+# must remain disabled for the standalone production image.
+no-entrypoint = []
 static-write-probe = []
 account-address-probe = []
 # `zero-bss-probe` adds one mutable C global with NO initializer (a `.bss`

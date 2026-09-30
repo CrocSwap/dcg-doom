@@ -1,88 +1,96 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use dcg_program::kernel::{Kernel, KernelError, ManifestError, ManifestRunError, StatefulKernel};
+use dcg_program::kernel::{KernelError, StatefulKernel};
 use doom_dcg::{
-    validate_manifest, DoomRenderStripKernel, DoomSimStepKernel, DoomSnapshotKernel,
-    DOOM_DCG_APPLICATION_MANIFEST, MODE_CONSENSUS_V1, RENDER_STRIP, SIM_ENGINE_STATE_BUNDLE_BYTES,
-    SIM_KERNEL_ID, SIM_STEP, SNAPSHOT, SNAPSHOT_ACCOUNT_BYTES, SNAPSHOT_KERNEL_ID,
-    STRIP_ACCOUNT_BYTES, STRIP_KERNEL_ID,
+    validate_manifest, DoomKernel, DoomResourceBundle, DOOM_DCG_APPLICATION_MANIFEST,
+    DOOM_KERNEL_ID, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V2, MP1_ACCOUNT_BYTES, RESOURCE_BYTES,
+    RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES, ST1_ACCOUNT_BYTES, STATE_BYTES, STATE_SCHEMA,
+    STRIP_BYTES,
 };
 
 #[test]
-fn application_manifest_registers_the_three_doom_kernels_but_rejects_unbounded_compute() {
-    assert_eq!(
-        validate_manifest(),
-        Err(ManifestError::InvalidComputeLimit(SIM_KERNEL_ID))
-    );
+fn application_manifest_pins_one_composite_v2_doom_kernel() {
+    assert_eq!(validate_manifest(), Ok(()));
     assert_eq!(
         DOOM_DCG_APPLICATION_MANIFEST.application_id,
-        b"basanos-doom/1"
+        b"basanos-doom/2"
     );
-    assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.version, 1);
-    assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.kernels.len(), 3);
+    assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.version, 2);
+    assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.kernels.len(), 1);
 
-    for (id, kernel) in [
-        (SIM_KERNEL_ID, &SIM_STEP as &dyn Kernel),
-        (SNAPSHOT_KERNEL_ID, &SNAPSHOT as &dyn Kernel),
-        (STRIP_KERNEL_ID, &RENDER_STRIP as &dyn Kernel),
-    ] {
-        let spec = kernel.manifest();
-        assert_eq!(spec.id, id);
-        assert_eq!(spec.semantic_version, 1);
-        assert_eq!(spec.abi_version, 1);
-        assert!(spec.modes.contains(&MODE_CONSENSUS_V1));
-        assert!(!spec.state.is_none());
-        assert!(DOOM_DCG_APPLICATION_MANIFEST.resolve(id, 1, 1).is_some());
-        assert!(DOOM_DCG_APPLICATION_MANIFEST.supports_mode(id, 1, 1, MODE_CONSENSUS_V1));
-    }
+    let kernel = DOOM_DCG_APPLICATION_MANIFEST.kernels[0];
+    let spec = kernel.manifest();
+    assert_eq!(spec.id, DOOM_KERNEL_ID);
+    assert_eq!(spec.semantic_version, 2);
+    assert_eq!(spec.abi_version, 1);
+    assert_eq!(spec.modes, &[MODE_CONSENSUS_V2]);
+    assert_eq!(spec.input.max_bytes, 4);
+    assert_eq!(spec.state.unwrap().id, STATE_SCHEMA);
+    assert_eq!(spec.state.unwrap().max_bytes, STATE_BYTES);
 
     assert_eq!(
-        SIM_STEP.manifest().state.unwrap().max_bytes,
-        SIM_ENGINE_STATE_BUNDLE_BYTES
+        ENGINE_CONTEXT_BYTES + ST1_ACCOUNT_BYTES + MP1_ACCOUNT_BYTES,
+        STATE_BYTES
     );
-    assert_eq!(SNAPSHOT.manifest().output.max_bytes, SNAPSHOT_ACCOUNT_BYTES);
+    assert_eq!(SNAPSHOT_BYTES, 1_048_768);
+    assert_eq!(STRIP_BYTES, 8_128);
+    assert_eq!(RESOURCE_BYTES, 4_457_108);
+    assert_eq!(RESOURCE_KEY, [0xd0; 32]);
+    assert_eq!(RESOURCE_SCHEMA.version, 1);
+}
+
+#[test]
+fn the_local_engine_binding_shim_refuses_the_v2_state_address() {
+    let kernel = DoomKernel::default();
+    let mut context = vec![0u8; ENGINE_CONTEXT_BYTES as usize];
+    let mut st1 = vec![0u8; ST1_ACCOUNT_BYTES as usize];
+    let mut mp1 = vec![0u8; MP1_ACCOUNT_BYTES as usize];
+    let mut spans = [
+        dcg_program::kernel::StateSpanMut {
+            key: [1; 32],
+            owner: [2; 32],
+            schema: STATE_SCHEMA,
+            offset: 0,
+            data: context.as_mut_slice(),
+        },
+        dcg_program::kernel::StateSpanMut {
+            key: [3; 32],
+            owner: [2; 32],
+            schema: STATE_SCHEMA,
+            offset: ENGINE_CONTEXT_BYTES,
+            data: st1.as_mut_slice(),
+        },
+        dcg_program::kernel::StateSpanMut {
+            key: [4; 32],
+            owner: [2; 32],
+            schema: STATE_SCHEMA,
+            offset: ENGINE_CONTEXT_BYTES + ST1_ACCOUNT_BYTES,
+            data: mp1.as_mut_slice(),
+        },
+    ];
+    kernel.bind_invocation_state(&mut spans).unwrap();
+    let mut output = [0u8; 4];
     assert_eq!(
-        RENDER_STRIP.manifest().output.max_bytes,
-        STRIP_ACCOUNT_BYTES
+        kernel.transition_spans(&[0, 0, 0, 0], &mut spans, &mut output),
+        Err(KernelError::Refused)
+    );
+    kernel.unbind_invocation_state();
+    assert_eq!(
+        kernel.transition_spans(&[0, 0, 0, 0], &mut spans, &mut output),
+        Err(KernelError::Refused)
     );
 }
 
 #[test]
-fn kernel_methods_fail_closed_until_the_svm_account_adapter_exists() {
-    let mut output = vec![0; STRIP_ACCOUNT_BYTES as usize];
-    let mut next_state = vec![0; SIM_ENGINE_STATE_BUNDLE_BYTES as usize];
+fn resource_bundle_rejects_wrong_shape_and_header() {
     assert_eq!(
-        SIM_STEP.initial_state(&mut next_state),
-        Err(KernelError::Refused)
+        DoomResourceBundle::decode(&[]).err(),
+        Some(KernelError::InvalidInput)
     );
+    let mut bytes = vec![0; RESOURCE_BYTES];
+    bytes[..8].copy_from_slice(b"WRONG000");
     assert_eq!(
-        SIM_STEP.transition(&[0; 8], &[], &mut output, &mut next_state),
-        Err(KernelError::Refused)
+        DoomResourceBundle::decode(&bytes).err(),
+        Some(KernelError::InvalidInput)
     );
-    assert_eq!(
-        SNAPSHOT.transition(&[0; 56], &[], &mut output, &mut next_state),
-        Err(KernelError::Refused)
-    );
-    assert_eq!(
-        RENDER_STRIP.transition(&[0; 128], &[], &mut output, &mut next_state),
-        Err(KernelError::Refused)
-    );
-    assert_eq!(
-        DOOM_DCG_APPLICATION_MANIFEST.execute(
-            SIM_KERNEL_ID,
-            1,
-            1,
-            MODE_CONSENSUS_V1,
-            &[0; 8],
-            &mut output,
-        ),
-        Err(ManifestRunError::Kernel(KernelError::Refused))
-    );
-}
-
-#[allow(dead_code)]
-fn type_check_stateful_bounds() {
-    let _: &dyn StatefulKernel = &DoomSimStepKernel;
-    let _: &dyn StatefulKernel = &DoomSnapshotKernel;
-    let _: &dyn StatefulKernel = &DoomRenderStripKernel;
 }
