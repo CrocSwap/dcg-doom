@@ -308,6 +308,10 @@ pub struct OracleTic {
 pub struct Oracle {
     pub initial_root: [u8; 32],
     pub tics: Vec<OracleTic>,
+    /// Pixel frame rendered from the same resident host session after the
+    /// final command.  ProgramTest render goldens compare the SBF strips to
+    /// this exact post-sweep state, not to a separately captured cursor.
+    pub frame: Vec<u8>,
 }
 
 /// Sequential no-render oracle: one host session, every command stepped in
@@ -353,7 +357,14 @@ pub fn sequential_oracle(
             probe: session.probe(),
         });
     }
-    Ok(Oracle { initial_root, tics })
+    let frame = session
+        .frame()
+        .map_err(|rc| format!("oracle final frame rc={rc}"))?;
+    Ok(Oracle {
+        initial_root,
+        tics,
+        frame,
+    })
 }
 
 pub fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {

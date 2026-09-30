@@ -28,7 +28,9 @@ mod common;
 use std::{collections::BTreeMap, env, error::Error, fs, io::Write, path::PathBuf};
 
 use common::{hex, Capture, Rng};
-use doom_sbf::{continuation_split_sbf, render_snapshot, resource_sbf, sim2, stage};
+use doom_sbf::{
+    continuation_split_sbf, render_snapshot, render_snapshot_v3 as rsn3, resource_sbf, sim2, stage,
+};
 use solana_account::Account;
 use solana_banks_interface::BanksTransactionResultWithMetadata;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -47,6 +49,7 @@ const FRAME: Pubkey = Pubkey::new_from_array([0xe5; 32]);
 const ZERO_BUFFER: Pubkey = Pubkey::new_from_array([0xb1; 32]);
 const DECOY_META: Pubkey = Pubkey::new_from_array([0xb2; 32]);
 const STAGE_CHUNK: usize = 900;
+const RENDER_COMPUTE_LIMIT: u32 = 30_000_000;
 const HOLD: [u32; 2] = [37, 555];
 const PHASE_MAGIC: &str = "0x444f4f4d50484153";
 const SIM_TRANSPORT_E2R_VERSION: u32 = 5;
@@ -113,6 +116,15 @@ fn markers(result: &BanksTransactionResultWithMetadata) -> Vec<(u64, u64)> {
         .collect()
 }
 
+fn slice_frame(frame: &[u8], strip_id: usize) -> Vec<u8> {
+    (0..200)
+        .flat_map(|row| {
+            let start = row * 320 + strip_id * 40;
+            frame[start..start + 40].iter().copied()
+        })
+        .collect()
+}
+
 /// The `SIM2-ADV` receipt ADVANCE logs with `sol_log_data`.
 fn sweep_receipt(result: &BanksTransactionResultWithMetadata) -> Option<Vec<u8>> {
     use base64::Engine as _;
@@ -137,11 +149,21 @@ impl Gate {
         instructions: Vec<Instruction>,
         signers: &[&Keypair],
     ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
+        self.send_with_compute_limit(base::NORMAL_LIMIT, instructions, signers)
+            .await
+    }
+
+    async fn send_with_compute_limit(
+        &mut self,
+        compute_limit: u32,
+        instructions: Vec<Instruction>,
+        signers: &[&Keypair],
+    ) -> Result<BanksTransactionResultWithMetadata, Box<dyn Error>> {
         // A unique compute-unit price per transaction keeps otherwise
         // identical sweeps distinct; it does not change the compute limit.
         self.nonce += 1;
         let mut all = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(base::NORMAL_LIMIT),
+            ComputeBudgetInstruction::set_compute_unit_limit(compute_limit),
             ComputeBudgetInstruction::set_compute_unit_price(self.nonce),
         ];
         all.extend(instructions);
@@ -361,6 +383,74 @@ impl Gate {
         }
     }
 
+    fn render_snapshot_v3_ix(&self, cursor: u32, root: &[u8; 32]) -> Instruction {
+        let snapshot = rsn3::snapshot_address(&base::PROGRAM, &self.keys.context.pubkey()).0;
+        let mut accounts = vec![
+            meta(
+                rsn3::scratch_address(&base::PROGRAM, &snapshot, 0).0,
+                true,
+                false,
+            ),
+            meta(self.keys.meta, false, false),
+            meta(self.keys.state.pubkey(), false, false),
+            meta(self.keys.mirror.pubkey(), false, false),
+            meta(RESOURCE, false, false),
+        ];
+        for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+            accounts.push(meta(wad_key(ordinal), false, false));
+        }
+        accounts.push(meta(snapshot, true, false));
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts,
+            data: rsn3::SnapshotRequest {
+                cursor,
+                state_root: *root,
+            }
+            .encode()
+            .to_vec(),
+        }
+    }
+
+    fn render_strip_v3_ix(
+        &self,
+        snapshot: Pubkey,
+        strip_id: u8,
+        cursor: u32,
+        snapshot_hash: [u8; 32],
+    ) -> Instruction {
+        let mut accounts = vec![
+            meta(
+                rsn3::scratch_address(&base::PROGRAM, &snapshot, strip_id).0,
+                true,
+                false,
+            ),
+            meta(RESOURCE, false, false),
+        ];
+        for ordinal in 0..resource_sbf::WAD_ACCOUNT_COUNT {
+            accounts.push(meta(wad_key(ordinal), false, false));
+        }
+        accounts.extend([
+            meta(snapshot, false, false),
+            meta(
+                rsn3::strip_address(&base::PROGRAM, &snapshot, strip_id).0,
+                true,
+                false,
+            ),
+        ]);
+        Instruction {
+            program_id: base::PROGRAM,
+            accounts,
+            data: rsn3::RenderRequest {
+                strip_id,
+                cursor,
+                snapshot_hash,
+            }
+            .encode()
+            .to_vec(),
+        }
+    }
+
     fn stage_ix(target: Pubkey, signs: bool, offset: usize, bytes: &[u8]) -> Instruction {
         Instruction {
             program_id: base::PROGRAM,
@@ -522,10 +612,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut tics = 1000usize;
     let mut seed = 0x5eed_d00d_2026_0922u64;
     let mut profile = false;
+    let mut expected_golden = None;
+    let mut allow_rebased_start = false;
+    let mut skip_legacy_rsn2 = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--profile" => profile = true,
+            "--allow-rebased-start" => allow_rebased_start = true,
+            "--skip-legacy-rsn2" => skip_legacy_rsn2 = true,
             "--tics" => tics = args.next().ok_or("--tics value")?.parse()?,
+            "--expected-golden" => {
+                expected_golden = Some(PathBuf::from(args.next().ok_or("--expected-golden path")?))
+            }
             "--seed" => {
                 seed = u64::from_str_radix(
                     args.next().ok_or("--seed value")?.trim_start_matches("0x"),
@@ -555,6 +653,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_data = Capture::load(&capture, &resource_path)?;
     let controller = base::read(&controller_path)?;
     let commands = capture_data.demo_commands(tics)?;
+    let retained_commands = fs::read(oracle_receipt.join("commands.bin"))?;
+    if retained_commands != commands {
+        return Err(format!(
+            "DEMO1 tape differs from gate-(a) commands.bin: retained {} bytes, computed {} bytes",
+            retained_commands.len(),
+            commands.len()
+        )
+        .into());
+    }
+    if tics == 0 {
+        return Err("ProgramTest golden requires a positive tic count".into());
+    }
     let staged_state = capture_data.state_account();
 
     let authority = Keypair::new();
@@ -573,8 +683,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bump,
     };
 
-    // Oracle in this process, tied to gate (a)'s retained per-tic roots.
+    // Oracle in this process.  By default it must start at gate (a)'s exact
+    // captured state; an explicitly rebased start still has to match the
+    // retained four-byte DEMO1 command tape exactly.
     let oracle = common::sequential_oracle(&capture_data, &commands, &keys.context.pubkey())?;
+    if oracle.frame.len() != resource_sbf::RI2_FRAME_BYTES {
+        return Err(format!(
+            "oracle frame has {} bytes; expected {}",
+            oracle.frame.len(),
+            resource_sbf::RI2_FRAME_BYTES
+        )
+        .into());
+    }
     let retained = fs::read_to_string(oracle_receipt.join("oracle-per-tic.jsonl"))?;
     let retained_roots: Vec<String> = retained
         .lines()
@@ -591,7 +711,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if let Some(i) = (0..tics).find(|&i| retained_roots[i] != hex(&oracle.tics[i].state_root)) {
+    let retained_root_mismatch =
+        (0..tics).find(|&i| retained_roots[i] != hex(&oracle.tics[i].state_root));
+    if let Some(i) = retained_root_mismatch.filter(|_| !allow_rebased_start) {
         return Err(format!(
             "in-process oracle differs from the retained gate-(a) oracle at seq {i}: retained {} computed {}",
             retained_roots[i],
@@ -599,10 +721,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let retained_gate_a_roots_match = retained_root_mismatch.is_none();
 
     let mut bank = ProgramTest::default();
     bank.prefer_bpf(true);
-    bank.set_compute_max_units(base::NORMAL_LIMIT as u64);
+    bank.set_compute_max_units(RENDER_COMPUTE_LIMIT as u64);
     bank.add_program("doom_sbf", base::PROGRAM, None);
     bank.add_account(
         keys.context.pubkey(),
@@ -626,6 +749,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     bank.add_account(ZERO_BUFFER, program_account(vec![0; sim2::BUFFER_BYTES]));
     bank.add_account(DECOY_META, program_account(vec![0; sim2::META_BYTES]));
+    let rsn3_snapshot = rsn3::snapshot_address(&base::PROGRAM, &keys.context.pubkey()).0;
+    bank.add_account(
+        rsn3_snapshot,
+        program_account(vec![0; rsn3::SNAPSHOT_BYTES]),
+    );
+    for strip_id in 0..8u8 {
+        let scratch = rsn3::scratch_address(&base::PROGRAM, &rsn3_snapshot, strip_id).0;
+        if strip_id == 0 {
+            bank.add_account(
+                scratch,
+                program_account(vec![0; resource_sbf::CONTEXT_BYTES]),
+            );
+        }
+        let strip = rsn3::strip_address(&base::PROGRAM, &rsn3_snapshot, strip_id).0;
+        bank.add_account(strip, program_account(vec![0; rsn3::STRIP_ACCOUNT_BYTES]));
+        if strip_id != 0 {
+            bank.add_account(
+                scratch,
+                program_account(vec![0; resource_sbf::CONTEXT_BYTES]),
+            );
+        }
+    }
     bank.add_account(keys.authority.pubkey(), system_account(100_000_000_000));
     bank.add_account(keys.attacker.pubkey(), system_account(100_000_000_000));
     let ctx = bank.start_with_context().await;
@@ -1175,13 +1320,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let state_key = gate.keys.state.pubkey();
         let mirror_key = gate.keys.mirror.pubkey();
         let view = sim2::MetaView::parse(&gate.data(meta_key).await?).ok_or("meta parse")?;
+        let state_bytes = gate.data(state_key).await?;
+        let mirror_bytes = gate.data(mirror_key).await?;
+        let st1_len = usize::try_from(view.state_len).map_err(|_| "ST1 length overflow")?;
+        if st1_len > state_bytes.len() {
+            return Err(format!("meta ST1 length {st1_len} exceeds account bytes").into());
+        }
         let report = sweep_receipt(&result).ok_or("missing SIM2-ADV receipt")?;
         let equal = if view.cursor == 0 {
             true
         } else {
             let tic = &oracle.tics[view.cursor as usize - 1];
-            gate.data(state_key).await? == tic.state
-                && gate.data(mirror_key).await? == tic.mirror
+            state_bytes == tic.state
+                && mirror_bytes == tic.mirror
                 && view.state_root == tic.state_root
                 && view.input_chain == tic.chain
         };
@@ -1190,12 +1341,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "{}",
             serde_json::json!({
                 "cu": base::units(&result)?,
+                "requested_cu_limit": base::NORMAL_LIMIT,
                 "before": u32::from_le_bytes(report[0..4].try_into().unwrap()),
                 "after": view.cursor,
                 "ran": u32::from_le_bytes(report[8..12].try_into().unwrap()),
                 "stop": report[12],
                 "max_tics": max_tics,
                 "oracle_equal": equal,
+                "st1_len": view.state_len,
+                "st1_canonical_sha256": base::sha(&state_bytes[..st1_len]),
+                "st1_account_sha256": base::sha(&state_bytes),
+                "mp1_sha256": base::sha(&mirror_bytes),
+                "state_root": hex(&view.state_root),
+                "input_chain": hex(&view.input_chain),
                 "markers": if gate.profile { serde_json::json!(markers(&result)) } else { serde_json::Value::Null },
             })
         )?;
@@ -1558,78 +1716,86 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "snapshot_committed_cursor".into(),
         serde_json::json!({"ok":true,"cursor":view.cursor,"cu":base::units(&result)?}),
     );
-    // DOOM-RSN/2 initialization and write are exercised on the same real
-    // SIM2 state produced by the preceding DEPOSIT/ADVANCE instructions.
-    let init_snapshot = gate.init_render_snapshot_ix();
-    let init_result = gate.send(vec![init_snapshot], &[]).await?;
-    if init_result.result.is_err() {
-        return Err(format!("render snapshot init {:?}", init_result.result).into());
-    }
-    let snapshot_key = gate.render_snapshot_address();
-    let init_lamports = gate
-        .ctx
-        .banks_client
-        .get_account(snapshot_key)
-        .await?
-        .ok_or("render snapshot PDA missing after init")?
-        .lamports;
-    let durable_before_snapshot = gate.durable().await?;
-    let write_snapshot = gate.write_render_snapshot_ix(view.cursor, &view.state_root);
-    let write_result = gate.send(vec![write_snapshot], &[]).await?;
-    if write_result.result.is_err() {
-        return Err(format!("render snapshot at committed cursor {:?}", write_result.result).into());
-    }
-    let snapshot_bytes = gate.data(snapshot_key).await?;
-    let snapshot = render_snapshot::validate_snapshot(&snapshot_bytes)?;
-    let state_bytes = gate.data(state_kp.pubkey()).await?;
-    if snapshot.cursor != view.cursor
-        || snapshot.state_root != view.state_root
-        || snapshot.state.as_ref() != &state_bytes[..snapshot.state_len]
-        || gate.durable().await? != durable_before_snapshot
-    {
-        return Err("render snapshot differs from the committed SIM2 state".into());
-    }
-    controls.insert(
-        "render_snapshot_committed_cursor".into(),
-        serde_json::json!({
-            "ok": true,
-            "cursor": snapshot.cursor,
-            "gametic": snapshot.gametic,
-            "state_len": snapshot.state_len,
-            "snapshot_bytes": snapshot_bytes.len(),
-            "snapshot_hash": hex(&snapshot.snapshot_hash),
-            "snapshot_rent_lamports": init_lamports,
-            "init_cu": base::units(&init_result)?,
-            "write_cu": base::units(&write_result)?,
-            "tic_accounts_unchanged": true
-        }),
-    );
-    let committed_snapshot = snapshot_bytes;
-    let stale_render_snapshot = gate.write_render_snapshot_ix(view.cursor - 1, &view.state_root);
-    refused(
-        &mut gate,
-        &mut controls,
-        "render_snapshot_stale_cursor",
-        sim2::REFUSE_SNAPSHOT,
-        vec![stale_render_snapshot],
-        &[],
-    )
-    .await?;
-    if gate.data(snapshot_key).await? != committed_snapshot {
-        return Err("stale render snapshot request changed the committed snapshot".into());
-    }
-    let wrong_render_snapshot = gate.write_render_snapshot_ix(view.cursor, &oracle.tics[0].state_root);
-    refused(
-        &mut gate,
-        &mut controls,
-        "render_snapshot_wrong_root",
-        sim2::REFUSE_SNAPSHOT,
-        vec![wrong_render_snapshot],
-        &[],
-    )
-    .await?;
-    if gate.data(snapshot_key).await? != committed_snapshot {
-        return Err("wrong-root render snapshot request changed the committed snapshot".into());
+    if !skip_legacy_rsn2 {
+        // DOOM-RSN/2 initialization and write are exercised on the same real
+        // SIM2 state produced by the preceding DEPOSIT/ADVANCE instructions.
+        let init_snapshot = gate.init_render_snapshot_ix();
+        let init_result = gate.send(vec![init_snapshot], &[]).await?;
+        if init_result.result.is_err() {
+            return Err(format!("render snapshot init {:?}", init_result.result).into());
+        }
+        let snapshot_key = gate.render_snapshot_address();
+        let init_lamports = gate
+            .ctx
+            .banks_client
+            .get_account(snapshot_key)
+            .await?
+            .ok_or("render snapshot PDA missing after init")?
+            .lamports;
+        let durable_before_snapshot = gate.durable().await?;
+        let write_snapshot = gate.write_render_snapshot_ix(view.cursor, &view.state_root);
+        let write_result = gate.send(vec![write_snapshot], &[]).await?;
+        if write_result.result.is_err() {
+            return Err(format!(
+                "render snapshot at committed cursor {:?}",
+                write_result.result
+            )
+            .into());
+        }
+        let snapshot_bytes = gate.data(snapshot_key).await?;
+        let snapshot = render_snapshot::validate_snapshot(&snapshot_bytes)?;
+        let state_bytes = gate.data(state_kp.pubkey()).await?;
+        if snapshot.cursor != view.cursor
+            || snapshot.state_root != view.state_root
+            || snapshot.state.as_ref() != &state_bytes[..snapshot.state_len]
+            || gate.durable().await? != durable_before_snapshot
+        {
+            return Err("render snapshot differs from the committed SIM2 state".into());
+        }
+        controls.insert(
+            "render_snapshot_committed_cursor".into(),
+            serde_json::json!({
+                "ok": true,
+                "cursor": snapshot.cursor,
+                "gametic": snapshot.gametic,
+                "state_len": snapshot.state_len,
+                "snapshot_bytes": snapshot_bytes.len(),
+                "snapshot_hash": hex(&snapshot.snapshot_hash),
+                "snapshot_rent_lamports": init_lamports,
+                "init_cu": base::units(&init_result)?,
+                "write_cu": base::units(&write_result)?,
+                "tic_accounts_unchanged": true
+            }),
+        );
+        let committed_snapshot = snapshot_bytes;
+        let stale_render_snapshot =
+            gate.write_render_snapshot_ix(view.cursor - 1, &view.state_root);
+        refused(
+            &mut gate,
+            &mut controls,
+            "render_snapshot_stale_cursor",
+            sim2::REFUSE_SNAPSHOT,
+            vec![stale_render_snapshot],
+            &[],
+        )
+        .await?;
+        if gate.data(snapshot_key).await? != committed_snapshot {
+            return Err("stale render snapshot request changed the committed snapshot".into());
+        }
+        let wrong_render_snapshot =
+            gate.write_render_snapshot_ix(view.cursor, &oracle.tics[0].state_root);
+        refused(
+            &mut gate,
+            &mut controls,
+            "render_snapshot_wrong_root",
+            sim2::REFUSE_SNAPSHOT,
+            vec![wrong_render_snapshot],
+            &[],
+        )
+        .await?;
+        if gate.data(snapshot_key).await? != committed_snapshot {
+            return Err("wrong-root render snapshot request changed the committed snapshot".into());
+        }
     }
     let stale = gate.snapshot_ix(view.cursor - 1, &view.state_root);
     refused(
@@ -1762,6 +1928,269 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if result.result.is_err() {
         return Err(format!("final snapshot {:?}", result.result).into());
     }
+
+    // --- RSN/3 committed-state rendering ---------------------------------------
+    let snapshot_key = rsn3::snapshot_address(&base::PROGRAM, &gate.keys.context.pubkey()).0;
+    let snapshot_ix = gate.render_snapshot_v3_ix(view.cursor, &view.state_root);
+    let snapshot_result = gate
+        .send_with_compute_limit(RENDER_COMPUTE_LIMIT, vec![snapshot_ix], &[])
+        .await?;
+    if snapshot_result.result.is_err() {
+        return Err(format!("RSN/3 snapshot {:?}", snapshot_result.result).into());
+    }
+    let snapshot_bytes = gate.data(snapshot_key).await?;
+    let snapshot_view = rsn3::validate_snapshot(&snapshot_bytes)?;
+    if snapshot_view.cursor != view.cursor
+        || snapshot_view.gametic != view.first_tic + view.cursor
+        || snapshot_view.state_root != view.state_root
+        || gate.data(state_kp.pubkey()).await? != final_state
+        || gate.data(mirror_kp.pubkey()).await? != final_mirror
+    {
+        return Err("RSN/3 snapshot does not bind the final committed SIM/2 state".into());
+    }
+    let snapshot_hash = snapshot_view.snapshot_hash;
+    let snapshot_payload_bytes = snapshot_view.payload.len();
+    let snapshot_resource_hash = snapshot_view.resource_hash;
+    let snapshot_wad_hash = snapshot_view.wad_hash;
+    fs::write(receipt.join("render-rsn3-snapshot.bin"), &snapshot_bytes)?;
+    fs::write(receipt.join("render-rsn3-host-frame.fb1"), &oracle.frame)?;
+    let mut reconstructed = vec![0u8; resource_sbf::RI2_FRAME_BYTES];
+    let mut strip_golden = Vec::new();
+    let mut strip_compute = Vec::new();
+    let mut render_controls = serde_json::Map::new();
+    for strip_id in 0..8u8 {
+        let ix = gate.render_strip_v3_ix(snapshot_key, strip_id, view.cursor, snapshot_hash);
+        let result = gate
+            .send_with_compute_limit(RENDER_COMPUTE_LIMIT, vec![ix], &[])
+            .await?;
+        if result.result.is_err() {
+            return Err(format!("RSN/3 strip {strip_id}: {:?}", result.result).into());
+        }
+        let strip_key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, strip_id).0;
+        let strip_bytes = gate.data(strip_key).await?;
+        let strip_view = rsn3::validate_strip(&strip_bytes)?;
+        let expected_pixels = slice_frame(&oracle.frame, usize::from(strip_id));
+        if strip_view.strip_id != u32::from(strip_id)
+            || strip_view.cursor != view.cursor
+            || strip_view.gametic != view.first_tic + view.cursor
+            || strip_view.snapshot_hash != snapshot_hash
+            || strip_view.state_root != view.state_root
+            || strip_view.pixels != expected_pixels
+        {
+            return Err(format!("RSN/3 strip {strip_id} differs from the host frame").into());
+        }
+        for row in 0..200 {
+            let source = row * 40;
+            let target = row * 320 + usize::from(strip_id) * 40;
+            reconstructed[target..target + 40]
+                .copy_from_slice(&strip_view.pixels[source..source + 40]);
+        }
+        fs::write(
+            receipt.join(format!("render-rsn3-strip-{strip_id}.px8")),
+            strip_view.pixels,
+        )?;
+        strip_golden.push(serde_json::json!({
+            "strip_id": strip_id,
+            "account_sha256": base::sha(&strip_bytes),
+            "strip_hash": hex(&strip_view.strip_hash),
+            "pixels_sha256": base::sha(strip_view.pixels),
+        }));
+        strip_compute.push(serde_json::json!({
+            "strip_id": strip_id,
+            "requested_cu_limit": RENDER_COMPUTE_LIMIT,
+            "consumed_cu": base::units(&result)?,
+        }));
+    }
+    if reconstructed != oracle.frame {
+        return Err("reconstructed RSN/3 frame differs from the host oracle".into());
+    }
+    fs::write(
+        receipt.join("render-rsn3-reconstructed-frame.fb1"),
+        &reconstructed,
+    )?;
+
+    // Refuse malformed snapshot bytes, a stale render cursor, and a strip PDA
+    // substituted for another ID.  Every refusal must leave its targets intact.
+    let scratch0_key = rsn3::scratch_address(&base::PROGRAM, &snapshot_key, 0).0;
+    let strip0_key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, 0).0;
+    let strip1_key = rsn3::strip_address(&base::PROGRAM, &snapshot_key, 1).0;
+    let before_snapshot = gate.data(snapshot_key).await?;
+    let before_scratch0 = gate.data(scratch0_key).await?;
+    let before_strip0 = gate.data(strip0_key).await?;
+    let before_strip1 = gate.data(strip1_key).await?;
+    let mut malformed = rsn3::SnapshotRequest {
+        cursor: view.cursor,
+        state_root: view.state_root,
+    }
+    .encode();
+    malformed[13] = 1;
+    let mut malformed_ix = gate.render_snapshot_v3_ix(view.cursor, &view.state_root);
+    malformed_ix.data = malformed.to_vec();
+    let malformed_result = gate.send(vec![malformed_ix], &[]).await?;
+    if custom_code(&malformed_result) != Some(rsn3::REFUSE_MALFORMED)
+        || gate.data(snapshot_key).await? != before_snapshot
+        || gate.data(scratch0_key).await? != before_scratch0
+        || gate.data(strip0_key).await? != before_strip0
+        || gate.data(strip1_key).await? != before_strip1
+    {
+        return Err(format!(
+            "RSN/3 malformed request control: {:?}",
+            malformed_result.result
+        )
+        .into());
+    }
+    render_controls.insert(
+        "malformed_snapshot_reserved_byte".into(),
+        serde_json::json!({"refused":true,"code":rsn3::REFUSE_MALFORMED,"snapshot_scratch_strip_preserved":true,"compute_units":base::units(&malformed_result)?}),
+    );
+    let stale_ix = gate.render_strip_v3_ix(snapshot_key, 0, view.cursor - 1, snapshot_hash);
+    let stale_result = gate.send(vec![stale_ix], &[]).await?;
+    if custom_code(&stale_result) != Some(rsn3::REFUSE_BINDING)
+        || gate.data(snapshot_key).await? != before_snapshot
+        || gate.data(scratch0_key).await? != before_scratch0
+        || gate.data(strip0_key).await? != before_strip0
+        || gate.data(strip1_key).await? != before_strip1
+    {
+        return Err(format!(
+            "RSN/3 stale render cursor control: {:?}",
+            stale_result.result
+        )
+        .into());
+    }
+    render_controls.insert(
+        "stale_render_cursor".into(),
+        serde_json::json!({"refused":true,"code":rsn3::REFUSE_BINDING,"snapshot_scratch_strip_preserved":true,"compute_units":base::units(&stale_result)?}),
+    );
+    let mut wrong_strip = gate.render_strip_v3_ix(snapshot_key, 0, view.cursor, snapshot_hash);
+    wrong_strip.accounts[8].pubkey = strip1_key;
+    let wrong_role_result = gate.send(vec![wrong_strip], &[]).await?;
+    if custom_code(&wrong_role_result) != Some(rsn3::REFUSE_BINDING)
+        || gate.data(snapshot_key).await? != before_snapshot
+        || gate.data(scratch0_key).await? != before_scratch0
+        || gate.data(strip0_key).await? != before_strip0
+        || gate.data(strip1_key).await? != before_strip1
+    {
+        return Err(format!(
+            "RSN/3 wrong strip account control: {:?}",
+            wrong_role_result.result
+        )
+        .into());
+    }
+    render_controls.insert(
+        "wrong_strip_account_role".into(),
+        serde_json::json!({"refused":true,"code":rsn3::REFUSE_BINDING,"snapshot_scratch_strips_preserved":true,"compute_units":base::units(&wrong_role_result)?}),
+    );
+    common::write_json(
+        &receipt.join("render-rsn3-controls.json"),
+        &serde_json::Value::Object(render_controls),
+    )?;
+    let snapshot_golden = serde_json::json!({
+        "account_sha256": base::sha(&snapshot_bytes),
+        "snapshot_hash": hex(&snapshot_hash),
+        "payload_sha256": base::sha(snapshot_view.payload),
+        "payload_bytes": snapshot_payload_bytes,
+        "resource_hash": hex(&snapshot_resource_hash),
+        "wad_hash": hex(&snapshot_wad_hash),
+    });
+    common::write_json(
+        &receipt.join("render-rsn3.json"),
+        &serde_json::json!({
+            "profile": "DOOM-RSN/3 standalone SBF under local ProgramTest prefer_bpf(true)",
+            "cursor": view.cursor,
+            "state_root": hex(&view.state_root),
+            "requested_cu_limit": RENDER_COMPUTE_LIMIT,
+            "snapshot_consumed_cu": base::units(&snapshot_result)?,
+            "strip_compute": strip_compute,
+            "snapshot_hash": hex(&snapshot_hash),
+            "host_frame_sha256": base::sha(&oracle.frame),
+            "reconstructed_frame_sha256": base::sha(&reconstructed),
+            "eight_strips_match_host_frame": true,
+            "frame_reconstruction_matches": true,
+        }),
+    )?;
+
+    let mut sweep_boundaries = Vec::new();
+    for line in fs::read_to_string(receipt.join("sweeps.jsonl"))?.lines() {
+        let row: serde_json::Value = serde_json::from_str(line)?;
+        if row["ran"].as_u64().unwrap_or(0) == 0 {
+            continue;
+        }
+        sweep_boundaries.push(serde_json::json!({
+            "cursor": row["after"],
+            "state_len": row["st1_len"],
+            "st1_canonical_sha256": row["st1_canonical_sha256"],
+            "st1_account_sha256": row["st1_account_sha256"],
+            "mp1_sha256": row["mp1_sha256"],
+            "state_root": row["state_root"],
+        }));
+    }
+    let wad_accounts: Vec<serde_json::Value> = capture_data
+        .wad
+        .iter()
+        .enumerate()
+        .map(|(ordinal, bytes)| {
+            serde_json::json!({"ordinal":ordinal,"account_sha256":base::sha(bytes)})
+        })
+        .collect();
+    let golden = serde_json::json!({
+        "schema": "doom-dcg-r0-r2-programtest-golden/1",
+        "source_commit": manifest_json["compile_source_commit"],
+        "sbf_image_sha256": base::sha(&image_bytes),
+        "source_manifest_sha256": base::sha(&manifest_bytes),
+        "input": {
+            "capture_profile": "captured DEMO1",
+            "tics": tics,
+            "commands_sha256": base::sha(&commands),
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
+            "resource_sha256": base::sha(&capture_data.resource),
+            "wad_payload_sha256": capture_data.wad_payload_sha256,
+            "wad_accounts": wad_accounts,
+            "initial_st1_account_sha256": base::sha(&staged_state),
+            "initial_mp1_sha256": base::sha(&capture_data.mirror),
+            "initial_state_root": hex(&oracle.initial_root),
+        },
+        "sim2": {
+            "seed": format!("{seed:#x}"),
+            "requested_cu_limit": base::NORMAL_LIMIT,
+            "sweep_boundaries": sweep_boundaries,
+            "final_cursor": view.cursor,
+            "final_state_root": hex(&view.state_root),
+            "final_st1_account_sha256": base::sha(&final_state),
+            "final_mp1_sha256": base::sha(&final_mirror),
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
+        },
+        "render": {
+            "abi": "DOOM-RENDER-SNAPSHOT/3",
+            "legacy_rsn2_skipped": skip_legacy_rsn2,
+            "cursor": view.cursor,
+            "state_root": hex(&view.state_root),
+            "snapshot": snapshot_golden,
+            "host_frame_sha256": base::sha(&oracle.frame),
+            "strips": strip_golden,
+            "reconstructed_frame_sha256": base::sha(&reconstructed),
+        },
+    });
+    let golden_path = receipt.join("programtest-golden.json");
+    common::write_json(&golden_path, &golden)?;
+    if let Some(expected_path) = expected_golden {
+        let expected: serde_json::Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+        if expected != golden {
+            return Err(format!(
+                "ProgramTest golden mismatch against {}",
+                expected_path.display()
+            )
+            .into());
+        }
+        common::write_json(
+            &receipt.join("expected-golden-match.json"),
+            &serde_json::json!({
+                "expected_path": expected_path.display().to_string(),
+                "match": true,
+                "sweep_boundaries": receipt.join("sweeps.jsonl").to_string_lossy(),
+                "golden_sha256": base::sha(&fs::read(&golden_path)?),
+            }),
+        )?;
+    }
     fs::write(receipt.join("final-state.st1"), &final_state)?;
     fs::write(receipt.join("final-mirror.mp1"), &final_mirror)?;
     fs::write(receipt.join("final-meta.bin"), &final_meta)?;
@@ -1876,6 +2305,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "final_input_chain": hex(&view.input_chain),
             "final_st1_account_sha256": base::sha(&final_state),
             "final_mp1_sha256": base::sha(&final_mirror),
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
             "oracle_equal_every_running_sweep": true,
             "tic_reserve_cu": sim2::TIC_RESERVE_CU,
             "publish_reserve_cu": sim2::PUBLISH_RESERVE_CU,
@@ -1891,6 +2321,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "manifest_sha256": base::sha(&manifest_bytes),
             "manifest_source_tree": manifest_json["source_tree"],
             "diagnostic_profile_run": profile,
+            "allow_rebased_start": allow_rebased_start,
+            "skip_legacy_rsn2": skip_legacy_rsn2,
+            "retained_gate_a_roots_match": retained_gate_a_roots_match,
+            "first_retained_root_mismatch_tic": retained_root_mismatch,
             "command_line": argv,
             "capture": capture.display().to_string(),
             "resource_sha256": base::sha(&capture_data.resource),
