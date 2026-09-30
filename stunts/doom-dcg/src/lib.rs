@@ -909,6 +909,10 @@ impl StatefulKernel for DoomKernel {
         if end >= wad_end {
             let phase_index = current_chunk - first_engine_chunk;
             if phase_index < INITIAL_ENGINE_PHASES as usize {
+                #[cfg(all(feature = "sbf", target_os = "solana"))]
+                if phase_index < 6 {
+                    solana_program::msg!("doom static engine phase {}", phase_index);
+                }
                 let context_bytes = state[0].data.len();
                 let context_ptr = state[0].data.as_mut_ptr();
                 let bootstrap_ptr = unsafe { context_ptr.add(BOOTSTRAP_ARENA_OFFSET) };
