@@ -30,6 +30,9 @@ The adapter accepts exactly four input bytes and rejects the Doom
 callback. The app manifest kernel is immutable. This is designed to keep an
 address out of committed state and mutable global storage.
 
+The fixed-address refusal shim compares against the same `0x400000060` value
+as the pinned Doom C guard; the focused manifest test asserts that literal.
+
 **Measured:** `pack-dcg-resource.py` validated the retained RI2 image and five
 WAD account payloads and produced a 4,457,108-byte `DOOMDGR1` resource
 envelope. Its SHA-256 is
@@ -69,20 +72,20 @@ and were measured under a 30,000,000-CU local ProgramTest limit in round 2.
 
 **Measured:** the composed SBF app image loaded by the retained test is
 1,276,200 bytes, SHA-256
-`35bd3ca7be3f588aefe2b9c08fdaef17ff12e36fdb4cb0afad0065446783f13c`.
+`dd284c27ca9df22f46771e218f194fb9f90b3b8966f206ff37b886718a9e759f`.
 The ProgramTest case opens a v2 session and stream, then checks these
 successful or adversarial transactions:
 
 | Case | Result | CU |
 | --- | --- | ---: |
 | Open session | success | 6,832 |
-| Create indexed stream | success | 8,361 |
+| Create indexed stream | success | 9,861 |
 | Write input as wrong authority | refused with 2322 | 2,473 |
 | Write input at index 0 | success | 3,422 |
 | Write the same index twice | refused with 2327 | 2,783 |
 | ADVANCE at stale cursor 1 | refused with 2329 | 2,554 |
 | Close stream while session is live | refused with 2325 | 2,516 |
-| Create a one-byte state span | success | 13,083 |
+| Create a one-byte state span | success | 8,583 |
 | Initialize after corrupting its schema version | refused with 2331 | 3,099 |
 
 CU values are from the single retained local run, not a cross-machine or
@@ -109,7 +112,7 @@ other, there were zero stack-frame errors, and all 82 repository and 137
 upstream manifest inputs verified without mismatch. The recorded source
 manifest hash changed from
 `ef1ddbd8fb23acdbe79de82dd40c9c6266c40772e0c91e8c5e3eca9dfa5bb8c1` to
-`36ec8845b7ebc11f486120486ea7403745bb70ed2909e2a83c52bc72e32fa913`; the
+`e87b15a0eb5fdd70d34778b39e2575b3c2be1887c46315485d73baf1767babe9`; the
 production SBF bytes remained identical.
 
 The only `stunts/doom-sbf` source edit is the permitted cfg guard around its
@@ -160,8 +163,9 @@ operation was used.
 ## Retained artifacts and commands
 
 Dispatch artifacts are under
-`out/runs/doom-dcg-r5-2026-09-30/`, including both production reproducibility
-receipts, the composed `doom_dcg.so`, its ProgramTest log, and the packed
+`out/runs/doom-dcg-r5-2026-09-30/`, including the pre-change receipt, two
+post-change reproducibility receipts (the last is from final source commit
+`5faf22d6`), the composed `doom_dcg.so`, its ProgramTest log, and the packed
 resource envelope.
 
 The focused commands were:
@@ -180,7 +184,7 @@ CARGO_TARGET_DIR=/private/tmp/basanos-doom-dcg-r5-target \
 DOOM_UPSTREAM_SEED=/private/tmp/doom-dcg-r5-upstream-seed \
 SBF_SDK_PATH=/private/tmp/basanos-sbf-sdk-v151-20260920 \
   sh stunts/doom-sbf/scripts/build-sbf-reproducible.sh "$PWD" HEAD \
-  "$PWD/out/runs/doom-dcg-r5-2026-09-30/production-after" \
+  "$PWD/out/runs/doom-dcg-r5-2026-09-30/production-after-replay" \
   sim-transport /private/tmp/basanos-doom-dcg-r5-production-target \
   --expect-sha256 7d3b63efee0bbbb9926c45dac4db51aaf033fd7f3d61ef33162de6f8c4d1b130
 ```
