@@ -1,30 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use dcg_program::kernel::{KernelError, StatefulKernel};
+use dcg_program::kernel::{Kernel, KernelError, StatefulKernel};
 use doom_dcg::{
     validate_manifest, DoomKernel, DoomResourceBundle, DOOM_CONTEXT_ADDRESS,
-    DOOM_DCG_APPLICATION_MANIFEST, DOOM_KERNEL_ID, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V2,
+    DOOM_DCG_APPLICATION_MANIFEST, DOOM_KERNEL_ID, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V3,
     MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
-    ST1_ACCOUNT_BYTES, STATE_BYTES, STATE_SCHEMA, STRIP_BYTES,
+    ST1_ACCOUNT_BYTES, STATE_BYTES, STATE_SCHEMA, STRIP_BYTES, V3_INITIALIZATION_PHASE_BYTES,
+    V3_INITIALIZATION_PHASE_COMPUTE_UNITS, V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING,
+    V3_VIEW_WORKSPACE_BYTES,
 };
 
 #[test]
-fn application_manifest_pins_one_composite_v2_doom_kernel() {
+fn application_manifest_pins_one_composite_v3_doom_kernel() {
     assert_eq!(validate_manifest(), Ok(()));
     assert_eq!(
         DOOM_DCG_APPLICATION_MANIFEST.application_id,
-        b"basanos-doom/2"
+        b"basanos-doom/3"
     );
-    assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.version, 2);
+    assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.version, 3);
     assert_eq!(DOOM_DCG_APPLICATION_MANIFEST.kernels.len(), 1);
 
     let kernel = DOOM_DCG_APPLICATION_MANIFEST.kernels[0];
     let spec = kernel.manifest();
     assert_eq!(spec.id, DOOM_KERNEL_ID);
-    assert_eq!(spec.semantic_version, 2);
+    assert_eq!(spec.semantic_version, 3);
     assert_eq!(spec.abi_version, 1);
-    assert_eq!(spec.modes, &[MODE_CONSENSUS_V2]);
+    assert_eq!(spec.modes, &[MODE_CONSENSUS_V3]);
     assert_eq!(spec.input.max_bytes, 4);
+    assert_eq!(spec.resources.max_operations, 8);
     assert_eq!(spec.state.unwrap().id, STATE_SCHEMA);
     assert_eq!(spec.state.unwrap().max_bytes, STATE_BYTES);
 
@@ -36,50 +39,33 @@ fn application_manifest_pins_one_composite_v2_doom_kernel() {
     assert_eq!(STRIP_BYTES, 8_128);
     assert_eq!(RESOURCE_BYTES, 4_457_108);
     assert_eq!(RESOURCE_KEY, [0xd0; 32]);
-    assert_eq!(RESOURCE_SCHEMA.version, 1);
+    assert_eq!(RESOURCE_SCHEMA.version, 2);
     assert_eq!(DOOM_CONTEXT_ADDRESS, 0x400000060);
+    assert_eq!(V3_INITIALIZATION_PHASE_BYTES, 16_384);
+    assert_eq!(V3_INITIALIZATION_PHASE_COMPUTE_UNITS, 1_400_000);
+    assert_eq!(V3_VIEW_PHASE_BYTES, STRIP_BYTES);
+    assert_eq!(V3_VIEW_PHASE_COMPUTE_CEILING, 1_400_000);
+    assert!(V3_VIEW_WORKSPACE_BYTES > SNAPSHOT_BYTES + 8 * STRIP_BYTES);
 }
 
 #[test]
-fn the_local_engine_binding_shim_refuses_the_v2_state_address() {
+fn doom_opts_into_mutable_v3_views_and_declares_bounded_phases() {
     let kernel = DoomKernel::default();
-    let mut context = vec![0u8; ENGINE_CONTEXT_BYTES as usize];
-    let mut st1 = vec![0u8; ST1_ACCOUNT_BYTES as usize];
-    let mut mp1 = vec![0u8; MP1_ACCOUNT_BYTES as usize];
-    let mut spans = [
-        dcg_program::kernel::StateSpanMut {
-            key: [1; 32],
-            owner: [2; 32],
-            schema: STATE_SCHEMA,
-            offset: 0,
-            data: context.as_mut_slice(),
-        },
-        dcg_program::kernel::StateSpanMut {
-            key: [3; 32],
-            owner: [2; 32],
-            schema: STATE_SCHEMA,
-            offset: ENGINE_CONTEXT_BYTES,
-            data: st1.as_mut_slice(),
-        },
-        dcg_program::kernel::StateSpanMut {
-            key: [4; 32],
-            owner: [2; 32],
-            schema: STATE_SCHEMA,
-            offset: ENGINE_CONTEXT_BYTES + ST1_ACCOUNT_BYTES,
-            data: mp1.as_mut_slice(),
-        },
-    ];
-    kernel.bind_invocation_state(&mut spans).unwrap();
-    let mut output = [0u8; 4];
+    assert!(kernel.view_requires_mutable_state());
+    assert_eq!(kernel.max_view_phase_bytes(), V3_VIEW_PHASE_BYTES);
     assert_eq!(
-        kernel.transition_spans(&[0, 0, 0, 0], &mut spans, &mut output),
-        Err(KernelError::Refused)
+        kernel.view_phase_compute_units(),
+        V3_VIEW_PHASE_COMPUTE_CEILING
     );
-    kernel.unbind_invocation_state();
     assert_eq!(
-        kernel.transition_spans(&[0, 0, 0, 0], &mut spans, &mut output),
-        Err(KernelError::Refused)
+        kernel.max_initialization_phase_bytes(),
+        V3_INITIALIZATION_PHASE_BYTES
     );
+    assert_eq!(
+        kernel.initialization_phase_compute_units(),
+        V3_INITIALIZATION_PHASE_COMPUTE_UNITS
+    );
+    assert_eq!(kernel.execute(&[], &mut []), Err(KernelError::Refused));
 }
 
 #[test]
