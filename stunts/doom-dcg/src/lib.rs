@@ -744,15 +744,33 @@ fn render_doom_view_at_workspace_base(
                 .try_into()
                 .map_err(|_| KernelError::InvalidInput)?,
         );
+        let mut bad_root_index = u32::MAX;
+        let mut bad_root_offset = u32::MAX;
+        for root_index in 0..32usize {
+            let root_offset = u32_at(rsr_header, 160 + root_index * 4);
+            if root_offset != u32::MAX && root_offset >= resource_sbf::CONTEXT_BYTES as u32 {
+                bad_root_index = root_index as u32;
+                bad_root_offset = root_offset;
+                break;
+            }
+        }
         solana_program::msg!(
-            "Doom workspace RSR layout: ptr={} base={} version={} header_bytes={} account_bytes={} context_bytes={} roots={}",
+            "Doom workspace RSR layout: ptr={} base={} magic={} version={} header_bytes={} account_bytes={} context_bytes={} roots={} bad_root={} bad_offset={} cache_magic={} cache_version={} cache_base={} cache_dynamic={} cache_end={}",
             context_ptr as usize,
             rsr_base,
+            u32_at(rsr_header, 0),
             u32_at(rsr_header, 8),
             u32_at(rsr_header, 12),
             u32_at(rsr_header, 16),
             u32_at(rsr_header, 20),
-            u32_at(rsr_header, 40)
+            u32_at(rsr_header, 40),
+            bad_root_index,
+            bad_root_offset,
+            u32_at(temp, 0),
+            u32_at(temp, 8),
+            u32_at(temp, 48),
+            u32_at(temp, 52),
+            u32_at(temp, 56)
         );
         let mut arena_high_water = 0usize;
         let rc = unsafe {
