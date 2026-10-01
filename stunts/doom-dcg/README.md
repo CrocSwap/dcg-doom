@@ -12,10 +12,13 @@ are returned as v3 prefix outcomes. The nine RSN/3 output views use the sealed
 resource and a dedicated writable workspace. Snapshot phases copy the
 committed context into that workspace in bounded chunks. Strip phases map the
 workspace first so Doom keeps its pinned fixed address; the primary context,
-ST1, and MP1 remain read-only. The workspace also caches the RSN/3 projection,
-complete strips, and render arena high-water mark. Its payload is fixed at
-10,462,608 bytes, and the RSN/3 cache is refused if the projection exceeds its
-640 KiB bound.
+ST1, and MP1 remain read-only, and DCG refuses view instructions that grant
+write privileges to those state accounts. Each new snapshot reseeds the
+context and clears the strip and render caches so arena marks cannot leak
+between frames. The workspace also caches the RSN/3 projection, complete
+strips, and render arena high-water mark. Its payload is fixed at 10,462,608
+bytes, and the RSN/3 cache is refused if the projection exceeds its 640 KiB
+bound.
 
 The SBF image routes every instruction only through
 `dcg_program::stateful::v3::process_with_kernel`. It does not route headerless
