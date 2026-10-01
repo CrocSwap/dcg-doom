@@ -37,6 +37,9 @@ const RESOURCE_UPLOAD_BATCH: usize = 4;
 const STATE_GROW_BATCH: usize = 8;
 const VIEW_GROW_BATCH: usize = 8;
 const TRANSACTION_COMPUTE_LIMIT: u32 = 1_400_000;
+const TRANSACTION_PACKET_LIMIT: usize = 1_232;
+const ACCOUNT_HEADER_BYTES: usize = 128;
+const RENDER_STATE_START: usize = 7_637_008;
 const GOLDEN: &str = include_str!("../../../tests/golden/doom/dcg_r0_r2_programtest.json");
 const COMMANDS: &[u8] = include_bytes!("fixtures/commands.bin");
 
@@ -455,15 +458,24 @@ fn begin_views(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
     )
 }
 
-fn run_view_phase(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
+fn run_view_phase_with_state_rights(
+    authority: Pubkey,
+    session: Pubkey,
+    cursor: u32,
+    states_writable: bool,
+) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, 1];
     payload.extend_from_slice(&cursor.to_le_bytes());
     payload.extend_from_slice(&V3_VIEW_PHASE_COMPUTE_CEILING.to_le_bytes());
     instruction(
         sw::TAG_PUBLISH_VIEWS,
         payload,
-        publication_accounts(authority, session, true, false, true, true),
+        publication_accounts(authority, session, states_writable, false, true, true),
     )
+}
+
+fn run_view_phase(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
+    run_view_phase_with_state_rights(authority, session, cursor, true)
 }
 
 fn commit_views(authority: Pubkey, session: Pubkey, cursor: u32, total: u32) -> Instruction {
@@ -765,6 +777,24 @@ fn decode_hex32(hex: &str) -> [u8; 32] {
     out
 }
 
+fn changed_bytes_within(before: &[u8], after: &[u8], allowed: &[(usize, usize)]) -> usize {
+    assert_eq!(before.len(), after.len());
+    let mut changed = 0;
+    for (offset, (old, new)) in before.iter().zip(after).enumerate() {
+        if old == new {
+            continue;
+        }
+        assert!(
+            allowed
+                .iter()
+                .any(|(start, end)| *start <= offset && offset < *end),
+            "unexpected write at byte {offset}"
+        );
+        changed += 1;
+    }
+    changed
+}
+
 async fn state_accounts(context: &mut ProgramTestContext, session: Pubkey) -> (Account, Account) {
     let st1 = context
         .banks_client
@@ -1044,18 +1074,267 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         Ok(()),
     )
     .await;
+    let readonly_state_view_attempt_cu = send(
+        &mut context,
+        run_view_phase_with_state_rights(authority.pubkey(), session, 0, false),
+        &[&authority],
+        Err(v3::REFUSAL_STATE),
+    )
+    .await;
+    let context_before_render = context
+        .banks_client
+        .get_account(state_pda(&session, 0))
+        .await
+        .unwrap()
+        .expect("primary state before view phases");
+    let st1_before_render = context
+        .banks_client
+        .get_account(state_pda(&session, 1))
+        .await
+        .unwrap()
+        .expect("ST1 before view phases");
+    let mp1_before_render = context
+        .banks_client
+        .get_account(state_pda(&session, 2))
+        .await
+        .unwrap()
+        .expect("MP1 before view phases");
+    let resource_before_render = context
+        .banks_client
+        .get_account(resource_pda(&session))
+        .await
+        .unwrap()
+        .expect("sealed resource before view phases");
+    let workspace_before_render = context
+        .banks_client
+        .get_account(view_pda(&session, v3::WORKSPACE_ROLE))
+        .await
+        .unwrap()
+        .expect("workspace after begin and before view phases");
+    let scratch_before_render = context
+        .banks_client
+        .get_account(view_pda(&session, v3::SCRATCH_ROLE))
+        .await
+        .unwrap()
+        .expect("publication scratch after begin and before view phases");
+    let mut output_views_before_render = Vec::with_capacity(9);
+    for role in 0..=8 {
+        output_views_before_render.push(
+            context
+                .banks_client
+                .get_account(view_pda(&session, role))
+                .await
+                .unwrap()
+                .expect("view account before render"),
+        );
+    }
     let mut view_phase_cu = Vec::new();
+    let mut view_transaction_cu = Vec::new();
+    let mut view_batch_sizes = Vec::new();
+    let mut view_transaction_bytes = Vec::new();
     let mut view_cursor = 0u32;
     while view_cursor < frame_bytes {
-        let cu = send(
-            &mut context,
-            run_view_phase(authority.pubkey(), session, view_cursor),
-            &[&authority],
-            Ok(()),
+        let remaining_phases =
+            (frame_bytes - view_cursor + V3_VIEW_PHASE_BYTES - 1) / V3_VIEW_PHASE_BYTES;
+        let blockhash = context.get_new_latest_blockhash().await.unwrap();
+        let mut candidate = remaining_phases;
+        loop {
+            let phase_instructions = (0..candidate)
+                .map(|index| {
+                    run_view_phase(
+                        authority.pubkey(),
+                        session,
+                        view_cursor + index * V3_VIEW_PHASE_BYTES,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut instructions = Vec::with_capacity(phase_instructions.len() + 1);
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                TRANSACTION_COMPUTE_LIMIT,
+            ));
+            instructions.extend(phase_instructions);
+            let signers = vec![&context.payer, &authority];
+            let tx = Transaction::new(
+                &signers,
+                solana_message::Message::new(&instructions, Some(&context.payer.pubkey())),
+                blockhash,
+            );
+            let tx_bytes = bincode::serialized_size(&tx).unwrap() as usize;
+            if tx_bytes > TRANSACTION_PACKET_LIMIT {
+                assert!(candidate > 1, "one view phase exceeds the packet limit");
+                candidate -= 1;
+                continue;
+            }
+            let simulation = context
+                .banks_client
+                .simulate_transaction(tx.clone())
+                .await
+                .unwrap();
+            let simulation_result = simulation
+                .result
+                .expect("ProgramTest returns a view-batch simulation result");
+            match simulation_result {
+                Ok(()) => {}
+                Err(TransactionError::InstructionError(
+                    _,
+                    InstructionError::ComputationalBudgetExceeded,
+                )) => {
+                    assert!(candidate > 1, "one view phase exceeds the CU limit");
+                    candidate -= 1;
+                    continue;
+                }
+                Err(error) => {
+                    let logs = simulation
+                        .simulation_details
+                        .as_ref()
+                        .map(|details| details.logs.join("\n"))
+                        .unwrap_or_default();
+                    panic!("view-batch simulation failed: {error:?}\n{logs}");
+                }
+            }
+            let simulated_cu = simulation
+                .simulation_details
+                .as_ref()
+                .expect("ProgramTest returns simulation details")
+                .units_consumed;
+            assert!(simulated_cu <= TRANSACTION_COMPUTE_LIMIT as u64);
+
+            let result = context
+                .banks_client
+                .process_transaction_with_metadata(tx)
+                .await
+                .unwrap();
+            if let Err(error) = result.result {
+                let logs = result
+                    .metadata
+                    .as_ref()
+                    .map(|meta| meta.log_messages.join("\n"))
+                    .unwrap_or_default();
+                panic!("view-batch transaction failed: {error:?}\n{logs}");
+            }
+            let metadata = result.metadata.expect("view-batch transaction metadata");
+            assert_eq!(metadata.compute_units_consumed, simulated_cu);
+            assert!(metadata.compute_units_consumed <= TRANSACTION_COMPUTE_LIMIT as u64);
+            let program_prefix = format!("Program {PROGRAM} consumed ");
+            let instruction_cu = metadata
+                .log_messages
+                .iter()
+                .filter_map(|line| line.strip_prefix(&program_prefix))
+                .filter_map(|line| line.split_once(" of "))
+                .filter_map(|(used, _)| used.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            assert_eq!(instruction_cu.len(), candidate as usize);
+            for (index, cu) in instruction_cu.iter().enumerate() {
+                view_phase_cu.push(json!({
+                    "cursor": view_cursor + index as u32 * V3_VIEW_PHASE_BYTES,
+                    "cu": cu,
+                }));
+            }
+            view_cursor = (view_cursor + candidate * V3_VIEW_PHASE_BYTES).min(frame_bytes);
+            view_transaction_cu.push(metadata.compute_units_consumed);
+            view_batch_sizes.push(candidate);
+            view_transaction_bytes.push(tx_bytes);
+            break;
+        }
+    }
+    assert_eq!(view_cursor, frame_bytes);
+
+    let context_after_render = context
+        .banks_client
+        .get_account(state_pda(&session, 0))
+        .await
+        .unwrap()
+        .expect("primary state after view phases");
+    let st1_after_render = context
+        .banks_client
+        .get_account(state_pda(&session, 1))
+        .await
+        .unwrap()
+        .expect("ST1 after view phases");
+    let mp1_after_render = context
+        .banks_client
+        .get_account(state_pda(&session, 2))
+        .await
+        .unwrap()
+        .expect("MP1 after view phases");
+    let resource_after_render = context
+        .banks_client
+        .get_account(resource_pda(&session))
+        .await
+        .unwrap()
+        .expect("sealed resource after view phases");
+    let context_render_writes = changed_bytes_within(
+        &context_before_render.data,
+        &context_after_render.data,
+        &[(RENDER_STATE_START, ENGINE_CONTEXT_BYTES as usize)],
+    );
+    let mut disallowed_write_probe = context_after_render.data.clone();
+    disallowed_write_probe[RENDER_STATE_START - 1] ^= 1;
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        changed_bytes_within(
+            &context_before_render.data,
+            &disallowed_write_probe,
+            &[(RENDER_STATE_START, ENGINE_CONTEXT_BYTES as usize)],
         )
-        .await;
-        view_phase_cu.push(json!({"cursor": view_cursor, "cu": cu}));
-        view_cursor += V3_VIEW_PHASE_BYTES.min(frame_bytes - view_cursor);
+    }))
+    .is_err());
+    assert_eq!(st1_before_render.data, st1_after_render.data);
+    assert_eq!(mp1_before_render.data, mp1_after_render.data);
+    assert_eq!(resource_before_render.data, resource_after_render.data);
+    let workspace_after_render = context
+        .banks_client
+        .get_account(view_pda(&session, v3::WORKSPACE_ROLE))
+        .await
+        .unwrap()
+        .expect("workspace after view phases");
+    assert_eq!(
+        workspace_before_render.data[..ACCOUNT_HEADER_BYTES],
+        workspace_after_render.data[..ACCOUNT_HEADER_BYTES]
+    );
+    assert_eq!(
+        workspace_after_render.data.len(),
+        ACCOUNT_HEADER_BYTES + V3_VIEW_WORKSPACE_BYTES as usize
+    );
+    let workspace_changed_bytes = changed_bytes_within(
+        &workspace_before_render.data,
+        &workspace_after_render.data,
+        &[(ACCOUNT_HEADER_BYTES, workspace_after_render.data.len())],
+    );
+    let scratch_after_render = context
+        .banks_client
+        .get_account(view_pda(&session, v3::SCRATCH_ROLE))
+        .await
+        .unwrap()
+        .expect("publication scratch after view phases");
+    assert_eq!(
+        scratch_before_render.data[..ACCOUNT_HEADER_BYTES],
+        scratch_after_render.data[..ACCOUNT_HEADER_BYTES]
+    );
+    assert_eq!(
+        scratch_after_render.data.len(),
+        ACCOUNT_HEADER_BYTES + frame_bytes as usize
+    );
+    let scratch_changed_bytes = changed_bytes_within(
+        &scratch_before_render.data,
+        &scratch_after_render.data,
+        &[(ACCOUNT_HEADER_BYTES, scratch_after_render.data.len())],
+    );
+    let mut output_views_after_render = Vec::with_capacity(9);
+    for role in 0..=8 {
+        output_views_after_render.push(
+            context
+                .banks_client
+                .get_account(view_pda(&session, role))
+                .await
+                .unwrap()
+                .expect("view account after render, before commit"),
+        );
+    }
+    for (before, after) in output_views_before_render
+        .iter()
+        .zip(output_views_after_render.iter())
+    {
+        assert_eq!(before.data, after.data, "RUN_PHASE must not publish output");
     }
     let view_commit_cu = send(
         &mut context,
@@ -1064,6 +1343,31 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         Ok(()),
     )
     .await;
+    let context_after_commit = context
+        .banks_client
+        .get_account(state_pda(&session, 0))
+        .await
+        .unwrap()
+        .expect("primary state after publication commit");
+    let st1_after_commit = context
+        .banks_client
+        .get_account(state_pda(&session, 1))
+        .await
+        .unwrap()
+        .expect("ST1 after publication commit");
+    let mp1_after_commit = context
+        .banks_client
+        .get_account(state_pda(&session, 2))
+        .await
+        .unwrap()
+        .expect("MP1 after publication commit");
+    assert_eq!(context_after_render.data, context_after_commit.data);
+    assert_eq!(st1_after_render.data, st1_after_commit.data);
+    assert_eq!(mp1_after_render.data, mp1_after_commit.data);
+    let mut frame_transaction_cu = vec![view_begin_cu];
+    frame_transaction_cu.extend_from_slice(&view_transaction_cu);
+    frame_transaction_cu.push(view_commit_cu);
+    let frame_total_cu = frame_transaction_cu.iter().sum::<u64>();
     let mut strips = Vec::with_capacity(8);
     let mut strip_hashes = Vec::new();
     for role in 1..=8 {
@@ -1229,10 +1533,28 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "bytes": frame_bytes,
                 "view_phase_bytes": V3_VIEW_PHASE_BYTES,
                 "run_phase_count": view_phase_cu.len(),
-                "transactions_per_frame": view_phase_cu.len() + 2,
+                "transactions_per_frame": view_transaction_cu.len() + 2,
                 "phase_compute_units": view_phase_cu,
+                "run_phase_transactions": view_transaction_cu,
+                "phases_per_run_transaction": view_batch_sizes,
+                "serialized_transaction_bytes": view_transaction_bytes,
+                "compute_units_per_transaction": frame_transaction_cu,
+                "compute_units_total": frame_total_cu,
+                "compute_units_mean_per_transaction": frame_total_cu as f64
+                    / (view_batch_sizes.len() + 2) as f64,
                 "snapshot_create_cu": view_begin_cu,
+                "readonly_state_view_attempt_cu": readonly_state_view_attempt_cu,
                 "publish_commit_cu": view_commit_cu,
+                "state_write_audit": {
+                    "context_allowed_range": [RENDER_STATE_START, ENGINE_CONTEXT_BYTES],
+                    "context_changed_bytes": context_render_writes,
+                    "st1_unchanged": true,
+                    "mp1_unchanged": true,
+                    "resource_unchanged": true,
+                    "workspace_changed_bytes": workspace_changed_bytes,
+                    "publication_scratch_changed_bytes": scratch_changed_bytes,
+                    "view_outputs_unchanged_until_commit": true,
+                },
                 "pixel_sha256": frame_hash,
             },
             "adversarial": {
@@ -1242,6 +1564,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "engine_halt_cu": engine_halt_cu,
                 "halted_session_advance_cu": after_halt_advance_cu,
                 "wrong_wad_cu": bad_wad_cu,
+                "readonly_mutable_view_attempt_cu": readonly_state_view_attempt_cu,
             },
             "setup": {
                 "open_cu": open_cu,

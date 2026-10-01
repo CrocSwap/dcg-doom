@@ -12,7 +12,7 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = []
-sbf = ["dep:doom-sbf", "doom-sbf/sim-transport", "doom-sbf/no-entrypoint"]
+sbf = ["dep:doom-sbf", "doom-sbf/sim-transport", "doom-sbf/no-entrypoint", "doom-sbf/dcg-stateful-v3"]
 sbf-programtest = []
 
 [dependencies]

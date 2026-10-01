@@ -23,6 +23,10 @@ default = []
 # without exporting a second Solana entrypoint.  This is packaging-only and
 # must remain disabled for the standalone production image.
 no-entrypoint = []
+# DCG stateful-v3 has a 512-byte header before its 2 MiB renderer arena and
+# initializes the primary context in bounded phases. Standalone images leave
+# this feature disabled.
+dcg-stateful-v3 = []
 static-write-probe = []
 account-address-probe = []
 # `zero-bss-probe` adds one mutable C global with NO initializer (a `.bss`
