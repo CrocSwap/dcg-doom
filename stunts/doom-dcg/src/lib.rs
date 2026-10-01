@@ -349,7 +349,6 @@ impl Kernel for DoomKernel {
 
 #[cfg(all(feature = "sbf", target_os = "solana"))]
 unsafe extern "C" {
-    fn doom_sbf_arena_mark() -> usize;
     fn doom_engine_rsn3_build_static_phase(
         phase: u32,
         context: *mut u8,
@@ -735,52 +734,11 @@ fn render_doom_view_at_workspace_base(
         let header_ptr = unsafe { context_ptr.add(BOOTSTRAP_OFFSET) };
         let bootstrap_ptr = unsafe { context_ptr.add(BOOTSTRAP_ARENA_OFFSET) };
         let temp = &mut workspace[RENDER_TEMP_OFFSET..RENDER_TEMP_OFFSET + RENDER_TEMP_BYTES];
-        let cache_magic = u32_at(temp, 0);
-        let cache_version = u32_at(temp, 8);
-        let cache_base = u32_at(temp, 48);
-        let cache_dynamic = u32_at(temp, 52);
-        let cache_end = u32_at(temp, 56);
-        let arena_mark = unsafe { doom_sbf_arena_mark() };
         let cache_ptr = temp.as_mut_ptr();
         let pixels_ptr = unsafe { cache_ptr.add(RENDER_CACHE_BYTES) };
         let workspace_ptr = workspace.as_ptr();
         let payload_ptr = unsafe { workspace_ptr.add(SNAPSHOT_CACHE_OFFSET + rsn3::HEADER_BYTES) };
         let snapshot_hash_ptr = unsafe { workspace_ptr.add(SNAPSHOT_CACHE_OFFSET + 128) };
-        let rsr_header = unsafe { core::slice::from_raw_parts(header_ptr, RSR_HEADER_BYTES) };
-        let rsr_base = u64::from_le_bytes(
-            rsr_header[112..120]
-                .try_into()
-                .map_err(|_| KernelError::InvalidInput)?,
-        );
-        let mut bad_root_index = u32::MAX;
-        let mut bad_root_offset = u32::MAX;
-        for root_index in 0..32usize {
-            let root_offset = u32_at(rsr_header, 160 + root_index * 4);
-            if root_offset != u32::MAX && root_offset >= resource_sbf::CONTEXT_BYTES as u32 {
-                bad_root_index = root_index as u32;
-                bad_root_offset = root_offset;
-                break;
-            }
-        }
-        solana_program::msg!(
-            "Doom workspace RSR layout: ptr={} base={} magic={} version={} header_bytes={} account_bytes={} context_bytes={} roots={} bad_root={} bad_offset={} cache_magic={} cache_version={} cache_base={} cache_dynamic={} cache_end={} arena_mark={}",
-            context_ptr as usize,
-            rsr_base,
-            u32_at(rsr_header, 0),
-            u32_at(rsr_header, 8),
-            u32_at(rsr_header, 12),
-            u32_at(rsr_header, 16),
-            u32_at(rsr_header, 20),
-            u32_at(rsr_header, 40),
-            bad_root_index,
-            bad_root_offset,
-            cache_magic,
-            cache_version,
-            cache_base,
-            cache_dynamic,
-            cache_end,
-            arena_mark
-        );
         let mut arena_high_water = 0usize;
         let rc = unsafe {
             doom_engine_rsn3_render_static(
