@@ -733,6 +733,11 @@ fn render_doom_view_at_workspace_base(
         let header_ptr = unsafe { context_ptr.add(BOOTSTRAP_OFFSET) };
         let bootstrap_ptr = unsafe { context_ptr.add(BOOTSTRAP_ARENA_OFFSET) };
         let temp = &mut workspace[RENDER_TEMP_OFFSET..RENDER_TEMP_OFFSET + RENDER_TEMP_BYTES];
+        let cache_magic = u32_at(temp, 0);
+        let cache_version = u32_at(temp, 8);
+        let cache_base = u32_at(temp, 48);
+        let cache_dynamic = u32_at(temp, 52);
+        let cache_end = u32_at(temp, 56);
         let cache_ptr = temp.as_mut_ptr();
         let pixels_ptr = unsafe { cache_ptr.add(RENDER_CACHE_BYTES) };
         let workspace_ptr = workspace.as_ptr();
@@ -766,11 +771,11 @@ fn render_doom_view_at_workspace_base(
             u32_at(rsr_header, 40),
             bad_root_index,
             bad_root_offset,
-            u32_at(temp, 0),
-            u32_at(temp, 8),
-            u32_at(temp, 48),
-            u32_at(temp, 52),
-            u32_at(temp, 56)
+            cache_magic,
+            cache_version,
+            cache_base,
+            cache_dynamic,
+            cache_end
         );
         let mut arena_high_water = 0usize;
         let rc = unsafe {
