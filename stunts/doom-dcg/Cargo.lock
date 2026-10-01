@@ -982,7 +982,7 @@ dependencies = [
 [[package]]
 name = "curve25519-dalek"
 version = "3.2.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/basanos/.fadeno/local/worktrees/doom-dcg-r7c/dcg-repo?rev=711f2f18209f68658b5f1600df44fc248a416f29#711f2f18209f68658b5f1600df44fc248a416f29"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=0ec72af4a108e1457c5c601787e1a775aff78458#0ec72af4a108e1457c5c601787e1a775aff78458"
 dependencies = [
  "byteorder",
  "digest 0.9.0",
@@ -1077,7 +1077,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "dcg-program"
 version = "0.1.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/basanos/.fadeno/local/worktrees/doom-dcg-r7c/dcg-repo?rev=711f2f18209f68658b5f1600df44fc248a416f29#711f2f18209f68658b5f1600df44fc248a416f29"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=0ec72af4a108e1457c5c601787e1a775aff78458#0ec72af4a108e1457c5c601787e1a775aff78458"
 dependencies = [
  "blake3",
  "ed25519-dalek",

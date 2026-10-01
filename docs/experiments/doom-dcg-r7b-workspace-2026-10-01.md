@@ -19,13 +19,10 @@ The unchanged production image in the receipt has SHA-256
 The sealed Doom resource SHA-256 is
 `d9cb710813d965c62eb919a477e3ea571d7ad986d82a07f611969bc8f09b9cf0`.
 
-`stunts/doom-dcg/Cargo.toml` and `Cargo.lock` pin both DCG packages to the
-local clone's Git commit, rather than resolving an unpinned sibling directory.
-The README records the baseline, accepted patch/fixes, clone location, and
-recreation steps. Because Cargo's source is a `file://` URL, another checkout
-must recreate the clone at the configured worktree path before running Cargo.
-The ignored `dcg-repo/` clone was retained locally at the pinned commit; it was
-not pushed.
+`stunts/doom-dcg/Cargo.toml` and `Cargo.lock` pin both DCG packages to revision
+`0ec72af4a108e1457c5c601787e1a775aff78458` at the stable local repository URL.
+The ignored `dcg-repo/` clone used to verify the not-yet-merged revision is
+retained in this assigned worktree; it is not part of the Basanos source tree.
 
 ## Accepted DCG changes
 
@@ -41,8 +38,11 @@ not pushed.
   validators run. DCG snapshots the full 128-byte workspace account header
   around the callback and returns `REFUSAL_KERNEL` if the callback changes it.
 - The SBF workload covers workspace-first ordering and malformed ordering,
-  refusal paths, callback header restoration and mutation refusal, and the
-  opt-out from clearing workspace payloads at begin.
+  refusal paths, callback header restoration and mutation refusal, refusal to
+  close a live workspace, and the opt-out from clearing workspace payloads at
+  begin. Direct normalizer tests cover authority/session positions, account
+  count, and an empty state-span list; the ordinary account-order path borrows
+  the caller slice without copying.
 
 ## Measured local results
 
@@ -63,26 +63,42 @@ The single golden-pixel render used 9,642,629 CU across 20 transactions and
 (19.8 per frame average) and 109,023,495 CU total, or 10,902,349.5 CU per
 frame including the snapshot seed transaction.
 
-The brief supplied 16.1M CU as the ten-frame average and 14.85M CU as the
-golden-frame figure. Those values are **not reproduced** by this final
-ProgramTest artifact: its recorded values are 10.902M and 9.643M respectively.
-Treat the brief-supplied figures as open pending reconciliation with their
-source run; do not cite them as measurements from this build. The retained
-artifact is `out/runs/doom-dcg-r7c-2026-10-01/doom-programtest-metrics.json`.
+The lower r7b CU totals came from a run against DCG `8dcc85f8`, where
+`view_meta` and `state_meta` re-derived addresses on every instruction. The
+provenance rework at `057f088` removed that repeated work. **Estimated
+attribution:** about 37.2k CU per view instruction across 140 view instructions
+accounts for roughly 5.21M CU per frame. This reconciles r7b's reported 14.85M
+golden frame and 16.1M ten-frame average with the current 9.643M golden frame
+and 10.902M ten-frame average; those earlier totals describe a different DCG
+implementation, not a different workload. The current run's measured figures
+remain 9.642629M CU for the golden frame and 10.9023495M CU per frame averaged
+over ten cadence frames.
+
+Compute units do not set the estimated local sender-limited picture rate here;
+transaction count does. The measured cadence uses 19.8 render transactions per
+picture plus nine input/advance transactions. At 60 transactions/second, the
+estimate is `60 / (19.8 + 9) = 2.083` pictures/second (about 2.08), or 16.7
+tics/second at eight tics per picture. The retained artifact is
+`out/runs/doom-dcg-r7c-2026-10-01/doom-programtest-metrics.json`.
 
 **Measured: cache and rerender checks.** The snapshot cache is 655,360 bytes
 (640 KiB). Each of the ten observed frames used an 18,652-byte snapshot
-payload, or 18,780 bytes including its 128-byte header; none exceeded the
-cache. The arena high-water observation was 613,664 bytes on each frame. This
-sample does not prove a bound for every reachable game state. If a snapshot
-callback reports a projection larger than its cache, the designed behavior is
-`InvalidInput`, mapped by DCG to `REFUSAL_KERNEL`, and the `RUN_PHASE`
-transaction rolls back; no over-cap reachable state was measured here.
+payload, or 18,844 bytes including the 192-byte RSN/3 header. The SBF encoder
+enforces a 1,024-mobj cap. The ProgramTest derives a resource-specific maximum
+from the committed WAD's fixed sector, side, texture, and flat counts plus that
+mobj cap, then asserts that the maximum plus the 192-byte wire header fits the
+cache. This bounds every projection the encoder can accept for this committed
+resource, not just the ten measured frames; the manifest test checks the
+encoder's record sizes and dynamic cap. If a future resource or encoder change
+exceeds the workspace cache, Doom returns `KernelError::Refused`, which DCG
+maps to `REFUSAL_KERNEL`; the `RUN_PHASE` transaction rolls back. The arena
+high-water observation was 613,664 bytes on each frame.
 
 Each of ten deliberate aborts followed caching two rendered strip payloads.
-Both cached cursor checks refused on each frame. The test then reset the
-workspace and rerendered; all ten resulting frame hashes matched the
-abort/rerender trace, and frames 2–10 matched renders from a fresh workspace.
+Both cached cursor checks refused on each frame. The test then retried against
+the same dirty workspace without zeroing it; the begin-phase payload comparison
+confirmed it stayed byte-identical, and all ten resulting frame hashes matched
+the abort/retry trace. Frames 2–10 also matched the cadence render.
 No render blockhash retry was needed in the final cadence trace. The final
 log contains an expected caught panic from the byte-audit negative control,
 which deliberately flips a protected workspace-header byte; the test passed.

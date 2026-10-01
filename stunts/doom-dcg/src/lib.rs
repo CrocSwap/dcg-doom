@@ -93,6 +93,27 @@ const RENDER_FRAME_BYTES: usize = 320 * 200;
 // context, strip cache, and render scratch only if the cached RSN3 projection
 // stays within this checked bound.
 pub const V3_SNAPSHOT_CACHE_BYTES: usize = 640 * 1024;
+/// Frozen RSN/3 wire header size. This is separate from the 128-byte DCG
+/// workspace-account header.
+pub const V3_SNAPSHOT_HEADER_BYTES: usize = 192;
+pub const V3_SNAPSHOT_DATA_HEADER_BYTES: usize = 128;
+pub const V3_SNAPSHOT_PSPRITE_COUNT: usize = 2;
+pub const V3_SNAPSHOT_PSPRITE_BYTES: usize = 16;
+pub const V3_SNAPSHOT_SECTOR_BYTES: usize = 16;
+pub const V3_SNAPSHOT_SIDE_BYTES: usize = 16;
+pub const V3_SNAPSHOT_TRANSLATION_BYTES: usize = 4;
+pub const V3_SNAPSHOT_MAX_MOBJ_COUNT: usize = 1_024;
+pub const V3_SNAPSHOT_MOBJ_BYTES: usize = 52;
+pub const V3_SNAPSHOT_MAX_MOBJ_BYTES: usize = V3_SNAPSHOT_MAX_MOBJ_COUNT * V3_SNAPSHOT_MOBJ_BYTES;
+// ProgramTest derives the remaining bound from the committed resource's fixed
+// texture, flat, sector, and side counts plus this encoder-enforced mobj cap.
+const _: () = assert!(
+    V3_SNAPSHOT_HEADER_BYTES
+        + V3_SNAPSHOT_DATA_HEADER_BYTES
+        + V3_SNAPSHOT_PSPRITE_COUNT * V3_SNAPSHOT_PSPRITE_BYTES
+        + V3_SNAPSHOT_MAX_MOBJ_BYTES
+        <= V3_SNAPSHOT_CACHE_BYTES
+);
 pub const V3_SNAPSHOT_CACHE_OFFSET: usize = ENGINE_CONTEXT_BYTES as usize;
 const SNAPSHOT_CACHE_BYTES: usize = V3_SNAPSHOT_CACHE_BYTES;
 const SNAPSHOT_CACHE_OFFSET: usize = V3_SNAPSHOT_CACHE_OFFSET;
@@ -587,7 +608,7 @@ fn render_doom_view(
         if payload_len > rsn3::MAX_PAYLOAD_BYTES
             || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
         {
-            return Err(KernelError::InvalidInput);
+            return Err(KernelError::Refused);
         }
         snapshot[..8].copy_from_slice(rsn3::MAGIC);
         put_u32(snapshot, 8, rsn3::VERSION);

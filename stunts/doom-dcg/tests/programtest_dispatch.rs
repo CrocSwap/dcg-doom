@@ -10,8 +10,11 @@ use doom_dcg::{
     MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
     ST1_ACCOUNT_BYTES, STATE_SCHEMA, STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS,
     V3_RENDER_ARENA_HIGH_WATER_OFFSET, V3_RENDER_ARENA_MAX_BYTES, V3_SNAPSHOT_ABI,
-    V3_SNAPSHOT_CACHE_BYTES, V3_SNAPSHOT_CACHE_OFFSET, V3_STRIP_ABIS, V3_VIEW_PHASE_BYTES,
-    V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
+    V3_SNAPSHOT_CACHE_BYTES, V3_SNAPSHOT_CACHE_OFFSET, V3_SNAPSHOT_DATA_HEADER_BYTES,
+    V3_SNAPSHOT_HEADER_BYTES, V3_SNAPSHOT_MAX_MOBJ_BYTES, V3_SNAPSHOT_MAX_MOBJ_COUNT,
+    V3_SNAPSHOT_MOBJ_BYTES, V3_SNAPSHOT_PSPRITE_BYTES, V3_SNAPSHOT_PSPRITE_COUNT,
+    V3_SNAPSHOT_SECTOR_BYTES, V3_SNAPSHOT_SIDE_BYTES, V3_SNAPSHOT_TRANSLATION_BYTES, V3_STRIP_ABIS,
+    V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
 };
 use serde_json::{json, Value};
 use solana_account::{Account, AccountSharedData};
@@ -928,9 +931,11 @@ struct FrameObservation {
     workspace_bytes: usize,
     arena_high_water: u32,
     snapshot_payload_bytes: usize,
+    snapshot_resource_payload_bound_bytes: usize,
+    snapshot_resource_counts: [u32; 4],
     abort_cached_strips: u8,
     abort_cache_cursor_refusals: u8,
-    fresh_workspace_reset: bool,
+    retry_from_dirty_workspace: bool,
     render_blockhash_retries: u32,
 }
 
@@ -1004,7 +1009,8 @@ async fn publish_observed_frame(
     let mut render_blockhash_retries = 0u32;
     let mut abort_cached_strips = 0;
     let mut abort_cache_cursor_refusals = 0;
-    let mut fresh_workspace_reset = false;
+    let mut dirty_workspace_payload_before_retry = None;
+    let mut retry_from_dirty_workspace = false;
     if abort_and_restart {
         let output_views_before_abort = (0..=8)
             .map(|role| view_pda(&session, role))
@@ -1206,12 +1212,8 @@ async fn publish_observed_frame(
             );
         }
 
-        // Start the comparison render from the workspace's zero-initialized
-        // payload, preserving its authenticated child header and cursor.
-        let mut fresh_workspace = partial_workspace;
-        fresh_workspace.data[ACCOUNT_HEADER_BYTES..].fill(0);
-        context.set_account(&workspace_key, &AccountSharedData::from(fresh_workspace));
-        fresh_workspace_reset = true;
+        dirty_workspace_payload_before_retry =
+            Some(partial_workspace.data[ACCOUNT_HEADER_BYTES..].to_vec());
     }
 
     let primary_before = context
@@ -1229,6 +1231,20 @@ async fn publish_observed_frame(
         )
         .await,
     );
+    if let Some(before) = dirty_workspace_payload_before_retry.as_ref() {
+        let workspace_after_retry_begin = context
+            .banks_client
+            .get_account(view_pda(&session, v3::WORKSPACE_ROLE))
+            .await
+            .unwrap()
+            .expect("workspace after retry begin");
+        assert_eq!(
+            &workspace_after_retry_begin.data[ACCOUNT_HEADER_BYTES..],
+            before.as_slice(),
+            "retry after abort must preserve the dirty workspace without zeroing"
+        );
+        retry_from_dirty_workspace = true;
+    }
 
     let boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
     let mut view_cursor = 0u32;
@@ -1409,15 +1425,41 @@ async fn publish_observed_frame(
         &workspace.data,
         ACCOUNT_HEADER_BYTES + V3_SNAPSHOT_CACHE_OFFSET + 28,
     ) as usize;
+    let snapshot_payload_start =
+        ACCOUNT_HEADER_BYTES + V3_SNAPSHOT_CACHE_OFFSET + V3_SNAPSHOT_HEADER_BYTES;
+    let snapshot_payload =
+        &workspace.data[snapshot_payload_start..snapshot_payload_start + snapshot_payload_bytes];
+    let snapshot_resource_counts = [
+        u32_at(snapshot_payload, 12),
+        u32_at(snapshot_payload, 16),
+        u32_at(snapshot_payload, 20),
+        u32_at(snapshot_payload, 24),
+    ];
+    let snapshot_mobj_count = u32_at(snapshot_payload, 28) as usize;
+    assert!(snapshot_mobj_count <= V3_SNAPSHOT_MAX_MOBJ_COUNT);
+    let snapshot_resource_payload_bound_bytes = V3_SNAPSHOT_DATA_HEADER_BYTES
+        + V3_SNAPSHOT_PSPRITE_COUNT * V3_SNAPSHOT_PSPRITE_BYTES
+        + snapshot_resource_counts[0] as usize * V3_SNAPSHOT_SECTOR_BYTES
+        + snapshot_resource_counts[1] as usize * V3_SNAPSHOT_SIDE_BYTES
+        + snapshot_resource_counts[2] as usize * V3_SNAPSHOT_TRANSLATION_BYTES
+        + snapshot_resource_counts[3] as usize * V3_SNAPSHOT_TRANSLATION_BYTES
+        + V3_SNAPSHOT_MAX_MOBJ_BYTES;
+    assert!(
+        snapshot_resource_payload_bound_bytes + V3_SNAPSHOT_HEADER_BYTES <= V3_SNAPSHOT_CACHE_BYTES,
+        "committed Doom resource counts plus the encoder mobj cap must fit the snapshot cache"
+    );
+    assert!(snapshot_payload_bytes <= snapshot_resource_payload_bound_bytes);
     FrameObservation {
         pixel_sha256: sha256(&[&pixels]),
         transaction_cu,
         workspace_bytes: workspace.data.len(),
         arena_high_water: high_water,
         snapshot_payload_bytes,
+        snapshot_resource_payload_bound_bytes,
+        snapshot_resource_counts,
         abort_cached_strips,
         abort_cache_cursor_refusals,
-        fresh_workspace_reset,
+        retry_from_dirty_workspace,
         render_blockhash_retries,
     }
 }
@@ -1700,21 +1742,27 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     assert!(abort_rerender_trace
         .frames
         .iter()
-        .all(|frame| frame.fresh_workspace_reset));
+        .all(|frame| frame.retry_from_dirty_workspace));
     assert!(abort_rerender_trace
         .frames
         .iter()
         .skip(1)
         .zip(cadence_trace.frames.iter().skip(1))
         .all(|(fresh, reused)| fresh.pixel_sha256 == reused.pixel_sha256));
-    assert!(cadence_trace
-        .frames
-        .iter()
-        .all(|frame| { frame.snapshot_payload_bytes + 128 <= V3_SNAPSHOT_CACHE_BYTES }));
-    assert!(abort_rerender_trace
-        .frames
-        .iter()
-        .all(|frame| { frame.snapshot_payload_bytes + 128 <= V3_SNAPSHOT_CACHE_BYTES }));
+    assert!(cadence_trace.frames.iter().all(|frame| {
+        frame.snapshot_payload_bytes <= frame.snapshot_resource_payload_bound_bytes
+            && frame.snapshot_payload_bytes + V3_SNAPSHOT_HEADER_BYTES <= V3_SNAPSHOT_CACHE_BYTES
+    }));
+    assert!(abort_rerender_trace.frames.iter().all(|frame| {
+        frame.snapshot_payload_bytes <= frame.snapshot_resource_payload_bound_bytes
+            && frame.snapshot_payload_bytes + V3_SNAPSHOT_HEADER_BYTES <= V3_SNAPSHOT_CACHE_BYTES
+    }));
+    assert!(cadence_trace.frames.iter().all(|frame| {
+        frame.snapshot_resource_counts == cadence_trace.frames[0].snapshot_resource_counts
+    }));
+    assert!(abort_rerender_trace.frames.iter().all(|frame| {
+        frame.snapshot_resource_counts == cadence_trace.frames[0].snapshot_resource_counts
+    }));
     let cadence_frame_transaction_count = cadence_trace
         .frames
         .iter()
@@ -2382,7 +2430,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "same_rendered_frame_hashes_after_abort_fresh_workspace_rerender": true,
                 "aborted_partial_render_cached_strips": abort_rerender_trace.frames.iter().map(|f| f.abort_cached_strips).collect::<Vec<_>>(),
                 "aborted_cache_cursor_refusals": abort_rerender_trace.frames.iter().map(|f| f.abort_cache_cursor_refusals).collect::<Vec<_>>(),
-                "fresh_workspace_reset_before_comparison_render": abort_rerender_trace.frames.iter().map(|f| f.fresh_workspace_reset).collect::<Vec<_>>(),
+                "retry_from_dirty_workspace_without_zeroing": abort_rerender_trace.frames.iter().map(|f| f.retry_from_dirty_workspace).collect::<Vec<_>>(),
                 "frames_2_through_10_match_fresh_workspace_render": abort_rerender_trace.frames.iter().skip(1).zip(cadence_trace.frames.iter().skip(1)).all(|(fresh, reused)| fresh.pixel_sha256 == reused.pixel_sha256),
                 "state_roots_after_each_tic": cadence_trace.ticks.iter().map(|tick| json!({
                     "cursor": tick.cursor,
@@ -2399,9 +2447,14 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "compute_units_for_ten_frames_including_snapshot_seed": cadence_frame_cu,
                 "snapshot_cache_bytes": V3_SNAPSHOT_CACHE_BYTES,
                 "snapshot_payload_bytes_per_frame": cadence_trace.frames.iter().map(|f| f.snapshot_payload_bytes).collect::<Vec<_>>(),
-                "snapshot_payload_and_header_bytes_per_frame": cadence_trace.frames.iter().map(|f| f.snapshot_payload_bytes + 128).collect::<Vec<_>>(),
-                "snapshot_cache_exceeded_frame_numbers": cadence_trace.frames.iter().enumerate().filter_map(|(index, f)| (f.snapshot_payload_bytes + 128 > V3_SNAPSHOT_CACHE_BYTES).then_some(index + 1)).collect::<Vec<_>>(),
-                "snapshot_cache_oversize_behavior": "render callback returns InvalidInput, mapped by DCG to REFUSAL_KERNEL; RUN_PHASE transaction rolls back",
+                "snapshot_header_bytes": V3_SNAPSHOT_HEADER_BYTES,
+                "snapshot_payload_and_header_bytes_per_frame": cadence_trace.frames.iter().map(|f| f.snapshot_payload_bytes + V3_SNAPSHOT_HEADER_BYTES).collect::<Vec<_>>(),
+                "snapshot_cache_exceeded_frame_numbers": cadence_trace.frames.iter().enumerate().filter_map(|(index, f)| (f.snapshot_payload_bytes + V3_SNAPSHOT_HEADER_BYTES > V3_SNAPSHOT_CACHE_BYTES).then_some(index + 1)).collect::<Vec<_>>(),
+                "snapshot_static_resource_counts_sectors_sides_textures_flats": cadence_trace.frames[0].snapshot_resource_counts,
+                "snapshot_mobj_count_cap": V3_SNAPSHOT_MAX_MOBJ_COUNT,
+                "snapshot_max_payload_bound_bytes": cadence_trace.frames.iter().map(|f| f.snapshot_resource_payload_bound_bytes).max().unwrap_or(0),
+                "snapshot_max_total_bound_bytes": cadence_trace.frames.iter().map(|f| f.snapshot_resource_payload_bound_bytes + V3_SNAPSHOT_HEADER_BYTES).max().unwrap_or(0),
+                "snapshot_oversize_error": "KernelError::Refused maps to REFUSAL_KERNEL; ProgramTest proves the committed resource's fixed counts plus the C encoder's 1,024-mobj cap fit the 640 KiB cache",
                 "workspace_account_bytes": workspace_allocation,
                 "workspace_bytes_after_each_frame": cadence_trace.frames.iter().map(|f| f.workspace_bytes).collect::<Vec<_>>(),
                 "render_arena_high_water_bytes": cadence_trace.frames.iter().map(|f| f.arena_high_water).collect::<Vec<_>>(),
