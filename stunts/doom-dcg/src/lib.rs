@@ -738,6 +738,22 @@ fn render_doom_view_at_workspace_base(
         let workspace_ptr = workspace.as_ptr();
         let payload_ptr = unsafe { workspace_ptr.add(SNAPSHOT_CACHE_OFFSET + rsn3::HEADER_BYTES) };
         let snapshot_hash_ptr = unsafe { workspace_ptr.add(SNAPSHOT_CACHE_OFFSET + 128) };
+        let rsr_header = unsafe { core::slice::from_raw_parts(header_ptr, RSR_HEADER_BYTES) };
+        let rsr_base = u64::from_le_bytes(
+            rsr_header[112..120]
+                .try_into()
+                .map_err(|_| KernelError::InvalidInput)?,
+        );
+        solana_program::msg!(
+            "Doom workspace RSR layout: ptr={} base={} version={} header_bytes={} account_bytes={} context_bytes={} roots={}",
+            context_ptr as usize,
+            rsr_base,
+            u32_at(rsr_header, 8),
+            u32_at(rsr_header, 12),
+            u32_at(rsr_header, 16),
+            u32_at(rsr_header, 20),
+            u32_at(rsr_header, 40)
+        );
         let mut arena_high_water = 0usize;
         let rc = unsafe {
             doom_engine_rsn3_render_static(
