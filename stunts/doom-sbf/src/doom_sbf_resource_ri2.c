@@ -133,6 +133,13 @@ static void rsr_prof_emit(void)
 #define RI2_WAD_BYTES 4196020u
 #define RI2_ZONE_BYTES 3145728u
 #define RI2_BOOTSTRAP_MIN (2u * 1024u * 1024u)
+#define RSR_HEADER_BYTES 512u
+#ifdef DOOM_DCG_STATEFUL_V3
+/* DCG passes the arena after the reserved RSN header, not the full 2 MiB. */
+#define RI2_SPLIT_BOOTSTRAP_MIN (RI2_BOOTSTRAP_MIN - RSR_HEADER_BYTES)
+#else
+#define RI2_SPLIT_BOOTSTRAP_MIN RI2_BOOTSTRAP_MIN
+#endif
 #define RI2_MIRROR_HEADER_BYTES 4096u
 #define RI2_MIRROR_SLOT_BYTES 160u
 #define RI2_MIRROR_SLOTS 384u
@@ -1684,7 +1691,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_prepare_phase(
     uint8_t *demo;
 
     if (doom_ctx_guard(context)) return 199;
-    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+    if (!bootstrap || bootstrap_bytes < RI2_SPLIT_BOOTSTRAP_MIN ||
         ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
     if (!ri2_split_arena_bytes(bootstrap_bytes) ||
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
@@ -1767,7 +1774,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_newgame_phase(
 {
     if (phase >= 37u) return RI2_REFUSE_RESOURCE;
     if (doom_ctx_guard(context)) return 199;
-    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+    if (!bootstrap || bootstrap_bytes < RI2_SPLIT_BOOTSTRAP_MIN ||
         ((uintptr_t)bootstrap & 15u) != 0) return RI2_REFUSE_ARENA;
     if (!ri2_split_arena_bytes(bootstrap_bytes) ||
         !doom_sbf_rebind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes), RI2_ZONE_BYTES))
@@ -1872,7 +1879,7 @@ int doom_engine_ex2_resource_sbf_ri2_split_finalize(
     uint8_t *encoded = 0, *derived = 0;
     size_t encoded_bytes = 0;
     if (doom_ctx_guard(context)) return 199;
-    if (!bootstrap || bootstrap_bytes < RI2_BOOTSTRAP_MIN ||
+    if (!bootstrap || bootstrap_bytes < RI2_SPLIT_BOOTSTRAP_MIN ||
         !state_out || !state_out_len || !mirror_out || !mirror_out_len ||
         !frame_out || !frame_out_len || state_cap < RI2_STATE_MAX ||
         mirror_cap < RI2_MIRROR_BYTES || frame_cap < RI2_FRAME_BYTES)
@@ -2076,7 +2083,6 @@ int doom_sbf_sim2_reset(
 /* ------------------------------------------------------------------ */
 /* DOOM-RSR/2 pinned-base static renderer resource account              */
 
-#define RSR_HEADER_BYTES 512u
 #define RSR_ROOTS_OFFSET 160u
 #define RSR_ROOT_COUNT 32u
 #define RSR_REFUSE_LAYOUT 302u
@@ -2269,7 +2275,13 @@ int doom_engine_rsn3_build_static_phase(
         if (r2_v2_preflight(resource, (size_t)resource_bytes, sections, plan))
             return RI2_REFUSE_IMAGE;
         RI2_PHASE(1001);
+#ifndef DOOM_DCG_STATEFUL_V3
         memset((void *)DOOM_CTX, 0, sizeof(doom_ctx_t));
+#endif
+        /* DCG created this primary state account as zeroed data, then copied
+         * the WAD image into its reserved range in bounded initialization
+         * phases.  Clearing the full 9.7 MB context here both exceeds one SVM
+         * instruction budget and destroys that already-committed WAD image. */
         doom_ctx_init();
         if (!doom_sbf_bind_arena(bootstrap, ri2_split_arena_bytes(bootstrap_bytes),
                                  RI2_ZONE_BYTES)) return RI2_REFUSE_ARENA;
