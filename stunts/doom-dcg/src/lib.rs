@@ -608,14 +608,18 @@ fn render_doom_view(
         put_u32(workspace, ARENA_HIGH_WATER_OFFSET, 0);
     }
 
-    let snapshot = &workspace[SNAPSHOT_CACHE_OFFSET..SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES];
-    let payload_len = u32_at(snapshot, 28) as usize;
-    if snapshot[..8] != *rsn3::MAGIC
-        || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
-        || snapshot[160..192] != V3_SNAPSHOT_ABI
-    {
-        return Err(KernelError::Refused);
-    }
+    let payload_len = {
+        let snapshot =
+            &workspace[SNAPSHOT_CACHE_OFFSET..SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES];
+        let payload_len = u32_at(snapshot, 28) as usize;
+        if snapshot[..8] != *rsn3::MAGIC
+            || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
+            || snapshot[160..192] != V3_SNAPSHOT_ABI
+        {
+            return Err(KernelError::Refused);
+        }
+        payload_len
+    };
 
     // Distribute the 9.7 MB context seed over the aligned snapshot phases.
     // Each phase copies a bounded proportional range; the last phase reaches
@@ -630,6 +634,7 @@ fn render_doom_view(
     workspace[copy_start..copy_end].copy_from_slice(&state[0].data[copy_start..copy_end]);
 
     output.fill(0);
+    let snapshot = &workspace[SNAPSHOT_CACHE_OFFSET..SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES];
     let snapshot_end = rsn3::HEADER_BYTES + payload_len;
     let output_start = phase.output_offset as usize;
     if output_start < snapshot_end {
