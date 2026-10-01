@@ -349,6 +349,7 @@ impl Kernel for DoomKernel {
 
 #[cfg(all(feature = "sbf", target_os = "solana"))]
 unsafe extern "C" {
+    fn doom_sbf_arena_mark() -> usize;
     fn doom_engine_rsn3_build_static_phase(
         phase: u32,
         context: *mut u8,
@@ -738,6 +739,7 @@ fn render_doom_view_at_workspace_base(
         let cache_base = u32_at(temp, 48);
         let cache_dynamic = u32_at(temp, 52);
         let cache_end = u32_at(temp, 56);
+        let arena_mark = unsafe { doom_sbf_arena_mark() };
         let cache_ptr = temp.as_mut_ptr();
         let pixels_ptr = unsafe { cache_ptr.add(RENDER_CACHE_BYTES) };
         let workspace_ptr = workspace.as_ptr();
@@ -760,7 +762,7 @@ fn render_doom_view_at_workspace_base(
             }
         }
         solana_program::msg!(
-            "Doom workspace RSR layout: ptr={} base={} magic={} version={} header_bytes={} account_bytes={} context_bytes={} roots={} bad_root={} bad_offset={} cache_magic={} cache_version={} cache_base={} cache_dynamic={} cache_end={}",
+            "Doom workspace RSR layout: ptr={} base={} magic={} version={} header_bytes={} account_bytes={} context_bytes={} roots={} bad_root={} bad_offset={} cache_magic={} cache_version={} cache_base={} cache_dynamic={} cache_end={} arena_mark={}",
             context_ptr as usize,
             rsr_base,
             u32_at(rsr_header, 0),
@@ -775,7 +777,8 @@ fn render_doom_view_at_workspace_base(
             cache_version,
             cache_base,
             cache_dynamic,
-            cache_end
+            cache_end,
+            arena_mark
         );
         let mut arena_high_water = 0usize;
         let rc = unsafe {
