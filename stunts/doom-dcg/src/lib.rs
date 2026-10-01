@@ -183,20 +183,10 @@ pub struct DoomResourceBundle<'a> {
 
 impl<'a> DoomResourceBundle<'a> {
     pub fn decode(bytes: &'a [u8]) -> Result<Self, KernelError> {
-        let bundle = Self::decode_shape(bytes).map_err(|error| {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom resource envelope shape rejected len={}", bytes.len());
-            error
-        })?;
+        let bundle = Self::decode_shape(bytes)?;
         let ri2_matches = dcg_program::hash::sha256(&[bundle.ri2]) == DOOM_RI2_DIGEST;
         let wad_matches = dcg_program::hash::sha256(&[bundle.wad]) == DOOM_WAD_DIGEST;
         if !ri2_matches || !wad_matches {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!(
-                "doom resource digest mismatch ri2={} wad={}",
-                ri2_matches,
-                wad_matches
-            );
             return Err(KernelError::InvalidInput);
         }
         Ok(bundle)
@@ -212,8 +202,6 @@ impl<'a> DoomResourceBundle<'a> {
             || u32_at(bytes, 24) as usize != WAD_IMAGE_BYTES
             || bytes[28..32] != [0; 4]
         {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom outer resource header rejected len={}", bytes.len());
             return Err(KernelError::InvalidInput);
         }
         let ri2_end = RESOURCE_HEADER_BYTES + RI2_RESOURCE_BYTES;
@@ -224,8 +212,6 @@ impl<'a> DoomResourceBundle<'a> {
             || u32_at(ri2, 16) as usize != RI2_RESOURCE_BYTES
             || ri2[72..104] != DOOM_WAD_DIGEST
         {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom inner RI2 header rejected");
             return Err(KernelError::InvalidInput);
         }
         Ok(Self { ri2, wad })
@@ -290,28 +276,12 @@ impl DoomKernel {
         // The callback sees the program-owned sealed resource-copy PDA, not
         // the external source key supplied at open-session time.
         if resource.schema != RESOURCE_SCHEMA {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!(
-                "doom resource schema rejected got={}:{} expected={}:{}",
-                resource.schema.id,
-                resource.schema.version,
-                RESOURCE_SCHEMA.id,
-                RESOURCE_SCHEMA.version
-            );
             return Err(KernelError::Refused);
         }
         if resource.owner == [0; 32] || *commitment == [0; 32] {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!(
-                "doom resource owner/commitment rejected owner_zero={} commitment_zero={}",
-                resource.owner == [0; 32],
-                *commitment == [0; 32]
-            );
             return Err(KernelError::Refused);
         }
         if *commitment != DOOM_RESOURCE_COMMITMENT {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom resource commitment mismatch");
             return Err(KernelError::InvalidInput);
         }
         DoomResourceBundle::decode_shape(resource.data)
@@ -353,12 +323,6 @@ impl DoomKernel {
         if pointer as usize == DOOM_CONTEXT_ADDRESS {
             Ok(())
         } else {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!(
-                "doom context address got={} expected={}",
-                pointer as usize,
-                DOOM_CONTEXT_ADDRESS
-            );
             Err(KernelError::Refused)
         }
     }
@@ -745,11 +709,7 @@ impl StatefulKernel for DoomKernel {
     }
 
     fn bind_invocation_state(&self, spans: &mut [StateSpanMut<'_>]) -> Result<(), KernelError> {
-        if let Err(error) = Self::validate_spans(spans) {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom bind state spans rejected");
-            return Err(error);
-        }
+        Self::validate_spans(spans)?;
         let address = spans[0].data_address();
         if address.is_null() {
             return Err(KernelError::Refused);
@@ -862,35 +822,14 @@ impl StatefulKernel for DoomKernel {
         commitment: &[u8; 32],
         state: &mut [StateSpanMut<'_>],
     ) -> Result<usize, KernelError> {
-        #[cfg(all(feature = "sbf", target_os = "solana"))]
-        if phase.cursor == 9_912_320 {
-            solana_program::msg!("doom final tail callback enter");
-            solana_program::log::sol_log_compute_units();
-        }
-        if let Err(error) = Self::validate_spans(state) {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom init state spans rejected");
-            return Err(error);
-        }
+        Self::validate_spans(state)?;
         let bundle = (if phase.cursor == 0 {
             self.validate_resources(resources, commitment)
         } else {
             self.parse_resources(resources, commitment)
-        })
-        .map_err(|error| {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom init resource bundle rejected");
-            error
         })?;
-        #[cfg(all(feature = "sbf", target_os = "solana"))]
-        if phase.cursor == 9_912_320 {
-            solana_program::msg!("doom final tail resource parsed");
-            solana_program::log::sol_log_compute_units();
-        }
         let context = self.context_ptr()?;
         if context != state[0].data.as_mut_ptr() {
-            #[cfg(all(feature = "sbf", target_os = "solana"))]
-            solana_program::msg!("doom init context pointer differs from primary span");
             return Err(KernelError::Refused);
         }
         Self::require_context_address(context)?;
@@ -934,10 +873,6 @@ impl StatefulKernel for DoomKernel {
         if end >= wad_end {
             let phase_index = current_chunk - first_engine_chunk;
             if phase_index < INITIAL_ENGINE_PHASES as usize {
-                #[cfg(all(feature = "sbf", target_os = "solana"))]
-                if phase_index < 6 {
-                    solana_program::msg!("doom static engine phase {}", phase_index);
-                }
                 let context_bytes = state[0].data.len();
                 let context_ptr = state[0].data.as_mut_ptr();
                 let bootstrap_ptr = unsafe { context_ptr.add(BOOTSTRAP_ARENA_OFFSET) };
@@ -1001,14 +936,6 @@ impl StatefulKernel for DoomKernel {
                             || mirror_len != state[2].data.len()
                             || frame_len != RENDER_FRAME_BYTES
                         {
-                            #[cfg(all(feature = "sbf", target_os = "solana"))]
-                            solana_program::msg!(
-                                "doom finalization rejected rc={} state={} mirror={} frame={}",
-                                finalize_rc,
-                                state_len,
-                                mirror_len,
-                                frame_len
-                            );
                             return Err(KernelError::Refused);
                         }
                         let publish_rc = doom_sbf_sim2_publish(
@@ -1022,14 +949,6 @@ impl StatefulKernel for DoomKernel {
                         publish_rc
                     }
                 };
-                #[cfg(all(feature = "sbf", target_os = "solana"))]
-                if rc != 0 {
-                    solana_program::msg!(
-                        "doom initialization engine phase {} refused with rc={}",
-                        phase_index,
-                        rc
-                    );
-                }
                 engine_error(rc)?;
                 if phase_index == 5 {
                     finish_rsr_header(
@@ -1044,11 +963,6 @@ impl StatefulKernel for DoomKernel {
         {
             let _ = (phase, bundle);
             return Err(KernelError::Refused);
-        }
-        #[cfg(all(feature = "sbf", target_os = "solana"))]
-        if phase.cursor == 9_912_320 {
-            solana_program::msg!("doom final tail callback done");
-            solana_program::log::sol_log_compute_units();
         }
         Ok(count)
     }
@@ -1208,7 +1122,6 @@ pub fn process_instruction<'a>(
     accounts: &'a [solana_program::account_info::AccountInfo<'a>],
     instruction_data: &[u8],
 ) -> solana_program::entrypoint::ProgramResult {
-    solana_program::msg!("doom process entry");
     let kernel = DoomKernel::default();
     dcg_program::stateful::v3::process_with_kernel(program_id, accounts, instruction_data, &kernel)
 }

@@ -469,6 +469,7 @@ async fn send(
     expected: Result<(), u32>,
 ) -> u64 {
     let blockhash = context.get_new_latest_blockhash().await.unwrap();
+    let instruction_data = ix.data.clone();
     let mut signers = vec![&context.payer];
     signers.extend_from_slice(extra_signers);
     let instructions = [
@@ -500,7 +501,10 @@ async fn send(
                 .as_ref()
                 .map(|meta| meta.log_messages.join("\n"))
                 .unwrap_or_default();
-            panic!("expected {want:?}, got {got:?}\n{logs}");
+            panic!(
+                "expected {want:?}, got {got:?}, instruction_data={:?}\n{logs}",
+                instruction_data
+            );
         }
     }
     units
@@ -901,7 +905,6 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let mut init_phase_cu = Vec::new();
     for phase_index in 0..phase_count {
         let cursor = phase_index * 16_384;
-        eprintln!("running Doom initialization cursor {cursor}");
         let cu = send(
             &mut context,
             run_initialization(authority.pubkey(), session, cursor, None),
