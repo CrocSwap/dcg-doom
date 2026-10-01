@@ -931,6 +931,7 @@ struct FrameObservation {
     abort_cached_strips: u8,
     abort_cache_cursor_refusals: u8,
     fresh_workspace_reset: bool,
+    render_blockhash_retries: u32,
 }
 
 #[derive(Debug)]
@@ -1000,6 +1001,7 @@ async fn publish_observed_frame(
 ) -> FrameObservation {
     let frame_bytes = SNAPSHOT_BYTES + STRIP_BYTES * 8;
     let mut transaction_cu = Vec::new();
+    let mut render_blockhash_retries = 0u32;
     let mut abort_cached_strips = 0;
     let mut abort_cache_cursor_refusals = 0;
     let mut fresh_workspace_reset = false;
@@ -1239,6 +1241,7 @@ async fn publish_observed_frame(
         };
         let mut candidate = remaining.min(layout_remaining).min(13);
         assert!(candidate > 0);
+        let mut blockhash_retries_for_cursor = 0u8;
         loop {
             let blockhash = context.get_new_latest_blockhash().await.unwrap();
             let phase_instructions = (0..candidate)
@@ -1273,6 +1276,15 @@ async fn publish_observed_frame(
                 .await
                 .unwrap();
             let result = simulation.result.expect("render simulation result");
+            if matches!(&result, Err(TransactionError::BlockhashNotFound)) {
+                assert!(
+                    blockhash_retries_for_cursor < 3,
+                    "render simulation repeatedly rejected a refreshed blockhash at cursor {view_cursor}"
+                );
+                blockhash_retries_for_cursor += 1;
+                render_blockhash_retries += 1;
+                continue;
+            }
             let logs = simulation
                 .simulation_details
                 .as_ref()
@@ -1304,11 +1316,31 @@ async fn publish_observed_frame(
                 .as_ref()
                 .expect("render simulation details")
                 .units_consumed;
+            // ProgramTest can advance its bank while simulating this large
+            // render transaction. Sign the execution copy against the latest
+            // bank hash instead of reusing the simulation transaction's hash.
+            drop(signers);
+            let execution_blockhash = context.get_new_latest_blockhash().await.unwrap();
+            let execution_signers = vec![&context.payer, authority];
+            let execution_tx = Transaction::new(
+                &execution_signers,
+                solana_message::Message::new(&instructions, Some(&context.payer.pubkey())),
+                execution_blockhash,
+            );
             let execution = context
                 .banks_client
-                .process_transaction_with_metadata(tx)
+                .process_transaction_with_metadata(execution_tx)
                 .await
                 .unwrap();
+            if matches!(&execution.result, Err(TransactionError::BlockhashNotFound)) {
+                assert!(
+                    blockhash_retries_for_cursor < 3,
+                    "render execution repeatedly rejected a refreshed blockhash at cursor {view_cursor}"
+                );
+                blockhash_retries_for_cursor += 1;
+                render_blockhash_retries += 1;
+                continue;
+            }
             if let Err(error) = execution.result {
                 let logs = execution
                     .metadata
@@ -1386,6 +1418,7 @@ async fn publish_observed_frame(
         abort_cached_strips,
         abort_cache_cursor_refusals,
         fresh_workspace_reset,
+        render_blockhash_retries,
     }
 }
 
@@ -1791,7 +1824,9 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         &mut context,
         run_view_phase_with_state_rights(authority.pubkey(), session, 0, true),
         &[&authority],
-        Err(v3::REFUSAL_STATE),
+        // DCG accepts writable state-account privileges in a view message;
+        // Doom still rejects the attempt in its own kernel validator.
+        Err(v3::REFUSAL_KERNEL),
     )
     .await;
     let context_before_render = context
@@ -2358,6 +2393,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "frame_hashes": cadence_frame_hashes,
                 "abort_rerender_frame_hashes": abort_frame_hashes,
                 "abort_rerender_transaction_counts": abort_rerender_trace.frames.iter().map(|f| f.transaction_cu.len()).collect::<Vec<_>>(),
+                "render_blockhash_retries_per_frame": cadence_trace.frames.iter().map(|f| f.render_blockhash_retries).collect::<Vec<_>>(),
                 "transactions_per_frame_average": cadence_transactions_per_frame,
                 "transactions_for_ten_frames": cadence_frame_transaction_count,
                 "compute_units_for_ten_frames_including_snapshot_seed": cadence_frame_cu,
