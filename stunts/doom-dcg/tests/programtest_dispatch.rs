@@ -401,6 +401,18 @@ fn grow_view(payer: Pubkey, session: Pubkey, role: u8) -> Instruction {
     )
 }
 
+fn close_child(session: Pubkey, target: Pubkey, refund: Pubkey, kind: u8) -> Instruction {
+    instruction(
+        sw::TAG_CLOSE_ACCOUNT,
+        vec![v3::WIRE_VERSION, kind],
+        vec![
+            AccountMeta::new(session, false),
+            AccountMeta::new(target, false),
+            AccountMeta::new(refund, false),
+        ],
+    )
+}
+
 fn publication_accounts(
     authority: Pubkey,
     session: Pubkey,
@@ -599,6 +611,15 @@ async fn send(
         }
     }
     units
+}
+
+async fn account(context: &mut ProgramTestContext, key: Pubkey) -> Account {
+    context
+        .banks_client
+        .get_account(key)
+        .await
+        .unwrap()
+        .expect("expected account")
 }
 
 async fn send_many(

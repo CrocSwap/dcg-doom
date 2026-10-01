@@ -67,15 +67,19 @@ pub const INPUT_REFUSAL: u32 = 3_504;
 const ST1_OFFSET: u32 = ENGINE_CONTEXT_BYTES;
 const MP1_OFFSET: u32 = ENGINE_CONTEXT_BYTES + ST1_ACCOUNT_BYTES;
 const MAX_ADVANCE_TICS: u32 = 1;
-const STEP_COMPUTE_CEILING: u64 = 1_400_000;
+// DCG reserves dispatch overhead and headroom inside the 1.4M transaction
+// limit; application declarations use the resulting lower kernel ceiling.
+const STEP_COMPUTE_CEILING: u64 = dcg_program::kernel::MAX_DECLARED_KERNEL_COMPUTE_UNITS;
 pub const V3_INITIALIZATION_PHASE_BYTES: u32 = 16_384;
-pub const V3_INITIALIZATION_PHASE_COMPUTE_UNITS: u32 = 1_400_000;
+pub const V3_INITIALIZATION_PHASE_COMPUTE_UNITS: u32 =
+    dcg_program::kernel::MAX_DECLARED_KERNEL_COMPUTE_UNITS as u32;
 // Each publication phase is at most one 8,128-byte strip. The view byte
 // stream is the snapshot followed by eight strips. The renderer caches each
 // complete strip in the preserved workspace, then invalidates that cache when
 // the next frame starts so split phases do not rerun the C renderer.
 pub const V3_VIEW_PHASE_BYTES: u32 = STRIP_BYTES;
-pub const V3_VIEW_PHASE_COMPUTE_CEILING: u32 = 1_400_000;
+pub const V3_VIEW_PHASE_COMPUTE_CEILING: u32 =
+    dcg_program::kernel::MAX_DECLARED_KERNEL_COMPUTE_UNITS as u32;
 const RSR_HEADER_BYTES: usize = 512;
 const WAD_IMAGE_OFFSET: usize = 3_440_976;
 const BOOTSTRAP_OFFSET: usize = 7_637_008;
