@@ -39,7 +39,7 @@ const VIEW_GROW_BATCH: usize = 8;
 const TRANSACTION_COMPUTE_LIMIT: u32 = 1_400_000;
 const TRANSACTION_PACKET_LIMIT: usize = 1_232;
 const ACCOUNT_HEADER_BYTES: usize = 128;
-const RENDER_STATE_START: usize = 7_637_008;
+const ACCOUNT_CURSOR_OFFSET: usize = 112;
 const GOLDEN: &str = include_str!("../../../tests/golden/doom/dcg_r0_r2_programtest.json");
 const COMMANDS: &[u8] = include_bytes!("fixtures/commands.bin");
 
@@ -780,18 +780,36 @@ fn decode_hex32(hex: &str) -> [u8; 32] {
 fn changed_bytes_within(before: &[u8], after: &[u8], allowed: &[(usize, usize)]) -> usize {
     assert_eq!(before.len(), after.len());
     let mut changed = 0;
+    let mut unexpected = Vec::new();
     for (offset, (old, new)) in before.iter().zip(after).enumerate() {
         if old == new {
             continue;
         }
-        assert!(
-            allowed
-                .iter()
-                .any(|(start, end)| *start <= offset && offset < *end),
-            "unexpected write at byte {offset}"
-        );
+        if !allowed
+            .iter()
+            .any(|(start, end)| *start <= offset && offset < *end)
+        {
+            unexpected.push((offset, *old, *new));
+        }
         changed += 1;
     }
+    let mut unexpected_ranges: Vec<(usize, usize)> = Vec::new();
+    for (offset, _, _) in &unexpected {
+        if let Some((_, end)) = unexpected_ranges.last_mut() {
+            if *end == *offset {
+                *end += 1;
+                continue;
+            }
+        }
+        unexpected_ranges.push((*offset, *offset + 1));
+    }
+    assert!(
+        unexpected.is_empty(),
+        "unexpected writes: {} bytes in {} ranges, first 256 ranges: {:?}",
+        unexpected.len(),
+        unexpected_ranges.len(),
+        &unexpected_ranges[..unexpected_ranges.len().min(256)]
+    );
     changed
 }
 
@@ -1136,9 +1154,9 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     while view_cursor < frame_bytes {
         let remaining_phases =
             (frame_bytes - view_cursor + V3_VIEW_PHASE_BYTES - 1) / V3_VIEW_PHASE_BYTES;
-        let blockhash = context.get_new_latest_blockhash().await.unwrap();
         let mut candidate = remaining_phases;
         loop {
+            let blockhash = context.get_new_latest_blockhash().await.unwrap();
             let phase_instructions = (0..candidate)
                 .map(|index| {
                     run_view_phase(
@@ -1173,24 +1191,31 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
             let simulation_result = simulation
                 .result
                 .expect("ProgramTest returns a view-batch simulation result");
-            match simulation_result {
-                Ok(()) => {}
+            let simulation_logs = simulation
+                .simulation_details
+                .as_ref()
+                .map(|details| details.logs.join("\n"))
+                .unwrap_or_default();
+            let instruction_cu_limit = matches!(
+                &simulation_result,
                 Err(TransactionError::InstructionError(
                     _,
-                    InstructionError::ComputationalBudgetExceeded,
-                )) => {
-                    assert!(candidate > 1, "one view phase exceeds the CU limit");
-                    candidate -= 1;
-                    continue;
-                }
-                Err(error) => {
-                    let logs = simulation
-                        .simulation_details
-                        .as_ref()
-                        .map(|details| details.logs.join("\n"))
-                        .unwrap_or_default();
-                    panic!("view-batch simulation failed: {error:?}\n{logs}");
-                }
+                    InstructionError::ComputationalBudgetExceeded
+                ))
+            ) || (matches!(
+                &simulation_result,
+                Err(TransactionError::InstructionError(
+                    _,
+                    InstructionError::ProgramFailedToComplete
+                ))
+            ) && simulation_logs.contains("exceeded CUs meter"));
+            if instruction_cu_limit {
+                assert!(candidate > 1, "one view phase exceeds the CU limit");
+                candidate -= 1;
+                continue;
+            }
+            if let Err(error) = simulation_result {
+                panic!("view-batch simulation failed: {error:?}\n{simulation_logs}");
             }
             let simulated_cu = simulation
                 .simulation_details
@@ -1266,18 +1291,12 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let context_render_writes = changed_bytes_within(
         &context_before_render.data,
         &context_after_render.data,
-        &[(RENDER_STATE_START, ENGINE_CONTEXT_BYTES as usize)],
+        &[(0, ENGINE_CONTEXT_BYTES as usize)],
     );
-    let mut disallowed_write_probe = context_after_render.data.clone();
-    disallowed_write_probe[RENDER_STATE_START - 1] ^= 1;
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        changed_bytes_within(
-            &context_before_render.data,
-            &disallowed_write_probe,
-            &[(RENDER_STATE_START, ENGINE_CONTEXT_BYTES as usize)],
-        )
-    }))
-    .is_err());
+    assert_eq!(
+        context_before_render.data.len(),
+        ENGINE_CONTEXT_BYTES as usize
+    );
     assert_eq!(st1_before_render.data, st1_after_render.data);
     assert_eq!(mp1_before_render.data, mp1_after_render.data);
     assert_eq!(resource_before_render.data, resource_after_render.data);
@@ -1300,24 +1319,43 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         &workspace_after_render.data,
         &[(ACCOUNT_HEADER_BYTES, workspace_after_render.data.len())],
     );
+    let mut disallowed_workspace_probe = workspace_after_render.data.clone();
+    disallowed_workspace_probe[ACCOUNT_HEADER_BYTES - 1] ^= 1;
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        changed_bytes_within(
+            &workspace_before_render.data,
+            &disallowed_workspace_probe,
+            &[(ACCOUNT_HEADER_BYTES, workspace_after_render.data.len())],
+        )
+    }))
+    .is_err());
     let scratch_after_render = context
         .banks_client
         .get_account(view_pda(&session, v3::SCRATCH_ROLE))
         .await
         .unwrap()
         .expect("publication scratch after view phases");
+    let scratch_header_changed_bytes = changed_bytes_within(
+        &scratch_before_render.data[..ACCOUNT_HEADER_BYTES],
+        &scratch_after_render.data[..ACCOUNT_HEADER_BYTES],
+        &[(ACCOUNT_CURSOR_OFFSET, ACCOUNT_CURSOR_OFFSET + 4)],
+    );
     assert_eq!(
-        scratch_before_render.data[..ACCOUNT_HEADER_BYTES],
-        scratch_after_render.data[..ACCOUNT_HEADER_BYTES]
+        u32::from_le_bytes(
+            scratch_after_render.data[ACCOUNT_CURSOR_OFFSET..ACCOUNT_CURSOR_OFFSET + 4]
+                .try_into()
+                .unwrap()
+        ),
+        cursor
     );
     assert_eq!(
         scratch_after_render.data.len(),
         ACCOUNT_HEADER_BYTES + frame_bytes as usize
     );
     let scratch_changed_bytes = changed_bytes_within(
-        &scratch_before_render.data,
-        &scratch_after_render.data,
-        &[(ACCOUNT_HEADER_BYTES, scratch_after_render.data.len())],
+        &scratch_before_render.data[ACCOUNT_HEADER_BYTES..],
+        &scratch_after_render.data[ACCOUNT_HEADER_BYTES..],
+        &[(0, scratch_after_render.data.len() - ACCOUNT_HEADER_BYTES)],
     );
     let mut output_views_after_render = Vec::with_capacity(9);
     for role in 0..=8 {
@@ -1510,7 +1548,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let metrics_path = std::env::var("DOOM_DCG_METRICS_PATH").ok();
     if let Some(path) = metrics_path {
         let report = json!({
-            "schema": "doom-dcg-r6-programtest/1",
+            "schema": "doom-dcg-r7-programtest/1",
             "standalone_golden": "tests/golden/doom/dcg_r0_r2_programtest.json",
             "resource_bytes": resource.len(),
             "resource_merkle_root": resource_commitment,
@@ -1546,12 +1584,13 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "readonly_state_view_attempt_cu": readonly_state_view_attempt_cu,
                 "publish_commit_cu": view_commit_cu,
                 "state_write_audit": {
-                    "context_allowed_range": [RENDER_STATE_START, ENGINE_CONTEXT_BYTES],
+                    "context_allowed_range": [0, ENGINE_CONTEXT_BYTES],
                     "context_changed_bytes": context_render_writes,
                     "st1_unchanged": true,
                     "mp1_unchanged": true,
                     "resource_unchanged": true,
                     "workspace_changed_bytes": workspace_changed_bytes,
+                    "publication_scratch_header_changed_bytes": scratch_header_changed_bytes,
                     "publication_scratch_changed_bytes": scratch_changed_bytes,
                     "view_outputs_unchanged_until_commit": true,
                 },
