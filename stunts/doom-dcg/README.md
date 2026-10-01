@@ -22,11 +22,28 @@ bound.
 
 The SBF image routes every instruction only through
 `dcg_program::stateful::v3::process_with_kernel`. It does not route headerless
-primary accounts into revision-8 compatibility handlers. The DCG mutable-state
-render callback is not used. The additive workspace-first RUN_PHASE interface
-and large-workspace limit are recorded in
-`review/dcg-stateful-v3-workspace-render.patch` against DCG main; ordinary v3
-views remain read-only by default.
+primary accounts into revision-8 compatibility handlers. Doom uses the
+workspace-first `RUN_PHASE` account order so the workspace header stays at the
+engine's fixed address; DCG snapshots and checks that 128-byte header around
+each callback. Doom itself refuses writable state spans, and its begin-phase
+callback overwrites the workspace bytes it consumes rather than asking DCG to
+clear the 10 MiB payload. Ordinary v3 views retain the canonical account order
+and clear workspace payloads by default.
+
+The accepted DCG change is pinned in `Cargo.toml` to commit
+`711f2f18209f68658b5f1600df44fc248a416f29` from the local `dcg-repo/` Git
+clone. To recreate it, clone the DCG source at main commit
+`057f088c5f31b9fd53750628403eac96f0d6e133` into `dcg-repo/`, apply
+`review/dcg-stateful-v3-workspace-render.patch`, then make the accepted fixes:
+remove the DCG-wide writable-state view refusal; cap workspace payloads with
+`MAX_VIEW_BYTES` consistently in create, grow, and view validation; snapshot
+and compare all 128 workspace-header bytes around callbacks; and add the
+workspace-first order, refusal, header restore/refusal, and no-clear SBF tests.
+The resulting tree is commit `711f2f18209f68658b5f1600df44fc248a416f29`.
+Both the `dcg-program` dependency and `curve25519-dalek` patch are pinned to
+that Git revision; Cargo resolves the vendored Dalek package as a workspace
+member. Regenerate `Cargo.lock` with Cargo after recreating the clone. Do not
+apply the rejected `review/dcg-stateful-v3-mutable-render.patch`.
 
 `scripts/pack-dcg-resource.py` packs the retained RI2 image and five
 header-stripped WAD chunks. Packed input, SBF output, and ProgramTest receipts

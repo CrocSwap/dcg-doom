@@ -88,8 +88,10 @@ const RENDER_FRAME_BYTES: usize = 320 * 200;
 // The fixed 10 MiB DCG workspace cap leaves room for the 9.7 MiB engine
 // context, strip cache, and render scratch only if the cached RSN3 projection
 // stays within this checked bound.
-const SNAPSHOT_CACHE_BYTES: usize = 640 * 1024;
-const SNAPSHOT_CACHE_OFFSET: usize = ENGINE_CONTEXT_BYTES as usize;
+pub const V3_SNAPSHOT_CACHE_BYTES: usize = 640 * 1024;
+pub const V3_SNAPSHOT_CACHE_OFFSET: usize = ENGINE_CONTEXT_BYTES as usize;
+const SNAPSHOT_CACHE_BYTES: usize = V3_SNAPSHOT_CACHE_BYTES;
+const SNAPSHOT_CACHE_OFFSET: usize = V3_SNAPSHOT_CACHE_OFFSET;
 const STRIP_CACHE_BYTES: usize = STRIP_BYTES as usize * 8;
 const STRIP_CACHE_OFFSET: usize = SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES;
 const RENDER_TEMP_BYTES: usize = RENDER_CACHE_BYTES + RENDER_PIXEL_BYTES;
@@ -616,6 +618,7 @@ fn render_doom_view(
         if snapshot[..8] != *rsn3::MAGIC
             || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
             || snapshot[160..192] != V3_SNAPSHOT_ABI
+            || u32_at(snapshot, 20) != phase.state_cursor
         {
             return Err(KernelError::Refused);
         }
@@ -812,6 +815,8 @@ fn render_doom_view_at_workspace_base(
             &strip[128..],
         ]);
         strip[96..128].copy_from_slice(&strip_hash);
+    } else if u32_at(&workspace[strip_start..strip_end], 20) != phase.state_cursor {
+        return Err(KernelError::Refused);
     }
 
     output.copy_from_slice(

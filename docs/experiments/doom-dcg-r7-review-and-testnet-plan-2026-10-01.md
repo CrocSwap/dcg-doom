@@ -1,5 +1,10 @@
 # Doom on DCG round 7: renderer review package and part-2 plan
 
+> **Superseded:** This mutable-render proposal was rejected. The accepted
+> workspace-first DCG implementation and its local results are recorded in
+> [`doom-dcg-r7b-workspace-2026-10-01.md`](doom-dcg-r7b-workspace-2026-10-01.md).
+> The testnet measurement plan below remains unauthorized by this dispatch.
+
 ## Mutable-render rationale and write contract
 
 The pinned Doom renderer uses the fixed-address engine context for renderer

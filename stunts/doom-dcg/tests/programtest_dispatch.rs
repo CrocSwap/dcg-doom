@@ -9,8 +9,9 @@ use doom_dcg::{
     DoomKernel, DOOM_KERNEL_ID, DOOM_RESOURCE_COMMITMENT, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V3,
     MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
     ST1_ACCOUNT_BYTES, STATE_SCHEMA, STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS,
-    V3_RENDER_ARENA_HIGH_WATER_OFFSET, V3_RENDER_ARENA_MAX_BYTES, V3_SNAPSHOT_ABI, V3_STRIP_ABIS,
-    V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
+    V3_RENDER_ARENA_HIGH_WATER_OFFSET, V3_RENDER_ARENA_MAX_BYTES, V3_SNAPSHOT_ABI,
+    V3_SNAPSHOT_CACHE_BYTES, V3_SNAPSHOT_CACHE_OFFSET, V3_STRIP_ABIS, V3_VIEW_PHASE_BYTES,
+    V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
 };
 use serde_json::{json, Value};
 use solana_account::{Account, AccountSharedData};
@@ -905,6 +906,10 @@ struct FrameObservation {
     transaction_cu: Vec<u64>,
     workspace_bytes: usize,
     arena_high_water: u32,
+    snapshot_payload_bytes: usize,
+    abort_cached_strips: u8,
+    abort_cache_cursor_refusals: u8,
+    fresh_workspace_reset: bool,
 }
 
 #[derive(Debug)]
@@ -974,7 +979,27 @@ async fn publish_observed_frame(
 ) -> FrameObservation {
     let frame_bytes = SNAPSHOT_BYTES + STRIP_BYTES * 8;
     let mut transaction_cu = Vec::new();
+    let mut abort_cached_strips = 0;
+    let mut abort_cache_cursor_refusals = 0;
+    let mut fresh_workspace_reset = false;
     if abort_and_restart {
+        let output_views_before_abort = (0..=8)
+            .map(|role| view_pda(&session, role))
+            .collect::<Vec<_>>();
+        let output_images_before_abort = {
+            let mut images = Vec::with_capacity(output_views_before_abort.len());
+            for key in &output_views_before_abort {
+                images.push(
+                    context
+                        .banks_client
+                        .get_account(*key)
+                        .await
+                        .unwrap()
+                        .expect("output view before abort attempt"),
+                );
+            }
+            images
+        };
         transaction_cu.push(
             send(
                 context,
@@ -984,15 +1009,155 @@ async fn publish_observed_frame(
             )
             .await,
         );
+
+        // Complete the snapshot stream, then execute two workspace-first
+        // phases. They render both first strip caches, but the view outputs
+        // stay unpublished because COMMIT_PHASE is not sent.
+        let snapshot_strip_boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
+        let mut cursor = 0u32;
+        while cursor < snapshot_strip_boundary {
+            let phase_count =
+                ((snapshot_strip_boundary - cursor) / V3_VIEW_PHASE_BYTES).min(13) as usize;
+            assert!(phase_count > 0);
+            let phases = (0..phase_count)
+                .map(|index| {
+                    run_view_phase(
+                        authority.pubkey(),
+                        session,
+                        cursor + index as u32 * V3_VIEW_PHASE_BYTES,
+                    )
+                })
+                .collect();
+            let (cu, _) = send_many(context, phases, &[authority]).await;
+            transaction_cu.push(cu);
+            cursor += phase_count as u32 * V3_VIEW_PHASE_BYTES;
+        }
+        let workspace_key = view_pda(&session, v3::WORKSPACE_ROLE);
+        let mut snapshot_workspace = context
+            .banks_client
+            .get_account(workspace_key)
+            .await
+            .unwrap()
+            .expect("workspace after snapshot render");
+        let snapshot_cursor_offset = ACCOUNT_HEADER_BYTES + V3_SNAPSHOT_CACHE_OFFSET + 20;
+        assert_eq!(
+            u32_at(&snapshot_workspace.data, snapshot_cursor_offset),
+            state_cursor
+        );
+        put_u32(
+            &mut snapshot_workspace.data,
+            snapshot_cursor_offset,
+            state_cursor ^ 1,
+        );
+        context.set_account(
+            &workspace_key,
+            &AccountSharedData::from(snapshot_workspace.clone()),
+        );
         transaction_cu.push(
             send(
                 context,
-                run_view_phase(authority.pubkey(), session, 0),
+                run_view_phase_workspace_first(
+                    authority.pubkey(),
+                    session,
+                    snapshot_strip_boundary,
+                ),
+                &[authority],
+                Err(v3::REFUSAL_KERNEL),
+            )
+            .await,
+        );
+        abort_cache_cursor_refusals += 1;
+        put_u32(
+            &mut snapshot_workspace.data,
+            snapshot_cursor_offset,
+            state_cursor,
+        );
+        context.set_account(&workspace_key, &AccountSharedData::from(snapshot_workspace));
+        transaction_cu.push(
+            send(
+                context,
+                run_view_phase_workspace_first(
+                    authority.pubkey(),
+                    session,
+                    snapshot_strip_boundary,
+                ),
                 &[authority],
                 Ok(()),
             )
             .await,
         );
+
+        let first_strip_cache_start =
+            ACCOUNT_HEADER_BYTES + V3_SNAPSHOT_CACHE_OFFSET + V3_SNAPSHOT_CACHE_BYTES;
+        let first_strip_cursor_offset = first_strip_cache_start + 20;
+        let first_strip_workspace = context
+            .banks_client
+            .get_account(workspace_key)
+            .await
+            .unwrap()
+            .expect("workspace after first strip render");
+        assert_eq!(
+            u32_at(&first_strip_workspace.data, first_strip_cursor_offset),
+            state_cursor
+        );
+        let mut corrupted_strip_workspace = first_strip_workspace.clone();
+        put_u32(
+            &mut corrupted_strip_workspace.data,
+            first_strip_cursor_offset,
+            state_cursor ^ 1,
+        );
+        context.set_account(
+            &workspace_key,
+            &AccountSharedData::from(corrupted_strip_workspace),
+        );
+        transaction_cu.push(
+            send(
+                context,
+                run_view_phase_workspace_first(
+                    authority.pubkey(),
+                    session,
+                    snapshot_strip_boundary + V3_VIEW_PHASE_BYTES,
+                ),
+                &[authority],
+                Err(v3::REFUSAL_KERNEL),
+            )
+            .await,
+        );
+        abort_cache_cursor_refusals += 1;
+        context.set_account(
+            &workspace_key,
+            &AccountSharedData::from(first_strip_workspace),
+        );
+        transaction_cu.push(
+            send(
+                context,
+                run_view_phase_workspace_first(
+                    authority.pubkey(),
+                    session,
+                    snapshot_strip_boundary + V3_VIEW_PHASE_BYTES,
+                ),
+                &[authority],
+                Ok(()),
+            )
+            .await,
+        );
+
+        let partial_workspace = context
+            .banks_client
+            .get_account(workspace_key)
+            .await
+            .unwrap()
+            .expect("workspace after partial strip render");
+        let strip_cache_start =
+            ACCOUNT_HEADER_BYTES + V3_SNAPSHOT_CACHE_OFFSET + V3_SNAPSHOT_CACHE_BYTES;
+        for strip_id in 0..2usize {
+            let strip_start = strip_cache_start + strip_id * STRIP_BYTES as usize;
+            assert_eq!(
+                &partial_workspace.data[strip_start..strip_start + 8],
+                b"DOOM-RS1"
+            );
+        }
+        abort_cached_strips = 2;
         transaction_cu.push(
             send(
                 context,
@@ -1002,6 +1167,28 @@ async fn publish_observed_frame(
             )
             .await,
         );
+        for (key, before) in output_views_before_abort
+            .iter()
+            .zip(output_images_before_abort.iter())
+        {
+            let after = context
+                .banks_client
+                .get_account(*key)
+                .await
+                .unwrap()
+                .expect("output view after aborted partial render");
+            assert_eq!(
+                after.data, before.data,
+                "ABORT_PHASE must not publish a view"
+            );
+        }
+
+        // Start the comparison render from the workspace's zero-initialized
+        // payload, preserving its authenticated child header and cursor.
+        let mut fresh_workspace = partial_workspace;
+        fresh_workspace.data[ACCOUNT_HEADER_BYTES..].fill(0);
+        context.set_account(&workspace_key, &AccountSharedData::from(fresh_workspace));
+        fresh_workspace_reset = true;
     }
 
     let primary_before = context
@@ -1165,11 +1352,19 @@ async fn publish_observed_frame(
         ACCOUNT_HEADER_BYTES + V3_RENDER_ARENA_HIGH_WATER_OFFSET as usize,
     );
     assert!(high_water <= V3_RENDER_ARENA_MAX_BYTES);
+    let snapshot_payload_bytes = u32_at(
+        &workspace.data,
+        ACCOUNT_HEADER_BYTES + V3_SNAPSHOT_CACHE_OFFSET + 28,
+    ) as usize;
     FrameObservation {
         pixel_sha256: sha256(&[&pixels]),
         transaction_cu,
         workspace_bytes: workspace.data.len(),
         arena_high_water: high_water,
+        snapshot_payload_bytes,
+        abort_cached_strips,
+        abort_cache_cursor_refusals,
+        fresh_workspace_reset,
     }
 }
 
@@ -1428,6 +1623,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
 
     let abort_rerender_trace =
         run_80_tic_trace(&mut context, &authority, session, true, true).await;
+    assert_eq!(abort_rerender_trace.frames.len(), 10);
     assert_eq!(cadence_trace.ticks, abort_rerender_trace.ticks);
     let abort_frame_hashes = abort_rerender_trace
         .frames
@@ -1439,6 +1635,32 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         .frames
         .iter()
         .all(|frame| frame.workspace_bytes == workspace_allocation));
+    assert!(abort_rerender_trace
+        .frames
+        .iter()
+        .all(|frame| frame.abort_cached_strips == 2));
+    assert!(abort_rerender_trace
+        .frames
+        .iter()
+        .all(|frame| frame.abort_cache_cursor_refusals == 2));
+    assert!(abort_rerender_trace
+        .frames
+        .iter()
+        .all(|frame| frame.fresh_workspace_reset));
+    assert!(abort_rerender_trace
+        .frames
+        .iter()
+        .skip(1)
+        .zip(cadence_trace.frames.iter().skip(1))
+        .all(|(fresh, reused)| fresh.pixel_sha256 == reused.pixel_sha256));
+    assert!(cadence_trace
+        .frames
+        .iter()
+        .all(|frame| { frame.snapshot_payload_bytes + 128 <= V3_SNAPSHOT_CACHE_BYTES }));
+    assert!(abort_rerender_trace
+        .frames
+        .iter()
+        .all(|frame| { frame.snapshot_payload_bytes + 128 <= V3_SNAPSHOT_CACHE_BYTES }));
     let cadence_frame_transaction_count = cadence_trace
         .frames
         .iter()
@@ -1953,6 +2175,46 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         Err(v3::REFUSAL_AUTHORITY),
     )
     .await;
+    let workspace_key = view_pda(&session, v3::WORKSPACE_ROLE);
+    let workspace_before_close = account(&mut context, workspace_key).await;
+    let authority_balance_before_close = context
+        .banks_client
+        .get_account(authority.pubkey())
+        .await
+        .unwrap()
+        .map(|account| account.lamports)
+        .unwrap_or(0);
+    let workspace_reclaim_cu = send(
+        &mut context,
+        close_child(
+            session,
+            workspace_key,
+            authority.pubkey(),
+            v3::KIND_WORKSPACE,
+        ),
+        &[],
+        Ok(()),
+    )
+    .await;
+    let authority_balance_after_close = context
+        .banks_client
+        .get_account(authority.pubkey())
+        .await
+        .unwrap()
+        .map(|account| account.lamports)
+        .unwrap_or(0);
+    let workspace_rent_returned_lamports =
+        authority_balance_after_close - authority_balance_before_close;
+    assert_eq!(
+        workspace_rent_returned_lamports,
+        workspace_before_close.lamports
+    );
+    assert!(context
+        .banks_client
+        .get_account(workspace_key)
+        .await
+        .unwrap()
+        .is_none());
 
     // A separately sealed resource has a valid DCG chunk root, but the WAD
     // payload digest is wrong. The large state allocations are injected only
@@ -2007,7 +2269,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let metrics_path = std::env::var("DOOM_DCG_METRICS_PATH").ok();
     if let Some(path) = metrics_path {
         let report = json!({
-            "schema": "doom-dcg-r7-programtest/1",
+            "schema": "doom-dcg-r7-programtest/2",
             "standalone_golden": "tests/golden/doom/dcg_r0_r2_programtest.json",
             "resource_bytes": resource.len(),
             "resource_merkle_root": resource_commitment,
@@ -2061,7 +2323,11 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "frames_in_a_row": cadence_trace.frames.len(),
                 "same_st1_mp1_roots_after_every_tic": true,
                 "same_st1_mp1_account_hashes_after_every_tic": true,
-                "same_rendered_frame_hashes_after_abort_rerender": true,
+                "same_rendered_frame_hashes_after_abort_fresh_workspace_rerender": true,
+                "aborted_partial_render_cached_strips": abort_rerender_trace.frames.iter().map(|f| f.abort_cached_strips).collect::<Vec<_>>(),
+                "aborted_cache_cursor_refusals": abort_rerender_trace.frames.iter().map(|f| f.abort_cache_cursor_refusals).collect::<Vec<_>>(),
+                "fresh_workspace_reset_before_comparison_render": abort_rerender_trace.frames.iter().map(|f| f.fresh_workspace_reset).collect::<Vec<_>>(),
+                "frames_2_through_10_match_fresh_workspace_render": abort_rerender_trace.frames.iter().skip(1).zip(cadence_trace.frames.iter().skip(1)).all(|(fresh, reused)| fresh.pixel_sha256 == reused.pixel_sha256),
                 "state_roots_after_each_tic": cadence_trace.ticks.iter().map(|tick| json!({
                     "cursor": tick.cursor,
                     "root": tick.root,
@@ -2070,14 +2336,26 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 })).collect::<Vec<_>>(),
                 "frame_hashes": cadence_frame_hashes,
                 "abort_rerender_frame_hashes": abort_frame_hashes,
+                "abort_rerender_transaction_counts": abort_rerender_trace.frames.iter().map(|f| f.transaction_cu.len()).collect::<Vec<_>>(),
                 "transactions_per_frame_average": cadence_transactions_per_frame,
                 "transactions_for_ten_frames": cadence_frame_transaction_count,
                 "compute_units_for_ten_frames_including_snapshot_seed": cadence_frame_cu,
+                "snapshot_cache_bytes": V3_SNAPSHOT_CACHE_BYTES,
+                "snapshot_payload_bytes_per_frame": cadence_trace.frames.iter().map(|f| f.snapshot_payload_bytes).collect::<Vec<_>>(),
+                "snapshot_payload_and_header_bytes_per_frame": cadence_trace.frames.iter().map(|f| f.snapshot_payload_bytes + 128).collect::<Vec<_>>(),
+                "snapshot_cache_exceeded_frame_numbers": cadence_trace.frames.iter().enumerate().filter_map(|(index, f)| (f.snapshot_payload_bytes + 128 > V3_SNAPSHOT_CACHE_BYTES).then_some(index + 1)).collect::<Vec<_>>(),
+                "snapshot_cache_oversize_behavior": "render callback returns InvalidInput, mapped by DCG to REFUSAL_KERNEL; RUN_PHASE transaction rolls back",
                 "workspace_account_bytes": workspace_allocation,
                 "workspace_bytes_after_each_frame": cadence_trace.frames.iter().map(|f| f.workspace_bytes).collect::<Vec<_>>(),
                 "render_arena_high_water_bytes": cadence_trace.frames.iter().map(|f| f.arena_high_water).collect::<Vec<_>>(),
                 "workspace_rent_lamports": workspace_rent_lamports,
                 "estimated_pictures_per_second_at_60_transactions_per_second": estimated_pictures_per_second_at_60_tps,
+            },
+            "workspace_reclaim_after_halt": {
+                "close_compute_units": workspace_reclaim_cu,
+                "lamports_in_workspace_before_close": workspace_before_close.lamports,
+                "lamports_received_by_session_authority": workspace_rent_returned_lamports,
+                "workspace_account_closed": true,
             },
             "adversarial": {
                 "unsealed_resource_begin_cu": unsealed_begin_cu,
