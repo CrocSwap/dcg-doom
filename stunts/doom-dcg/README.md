@@ -6,7 +6,8 @@ context, preserving `doom_ctx_guard` at `0x400000060`. ST1 and MP1 are the
 following two spans. A sealed RI2/WAD resource initializes the context through
 resumable 16,384-byte phases and 115 staged engine phases.
 
-ADVANCE executes up to eight four-byte commands per call. Doom pre-tic halts
+ADVANCE executes one four-byte command per call, the current SVM compute budget
+for the pinned engine. Doom pre-tic halts
 are returned as v3 prefix outcomes. The nine RSN/3 output views use the sealed
 resource and a cleared workspace; complete strips are cached there while the
 view phase copies bounded chunks to the staged outputs.

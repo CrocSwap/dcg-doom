@@ -27,7 +27,7 @@ fn application_manifest_pins_one_composite_v3_doom_kernel() {
     assert_eq!(spec.abi_version, 1);
     assert_eq!(spec.modes, &[MODE_CONSENSUS_V3]);
     assert_eq!(spec.input.max_bytes, 4);
-    assert_eq!(spec.resources.max_operations, 8);
+    assert_eq!(spec.resources.max_operations, 1);
     assert_eq!(spec.state.unwrap().id, STATE_SCHEMA);
     assert_eq!(spec.state.unwrap().max_bytes, STATE_BYTES);
 

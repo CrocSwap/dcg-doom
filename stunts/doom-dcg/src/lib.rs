@@ -66,8 +66,8 @@ pub const INPUT_REFUSAL: u32 = 3_504;
 
 const ST1_OFFSET: u32 = ENGINE_CONTEXT_BYTES;
 const MP1_OFFSET: u32 = ENGINE_CONTEXT_BYTES + ST1_ACCOUNT_BYTES;
-const MAX_ADVANCE_TICS: u32 = 8;
-const STEP_COMPUTE_CEILING: u64 = 175_000;
+const MAX_ADVANCE_TICS: u32 = 1;
+const STEP_COMPUTE_CEILING: u64 = 1_400_000;
 pub const V3_INITIALIZATION_PHASE_BYTES: u32 = 16_384;
 pub const V3_INITIALIZATION_PHASE_COMPUTE_UNITS: u32 = 1_400_000;
 // Keep each publication transaction to one clipped strip render. The view
@@ -166,9 +166,8 @@ static MANIFEST: KernelManifest = KernelManifest {
         max_output_bytes: 4,
         max_state_bytes: STATE_BYTES,
         max_operations: MAX_ADVANCE_TICS,
-        // Designed per-step declaration: 8 * 175,000 is below v3's
-        // 1,400,000-CU transaction ceiling. The r6 receipt records measured
-        // ProgramTest costs.
+        // One engine tic per ADVANCE keeps the worst-case declaration within
+        // the SVM transaction ceiling. The r6 receipt records measured costs.
         max_compute_units: STEP_COMPUTE_CEILING,
     },
     modes: &MODES,

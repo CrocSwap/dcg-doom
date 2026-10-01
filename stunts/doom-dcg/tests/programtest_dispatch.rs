@@ -86,7 +86,7 @@ fn open_session(
     payload.push(0); // indexed input policy
     payload.push(COMMAND_WIDTH as u8);
     payload.extend_from_slice(&STREAM_CAPACITY.to_le_bytes());
-    payload.push(8); // maximum steps per ADVANCE
+    payload.push(1); // maximum steps per ADVANCE
     payload.extend_from_slice(&DOOM_KERNEL_ID.0);
     payload.extend_from_slice(&manifest.semantic_version.to_le_bytes());
     payload.extend_from_slice(&manifest.abi_version.to_le_bytes());
@@ -941,7 +941,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     for boundary in golden["sim2"]["sweep_boundaries"].as_array().unwrap() {
         let target = boundary["cursor"].as_u64().unwrap() as u32;
         while cursor < target {
-            let write_target = target.min(cursor.saturating_add(8));
+            let write_target = target.min(cursor.saturating_add(1));
             while written < write_target {
                 let end = (written + WRITE_BATCH as u32).min(write_target);
                 let batch = (written..end)
@@ -960,7 +960,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 input_write_instruction_cu.extend(instruction_cu);
                 written = end;
             }
-            let steps = (target - cursor).min(8) as u8;
+            let steps = (target - cursor).min(1) as u8;
             let cu = send(
                 &mut context,
                 advance(authority.pubkey(), session, cursor, steps),
