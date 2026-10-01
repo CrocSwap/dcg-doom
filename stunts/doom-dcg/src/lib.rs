@@ -70,10 +70,10 @@ const MAX_ADVANCE_TICS: u32 = 1;
 const STEP_COMPUTE_CEILING: u64 = 1_400_000;
 pub const V3_INITIALIZATION_PHASE_BYTES: u32 = 16_384;
 pub const V3_INITIALIZATION_PHASE_COMPUTE_UNITS: u32 = 1_400_000;
-// Keep each publication transaction to one clipped strip render. The view
-// byte stream is the snapshot followed by eight strips, each 8,128 bytes.
-// The strip renderer caches each complete strip in the cleared workspace so
-// phase boundaries that split an output account do not rerun the C renderer.
+// Each publication phase is at most one 8,128-byte strip. The view byte
+// stream is the snapshot followed by eight strips. The renderer caches each
+// complete strip in the preserved workspace, then invalidates that cache when
+// the next frame starts so split phases do not rerun the C renderer.
 pub const V3_VIEW_PHASE_BYTES: u32 = STRIP_BYTES;
 pub const V3_VIEW_PHASE_COMPUTE_CEILING: u32 = 1_400_000;
 const RSR_HEADER_BYTES: usize = 512;
@@ -85,9 +85,19 @@ const BOOTSTRAP_ARENA_BYTES: usize = BOOTSTRAP_BYTES - RSR_HEADER_BYTES;
 const RENDER_CACHE_BYTES: usize = 60;
 const RENDER_PIXEL_BYTES: usize = 40 * 200;
 const RENDER_FRAME_BYTES: usize = 320 * 200;
-const STRIP_CACHE_BYTES: u32 = STRIP_BYTES * 8;
-const RENDER_TEMP_BYTES: u32 = RENDER_CACHE_BYTES as u32 + RENDER_PIXEL_BYTES as u32;
-pub const V3_VIEW_WORKSPACE_BYTES: u32 = SNAPSHOT_BYTES + STRIP_CACHE_BYTES + RENDER_TEMP_BYTES;
+// The fixed 10 MiB DCG workspace cap leaves room for the 9.7 MiB engine
+// context, strip cache, and render scratch only if the cached RSN3 projection
+// stays within this checked bound.
+const SNAPSHOT_CACHE_BYTES: usize = 640 * 1024;
+const SNAPSHOT_CACHE_OFFSET: usize = ENGINE_CONTEXT_BYTES as usize;
+const STRIP_CACHE_BYTES: usize = STRIP_BYTES as usize * 8;
+const STRIP_CACHE_OFFSET: usize = SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES;
+const RENDER_TEMP_BYTES: usize = RENDER_CACHE_BYTES + RENDER_PIXEL_BYTES;
+const RENDER_TEMP_OFFSET: usize = STRIP_CACHE_OFFSET + STRIP_CACHE_BYTES;
+const ARENA_HIGH_WATER_OFFSET: usize = RENDER_TEMP_OFFSET + RENDER_TEMP_BYTES;
+pub const V3_VIEW_WORKSPACE_BYTES: u32 = (ARENA_HIGH_WATER_OFFSET + 4) as u32;
+pub const V3_RENDER_ARENA_HIGH_WATER_OFFSET: u32 = ARENA_HIGH_WATER_OFFSET as u32;
+pub const V3_RENDER_ARENA_MAX_BYTES: u32 = BOOTSTRAP_ARENA_BYTES as u32;
 const INITIAL_ENGINE_PHASES: u32 = 6 + 71 + 37 + 1;
 
 pub const V3_SNAPSHOT_ABI: [u8; 32] = [0x52; 32];
@@ -317,8 +327,8 @@ impl DoomKernel {
     }
 
     fn require_context_address(pointer: *mut u8) -> Result<(), KernelError> {
-        // The v3 primary headerless account is deliberately account zero, so
-        // it must retain the pinned 0007 engine ABI address.
+        // The v3 workspace-first RUN_PHASE mapping must retain the pinned
+        // fixed address while committed state stays read-only.
         if pointer as usize == DOOM_CONTEXT_ADDRESS {
             Ok(())
         } else {
@@ -517,100 +527,179 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 fn render_doom_view(
     kernel: &DoomKernel,
     phase: ViewPhase,
-    state: &mut [StateSpanMut<'_>],
+    state: &[AccountSpan<'_>],
     resources: &[AccountSpan<'_>],
     commitment: &[u8; 32],
     workspace: &mut [u8],
     output: &mut [u8],
 ) -> Result<usize, KernelError> {
     use doom_sbf::render_snapshot_v3 as rsn3;
+    validate_render_state(state)?;
+    if workspace.len() < V3_VIEW_WORKSPACE_BYTES as usize
+        || phase.role != 0
+        || phase.source_offset != 0
+        || output.is_empty()
+    {
+        return Err(KernelError::InvalidInput);
+    }
+    let end = phase
+        .output_offset
+        .checked_add(output.len() as u32)
+        .ok_or(KernelError::InvalidInput)?;
+    if end > SNAPSHOT_BYTES {
+        return Err(KernelError::InvalidInput);
+    }
+
+    if phase.output_offset == 0 {
+        let bundle = kernel.validate_resources(resources, commitment)?;
+        let resource_hash = dcg_program::hash::sha256(&[bundle.ri2]);
+        let engine_header = &state[0].data[BOOTSTRAP_OFFSET..BOOTSTRAP_OFFSET + RSR_HEADER_BYTES];
+        if engine_header[..8] != *b"DOOM-RSR"
+            || engine_header[48..80] != DOOM_WAD_DIGEST
+            || engine_header[80..112] != resource_hash
+        {
+            return Err(KernelError::Refused);
+        }
+        let (_, state_root) = doom_sbf::sim2::verified_state_root(state[1].data, state[2].data)
+            .map_err(|_| KernelError::Refused)?;
+        let source_context = state[0].data.as_ptr().cast_mut();
+        DoomKernel::require_context_address(source_context)?;
+        let snapshot =
+            &mut workspace[SNAPSHOT_CACHE_OFFSET..SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES];
+        snapshot[..rsn3::HEADER_BYTES].fill(0);
+        let payload_out = &mut snapshot[rsn3::HEADER_BYTES..];
+        let mut payload_len = 0usize;
+        let rc = unsafe {
+            doom_engine_ex2_resource_sbf_ri2_snapshot_rsn3_live(
+                source_context,
+                payload_out.as_mut_ptr(),
+                payload_out.len(),
+                &mut payload_len,
+            )
+        };
+        engine_error(rc)?;
+        if payload_len > rsn3::MAX_PAYLOAD_BYTES
+            || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
+        {
+            return Err(KernelError::InvalidInput);
+        }
+        snapshot[..8].copy_from_slice(rsn3::MAGIC);
+        put_u32(snapshot, 8, rsn3::VERSION);
+        put_u32(snapshot, 12, rsn3::HEADER_BYTES as u32);
+        put_u32(snapshot, 16, SNAPSHOT_BYTES);
+        put_u32(snapshot, 20, phase.state_cursor);
+        put_u32(snapshot, 24, u32_at(state[1].data, 20));
+        put_u32(snapshot, 28, payload_len as u32);
+        snapshot[32..64].copy_from_slice(&state_root);
+        snapshot[64..96].copy_from_slice(&DOOM_WAD_DIGEST);
+        snapshot[96..128].copy_from_slice(&resource_hash);
+        snapshot[160..192].copy_from_slice(&V3_SNAPSHOT_ABI);
+        let zero_hash = [0; 32];
+        let snapshot_hash = dcg_program::hash::sha256(&[
+            rsn3::HASH_DOMAIN,
+            &snapshot[..128],
+            &zero_hash,
+            &snapshot[160..192],
+            &snapshot[rsn3::HEADER_BYTES..rsn3::HEADER_BYTES + payload_len],
+        ]);
+        snapshot[128..160].copy_from_slice(&snapshot_hash);
+
+        workspace[STRIP_CACHE_OFFSET..STRIP_CACHE_OFFSET + STRIP_CACHE_BYTES].fill(0);
+        put_u32(workspace, ARENA_HIGH_WATER_OFFSET, 0);
+    }
+
+    let snapshot = &workspace[SNAPSHOT_CACHE_OFFSET..SNAPSHOT_CACHE_OFFSET + SNAPSHOT_CACHE_BYTES];
+    let payload_len = u32_at(snapshot, 28) as usize;
+    if snapshot[..8] != *rsn3::MAGIC
+        || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
+        || snapshot[160..192] != V3_SNAPSHOT_ABI
+    {
+        return Err(KernelError::Refused);
+    }
+
+    // Distribute the 9.7 MB context seed over the aligned snapshot phases.
+    // Each phase copies a bounded proportional range; the last phase reaches
+    // the exact context end before any strip callback can run.
+    let copy_start =
+        (phase.output_offset as u64 * ENGINE_CONTEXT_BYTES as u64 / SNAPSHOT_BYTES as u64) as usize;
+    let copy_end = (end as u64 * ENGINE_CONTEXT_BYTES as u64 / SNAPSHOT_BYTES as u64)
+        .min(ENGINE_CONTEXT_BYTES as u64) as usize;
+    if copy_end < copy_start || copy_end > ENGINE_CONTEXT_BYTES as usize {
+        return Err(KernelError::InvalidInput);
+    }
+    workspace[copy_start..copy_end].copy_from_slice(&state[0].data[copy_start..copy_end]);
+
+    output.fill(0);
+    let snapshot_end = rsn3::HEADER_BYTES + payload_len;
+    let output_start = phase.output_offset as usize;
+    if output_start < snapshot_end {
+        let count = (snapshot_end - output_start).min(output.len());
+        output[..count].copy_from_slice(&snapshot[output_start..output_start + count]);
+    }
+    Ok(output.len())
+}
+
+#[cfg(all(feature = "sbf", target_os = "solana"))]
+fn render_doom_view_at_workspace_base(
+    kernel: &DoomKernel,
+    phase: ViewPhase,
+    state: &[AccountSpan<'_>],
+    resources: &[AccountSpan<'_>],
+    commitment: &[u8; 32],
+    workspace_header: &mut [u8],
+    workspace: &mut [u8],
+    output: &mut [u8],
+) -> Result<usize, KernelError> {
+    use doom_sbf::render_snapshot_v3 as rsn3;
     use doom_sbf::resource_sbf;
 
-    if workspace.len() < V3_VIEW_WORKSPACE_BYTES as usize
-        || resources.len() != 1
-        || resources[0].schema != RESOURCE_SCHEMA
-        || resources[0].owner == [0; 32]
+    validate_render_state(state)?;
+    if workspace_header.len() != 128
+        || workspace.len() < V3_VIEW_WORKSPACE_BYTES as usize
+        || phase.source_offset != 0
+        || output.is_empty()
     {
         return Err(KernelError::InvalidInput);
     }
-    let context = kernel.context_ptr()?;
-    if context != state[0].data.as_mut_ptr() {
-        return Err(KernelError::Refused);
-    }
-    DoomKernel::require_context_address(context)?;
-
+    // The final snapshot bytes share one RUN_PHASE chunk with the first strip.
+    // Snapshotting still reads the committed context; only strip rendering
+    // needs the workspace account mapped at the fixed engine address.
     if phase.role == 0 {
-        if phase.output_offset == 0 {
-            let bundle = kernel.validate_resources(resources, commitment)?;
-            let resource_hash = dcg_program::hash::sha256(&[bundle.ri2]);
-            let header = &state[0].data[BOOTSTRAP_OFFSET..BOOTSTRAP_OFFSET + RSR_HEADER_BYTES];
-            if header[..8] != *b"DOOM-RSR"
-                || header[48..80] != DOOM_WAD_DIGEST
-                || header[80..112] != resource_hash
-            {
-                return Err(KernelError::Refused);
-            }
-            let (_, state_root) = doom_sbf::sim2::verified_state_root(state[1].data, state[2].data)
-                .map_err(|_| KernelError::Refused)?;
-            let payload_len = {
-                let payload_out = &mut workspace[rsn3::HEADER_BYTES..SNAPSHOT_BYTES as usize];
-                let mut payload_len = 0usize;
-                let rc = unsafe {
-                    doom_engine_ex2_resource_sbf_ri2_snapshot_rsn3_live(
-                        context,
-                        payload_out.as_mut_ptr(),
-                        payload_out.len(),
-                        &mut payload_len,
-                    )
-                };
-                engine_error(rc)?;
-                if payload_len > rsn3::MAX_PAYLOAD_BYTES {
-                    return Err(KernelError::InvalidInput);
-                }
-                payload_len
-            };
-            workspace[..rsn3::HEADER_BYTES].fill(0);
-            workspace[..8].copy_from_slice(rsn3::MAGIC);
-            put_u32(&mut workspace[..], 8, rsn3::VERSION);
-            put_u32(&mut workspace[..], 12, rsn3::HEADER_BYTES as u32);
-            put_u32(&mut workspace[..], 16, SNAPSHOT_BYTES);
-            put_u32(&mut workspace[..], 20, phase.state_cursor);
-            put_u32(&mut workspace[..], 24, u32_at(state[1].data, 20));
-            put_u32(&mut workspace[..], 28, payload_len as u32);
-            workspace[32..64].copy_from_slice(&state_root);
-            workspace[64..96].copy_from_slice(&DOOM_WAD_DIGEST);
-            workspace[96..128].copy_from_slice(&resource_hash);
-            workspace[160..192].copy_from_slice(&V3_SNAPSHOT_ABI);
-            let zero_hash = [0; 32];
-            let snapshot_hash = dcg_program::hash::sha256(&[
-                rsn3::HASH_DOMAIN,
-                &workspace[..128],
-                &zero_hash,
-                &workspace[160..192],
-                &workspace[rsn3::HEADER_BYTES..rsn3::HEADER_BYTES + payload_len],
-            ]);
-            workspace[128..160].copy_from_slice(&snapshot_hash);
-        }
-        let start = phase.output_offset as usize;
-        let end = start
-            .checked_add(output.len())
-            .ok_or(KernelError::InvalidInput)?;
-        output.copy_from_slice(workspace.get(start..end).ok_or(KernelError::InvalidInput)?);
-        return Ok(output.len());
+        return render_doom_view(
+            kernel, phase, state, resources, commitment, workspace, output,
+        );
     }
-
-    if !(1..=8).contains(&phase.role) || output.is_empty() {
+    if !(1..=8).contains(&phase.role) {
         return Err(KernelError::InvalidInput);
     }
-    let payload_len = u32_at(workspace, 28) as usize;
-    if workspace[..8] != *rsn3::MAGIC
-        || payload_len > rsn3::MAX_PAYLOAD_BYTES
-        || workspace[160..192] != V3_SNAPSHOT_ABI
+    let bundle = kernel.validate_resources(resources, commitment)?;
+    let payload_len = u32_at(workspace, SNAPSHOT_CACHE_OFFSET + 28) as usize;
+    if workspace[SNAPSHOT_CACHE_OFFSET..SNAPSHOT_CACHE_OFFSET + 8] != *rsn3::MAGIC
+        || payload_len + rsn3::HEADER_BYTES > SNAPSHOT_CACHE_BYTES
+        || workspace[SNAPSHOT_CACHE_OFFSET + 160..SNAPSHOT_CACHE_OFFSET + 192] != V3_SNAPSHOT_ABI
+        || u32_at(workspace, SNAPSHOT_CACHE_OFFSET + 20) != phase.state_cursor
     {
         return Err(KernelError::Refused);
     }
+    let (_, state_root) = doom_sbf::sim2::verified_state_root(state[1].data, state[2].data)
+        .map_err(|_| KernelError::Refused)?;
+    if workspace[SNAPSHOT_CACHE_OFFSET + 32..SNAPSHOT_CACHE_OFFSET + 64] != state_root
+        || u32_at(workspace, SNAPSHOT_CACHE_OFFSET + 24) != u32_at(state[1].data, 20)
+    {
+        return Err(KernelError::Refused);
+    }
+
+    let engine_header = &workspace[BOOTSTRAP_OFFSET..BOOTSTRAP_OFFSET + RSR_HEADER_BYTES];
+    let resource_hash = dcg_program::hash::sha256(&[bundle.ri2]);
+    if engine_header[..8] != *b"DOOM-RSR"
+        || engine_header[48..80] != DOOM_WAD_DIGEST
+        || engine_header[80..112] != resource_hash
+    {
+        return Err(KernelError::Refused);
+    }
+
     let strip_id = u32::from(phase.role - 1);
-    let strip_start = SNAPSHOT_BYTES as usize + strip_id as usize * STRIP_BYTES as usize;
+    let strip_start = STRIP_CACHE_OFFSET + strip_id as usize * STRIP_BYTES as usize;
     let strip_end = strip_start + STRIP_BYTES as usize;
     let phase_end = (phase.output_offset as usize)
         .checked_add(output.len())
@@ -618,25 +707,27 @@ fn render_doom_view(
     if phase_end > STRIP_BYTES as usize || strip_end > workspace.len() {
         return Err(KernelError::InvalidInput);
     }
+
     if workspace[strip_start..strip_start + 8] != *b"DOOM-RS1" {
-        let snapshot_hash: [u8; 32] = workspace[128..160]
+        let snapshot_hash: [u8; 32] = workspace
+            [SNAPSHOT_CACHE_OFFSET + 128..SNAPSHOT_CACHE_OFFSET + 160]
             .try_into()
             .map_err(|_| KernelError::InvalidInput)?;
-        let state_root: [u8; 32] = workspace[32..64]
-            .try_into()
-            .map_err(|_| KernelError::InvalidInput)?;
-        let cursor = u32_at(workspace, 20);
-        let gametic = u32_at(workspace, 24);
-        let context_ptr = state[0].data.as_mut_ptr();
+        let cursor = u32_at(workspace, SNAPSHOT_CACHE_OFFSET + 20);
+        let gametic = u32_at(workspace, SNAPSHOT_CACHE_OFFSET + 24);
+        let mut saved_workspace_header = [0u8; 128];
+        saved_workspace_header.copy_from_slice(workspace_header);
+        let context_ptr = workspace_header.as_mut_ptr();
+        DoomKernel::require_context_address(context_ptr)?;
+        workspace_header.copy_from_slice(&workspace[..128]);
         let header_ptr = unsafe { context_ptr.add(BOOTSTRAP_OFFSET) };
         let bootstrap_ptr = unsafe { context_ptr.add(BOOTSTRAP_ARENA_OFFSET) };
-        let workspace_ptr = workspace.as_mut_ptr();
-        let payload_ptr = unsafe { workspace_ptr.add(rsn3::HEADER_BYTES) };
-        let snapshot_hash_ptr = unsafe { workspace_ptr.add(128) };
-        let temp_start = SNAPSHOT_BYTES as usize + STRIP_CACHE_BYTES as usize;
-        let temp = &mut workspace[temp_start..temp_start + RENDER_TEMP_BYTES as usize];
+        let temp = &mut workspace[RENDER_TEMP_OFFSET..RENDER_TEMP_OFFSET + RENDER_TEMP_BYTES];
         let cache_ptr = temp.as_mut_ptr();
         let pixels_ptr = unsafe { cache_ptr.add(RENDER_CACHE_BYTES) };
+        let workspace_ptr = workspace.as_ptr();
+        let payload_ptr = unsafe { workspace_ptr.add(SNAPSHOT_CACHE_OFFSET + rsn3::HEADER_BYTES) };
+        let snapshot_hash_ptr = unsafe { workspace_ptr.add(SNAPSHOT_CACHE_OFFSET + 128) };
         let mut arena_high_water = 0usize;
         let rc = unsafe {
             doom_engine_rsn3_render_static(
@@ -657,7 +748,23 @@ fn render_doom_view(
                 &mut arena_high_water,
             )
         };
+        // The account header temporarily carried the first 128 engine bytes
+        // at the fixed address. Preserve that updated context prefix in the
+        // declared workspace payload and restore the authenticated DCG header.
+        workspace[..128].copy_from_slice(workspace_header);
+        workspace_header.copy_from_slice(&saved_workspace_header);
         engine_error(rc)?;
+        if arena_high_water > BOOTSTRAP_ARENA_BYTES {
+            return Err(KernelError::Refused);
+        }
+        let prior_high_water = u32_at(workspace, ARENA_HIGH_WATER_OFFSET) as usize;
+        put_u32(
+            workspace,
+            ARENA_HIGH_WATER_OFFSET,
+            prior_high_water
+                .max(arena_high_water)
+                .min(u32::MAX as usize) as u32,
+        );
         let pixels = unsafe { core::slice::from_raw_parts(pixels_ptr, RENDER_PIXEL_BYTES) };
         let strip = &mut workspace[strip_start..strip_end];
         strip.fill(0);
@@ -680,12 +787,29 @@ fn render_doom_view(
             &strip[128..],
         ]);
         strip[96..128].copy_from_slice(&strip_hash);
-        let _ = arena_high_water;
     }
+
     output.copy_from_slice(
         &workspace[strip_start + phase.output_offset as usize..strip_start + phase_end],
     );
     Ok(output.len())
+}
+
+fn validate_render_state(state: &[AccountSpan<'_>]) -> Result<(), KernelError> {
+    if state.len() != 3
+        || state
+            .iter()
+            .any(|span| span.schema != STATE_SCHEMA || span.is_writable)
+        || state[0].offset != 0
+        || state[0].data.len() != ENGINE_CONTEXT_BYTES as usize
+        || state[1].offset != ST1_OFFSET
+        || state[1].data.len() != ST1_ACCOUNT_BYTES as usize
+        || state[2].offset != MP1_OFFSET
+        || state[2].data.len() != MP1_ACCOUNT_BYTES as usize
+    {
+        return Err(KernelError::InvalidInput);
+    }
+    Ok(())
 }
 
 impl StatefulKernel for DoomKernel {
@@ -966,12 +1090,16 @@ impl StatefulKernel for DoomKernel {
         Ok(count)
     }
 
-    fn view_requires_mutable_state(&self) -> bool {
-        true
-    }
-
     fn max_view_workspace_bytes(&self) -> u32 {
         V3_VIEW_WORKSPACE_BYTES
+    }
+
+    fn clear_view_workspace_on_begin(&self) -> bool {
+        false
+    }
+
+    fn view_workspace_at_account_base(&self) -> bool {
+        true
     }
 
     fn render_view_phase(
@@ -1009,31 +1137,60 @@ impl StatefulKernel for DoomKernel {
         Err(KernelError::Refused)
     }
 
-    fn render_view_phase_with_mutable_state(
+    fn render_view_phase_with_resources(
         &self,
         phase: ViewPhase,
-        state: &mut [StateSpanMut<'_>],
+        state: &[AccountSpan<'_>],
         resources: &[AccountSpan<'_>],
         commitment: &[u8; 32],
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<usize, KernelError> {
-        Self::validate_spans(state)?;
-        let (expected_len, _) = view_shape(phase.role)?;
-        let end = phase
-            .output_offset
-            .checked_add(output.len() as u32)
-            .ok_or(KernelError::InvalidInput)?;
-        if phase.source_offset != 0 || output.is_empty() || end > expected_len {
-            return Err(KernelError::InvalidInput);
-        }
         #[cfg(all(feature = "sbf", target_os = "solana"))]
         {
             render_doom_view(self, phase, state, resources, commitment, workspace, output)
         }
         #[cfg(not(all(feature = "sbf", target_os = "solana")))]
         {
-            let _ = (state, resources, commitment, workspace);
+            let _ = (phase, state, resources, commitment, workspace);
+            Err(KernelError::Refused)
+        }
+    }
+
+    fn render_view_phase_with_workspace_header(
+        &self,
+        phase: ViewPhase,
+        state: &[AccountSpan<'_>],
+        resources: &[AccountSpan<'_>],
+        commitment: &[u8; 32],
+        workspace_header: &mut [u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        #[cfg(all(feature = "sbf", target_os = "solana"))]
+        {
+            render_doom_view_at_workspace_base(
+                self,
+                phase,
+                state,
+                resources,
+                commitment,
+                workspace_header,
+                workspace,
+                output,
+            )
+        }
+        #[cfg(not(all(feature = "sbf", target_os = "solana")))]
+        {
+            let _ = (
+                phase,
+                state,
+                resources,
+                commitment,
+                workspace_header,
+                workspace,
+                output,
+            );
             Err(KernelError::Refused)
         }
     }

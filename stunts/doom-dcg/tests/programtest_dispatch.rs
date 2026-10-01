@@ -9,8 +9,8 @@ use doom_dcg::{
     DoomKernel, DOOM_KERNEL_ID, DOOM_RESOURCE_COMMITMENT, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V3,
     MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
     ST1_ACCOUNT_BYTES, STATE_SCHEMA, STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS,
-    V3_SNAPSHOT_ABI, V3_STRIP_ABIS, V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING,
-    V3_VIEW_WORKSPACE_BYTES,
+    V3_RENDER_ARENA_HIGH_WATER_OFFSET, V3_RENDER_ARENA_MAX_BYTES, V3_SNAPSHOT_ABI, V3_STRIP_ABIS,
+    V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
 };
 use serde_json::{json, Value};
 use solana_account::{Account, AccountSharedData};
@@ -447,6 +447,44 @@ fn publication_accounts(
     accounts
 }
 
+fn workspace_first_publication_accounts(
+    authority: Pubkey,
+    session: Pubkey,
+    outputs_writable: bool,
+    workspace_writable: bool,
+    scratch_writable: bool,
+) -> Vec<AccountMeta> {
+    let workspace = view_pda(&session, v3::WORKSPACE_ROLE);
+    let mut accounts = vec![
+        if workspace_writable {
+            AccountMeta::new(workspace, false)
+        } else {
+            AccountMeta::new_readonly(workspace, false)
+        },
+        AccountMeta::new_readonly(authority, true),
+        AccountMeta::new(session, false),
+        AccountMeta::new_readonly(resource_pda(&session), false),
+        AccountMeta::new_readonly(state_pda(&session, 0), false),
+        AccountMeta::new_readonly(state_pda(&session, 1), false),
+        AccountMeta::new_readonly(state_pda(&session, 2), false),
+    ];
+    for role in 0..=8 {
+        let key = view_pda(&session, role);
+        accounts.push(if outputs_writable {
+            AccountMeta::new(key, false)
+        } else {
+            AccountMeta::new_readonly(key, false)
+        });
+    }
+    let scratch = view_pda(&session, v3::SCRATCH_ROLE);
+    accounts.push(if scratch_writable {
+        AccountMeta::new(scratch, false)
+    } else {
+        AccountMeta::new_readonly(scratch, false)
+    });
+    accounts
+}
+
 fn begin_views(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, 0];
     payload.extend_from_slice(&cursor.to_le_bytes());
@@ -475,7 +513,18 @@ fn run_view_phase_with_state_rights(
 }
 
 fn run_view_phase(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
-    run_view_phase_with_state_rights(authority, session, cursor, true)
+    run_view_phase_with_state_rights(authority, session, cursor, false)
+}
+
+fn run_view_phase_workspace_first(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
+    let mut payload = vec![v3::WIRE_VERSION, 1];
+    payload.extend_from_slice(&cursor.to_le_bytes());
+    payload.extend_from_slice(&V3_VIEW_PHASE_COMPUTE_CEILING.to_le_bytes());
+    instruction(
+        sw::TAG_PUBLISH_VIEWS,
+        payload,
+        workspace_first_publication_accounts(authority, session, false, true, true),
+    )
 }
 
 fn commit_views(authority: Pubkey, session: Pubkey, cursor: u32, total: u32) -> Instruction {
@@ -487,6 +536,19 @@ fn commit_views(authority: Pubkey, session: Pubkey, cursor: u32, total: u32) -> 
         sw::TAG_PUBLISH_VIEWS,
         payload,
         publication_accounts(authority, session, false, true, false, false),
+    )
+}
+
+fn abort_views(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
+    let mut payload = vec![v3::WIRE_VERSION, 3];
+    payload.extend_from_slice(&cursor.to_le_bytes());
+    instruction(
+        sw::TAG_PUBLISH_VIEWS,
+        payload,
+        vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new(session, false),
+        ],
     )
 }
 
@@ -829,6 +891,335 @@ async fn state_accounts(context: &mut ProgramTestContext, session: Pubkey) -> (A
     (st1, mp1)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TickObservation {
+    cursor: u32,
+    root: [u8; 32],
+    st1_sha256: [u8; 32],
+    mp1_sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+struct FrameObservation {
+    pixel_sha256: [u8; 32],
+    transaction_cu: Vec<u64>,
+    workspace_bytes: usize,
+    arena_high_water: u32,
+}
+
+#[derive(Debug)]
+struct CadenceObservation {
+    ticks: Vec<TickObservation>,
+    frames: Vec<FrameObservation>,
+}
+
+async fn capture_replay_accounts(
+    context: &mut ProgramTestContext,
+    session: Pubkey,
+) -> Vec<(Pubkey, Account)> {
+    let mut keys = vec![
+        context.payer.pubkey(),
+        session,
+        stream_pda(&session),
+        view_pda(&session, v3::WORKSPACE_ROLE),
+        view_pda(&session, v3::SCRATCH_ROLE),
+    ];
+    for index in 0..3 {
+        keys.push(state_pda(&session, index));
+    }
+    for role in 0..=8 {
+        keys.push(view_pda(&session, role));
+    }
+    let mut snapshot = Vec::with_capacity(keys.len());
+    for key in keys {
+        snapshot.push((
+            key,
+            context
+                .banks_client
+                .get_account(key)
+                .await
+                .unwrap()
+                .expect("replay account exists"),
+        ));
+    }
+    snapshot
+}
+
+fn restore_replay_accounts(context: &mut ProgramTestContext, snapshot: &[(Pubkey, Account)]) {
+    for (key, account) in snapshot {
+        context.set_account(key, &AccountSharedData::from(account.clone()));
+    }
+}
+
+async fn observe_tick(
+    context: &mut ProgramTestContext,
+    session: Pubkey,
+    cursor: u32,
+) -> TickObservation {
+    let (st1, mp1) = state_accounts(context, session).await;
+    TickObservation {
+        cursor,
+        root: sim2_state_root(&st1.data[128..], &mp1.data[128..]),
+        st1_sha256: sha256(&[&st1.data[128..]]),
+        mp1_sha256: sha256(&[&mp1.data[128..]]),
+    }
+}
+
+async fn publish_observed_frame(
+    context: &mut ProgramTestContext,
+    authority: &Keypair,
+    session: Pubkey,
+    state_cursor: u32,
+    abort_and_restart: bool,
+) -> FrameObservation {
+    let frame_bytes = SNAPSHOT_BYTES + STRIP_BYTES * 8;
+    let mut transaction_cu = Vec::new();
+    if abort_and_restart {
+        transaction_cu.push(
+            send(
+                context,
+                begin_views(authority.pubkey(), session, state_cursor),
+                &[authority],
+                Ok(()),
+            )
+            .await,
+        );
+        transaction_cu.push(
+            send(
+                context,
+                run_view_phase(authority.pubkey(), session, 0),
+                &[authority],
+                Ok(()),
+            )
+            .await,
+        );
+        transaction_cu.push(
+            send(
+                context,
+                abort_views(authority.pubkey(), session, state_cursor),
+                &[authority],
+                Ok(()),
+            )
+            .await,
+        );
+    }
+
+    let primary_before = context
+        .banks_client
+        .get_account(state_pda(&session, 0))
+        .await
+        .unwrap()
+        .expect("primary state before observed frame");
+    transaction_cu.push(
+        send(
+            context,
+            begin_views(authority.pubkey(), session, state_cursor),
+            &[authority],
+            Ok(()),
+        )
+        .await,
+    );
+
+    let boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
+    let mut view_cursor = 0u32;
+    while view_cursor < frame_bytes {
+        let remaining = (frame_bytes - view_cursor + V3_VIEW_PHASE_BYTES - 1) / V3_VIEW_PHASE_BYTES;
+        let layout_remaining = if view_cursor < boundary {
+            (boundary - view_cursor) / V3_VIEW_PHASE_BYTES
+        } else {
+            remaining
+        };
+        let mut candidate = remaining.min(layout_remaining).min(13);
+        assert!(candidate > 0);
+        loop {
+            let blockhash = context.get_new_latest_blockhash().await.unwrap();
+            let phase_instructions = (0..candidate)
+                .map(|index| {
+                    let cursor = view_cursor + index * V3_VIEW_PHASE_BYTES;
+                    if cursor < boundary {
+                        run_view_phase(authority.pubkey(), session, cursor)
+                    } else {
+                        run_view_phase_workspace_first(authority.pubkey(), session, cursor)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut instructions = Vec::with_capacity(phase_instructions.len() + 1);
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                TRANSACTION_COMPUTE_LIMIT,
+            ));
+            instructions.extend(phase_instructions);
+            let signers = vec![&context.payer, authority];
+            let tx = Transaction::new(
+                &signers,
+                solana_message::Message::new(&instructions, Some(&context.payer.pubkey())),
+                blockhash,
+            );
+            if bincode::serialized_size(&tx).unwrap() as usize > TRANSACTION_PACKET_LIMIT {
+                assert!(candidate > 1, "one render phase exceeds packet limit");
+                candidate -= 1;
+                continue;
+            }
+            let simulation = context
+                .banks_client
+                .simulate_transaction(tx.clone())
+                .await
+                .unwrap();
+            let result = simulation.result.expect("render simulation result");
+            let logs = simulation
+                .simulation_details
+                .as_ref()
+                .map(|details| details.logs.join("\n"))
+                .unwrap_or_default();
+            let over_limit = matches!(
+                &result,
+                Err(TransactionError::InstructionError(
+                    _,
+                    InstructionError::ComputationalBudgetExceeded
+                ))
+            ) || (matches!(
+                &result,
+                Err(TransactionError::InstructionError(
+                    _,
+                    InstructionError::ProgramFailedToComplete
+                ))
+            ) && logs.contains("exceeded CUs meter"));
+            if over_limit {
+                assert!(candidate > 1, "one render phase exceeds CU limit");
+                candidate -= 1;
+                continue;
+            }
+            if let Err(error) = result {
+                panic!("render simulation failed: {error:?}\n{logs}");
+            }
+            let simulated_cu = simulation
+                .simulation_details
+                .as_ref()
+                .expect("render simulation details")
+                .units_consumed;
+            let execution = context
+                .banks_client
+                .process_transaction_with_metadata(tx)
+                .await
+                .unwrap();
+            if let Err(error) = execution.result {
+                let logs = execution
+                    .metadata
+                    .as_ref()
+                    .map(|meta| meta.log_messages.join("\n"))
+                    .unwrap_or_default();
+                panic!("render transaction failed: {error:?}\n{logs}");
+            }
+            let used = execution
+                .metadata
+                .expect("render transaction metadata")
+                .compute_units_consumed;
+            assert_eq!(used, simulated_cu);
+            assert!(used <= TRANSACTION_COMPUTE_LIMIT as u64);
+            transaction_cu.push(used);
+            view_cursor = (view_cursor + candidate * V3_VIEW_PHASE_BYTES).min(frame_bytes);
+            break;
+        }
+    }
+    transaction_cu.push(
+        send(
+            context,
+            commit_views(authority.pubkey(), session, state_cursor, frame_bytes),
+            &[authority],
+            Ok(()),
+        )
+        .await,
+    );
+
+    let primary_after = context
+        .banks_client
+        .get_account(state_pda(&session, 0))
+        .await
+        .unwrap()
+        .expect("primary state after observed frame");
+    assert_eq!(primary_before.data, primary_after.data);
+    let mut strips = Vec::with_capacity(8);
+    for role in 1..=8 {
+        let account = context
+            .banks_client
+            .get_account(view_pda(&session, role))
+            .await
+            .unwrap()
+            .expect("committed frame strip");
+        assert_eq!(&account.data[128..136], b"DOOM-RS1");
+        strips.push(account.data[256..].to_vec());
+    }
+    let mut pixels = Vec::with_capacity(320 * 200);
+    for y in 0..200 {
+        for strip in &strips {
+            pixels.extend_from_slice(&strip[y * 40..(y + 1) * 40]);
+        }
+    }
+    let workspace = context
+        .banks_client
+        .get_account(view_pda(&session, v3::WORKSPACE_ROLE))
+        .await
+        .unwrap()
+        .expect("workspace after observed frame");
+    let high_water = u32_at(
+        &workspace.data,
+        ACCOUNT_HEADER_BYTES + V3_RENDER_ARENA_HIGH_WATER_OFFSET as usize,
+    );
+    assert!(high_water <= V3_RENDER_ARENA_MAX_BYTES);
+    FrameObservation {
+        pixel_sha256: sha256(&[&pixels]),
+        transaction_cu,
+        workspace_bytes: workspace.data.len(),
+        arena_high_water: high_water,
+    }
+}
+
+async fn run_80_tic_trace(
+    context: &mut ProgramTestContext,
+    authority: &Keypair,
+    session: Pubkey,
+    render_every_8: bool,
+    abort_and_rerender: bool,
+) -> CadenceObservation {
+    let mut ticks = Vec::with_capacity(80);
+    let mut frames = Vec::new();
+    for batch_start in (0..80u32).step_by(8) {
+        let first_input = if batch_start == 0 {
+            1 // sequence zero was preloaded before initialization
+        } else {
+            batch_start + 1
+        };
+        let inputs = (first_input..batch_start + 9)
+            .map(|sequence| {
+                write_input(
+                    authority.pubkey(),
+                    session,
+                    sequence,
+                    command_at(sequence as usize),
+                )
+            })
+            .collect::<Vec<_>>();
+        send_many(context, inputs, &[authority]).await;
+        for sequence in batch_start..batch_start + 8 {
+            send(
+                context,
+                advance(authority.pubkey(), session, sequence, 1),
+                &[authority],
+                Ok(()),
+            )
+            .await;
+            let cursor = sequence + 1;
+            ticks.push(observe_tick(context, session, cursor).await);
+            if render_every_8 && cursor % 8 == 0 {
+                frames.push(
+                    publish_observed_frame(context, authority, session, cursor, abort_and_rerender)
+                        .await,
+                );
+            }
+        }
+    }
+    CadenceObservation { ticks, frames }
+}
+
 async fn inject_full_spans_for_bad_resource(
     context: &mut ProgramTestContext,
     session: Pubkey,
@@ -1000,6 +1391,69 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         decode_hex32(golden["input"]["initial_state_root"].as_str().unwrap())
     );
 
+    let (view_create_cu, view_create_instruction_cu, view_grow_cu, view_grow_instruction_cu) =
+        create_and_grow_views(&mut context, session).await;
+    let workspace_rent_lamports = context
+        .banks_client
+        .get_account(view_pda(&session, v3::WORKSPACE_ROLE))
+        .await
+        .unwrap()
+        .expect("workspace account after allocation")
+        .lamports;
+    let replay_baseline = capture_replay_accounts(&mut context, session).await;
+
+    let no_render_trace = run_80_tic_trace(&mut context, &authority, session, false, false).await;
+    assert_eq!(no_render_trace.ticks.len(), 80);
+    assert!(no_render_trace.frames.is_empty());
+    restore_replay_accounts(&mut context, &replay_baseline);
+
+    let cadence_trace = run_80_tic_trace(&mut context, &authority, session, true, false).await;
+    assert_eq!(cadence_trace.frames.len(), 10);
+    assert_eq!(no_render_trace.ticks, cadence_trace.ticks);
+    let cadence_frame_hashes = cadence_trace
+        .frames
+        .iter()
+        .map(|frame| frame.pixel_sha256)
+        .collect::<Vec<_>>();
+    let workspace_allocation = ACCOUNT_HEADER_BYTES + V3_VIEW_WORKSPACE_BYTES as usize;
+    assert!(cadence_trace
+        .frames
+        .iter()
+        .all(|frame| frame.workspace_bytes == workspace_allocation));
+    assert!(cadence_trace
+        .frames
+        .iter()
+        .all(|frame| frame.arena_high_water <= V3_RENDER_ARENA_MAX_BYTES));
+    restore_replay_accounts(&mut context, &replay_baseline);
+
+    let abort_rerender_trace =
+        run_80_tic_trace(&mut context, &authority, session, true, true).await;
+    assert_eq!(cadence_trace.ticks, abort_rerender_trace.ticks);
+    let abort_frame_hashes = abort_rerender_trace
+        .frames
+        .iter()
+        .map(|frame| frame.pixel_sha256)
+        .collect::<Vec<_>>();
+    assert_eq!(cadence_frame_hashes, abort_frame_hashes);
+    assert!(abort_rerender_trace
+        .frames
+        .iter()
+        .all(|frame| frame.workspace_bytes == workspace_allocation));
+    let cadence_frame_transaction_count = cadence_trace
+        .frames
+        .iter()
+        .map(|frame| frame.transaction_cu.len() as u64)
+        .sum::<u64>();
+    let cadence_frame_cu = cadence_trace
+        .frames
+        .iter()
+        .flat_map(|frame| frame.transaction_cu.iter().copied())
+        .sum::<u64>();
+    let cadence_transactions_per_frame =
+        cadence_frame_transaction_count as f64 / cadence_trace.frames.len() as f64;
+    let estimated_pictures_per_second_at_60_tps = 60.0 / (cadence_transactions_per_frame + 9.0); // 8 advances + 1 batched input write
+    restore_replay_accounts(&mut context, &replay_baseline);
+
     let mut adv_cu = Vec::new();
     let mut stream_grow_cu = Vec::new();
     let mut cursor = 0u32;
@@ -1082,8 +1536,6 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     }
     assert_eq!(cursor, 1_000);
 
-    let (view_create_cu, view_create_instruction_cu, view_grow_cu, view_grow_instruction_cu) =
-        create_and_grow_views(&mut context, session).await;
     let frame_bytes = SNAPSHOT_BYTES + STRIP_BYTES * 8;
     let view_begin_cu = send(
         &mut context,
@@ -1092,9 +1544,9 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         Ok(()),
     )
     .await;
-    let readonly_state_view_attempt_cu = send(
+    let writable_state_view_attempt_cu = send(
         &mut context,
-        run_view_phase_with_state_rights(authority.pubkey(), session, 0, false),
+        run_view_phase_with_state_rights(authority.pubkey(), session, 0, true),
         &[&authority],
         Err(v3::REFUSAL_STATE),
     )
@@ -1151,19 +1603,26 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let mut view_batch_sizes = Vec::new();
     let mut view_transaction_bytes = Vec::new();
     let mut view_cursor = 0u32;
+    let workspace_first_boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
     while view_cursor < frame_bytes {
         let remaining_phases =
             (frame_bytes - view_cursor + V3_VIEW_PHASE_BYTES - 1) / V3_VIEW_PHASE_BYTES;
-        let mut candidate = remaining_phases;
+        let mut candidate = if view_cursor < workspace_first_boundary {
+            remaining_phases.min((workspace_first_boundary - view_cursor) / V3_VIEW_PHASE_BYTES)
+        } else {
+            remaining_phases
+        };
+        assert!(candidate > 0, "view batch crossed workspace-first boundary");
         loop {
             let blockhash = context.get_new_latest_blockhash().await.unwrap();
             let phase_instructions = (0..candidate)
                 .map(|index| {
-                    run_view_phase(
-                        authority.pubkey(),
-                        session,
-                        view_cursor + index * V3_VIEW_PHASE_BYTES,
-                    )
+                    let cursor = view_cursor + index * V3_VIEW_PHASE_BYTES;
+                    if cursor < workspace_first_boundary {
+                        run_view_phase(authority.pubkey(), session, cursor)
+                    } else {
+                        run_view_phase_workspace_first(authority.pubkey(), session, cursor)
+                    }
                 })
                 .collect::<Vec<_>>();
             let mut instructions = Vec::with_capacity(phase_instructions.len() + 1);
@@ -1581,7 +2040,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "compute_units_mean_per_transaction": frame_total_cu as f64
                     / (view_batch_sizes.len() + 2) as f64,
                 "snapshot_create_cu": view_begin_cu,
-                "readonly_state_view_attempt_cu": readonly_state_view_attempt_cu,
+                "writable_state_view_attempt_cu": writable_state_view_attempt_cu,
                 "publish_commit_cu": view_commit_cu,
                 "state_write_audit": {
                     "context_allowed_range": [0, ENGINE_CONTEXT_BYTES],
@@ -1596,6 +2055,30 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 },
                 "pixel_sha256": frame_hash,
             },
+            "render_cadence": {
+                "tape_tics": 80,
+                "render_every_tics": 8,
+                "frames_in_a_row": cadence_trace.frames.len(),
+                "same_st1_mp1_roots_after_every_tic": true,
+                "same_st1_mp1_account_hashes_after_every_tic": true,
+                "same_rendered_frame_hashes_after_abort_rerender": true,
+                "state_roots_after_each_tic": cadence_trace.ticks.iter().map(|tick| json!({
+                    "cursor": tick.cursor,
+                    "root": tick.root,
+                    "st1_sha256": tick.st1_sha256,
+                    "mp1_sha256": tick.mp1_sha256,
+                })).collect::<Vec<_>>(),
+                "frame_hashes": cadence_frame_hashes,
+                "abort_rerender_frame_hashes": abort_frame_hashes,
+                "transactions_per_frame_average": cadence_transactions_per_frame,
+                "transactions_for_ten_frames": cadence_frame_transaction_count,
+                "compute_units_for_ten_frames_including_snapshot_seed": cadence_frame_cu,
+                "workspace_account_bytes": workspace_allocation,
+                "workspace_bytes_after_each_frame": cadence_trace.frames.iter().map(|f| f.workspace_bytes).collect::<Vec<_>>(),
+                "render_arena_high_water_bytes": cadence_trace.frames.iter().map(|f| f.arena_high_water).collect::<Vec<_>>(),
+                "workspace_rent_lamports": workspace_rent_lamports,
+                "estimated_pictures_per_second_at_60_transactions_per_second": estimated_pictures_per_second_at_60_tps,
+            },
             "adversarial": {
                 "unsealed_resource_begin_cu": unsealed_begin_cu,
                 "advance_before_init_cu": early_advance_cu,
@@ -1603,7 +2086,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "engine_halt_cu": engine_halt_cu,
                 "halted_session_advance_cu": after_halt_advance_cu,
                 "wrong_wad_cu": bad_wad_cu,
-                "readonly_mutable_view_attempt_cu": readonly_state_view_attempt_cu,
+                "writable_state_view_attempt_cu": writable_state_view_attempt_cu,
             },
             "setup": {
                 "open_cu": open_cu,

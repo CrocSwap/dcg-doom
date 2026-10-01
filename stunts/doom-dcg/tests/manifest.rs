@@ -49,9 +49,10 @@ fn application_manifest_pins_one_composite_v3_doom_kernel() {
 }
 
 #[test]
-fn doom_opts_into_mutable_v3_views_and_declares_bounded_phases() {
+fn doom_keeps_v3_state_read_only_and_declares_bounded_workspace_phases() {
     let kernel = DoomKernel::default();
-    assert!(kernel.view_requires_mutable_state());
+    assert!(kernel.view_workspace_at_account_base());
+    assert!(!kernel.clear_view_workspace_on_begin());
     assert_eq!(kernel.max_view_phase_bytes(), V3_VIEW_PHASE_BYTES);
     assert_eq!(
         kernel.view_phase_compute_units(),

@@ -9,14 +9,21 @@ resumable 16,384-byte phases and 115 staged engine phases.
 ADVANCE executes one four-byte command per call, the current SVM compute budget
 for the pinned engine. Doom pre-tic halts
 are returned as v3 prefix outcomes. The nine RSN/3 output views use the sealed
-resource and a cleared workspace; complete strips are cached there while the
-view phase copies bounded chunks to the staged outputs.
+resource and a dedicated writable workspace. Snapshot phases copy the
+committed context into that workspace in bounded chunks. Strip phases map the
+workspace first so Doom keeps its pinned fixed address; the primary context,
+ST1, and MP1 remain read-only. The workspace also caches the RSN/3 projection,
+complete strips, and render arena high-water mark. Its payload is fixed at
+10,462,608 bytes, and the RSN/3 cache is refused if the projection exceeds its
+640 KiB bound.
 
 The SBF image routes every instruction only through
 `dcg_program::stateful::v3::process_with_kernel`. It does not route headerless
-primary accounts into revision-8 compatibility handlers. The DCG-side mutable
-view callback is opt-in and leaves existing read-only view behavior as the
-default.
+primary accounts into revision-8 compatibility handlers. The DCG mutable-state
+render callback is not used. The additive workspace-first RUN_PHASE interface
+and large-workspace limit are recorded in
+`review/dcg-stateful-v3-workspace-render.patch` against DCG main; ordinary v3
+views remain read-only by default.
 
 `scripts/pack-dcg-resource.py` packs the retained RI2 image and five
 header-stripped WAD chunks. Packed input, SBF output, and ProgramTest receipts

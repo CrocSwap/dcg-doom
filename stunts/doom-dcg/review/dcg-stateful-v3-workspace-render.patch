@@ -1,0 +1,278 @@
+diff --git a/crates/dcg-program/src/kernel.rs b/crates/dcg-program/src/kernel.rs
+index 6b0dc8d..2ef93f2 100644
+--- a/crates/dcg-program/src/kernel.rs
++++ b/crates/dcg-program/src/kernel.rs
+@@ -484,6 +484,22 @@ pub trait StatefulKernel: Kernel {
+         0
+     }
+ 
++    /// Whether a view publication may keep its session-bound workspace bytes
++    /// between BEGIN_PHASE and later publications. The default clears the
++    /// payload at each begin. Kernels that preserve it must overwrite every
++    /// byte they rely on before reading it in a new publication.
++    fn clear_view_workspace_on_begin(&self) -> bool {
++        true
++    }
++
++    /// Opt in to the additive RUN_PHASE account layout that places the
++    /// writable workspace account first. This lets a fixed-address engine
++    /// use the workspace as its invocation-local context while all committed
++    /// state accounts remain read-only later in the account list.
++    fn view_workspace_at_account_base(&self) -> bool {
++        false
++    }
++
+     /// Render with the session's read-only authenticated resources and its
+     /// declared writable workspace. The default retains resource-free v2
+     /// rendering behavior.
+@@ -502,6 +518,28 @@ pub trait StatefulKernel: Kernel {
+         self.render_view_phase(phase, state, output)
+     }
+ 
++    /// Render when RUN_PHASE places the whole writable workspace account at
++    /// the invocation's first-account address. `workspace_header` is the
++    /// authenticated 128-byte DCG child header; `workspace` is its declared
++    /// payload. The default preserves the ordinary resource/workspace API.
++    /// An opted-in kernel may borrow the header temporarily, but must restore
++    /// all DCG header bytes before returning.
++    fn render_view_phase_with_workspace_header(
++        &self,
++        phase: ViewPhase,
++        state: &[AccountSpan<'_>],
++        resources: &[AccountSpan<'_>],
++        commitment: &[u8; 32],
++        workspace_header: &mut [u8],
++        workspace: &mut [u8],
++        output: &mut [u8],
++    ) -> Result<usize, KernelError> {
++        let _ = workspace_header;
++        self.render_view_phase_with_resources(
++            phase, state, resources, commitment, workspace, output,
++        )
++    }
++
+     /// The output ABIs this application image permits for state views.
+     /// Unknown ABI ids are refused when a view account is declared.
+     fn view_abis(&self) -> &'static [ViewAbi] {
+diff --git a/crates/dcg-program/src/stateful_v3.rs b/crates/dcg-program/src/stateful_v3.rs
+index d2593c3..3198529 100644
+--- a/crates/dcg-program/src/stateful_v3.rs
++++ b/crates/dcg-program/src/stateful_v3.rs
+@@ -1901,7 +1901,7 @@ fn grow_view(
+         || allocated > len
+         || (kind == KIND_SCRATCH && len > MAX_SCRATCH_BYTES)
+         || (kind == KIND_WORKSPACE
+-            && (len > kernel.max_view_workspace_bytes() || len > MAX_SCRATCH_BYTES))
++            && (len > kernel.max_view_workspace_bytes() || len > MAX_VIEW_BYTES))
+         || (kind == KIND_VIEW && len > MAX_VIEW_BYTES)
+     {
+         return Err(refusal(REFUSAL_VIEW));
+@@ -2085,7 +2085,7 @@ fn create_view(
+     let source_offset = u32_at(data, 35);
+     let len = u32_at(data, 39);
+     if len == 0
+-        || len > MAX_VIEW_BYTES
++        || len > MAX_SCRATCH_BYTES
+         || role as usize >= MAX_VIEW_OUTPUTS
+         || session.view_keys[role as usize] != Pubkey::default()
+     {
+@@ -2241,7 +2241,7 @@ fn create_workspace(
+         || session.workspace_key != Pubkey::default()
+         || len == 0
+         || len > limit
+-        || len > MAX_SCRATCH_BYTES
++        || len > MAX_VIEW_BYTES
+         || *system.key != system_program::id()
+     {
+         return Err(refusal(REFUSAL_VIEW));
+@@ -2329,7 +2329,7 @@ fn view_meta(
+     } else if kind == KIND_WORKSPACE {
+         if abi_id != [0; 32]
+             || len > kernel.max_view_workspace_bytes()
+-            || len > MAX_SCRATCH_BYTES
++            || len > MAX_VIEW_BYTES
+             || source_offset != 0
+         {
+             return Err(refusal(REFUSAL_VIEW));
+@@ -2807,6 +2807,53 @@ fn parse_publication_accounts<'a>(
+     })
+ }
+ 
++/// Convert the additive workspace-first RUN_PHASE account order into the
++/// canonical order used by the existing v3 validators. The runtime's first
++/// account data address is fixed for some engines; the workspace occupies it
++/// while all committed state remains read-only later in the message.
++fn normalize_workspace_first_accounts<'a>(
++    session: &Session,
++    accounts: &[AccountInfo<'a>],
++) -> Result<Vec<AccountInfo<'a>>, ProgramError> {
++    if !session.primary_state || accounts.len() < 4 || accounts[0].key != &session.workspace_key {
++        return Err(refusal(REFUSAL_VIEW));
++    }
++    let resource_count = usize::from(session.resource_key != Pubkey::default());
++    let state_start = 3usize
++        .checked_add(resource_count)
++        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
++    let state_count = session.state_span_count as usize;
++    let view_count = session.view_count as usize;
++    let state_end = state_start
++        .checked_add(state_count)
++        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
++    let view_end = state_end
++        .checked_add(view_count)
++        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
++    let expected_accounts = view_end
++        .checked_add(1)
++        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
++    if accounts.len() != expected_accounts
++        || accounts[1].key != &session.authority
++        || accounts[2].key != &session.self_key
++    {
++        return Err(refusal(REFUSAL_VIEW));
++    }
++
++    let mut normalized = Vec::with_capacity(accounts.len());
++    normalized.push(accounts[state_start].clone());
++    normalized.push(accounts[1].clone());
++    normalized.push(accounts[2].clone());
++    if resource_count == 1 {
++        normalized.push(accounts[3].clone());
++    }
++    normalized.extend(accounts[state_start + 1..state_end].iter().cloned());
++    normalized.extend(accounts[state_end..view_end].iter().cloned());
++    normalized.push(accounts[0].clone());
++    normalized.push(accounts[view_end].clone());
++    Ok(normalized)
++}
++
+ fn phase_declaration(kernel: &dyn StatefulKernel, declared: u32) -> ProgramResult {
+     let limit = kernel.view_phase_compute_units();
+     let bytes = kernel.max_view_phase_bytes();
+@@ -2907,7 +2954,9 @@ fn begin_view_phase(
+     }
+     {
+         let mut workspace = accounts[parsed.workspace_index].try_borrow_mut_data()?;
+-        workspace[CHILD_HEADER_BYTES..].fill(0);
++        if kernel.clear_view_workspace_on_begin() {
++            workspace[CHILD_HEADER_BYTES..].fill(0);
++        }
+         put_u32(&mut workspace, 112, expected_cursor);
+     }
+     session.phase = PHASE_VIEW_PUBLICATION;
+@@ -2925,6 +2974,7 @@ fn render_phase_chunk(
+     view_metas: &[ViewMeta],
+     resources: &[AccountSpan<'_>],
+     commitment: &[u8; 32],
++    mut workspace_header: Option<&mut [u8]>,
+     workspace: &mut [u8],
+     chunk_start: u32,
+     chunk: &mut [u8],
+@@ -2976,16 +3026,17 @@ fn render_phase_chunk(
+                 output_offset: local,
+                 compute_units,
+             };
+-            let written = kernel
+-                .render_view_phase_with_resources(
+-                    request,
+-                    &state,
+-                    resources,
+-                    commitment,
+-                    workspace,
+-                    &mut chunk[target..target + len],
++            let output = &mut chunk[target..target + len];
++            let written = if let Some(header) = workspace_header.as_deref_mut() {
++                kernel.render_view_phase_with_workspace_header(
++                    request, &state, resources, commitment, header, workspace, output,
++                )
++            } else {
++                kernel.render_view_phase_with_resources(
++                    request, &state, resources, commitment, workspace, output,
+                 )
+-                .map_err(|_| refusal(REFUSAL_KERNEL))?;
++            }
++            .map_err(|_| refusal(REFUSAL_KERNEL))?;
+             if written != len {
+                 return Err(refusal(REFUSAL_KERNEL));
+             }
+@@ -3038,6 +3089,16 @@ fn run_view_phase(
+     if declared != session.phase_compute_units {
+         return Err(refusal(REFUSAL_RESOURCE));
+     }
++    let workspace_first = accounts[0].key == &session.workspace_key;
++    if workspace_first && !kernel.view_workspace_at_account_base() {
++        return Err(refusal(REFUSAL_VIEW));
++    }
++    let normalized_accounts = if workspace_first {
++        normalize_workspace_first_accounts(&session, accounts)?
++    } else {
++        accounts.to_vec()
++    };
++    let accounts = normalized_accounts.as_slice();
+     let parsed =
+         parse_publication_accounts(program, &session, accounts, false, true, true, kernel)?;
+     if parsed
+@@ -3084,6 +3145,14 @@ fn run_view_phase(
+         let mut scratch_raw = scratch.try_borrow_mut_data()?;
+         let stage_start = CHILD_HEADER_BYTES + session.phase_cursor as usize;
+         let stage_end = stage_start + count;
++        let mut workspace_header = None;
++        let workspace_payload = if workspace_first {
++            let (header, payload) = workspace_raw.split_at_mut(CHILD_HEADER_BYTES);
++            workspace_header = Some(header);
++            &mut payload[..workspace_len]
++        } else {
++            &mut workspace_raw[CHILD_HEADER_BYTES..CHILD_HEADER_BYTES + workspace_len]
++        };
+         render_phase_chunk(
+             &parsed.state_metas,
+             &parsed.state_accounts,
+@@ -3091,7 +3160,8 @@ fn run_view_phase(
+             &parsed.view_metas,
+             &resources,
+             &session.resource_commitment,
+-            &mut workspace_raw[CHILD_HEADER_BYTES..CHILD_HEADER_BYTES + workspace_len],
++            workspace_header,
++            workspace_payload,
+             session.phase_cursor,
+             &mut scratch_raw[stage_start..stage_end],
+             session.phase_state_cursor,
+diff --git a/docs/stateful-workloads-v3.md b/docs/stateful-workloads-v3.md
+index 22d1bcd..adb6bac 100644
+--- a/docs/stateful-workloads-v3.md
++++ b/docs/stateful-workloads-v3.md
+@@ -44,8 +44,9 @@ existing bounds: at most eight state spans, 10,000,000 aggregate engine-state
+ bytes, at most eight transitions per `ADVANCE`, at most 64 input slots in the
+ active write window, and state growth in 8,192-byte increments. Views support
+ up to 16 outputs; publication scratch is capped at 4,000,000 bytes. A renderer
+-workspace has a kernel-declared maximum. Kernel phase declarations are checked
+-against the shared `MAX_DECLARED_KERNEL_COMPUTE_UNITS` constant. The test
++workspace has a kernel-declared maximum, bounded by the 10 MiB SVM account-data
++limit separately from publication scratch. Kernel phase declarations are
++checked against the shared `MAX_DECLARED_KERNEL_COMPUTE_UNITS` constant. The test
+ kernel declares initialization at 90% of that constant, below the
+ 1,289,567-CU compatibility target for the seam-fix work. These are designed
+ limits, not measured cost promises.
+@@ -118,6 +119,23 @@ versioned alongside the state cursor. The view output remains staged in the
+ existing publication scratch until `COMMIT_PHASE`; workspace changes alone do
+ not publish output.
+ 
++The ordinary `RUN_PHASE` account order keeps a headerless primary state span
++first. A fixed-address engine may opt into the additive workspace-first order
++for `RUN_PHASE` only: `[workspace, authority, session, resource?, state spans,
++view outputs, publication scratch]`. This makes the workspace account the
++invocation's first data region while the committed state spans remain
++read-only. The processor validates the same session, state, view, resource,
++workspace, and scratch PDAs as the ordinary order, then normalizes the spans
++for the kernel callback. `BEGIN_PHASE`, `COMMIT_PHASE`, and `ABORT_PHASE` keep
++the ordinary account order. A kernel that opts into this path may temporarily
++use the authenticated 128-byte workspace child header as fixed-address engine
++bytes during its callback; it must restore every header byte before returning.
++
++By default, `BEGIN_PHASE` clears the workspace payload. A kernel may opt out
++when it overwrites every byte it relies on before reading the workspace in a
++new publication. The view cursor still starts at zero, outputs remain staged,
++and transaction rollback still covers callback changes.
++
+ At `OPEN_SESSION`, the caller names a read-only source account and commits a
+ Merkle root over its 65,536-byte chunks. The program creates a `DRS3`
+ program-owned copy, initially allocating at most 8,192 data bytes. Tag 240
