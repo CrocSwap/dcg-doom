@@ -724,7 +724,12 @@ fn render_doom_view_at_workspace_base(
         saved_workspace_header.copy_from_slice(workspace_header);
         let context_ptr = workspace_header.as_mut_ptr();
         DoomKernel::require_context_address(context_ptr)?;
+        // The logical workspace stores a complete context at payload offset
+        // zero. Account memory begins 128 bytes earlier, at workspace_header,
+        // so move the context tail down before using the account as a
+        // contiguous fixed-address engine image.
         workspace_header.copy_from_slice(&workspace[..128]);
+        workspace.copy_within(128..ENGINE_CONTEXT_BYTES as usize, 0);
         let header_ptr = unsafe { context_ptr.add(BOOTSTRAP_OFFSET) };
         let bootstrap_ptr = unsafe { context_ptr.add(BOOTSTRAP_ARENA_OFFSET) };
         let temp = &mut workspace[RENDER_TEMP_OFFSET..RENDER_TEMP_OFFSET + RENDER_TEMP_BYTES];
@@ -753,9 +758,9 @@ fn render_doom_view_at_workspace_base(
                 &mut arena_high_water,
             )
         };
-        // The account header temporarily carried the first 128 engine bytes
-        // at the fixed address. Preserve that updated context prefix in the
-        // declared workspace payload and restore the authenticated DCG header.
+        // Restore the logical context layout before preserving its updated
+        // prefix in the payload and restoring the authenticated DCG header.
+        workspace.copy_within(0..ENGINE_CONTEXT_BYTES as usize - 128, 128);
         workspace[..128].copy_from_slice(workspace_header);
         workspace_header.copy_from_slice(&saved_workspace_header);
         engine_error(rc)?;
