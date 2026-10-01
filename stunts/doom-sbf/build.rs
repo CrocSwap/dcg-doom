@@ -1319,6 +1319,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CTX_ENGINE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DIAGNOSTIC_PROFILE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SIM_TRANSPORT");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DCG_STATEFUL_V3");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RENDER_CLIP_MEASUREMENT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LEGACY_5120_BUFFER");
     println!("cargo:rerun-if-env-changed=DOOM_HOST_RENDER_CENSUS");
@@ -2012,6 +2013,9 @@ fn compile_ctx_engine(target: &str) {
             codec.define("DOOM_SIM2_LEGACY_DEMO_CAP", None);
         } else if env::var_os("CARGO_FEATURE_SIM_TRANSPORT").is_some() {
             codec.define("DOOM_SIM2_UNBOUNDED_INPUT", None);
+        }
+        if env::var_os("CARGO_FEATURE_DCG_STATEFUL_V3").is_some() {
+            codec.define("DOOM_DCG_STATEFUL_V3", None);
         }
         codec.compile("doom_engine_ctx_codec");
         println!(

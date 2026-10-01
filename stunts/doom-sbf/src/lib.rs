@@ -165,9 +165,9 @@ pub unsafe extern "C" fn doom_sbf_panic() -> ! {
     panic!("doom_sbf_panic");
 }
 
-#[cfg(not(feature = "sim-transport"))]
+#[cfg(all(not(feature = "sim-transport"), not(feature = "no-entrypoint")))]
 entrypoint!(process_instruction);
-#[cfg(feature = "sim-transport")]
+#[cfg(all(feature = "sim-transport", not(feature = "no-entrypoint")))]
 entrypoint!(transport_process_instruction);
 
 /// The deployable DOOM-SIM/2 transport profile.  Only three instruction
