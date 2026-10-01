@@ -6,11 +6,11 @@
 
 use dcg_program::{hash::sha256, kernel::Kernel, stateful as sw, stateful::v3};
 use doom_dcg::{
-    DoomKernel, DOOM_KERNEL_ID, DOOM_RESOURCE_COMMITMENT, ENGINE_CONTEXT_BYTES,
-    MODE_CONSENSUS_V3, MP1_ACCOUNT_BYTES,
-    RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES, ST1_ACCOUNT_BYTES, STATE_SCHEMA,
-    STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS, V3_SNAPSHOT_ABI, V3_STRIP_ABIS,
-    V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING, V3_VIEW_WORKSPACE_BYTES,
+    DoomKernel, DOOM_KERNEL_ID, DOOM_RESOURCE_COMMITMENT, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V3,
+    MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
+    ST1_ACCOUNT_BYTES, STATE_SCHEMA, STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS,
+    V3_SNAPSHOT_ABI, V3_STRIP_ABIS, V3_VIEW_PHASE_BYTES, V3_VIEW_PHASE_COMPUTE_CEILING,
+    V3_VIEW_WORKSPACE_BYTES,
 };
 use serde_json::{json, Value};
 use solana_account::{Account, AccountSharedData};
@@ -29,6 +29,7 @@ const WRONG_RESOURCE: Pubkey = Pubkey::new_from_array([0xd1; 32]);
 const SYSTEM: Pubkey = system_program::ID;
 const STATE_LENGTHS: [u32; 3] = [ENGINE_CONTEXT_BYTES, ST1_ACCOUNT_BYTES, MP1_ACCOUNT_BYTES];
 const STREAM_CAPACITY: u32 = 512;
+const STREAM_FINAL_CAPACITY: u32 = 1_024;
 const COMMAND_WIDTH: usize = 4;
 const WRITE_BATCH: usize = 8;
 const RESOURCE_GROW_BATCH: usize = 8;
@@ -205,6 +206,21 @@ fn create_stream(payer: Pubkey, session: Pubkey) -> Instruction {
     instruction(
         sw::TAG_CREATE_STREAM,
         vec![v3::WIRE_VERSION, 0],
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(session, false),
+            AccountMeta::new(stream_pda(&session), false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        ],
+    )
+}
+
+fn grow_stream(payer: Pubkey, session: Pubkey, new_capacity: u32) -> Instruction {
+    let mut payload = vec![v3::WIRE_VERSION, 1];
+    payload.extend_from_slice(&new_capacity.to_le_bytes());
+    instruction(
+        sw::TAG_CREATE_STREAM,
+        payload,
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
@@ -836,7 +852,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let stream_cu = send(&mut context, create_stream(payer, session), &[], Ok(())).await;
     let state_create_cu = send(&mut context, create_state(payer, session), &[], Ok(())).await;
 
-    // Keep the ring backlog within its 512-slot allocation. Commands are
+    // Keep the ring backlog within the initial 512-slot allocation. Commands are
     // written up to each next ADVANCE batch rather than filling the whole
     // 1,000-command stream before the engine has consumed any slots.
     let first_write_cu = send(
@@ -937,11 +953,31 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     );
 
     let mut adv_cu = Vec::new();
+    let mut stream_grow_cu = Vec::new();
     let mut cursor = 0u32;
+    let mut stream_capacity = STREAM_CAPACITY;
     for boundary in golden["sim2"]["sweep_boundaries"].as_array().unwrap() {
         let target = boundary["cursor"].as_u64().unwrap() as u32;
         while cursor < target {
-            let write_target = target.min(cursor.saturating_add(1));
+            if cursor == stream_capacity && cursor < target {
+                let new_capacity =
+                    (stream_capacity + v3::MAX_STREAM_GROWTH_SLOTS).min(STREAM_FINAL_CAPACITY);
+                let cu = send(
+                    &mut context,
+                    grow_stream(payer, session, new_capacity),
+                    &[],
+                    Ok(()),
+                )
+                .await;
+                stream_grow_cu.push(json!({
+                    "old_capacity": stream_capacity,
+                    "new_capacity": new_capacity,
+                    "cursor": cursor,
+                    "cu": cu
+                }));
+                stream_capacity = new_capacity;
+            }
+            let write_target = target.min(cursor.saturating_add(8)).min(stream_capacity);
             while written < write_target {
                 let end = (written + WRITE_BATCH as u32).min(write_target);
                 let batch = (written..end)
@@ -1028,7 +1064,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         Ok(()),
     )
     .await;
-    let mut pixels = Vec::with_capacity(320 * 200);
+    let mut strips = Vec::with_capacity(8);
     let mut strip_hashes = Vec::new();
     for role in 1..=8 {
         let account = context
@@ -1042,17 +1078,8 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         let strip_pixels = &strip[128..];
         assert_eq!(strip_pixels.len(), 40 * 200);
         strip_hashes.push(sha256(&[strip_pixels]));
-        pixels.extend_from_slice(strip_pixels);
+        strips.push(strip_pixels.to_vec());
     }
-    let frame_hash = sha256(&[&pixels]);
-    assert_eq!(
-        frame_hash,
-        decode_hex32(
-            golden["render"]["reconstructed_frame_sha256"]
-                .as_str()
-                .unwrap()
-        )
-    );
     for (index, expected) in golden["render"]["strips"]
         .as_array()
         .unwrap()
@@ -1064,6 +1091,21 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
             decode_hex32(expected["pixels_sha256"].as_str().unwrap())
         );
     }
+    let mut pixels = Vec::with_capacity(320 * 200);
+    for y in 0..200 {
+        for strip in &strips {
+            pixels.extend_from_slice(&strip[y * 40..(y + 1) * 40]);
+        }
+    }
+    let frame_hash = sha256(&[&pixels]);
+    assert_eq!(
+        frame_hash,
+        decode_hex32(
+            golden["render"]["reconstructed_frame_sha256"]
+                .as_str()
+                .unwrap()
+        )
+    );
 
     // Exercise a real Doom pre-tic halt. The offset is the host-compiled
     // offsetof(doom_ctx_t, gamestate) from the pinned headers; GS_INTERMISSION
@@ -1180,6 +1222,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "tic_count": 1_000,
                 "transaction_count": adv_cu.len(),
                 "transactions_per_tic": adv_cu.len() as f64 / 1_000.0,
+                "stream_growth_transactions": stream_grow_cu,
                 "compute_units_by_transaction": adv_cu,
             },
             "frame": {
