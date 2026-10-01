@@ -763,8 +763,22 @@ fn render_doom_view_at_workspace_base(
         workspace.copy_within(0..ENGINE_CONTEXT_BYTES as usize - 128, 128);
         workspace[..128].copy_from_slice(workspace_header);
         workspace_header.copy_from_slice(&saved_workspace_header);
+        if rc != 0 {
+            solana_program::msg!(
+                "Doom workspace render refused: rc={} cursor={} strip={} payload_bytes={}",
+                rc,
+                cursor,
+                strip_id,
+                payload_len
+            );
+        }
         engine_error(rc)?;
         if arena_high_water > BOOTSTRAP_ARENA_BYTES {
+            solana_program::msg!(
+                "Doom workspace arena overflow: used={} limit={}",
+                arena_high_water,
+                BOOTSTRAP_ARENA_BYTES
+            );
             return Err(KernelError::Refused);
         }
         let prior_high_water = u32_at(workspace, ARENA_HIGH_WATER_OFFSET) as usize;
