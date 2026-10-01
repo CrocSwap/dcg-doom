@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use dcg_program::kernel::MAX_DECLARED_KERNEL_COMPUTE_UNITS;
 use dcg_program::kernel::{Kernel, KernelError, StatefulKernel};
 use doom_dcg::{
     validate_manifest, DoomKernel, DoomResourceBundle, DOOM_CONTEXT_ADDRESS,
@@ -47,9 +48,15 @@ fn application_manifest_pins_one_composite_v3_doom_kernel() {
     assert_eq!(RESOURCE_SCHEMA.version, 2);
     assert_eq!(DOOM_CONTEXT_ADDRESS, 0x400000060);
     assert_eq!(V3_INITIALIZATION_PHASE_BYTES, 16_384);
-    assert_eq!(V3_INITIALIZATION_PHASE_COMPUTE_UNITS, 1_400_000);
+    assert_eq!(
+        V3_INITIALIZATION_PHASE_COMPUTE_UNITS,
+        MAX_DECLARED_KERNEL_COMPUTE_UNITS as u32
+    );
     assert_eq!(V3_VIEW_PHASE_BYTES, STRIP_BYTES);
-    assert_eq!(V3_VIEW_PHASE_COMPUTE_CEILING, 1_400_000);
+    assert_eq!(
+        V3_VIEW_PHASE_COMPUTE_CEILING,
+        MAX_DECLARED_KERNEL_COMPUTE_UNITS as u32
+    );
     assert!(V3_VIEW_WORKSPACE_BYTES > SNAPSHOT_BYTES + 8 * STRIP_BYTES);
 }
 

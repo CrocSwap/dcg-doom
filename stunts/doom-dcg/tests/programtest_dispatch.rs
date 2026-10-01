@@ -1928,6 +1928,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     let mut view_transaction_cu = Vec::new();
     let mut view_batch_sizes = Vec::new();
     let mut view_transaction_bytes = Vec::new();
+    let mut view_batch_blockhash_retries = 0u32;
     let mut view_cursor = 0u32;
     let workspace_first_boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
     while view_cursor < frame_bytes {
@@ -1939,6 +1940,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
             remaining_phases
         };
         assert!(candidate > 0, "view batch crossed workspace-first boundary");
+        let mut blockhash_retries_for_cursor = 0u8;
         loop {
             let blockhash = context.get_new_latest_blockhash().await.unwrap();
             let phase_instructions = (0..candidate)
@@ -1976,6 +1978,15 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
             let simulation_result = simulation
                 .result
                 .expect("ProgramTest returns a view-batch simulation result");
+            if matches!(&simulation_result, Err(TransactionError::BlockhashNotFound)) {
+                assert!(
+                    blockhash_retries_for_cursor < 3,
+                    "view-batch simulation repeatedly rejected a refreshed blockhash at cursor {view_cursor}"
+                );
+                blockhash_retries_for_cursor += 1;
+                view_batch_blockhash_retries += 1;
+                continue;
+            }
             let simulation_logs = simulation
                 .simulation_details
                 .as_ref()
@@ -2014,6 +2025,15 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 .process_transaction_with_metadata(tx)
                 .await
                 .unwrap();
+            if matches!(&result.result, Err(TransactionError::BlockhashNotFound)) {
+                assert!(
+                    blockhash_retries_for_cursor < 3,
+                    "view-batch execution repeatedly rejected a refreshed blockhash at cursor {view_cursor}"
+                );
+                blockhash_retries_for_cursor += 1;
+                view_batch_blockhash_retries += 1;
+                continue;
+            }
             if let Err(error) = result.result {
                 let logs = result
                     .metadata
@@ -2401,6 +2421,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
                 "run_phase_transactions": view_transaction_cu,
                 "phases_per_run_transaction": view_batch_sizes,
                 "serialized_transaction_bytes": view_transaction_bytes,
+                "blockhash_retries": view_batch_blockhash_retries,
                 "compute_units_per_transaction": frame_transaction_cu,
                 "compute_units_total": frame_total_cu,
                 "compute_units_mean_per_transaction": frame_total_cu as f64
