@@ -606,6 +606,7 @@ fn render_doom_view(
         snapshot[128..160].copy_from_slice(&snapshot_hash);
 
         workspace[STRIP_CACHE_OFFSET..STRIP_CACHE_OFFSET + STRIP_CACHE_BYTES].fill(0);
+        workspace[RENDER_TEMP_OFFSET..RENDER_TEMP_OFFSET + RENDER_CACHE_BYTES].fill(0);
         put_u32(workspace, ARENA_HIGH_WATER_OFFSET, 0);
     }
 
