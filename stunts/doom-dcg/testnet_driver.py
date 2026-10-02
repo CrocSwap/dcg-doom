@@ -41,6 +41,7 @@ from solders.transaction import Transaction
 
 from dcg.sequencer import (
     Backoff,
+    LatencyMode,
     Commitment,
     EndpointLimits,
     JournalStore,
@@ -70,6 +71,8 @@ from dcg.sequencer.types import AccountInfo, BlockhashLease, RpcEndpoint, SendRe
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# DOOM_FAST=1: skip RPC preflight and release dependents on processed status.
+FAST = os.environ.get("DOOM_FAST") == "1"
 DEFAULT_RUN = ROOT / "out/runs/doom-dcg-p2-stopgap-2026-10-01"
 DEFAULT_IMAGE_DIR = DEFAULT_RUN / "input"
 DEFAULT_RESOURCE = DEFAULT_IMAGE_DIR / "doom-dcg-resource.bin"
@@ -116,7 +119,7 @@ TESTNET_NODE_URLS = (
     "http://64.130.63.165:8899",
     "http://64.130.44.172:8899",
 )
-TESTNET_GENESIS = "9GGSFo95u8MAtJGn2peX7v6GkBX5doWvNQSDD4mG2sQT"
+TESTNET_GENESIS = "9GGSFo95raqzZxWqKM5tGYvJp5iv4Dm565S4r8h5PEu9"
 
 
 def sha256(data: bytes) -> bytes:
@@ -695,6 +698,7 @@ def make_pool(config: dict[str, Any], *, node_count: int, send_rate: float, requ
             requests_per_second=10_000,
             max_in_flight=max(16, max_in_flight * 2),
             commitment=Commitment.CONFIRMED,
+            skip_preflight=FAST,
         ))
         nodes[endpoint_id] = endpoint
         configs.append(EndpointNodeConfig(
@@ -727,7 +731,8 @@ def make_sequencer(config: dict[str, Any], endpoints: PooledRpcEndpoint, key_pat
             max_packet_bytes=TX_PACKET_LIMIT,
             blockhash_lifetime_seconds=60.0,
             per_step_time_cap_seconds=90.0,
-            confirmation_poll_seconds=0.2,
+            confirmation_poll_seconds=0.05 if FAST else 0.2,
+            latency_mode=LatencyMode.PROCESSED if FAST else LatencyMode.CONFIRMED,
             backoff=Backoff(initial_seconds=1.0, maximum_seconds=60.0, multiplier=2.0),
         ), event_hook=event_hook,
     )
