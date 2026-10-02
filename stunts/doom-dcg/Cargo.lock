@@ -982,7 +982,7 @@ dependencies = [
 [[package]]
 name = "curve25519-dalek"
 version = "3.2.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=0ec72af4a108e1457c5c601787e1a775aff78458#0ec72af4a108e1457c5c601787e1a775aff78458"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=e4752c8bb24ac9830cb50695eb0d411236dafc16#e4752c8bb24ac9830cb50695eb0d411236dafc16"
 dependencies = [
  "byteorder",
  "digest 0.9.0",
@@ -1075,11 +1075,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
+name = "dcg-kernels"
+version = "0.1.0"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=e4752c8bb24ac9830cb50695eb0d411236dafc16#e4752c8bb24ac9830cb50695eb0d411236dafc16"
+
+[[package]]
 name = "dcg-program"
 version = "0.1.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=0ec72af4a108e1457c5c601787e1a775aff78458#0ec72af4a108e1457c5c601787e1a775aff78458"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=e4752c8bb24ac9830cb50695eb0d411236dafc16#e4752c8bb24ac9830cb50695eb0d411236dafc16"
 dependencies = [
  "blake3",
+ "dcg-kernels",
  "ed25519-dalek",
  "indexmap",
  "proc-macro-crate 3.3.0",
