@@ -2536,3 +2536,225 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }
+
+// --- render lanes (DCG lanes slice 1, Doom slice 2) -------------------------------------
+
+const LANES: u8 = 2;
+
+fn lane_pda(session: &Pubkey, k: u8) -> Pubkey {
+    Pubkey::find_program_address(&[v3::lanes::LANE_SEED, session.as_ref(), &[k]], &PROGRAM).0
+}
+
+fn lane_ws(session: &Pubkey, k: u8) -> Pubkey {
+    view_pda(session, v3::lanes::WORKSPACE_ROLE_BASE + k)
+}
+
+fn lane_scratch(session: &Pubkey, k: u8) -> Pubkey {
+    view_pda(session, v3::lanes::SCRATCH_ROLE_BASE + k)
+}
+
+fn lane_op(op: u8, k: u8, rest: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
+    let mut p = vec![v3::WIRE_VERSION, op, k];
+    p.extend_from_slice(rest);
+    instruction(sw::TAG_PUBLISH_VIEWS, p, accounts)
+}
+
+fn cursor_rest(c: u32, extra: &[u32], phases: Option<u8>) -> Vec<u8> {
+    let mut r = c.to_le_bytes().to_vec();
+    for x in extra {
+        r.extend_from_slice(&x.to_le_bytes());
+    }
+    r.extend(phases);
+    r
+}
+
+fn all_views(session: &Pubkey, writable: bool) -> Vec<AccountMeta> {
+    (0..=8u8)
+        .map(|role| if writable { AccountMeta::new(view_pda(session, role), false) } else { AccountMeta::new_readonly(view_pda(session, role), false) })
+        .collect()
+}
+
+async fn lane_capture(context: &mut ProgramTestContext, authority: &Keypair, session: Pubkey, k: u8, c: u32) -> Vec<u64> {
+    let a = authority.pubkey();
+    let mut begin = vec![AccountMeta::new_readonly(a, true), AccountMeta::new(session, false), AccountMeta::new(lane_pda(&session, k), false)];
+    begin.extend(all_views(&session, false));
+    let mut cu = vec![send(context, lane_op(v3::lanes::OP_CAPTURE_BEGIN, k, &cursor_rest(c, &[V3_VIEW_PHASE_COMPUTE_CEILING], None), begin), &[authority], Ok(())).await];
+    let total = doom_dcg::LANE_CAPTURE_BYTES;
+    let mut at = 0u32;
+    while at < total {
+        let accounts = vec![
+            AccountMeta::new_readonly(state_pda(&session, 0), false),
+            AccountMeta::new_readonly(a, true),
+            AccountMeta::new_readonly(session, false),
+            AccountMeta::new_readonly(resource_pda(&session), false),
+            AccountMeta::new_readonly(state_pda(&session, 1), false),
+            AccountMeta::new_readonly(state_pda(&session, 2), false),
+            AccountMeta::new(lane_pda(&session, k), false),
+            AccountMeta::new(lane_ws(&session, k), false),
+        ];
+        cu.push(send(context, lane_op(v3::lanes::OP_CAPTURE_RUN, k, &cursor_rest(c, &[at, V3_VIEW_PHASE_COMPUTE_CEILING], None), accounts), &[authority], Ok(())).await);
+        at = (at + doom_dcg::LANE_CAPTURE_PHASE_BYTES).min(total);
+    }
+    let end = vec![AccountMeta::new_readonly(a, true), AccountMeta::new(session, false), AccountMeta::new(lane_pda(&session, k), false)];
+    cu.push(send(context, lane_op(v3::lanes::OP_CAPTURE_END, k, &cursor_rest(c, &[], None), end), &[authority], Ok(())).await);
+    cu
+}
+
+/// Render [from, to) of lane k's publication: snapshot phases 13 per
+/// instruction, strip phases one per instruction (one strip render each).
+async fn lane_render(context: &mut ProgramTestContext, authority: &Keypair, session: Pubkey, k: u8, c: u32, from: u32, to: u32) -> Vec<u64> {
+    let mut cu = Vec::new();
+    let mut at = from;
+    let snapshot_boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
+    while at < to {
+        let phases = if at + 13 * V3_VIEW_PHASE_BYTES <= snapshot_boundary { 13u8 } else { 1u8 };
+        let accounts = vec![
+            AccountMeta::new(lane_ws(&session, k), false),
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(lane_pda(&session, k), false),
+            AccountMeta::new(lane_scratch(&session, k), false),
+            AccountMeta::new_readonly(resource_pda(&session), false),
+        ];
+        cu.push(send(context, lane_op(v3::lanes::OP_RUN, k, &cursor_rest(c, &[at, V3_VIEW_PHASE_COMPUTE_CEILING], Some(phases)), accounts), &[authority], Ok(())).await);
+        at = (at + phases as u32 * V3_VIEW_PHASE_BYTES).min(to);
+    }
+    cu
+}
+
+async fn lane_commit(context: &mut ProgramTestContext, authority: &Keypair, session: Pubkey, k: u8, c: u32, expected: Result<(), u32>) -> u64 {
+    let mut accounts = vec![
+        AccountMeta::new_readonly(authority.pubkey(), true),
+        AccountMeta::new_readonly(session, false),
+        AccountMeta::new(lane_pda(&session, k), false),
+        AccountMeta::new_readonly(lane_scratch(&session, k), false),
+    ];
+    accounts.extend(all_views(&session, true));
+    send(context, lane_op(v3::lanes::OP_COMMIT, k, &cursor_rest(c, &[], None), accounts), &[authority], expected).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doom_lanes_publish_the_golden_frame_while_the_session_advances() {
+    let golden: Value = serde_json::from_str(GOLDEN).unwrap();
+    let resource = std::fs::read(std::env::var("DOOM_DCG_RESOURCE_PATH").expect("DOOM_DCG_RESOURCE_PATH must be set"))
+        .expect("packed RI2/WAD resource fixture");
+    let mut wrong_resource = resource.clone();
+    wrong_resource[32 + 261_056] ^= 1;
+    let mut context = start_sbf(&resource, &wrong_resource).await;
+    let authority = Keypair::new_from_array([0x18; 32]);
+    let payer = context.payer.pubkey();
+    let session = session_pda(&authority.pubkey(), 18);
+    let mut open = open_session(payer, authority.pubkey(), 18, RESOURCE, resource_root(&resource));
+    open.data.push(LANES);
+    send(&mut context, open, &[&authority], Ok(())).await;
+    send(&mut context, create_stream(payer, session), &[], Ok(())).await;
+    send(&mut context, create_state(payer, session), &[], Ok(())).await;
+    upload_sealed_resource(&mut context, &authority, session, RESOURCE, &resource).await;
+    grow_state_spans(&mut context, session).await;
+    send(&mut context, begin_initialization(authority.pubkey(), session), &[&authority], Ok(())).await;
+    let phase_count = (STATE_LENGTHS.iter().sum::<u32>() + 16_383) / 16_384;
+    for phase_index in 0..phase_count {
+        send(&mut context, run_initialization(authority.pubkey(), session, phase_index * 16_384, None), &[&authority], Ok(())).await;
+    }
+    create_and_grow_views(&mut context, session).await;
+    let frame_bytes = SNAPSHOT_BYTES + STRIP_BYTES * 8;
+    for k in 0..LANES {
+        let mut rest = V3_VIEW_WORKSPACE_BYTES.to_le_bytes().to_vec();
+        rest.extend_from_slice(&frame_bytes.to_le_bytes());
+        let accounts = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(session, false),
+            AccountMeta::new(lane_pda(&session, k), false),
+            AccountMeta::new(lane_ws(&session, k), false),
+            AccountMeta::new(lane_scratch(&session, k), false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        ];
+        send(&mut context, lane_op(v3::lanes::OP_CREATE, k, &rest, accounts), &[&authority], Ok(())).await;
+        let mut grows = Vec::new();
+        for (target, len) in [(lane_ws(&session, k), V3_VIEW_WORKSPACE_BYTES), (lane_scratch(&session, k), frame_bytes)] {
+            let mut allocated = len.min(v3::CHILD_GROW_BYTES);
+            while allocated < len {
+                allocated = (allocated + v3::CHILD_GROW_BYTES).min(len);
+                grows.push(lane_op(v3::lanes::OP_GROW, k, &[], vec![
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new_readonly(session, false),
+                    AccountMeta::new_readonly(lane_pda(&session, k), false),
+                    AccountMeta::new(target, false),
+                    AccountMeta::new_readonly(SYSTEM, false),
+                ]));
+            }
+        }
+        for batch in grows.chunks(VIEW_GROW_BATCH) {
+            send_many(&mut context, batch.to_vec(), &[]).await;
+        }
+    }
+
+    // Advance to cursor 999 (the golden frame is at 1,000).
+    let (mut cursor, mut written, mut capacity) = (0u32, 0u32, STREAM_CAPACITY);
+    async fn advance_to(context: &mut ProgramTestContext, authority: &Keypair, session: Pubkey, payer: Pubkey,
+                        cursor: &mut u32, written: &mut u32, capacity: &mut u32, target: u32) {
+        while *cursor < target {
+            if *cursor == *capacity {
+                let new_capacity = (*capacity + v3::MAX_STREAM_GROWTH_SLOTS).min(STREAM_FINAL_CAPACITY);
+                send(context, grow_stream(payer, session, new_capacity), &[], Ok(())).await;
+                *capacity = new_capacity;
+            }
+            let write_target = target.min(*cursor + 8).min(*capacity);
+            while *written < write_target {
+                let end = (*written + WRITE_BATCH as u32).min(write_target);
+                let batch = (*written..end)
+                    .map(|s| write_input(authority.pubkey(), session, s, command_at(s as usize)))
+                    .collect::<Vec<_>>();
+                send_many(context, batch, &[authority]).await;
+                *written = end;
+            }
+            send(context, advance(authority.pubkey(), session, *cursor, 1), &[authority], Ok(())).await;
+            *cursor += 1;
+        }
+    }
+    advance_to(&mut context, &authority, session, payer, &mut cursor, &mut written, &mut capacity, 999).await;
+
+    // Lane 0 captures 999; the state cannot advance during the capture.
+    let capture0 = lane_capture(&mut context, &authority, session, 0, 999).await;
+    // Lane 0 renders its snapshot while the session advances to 1,000 and
+    // lane 1 captures it; then lane 0 renders its strips from its capture.
+    let snapshot_boundary = SNAPSHOT_BYTES / V3_VIEW_PHASE_BYTES * V3_VIEW_PHASE_BYTES;
+    let render0a = lane_render(&mut context, &authority, session, 0, 999, 0, snapshot_boundary).await;
+    advance_to(&mut context, &authority, session, payer, &mut cursor, &mut written, &mut capacity, 1_000).await;
+    let capture1 = lane_capture(&mut context, &authority, session, 1, 1_000).await;
+    let render0b = lane_render(&mut context, &authority, session, 0, 999, snapshot_boundary, frame_bytes).await;
+    let render1 = lane_render(&mut context, &authority, session, 1, 1_000, 0, frame_bytes).await;
+
+    // Lane 1 (1,000) publishes first; lane 0's older frame is stale.
+    let commit1 = lane_commit(&mut context, &authority, session, 1, 1_000, Ok(())).await;
+    lane_commit(&mut context, &authority, session, 0, 999, Err(v3::REFUSAL_STALE_PUBLICATION)).await;
+
+    let mut strips = Vec::new();
+    for role in 1..=8u8 {
+        let account = context.banks_client.get_account(view_pda(&session, role)).await.unwrap().unwrap();
+        assert_eq!(u32_at(&account.data, ACCOUNT_CURSOR_OFFSET), 1_000);
+        let pixels = account.data[128 + 128..].to_vec();
+        assert_eq!(sha256(&[&pixels]), decode_hex32(golden["render"]["strips"][(role - 1) as usize]["pixels_sha256"].as_str().unwrap()));
+        strips.push(pixels);
+    }
+    let mut pixels = Vec::with_capacity(320 * 200);
+    for y in 0..200 {
+        for strip in &strips {
+            pixels.extend_from_slice(&strip[y * 40..(y + 1) * 40]);
+        }
+    }
+    assert_eq!(sha256(&[&pixels]), decode_hex32(golden["render"]["reconstructed_frame_sha256"].as_str().unwrap()));
+    let snapshot = context.banks_client.get_account(view_pda(&session, 0)).await.unwrap().unwrap();
+    assert_eq!(u32_at(&snapshot.data, ACCOUNT_CURSOR_OFFSET), 1_000);
+    eprintln!(
+        "doom-lanes CU capture0={capture0:?} render0_snapshot_max={} render0_strips={render0b:?} capture1={capture1:?} render1_strip_max={} commit1={commit1}",
+        render0a.iter().max().unwrap(),
+        render1.iter().max().unwrap()
+    );
+    if let Ok(path) = std::env::var("DOOM_DCG_LANES_METRICS_PATH") {
+        std::fs::write(path, serde_json::to_string_pretty(&json!({
+            "capture0": capture0, "render0_snapshot": render0a, "render0_strips": render0b,
+            "capture1": capture1, "render1": render1, "commit1": commit1,
+        })).unwrap()).unwrap();
+    }
+}
