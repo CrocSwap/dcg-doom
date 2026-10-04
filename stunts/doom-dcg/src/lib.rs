@@ -1319,6 +1319,7 @@ pub static DOOM_DCG_APPLICATION_MANIFEST: ApplicationManifest = ApplicationManif
     optimistic_replays: &[],
     legacy_forms: &[],
     require_legacy_form_binding: false,
+    admission_scan: dcg_program::kernel::AdmissionScan::Full,
     hooks: &dcg_program::compatibility::REVISION8_COMPATIBILITY,
     decision_routes: &dcg_program::compatibility::REVISION8_COMPATIBILITY,
 };
