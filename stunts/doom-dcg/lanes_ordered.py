@@ -121,6 +121,11 @@ async def run(args) -> int:
         raise SystemExit(f"session cursor {cursor0} is not at a frame boundary")
     commands = Path(c["commands_path"]).read_bytes()
     count = len(commands) // 4
+    if args.strip_use:
+        # The looped demo input presses USE (button bit 0x02, byte 3) at a
+        # switch the kernel refuses past (10-05: tic 5,310, refusal 2334);
+        # sustained runs clear it so the player stays in the level.
+        commands = bytes(b & ~0x02 if i % 4 == 3 else b for i, b in enumerate(commands))
 
     lane_free = [asyncio.Event() for _ in range(args.lanes)]
     for e in lane_free:
@@ -262,6 +267,7 @@ def main() -> int:
     ap.add_argument("--overlap", action="store_true", help="do not wait for a frame's capture before sending the next")
     ap.add_argument("--pipeline-commits", action="store_true", help="send each commit once the previous is sent")
     ap.add_argument("--priority-step", type=int, default=100)
+    ap.add_argument("--strip-use", action="store_true", help="clear the USE button in every command")
     ap.add_argument("--repair-delay", type=float, default=1.0,
                     help="seconds to let in-flight steps land before repair (repair checks original signatures)")
     ap.add_argument("--out", type=Path)
