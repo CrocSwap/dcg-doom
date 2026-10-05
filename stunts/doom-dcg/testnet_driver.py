@@ -177,7 +177,40 @@ def ix(program: Pubkey, tag: int, body: bytes, accounts: Iterable[tuple[Pubkey, 
     return Instruction(program, bytes([tag]) + body, metas)
 
 
-def open_session(program: Pubkey, payer: Pubkey, authority: Pubkey, addresses: Addresses, session_id: int) -> Instruction:
+# DCG session API generations (owner 10-05). "v3" is the deployed Doom
+# program (DCG pin 6d8df99): creators take no authority slot, no features.
+# "v3-r2" is a program rebuilt on DCG >= 5624a82: every child creator takes
+# the session authority, signing, as account 2 (sessions review H1), and the
+# open payload may carry `features` (ring stream, rejectable kernel; design
+# session-reject-and-ring-v1). Select it in driver-config.json with
+# "dcg_session_api": "v3-r2" and "session_features": <bits>.
+SESSION_API_V3 = "v3"
+SESSION_API_V3_R2 = "v3-r2"
+FEATURE_RING_STREAM = 1
+FEATURE_REJECTABLE = 2
+
+
+def session_api(config: dict[str, Any]) -> tuple[bool, int]:
+    """(creators take the authority at account 2, open features) from a driver config."""
+    api = config.get("dcg_session_api", SESSION_API_V3)
+    if api not in (SESSION_API_V3, SESSION_API_V3_R2):
+        raise ValueError(f"unknown dcg_session_api {api!r}")
+    features = int(config.get("session_features", 0))
+    if api == SESSION_API_V3 and features:
+        raise ValueError("session_features need dcg_session_api v3-r2 (a program on DCG >= 5624a82)")
+    if features & ~(FEATURE_RING_STREAM | FEATURE_REJECTABLE):
+        raise ValueError("unknown session feature bits")
+    if features & FEATURE_RING_STREAM and STREAM_CAPACITY < 128:
+        raise ValueError("a ring stream needs capacity >= 128")
+    return api == SESSION_API_V3_R2, features
+
+
+def _creator_authority(authority: Pubkey | None) -> tuple:
+    return () if authority is None else ((authority, True, False),)
+
+
+def open_session(program: Pubkey, payer: Pubkey, authority: Pubkey, addresses: Addresses, session_id: int,
+                 features: int = 0, lanes: int = 0) -> Instruction:
     body = bytearray([WIRE_VERSION])
     body.extend(u64(session_id))
     body.extend(bytes([0, 4]))  # indexed input, 4-byte Doom command
@@ -195,6 +228,10 @@ def open_session(program: Pubkey, payer: Pubkey, authority: Pubkey, addresses: A
     body.extend(u16(2))
     body.extend(DOOM_RESOURCE_ROOT)
     body.append(1)  # headerless primary state at span zero
+    if features:
+        body.extend((lanes, features))  # 180-byte form: lanes (0 allowed), features
+    elif lanes:
+        body.append(lanes)
     return ix(program, 230, bytes(body), (
         (payer, True, True),
         (authority, True, False),
@@ -205,19 +242,19 @@ def open_session(program: Pubkey, payer: Pubkey, authority: Pubkey, addresses: A
     ))
 
 
-def create_stream(program: Pubkey, payer: Pubkey, a: Addresses) -> Instruction:
+def create_stream(program: Pubkey, payer: Pubkey, a: Addresses, authority: Pubkey | None = None) -> Instruction:
     return ix(program, 231, bytes([WIRE_VERSION, 0]), (
-        (payer, True, True), (a.session, False, True), (a.stream, False, True),
+        (payer, True, True), (a.session, False, True), *_creator_authority(authority), (a.stream, False, True),
         (SYSTEM_PROGRAM, False, False),
     ))
 
 
-def create_state(program: Pubkey, payer: Pubkey, a: Addresses) -> Instruction:
+def create_state(program: Pubkey, payer: Pubkey, a: Addresses, authority: Pubkey | None = None) -> Instruction:
     body = bytearray([WIRE_VERSION, len(STATE_LENGTHS)])
     for length in STATE_LENGTHS:
         body.extend(u32(length))
     return ix(program, 232, bytes(body), (
-        (payer, True, True), (a.session, False, True), (a.resource, False, False),
+        (payer, True, True), (a.session, False, True), *_creator_authority(authority), (a.resource, False, False),
         (a.states[0], False, True), (a.states[1], False, True), (a.states[2], False, True),
         (SYSTEM_PROGRAM, False, False),
     ))
@@ -301,26 +338,27 @@ def advance(program: Pubkey, authority: Pubkey, a: Addresses, cursor: int) -> In
     ))
 
 
-def create_view(program: Pubkey, payer: Pubkey, a: Addresses, role: int, abi: bytes, length: int) -> Instruction:
+def create_view(program: Pubkey, payer: Pubkey, a: Addresses, role: int, abi: bytes, length: int,
+                authority: Pubkey | None = None) -> Instruction:
     body = bytes([WIRE_VERSION, role]) + abi + u32(0) + u32(length)
     address = a.views[role] if role < 9 else a.workspace if role == 254 else a.scratch
     return ix(program, 233, body, (
-        (payer, True, True), (a.session, False, True), (address, False, True),
+        (payer, True, True), (a.session, False, True), *_creator_authority(authority), (address, False, True),
         (SYSTEM_PROGRAM, False, False),
     ))
 
 
-def create_workspace(program: Pubkey, payer: Pubkey, a: Addresses) -> Instruction:
+def create_workspace(program: Pubkey, payer: Pubkey, a: Addresses, authority: Pubkey | None = None) -> Instruction:
     return ix(program, 233, bytes([WIRE_VERSION, 254]) + u32(VIEW_WORKSPACE_BYTES), (
-        (payer, True, True), (a.session, False, True), (a.workspace, False, True),
+        (payer, True, True), (a.session, False, True), *_creator_authority(authority), (a.workspace, False, True),
         (SYSTEM_PROGRAM, False, False),
     ))
 
 
-def create_scratch(program: Pubkey, payer: Pubkey, a: Addresses) -> Instruction:
+def create_scratch(program: Pubkey, payer: Pubkey, a: Addresses, authority: Pubkey | None = None) -> Instruction:
     body = bytes([WIRE_VERSION, 255]) + bytes(32) + u32(0) + u32(FRAME_BYTES)
     return ix(program, 233, body, (
-        (payer, True, True), (a.session, False, True), (a.scratch, False, True),
+        (payer, True, True), (a.session, False, True), *_creator_authority(authority), (a.scratch, False, True),
         (SYSTEM_PROGRAM, False, False),
     ))
 
@@ -845,15 +883,17 @@ def setup_plan(config: dict[str, Any], resource: bytes) -> tuple[TransactionPlan
     payer = Pubkey.from_string(config["pubkeys"]["payer"])
     authority = Pubkey.from_string(config["pubkeys"]["authority"])
     a = Addresses.derive(program, authority, config["session_id"])
+    with_authority, features = session_api(config)
+    creator = authority if with_authority else None
     steps: list[TransactionStep] = []
     _append_step(steps, program=program, payer=payer,
-                 instructions=[open_session(program, payer, authority, a, config["session_id"])],
+                 instructions=[open_session(program, payer, authority, a, config["session_id"], features)],
                  name="open-session", locks=(a.session, a.resource), compute_class="doom-open-session",
                  postcondition=exists_check((a.session,)))
-    _append_step(steps, program=program, payer=payer, instructions=[create_stream(program, payer, a)],
+    _append_step(steps, program=program, payer=payer, instructions=[create_stream(program, payer, a, creator)],
                  name="create-stream", locks=(a.session, a.stream), compute_class="doom-create-stream",
                  postcondition=exists_check((a.stream,)))
-    _append_step(steps, program=program, payer=payer, instructions=[create_state(program, payer, a)],
+    _append_step(steps, program=program, payer=payer, instructions=[create_state(program, payer, a, creator)],
                  name="create-state-spans", locks=(a.session, a.resource, *a.states),
                  compute_class="doom-create-state", postcondition=exists_check(a.states))
     commands = Path(config["commands_path"]).read_bytes()
@@ -907,10 +947,10 @@ def setup_plan(config: dict[str, Any], resource: bytes) -> tuple[TransactionPlan
                      name=f"initialize-{phase:04d}", locks=(a.session, a.resource, *a.states),
                      compute_class="doom-initialization-phase")
 
-    create_ops = [create_view(program, payer, a, 0, SNAPSHOT_ABI, SNAPSHOT_BYTES)]
+    create_ops = [create_view(program, payer, a, 0, SNAPSHOT_ABI, SNAPSHOT_BYTES, creator)]
     for role in range(1, 9):
-        create_ops.append(create_view(program, payer, a, role, STRIP_ABIS[role - 1], STRIP_BYTES))
-    create_ops.extend((create_workspace(program, payer, a), create_scratch(program, payer, a)))
+        create_ops.append(create_view(program, payer, a, role, STRIP_ABIS[role - 1], STRIP_BYTES, creator))
+    create_ops.extend((create_workspace(program, payer, a, creator), create_scratch(program, payer, a, creator)))
     _append_step(steps, program=program, payer=payer, instructions=create_ops,
                  name="create-views-workspace", locks=(a.session, *a.views, a.workspace, a.scratch),
                  compute_class="doom-view-create", postcondition=exists_check((*a.views, a.workspace, a.scratch)))

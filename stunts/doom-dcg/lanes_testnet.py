@@ -82,8 +82,8 @@ def _patch(config) -> None:
     open_session = D.open_session
 
     def open_with_lanes(*a, **kw):
-        ix = open_session(*a, **kw)
-        return D.Instruction(ix.program_id, bytes(ix.data) + bytes([lanes]), ix.accounts)
+        # lanes (and features, on a v3-r2 program) in the order the program reads them
+        return open_session(*a, lanes=lanes, **kw)
     D.open_session = open_with_lanes
 
     def make_sequencer(cfg, endpoints, key_paths, *, send_rate, max_in_flight, event_hook=None):
@@ -125,10 +125,12 @@ def provision_plan(c, resource: bytes):
             prev = step(f"{prefix}-{n:04d}", list(batch), (prev,), locks, cls)
         return prev
 
-    s = step("open-session", [D.open_session(program, payer, authority, a, c["session_id"])], (),
+    with_authority, features = D.session_api(c)
+    creator = authority if with_authority else None
+    s = step("open-session", [D.open_session(program, payer, authority, a, c["session_id"], features)], (),
              (a.session, a.resource), "doom-open-session", D.exists_check((a.session,)))
-    s = step("create-stream", [D.create_stream(program, payer, a)], (s,), (a.session, a.stream), "doom-create-stream")
-    s = step("create-state", [D.create_state(program, payer, a)], (s,), (a.session, *a.states), "doom-create-state")
+    s = step("create-stream", [D.create_stream(program, payer, a, creator)], (s,), (a.session, a.stream), "doom-create-stream")
+    s = step("create-state", [D.create_state(program, payer, a, creator)], (s,), (a.session, *a.states), "doom-create-state")
     commands = Path(c["commands_path"]).read_bytes()
     base = step("write-input-0", [D.write_input(program, authority, a, 0, commands[:4])], (s,),
                 (a.session, a.stream), "doom-write-input")
@@ -163,8 +165,8 @@ def provision_plan(c, resource: bytes):
         batch_cu += cu
     init = step(f"initialize-{n:04d}", batch, (init,), (a.session, a.resource, *a.states), "doom-init")
     # Output views (the single-workspace path is unused on a lane session).
-    views = [D.create_view(program, payer, a, 0, D.SNAPSHOT_ABI, D.SNAPSHOT_BYTES)]
-    views += [D.create_view(program, payer, a, role, D.STRIP_ABIS[role - 1], D.STRIP_BYTES) for role in range(1, 9)]
+    views = [D.create_view(program, payer, a, 0, D.SNAPSHOT_ABI, D.SNAPSHOT_BYTES, creator)]
+    views += [D.create_view(program, payer, a, role, D.STRIP_ABIS[role - 1], D.STRIP_BYTES, creator) for role in range(1, 9)]
     v = step("create-views", views, (init,), (a.session, *a.views), "doom-view-create", D.exists_check(a.views))
     ops, allocated = [], min(D.SNAPSHOT_BYTES, D.CHILD_GROW_BYTES)
     while allocated < D.SNAPSHOT_BYTES:

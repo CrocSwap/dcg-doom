@@ -99,6 +99,7 @@ async def run(args) -> int:
     payer = Pubkey.from_string(c["pubkeys"]["payer"])
     authority = Pubkey.from_string(c["pubkeys"]["authority"])
     a = D.Addresses.derive(program, authority, c["session_id"])
+    ring = bool(D.session_api(c)[1] & D.FEATURE_RING_STREAM)
     lanes = P.lanes_for(program, a, args.lanes)
     kp = c["key_paths"]
     # Priority: offset = step * n * (ceiling - epoch). With the default
@@ -210,7 +211,8 @@ async def run(args) -> int:
         # harmless inside the stream, but the last frame before capacity then
         # asked for an input past it and every later frame was refused (2328).
         grow = ()
-        if cursor == capacity:
+        # A ring stream (v3-r2 session feature) never fills and never grows.
+        if not ring and cursor == capacity:
             capacity += STREAM_GROWTH
             grow = (grow_stream(program, payer, a, capacity),)
         inputs = grow + tuple(D.write_input(program, authority, a, seq, commands[(seq % count) * 4:(seq % count + 1) * 4])
