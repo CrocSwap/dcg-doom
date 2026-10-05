@@ -41,7 +41,9 @@ RPC = "http://64.130.44.172:8899"
 # Measured on this program (campaign-L3-nohook, getTransaction): input 48.7k,
 # advance 317k, capture 348k, strips up to 776k, commit 21.8k; requests carry
 # a margin (OrderedLane raises them to the running maximum along a lane).
-LIMITS = {"input": 60_000, "advance": 380_000, "capture": 420_000, "render": 840_000, "commit": 40_000}
+# Strips vary with the frame: two exceeded 840k on 10-04 (frames 656, 664),
+# so strips request 1.2M: two still fit the 2.5M per-account block cap.
+LIMITS = {"input": 60_000, "advance": 380_000, "capture": 420_000, "render": 1_200_000, "commit": 40_000}
 
 
 def signer(*paths):
@@ -57,6 +59,29 @@ def wait_sync(lane: OrderedLane, handle, **kw):
     """OrderedLane.wait polls with blocking sleeps: run it on its own thread
     so lanes overlap."""
     return asyncio.run(lane.wait(handle, **kw))
+
+
+def bad_steps(r) -> list:
+    """(index, error, confirmation level) for every step whose status is
+    missing or failed: shows which step costs a repair pass."""
+    return [(i, (v or {}).get("err"), (v or {}).get("confirmationStatus")) for i, v in enumerate(r.statuses or [])
+            if v is None or v.get("err")]
+
+
+# A stream grows only when fully consumed (cursor == capacity), by at most
+# MAX_STREAM_GROWTH_SLOTS per instruction (DCG stateful_v3.rs grow_stream).
+STREAM_GROWTH = 512
+
+
+def grow_stream(program: Pubkey, payer: Pubkey, a: D.Addresses, capacity: int):
+    return D.ix(program, 231, bytes([D.WIRE_VERSION, 1]) + D.u32(capacity), (
+        (payer, True, True), (a.session, False, True), (a.stream, False, True), (D.SYSTEM_PROGRAM, False, False)))
+
+
+def session_counters(raw: bytes) -> tuple[int, int, int]:
+    """(capacity, cursor, frontier) of a v3 session record."""
+    u = lambda at: int.from_bytes(raw[at:at + 4], "little")
+    return u(10), u(112), u(116)
 
 
 def account(url: str, key: Pubkey) -> bytes:
@@ -76,12 +101,22 @@ async def run(args) -> int:
     a = D.Addresses.derive(program, authority, c["session_id"])
     lanes = P.lanes_for(program, a, args.lanes)
     kp = c["key_paths"]
-    # priority_step 1: with the epoch offset the default (1000) prices an
-    # 840k-CU strip near 1 FOGO, and the node refuses it at preflight.
-    session = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=1)
+    # Priority: offset = step * n * (ceiling - epoch). With the default
+    # ceiling (100,000) the gap between a lane's steps is ~1 part in 300,000,
+    # smaller than the scheduler's cost difference between transactions (the
+    # first session transaction carries the inputs), so the later step won
+    # and every frame paid a repair (10-04). A ceiling of frames + 1 makes the
+    # gap ~1%. The default step (1000) with the old ceiling priced an 840k-CU
+    # strip near 1 FOGO; with this ceiling --priority-step 100 costs ~0.0001.
+    ceiling = args.frames + 1
+    step_price = args.priority_step
+    session = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=step_price)
     render = [OrderedLane(RPC, Pubkey.from_string(c["pubkeys"][f"lane-payer-{k}"]),
-                          signer(kp[f"lane-payer-{k}"], kp["authority"]), priority_step=1) for k in range(args.lanes)]
-    cursor0 = int.from_bytes(account(RPC, a.session)[112:116], "little") if args.start_cursor < 0 else args.start_cursor
+                          signer(kp[f"lane-payer-{k}"], kp["authority"]), priority_step=step_price) for k in range(args.lanes)]
+    capacity, live_cursor, frontier = session_counters(account(RPC, a.session))
+    cursor0 = live_cursor if args.start_cursor < 0 else args.start_cursor
+    if (capacity - cursor0) % 8:
+        raise SystemExit(f"stream capacity {capacity} is not a whole number of frames past {cursor0}")
     if cursor0 % 8:
         raise SystemExit(f"session cursor {cursor0} is not at a frame boundary")
     commands = Path(c["commands_path"]).read_bytes()
@@ -92,7 +127,11 @@ async def run(args) -> int:
         e.set()
     committed: dict[int, asyncio.Event] = {}
     commit_sent: dict[int, asyncio.Event] = {}
-    commits = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=1)
+    commits = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=step_price)
+    # Frame N's session chain follows frame N-1's: wait (and repair) it only
+    # once N-1's capture resolved, or its repair finds steps refused that are
+    # merely early (10-04: a grow refused because N-1 had not yet landed).
+    session_done: dict[int, asyncio.Event] = {}
     log: list[dict] = []
     t0 = time.monotonic()
     failure: list[str] = []
@@ -107,15 +146,21 @@ async def run(args) -> int:
         try:
             # With repair on, a returned result means every step resolved
             # (repair raises otherwise); repaired counts out-of-order landings.
-            r = await asyncio.to_thread(wait_sync, session, capture_handle, watch_last=True, poll_seconds=0.03)
-            note({"frame": frame, "captured": target, "session_s": round(r.landed_seconds, 2), "repaired": r.repaired})
+            if frame > 0:
+                await session_done[frame - 1].wait()
+            r = await asyncio.to_thread(wait_sync, session, capture_handle, watch_last=True, poll_seconds=0.03,
+                                        repair_delay=args.repair_delay)
+            session_done[frame].set()
+            note({"frame": frame, "captured": target, "session_s": round(r.landed_seconds, 2), "repaired": r.repaired,
+                  "bad": bad_steps(r)})
             strips = [LaneStep(f"f{frame}-render-{at:08d}",
                                (P.lane_run(program, authority, a, lane, target, at, n),), LIMITS["render"])
                       for at, n in P.render_phases()]
-            h = await render_lane.send(strips, blockhash=await asyncio.to_thread(render_lane.blockhash), epoch=frame)
-            r = await asyncio.to_thread(wait_sync, render_lane, h, watch_last=True, poll_seconds=0.03)
+            h = await render_lane.send(strips, blockhash=await asyncio.to_thread(render_lane.blockhash), epoch=frame, epoch_ceiling=ceiling)
+            r = await asyncio.to_thread(wait_sync, render_lane, h, watch_last=True, poll_seconds=0.03,
+                                        repair_delay=args.repair_delay)
             note({"frame": frame, "rendered": target, "render_s": round(r.landed_seconds, 2), "repaired": r.repaired,
-                  "slots": r.slots, "error": str(r.first_error)[:80] if r.first_error else None})
+                  "slots": r.slots, "bad": bad_steps(r)})
             # Commits go out in frame order on one shared ordered lane: frame
             # N's commit is sent once frame N-1's is sent (not confirmed);
             # the newest-only guard and repair keep them in order.
@@ -124,14 +169,16 @@ async def run(args) -> int:
             commit = [LaneStep(f"f{frame}-commit-{target:08d}",
                                (P.lane_commit(program, authority, a, lane, target),), LIMITS["commit"])]
             via = commits if args.pipeline_commits else render_lane
-            h = await via.send(commit, blockhash=await asyncio.to_thread(via.blockhash), epoch=frame)
+            h = await via.send(commit, blockhash=await asyncio.to_thread(via.blockhash), epoch=frame, epoch_ceiling=ceiling)
             commit_sent[frame].set()
-            r = await asyncio.to_thread(wait_sync, via, h, watch_last=True, poll_seconds=0.03)
-            note({"frame": frame, "committed": target, "lane": lane.index, "repaired": r.repaired})
+            r = await asyncio.to_thread(wait_sync, via, h, watch_last=True, poll_seconds=0.03,
+                                        repair_delay=args.repair_delay)
+            note({"frame": frame, "committed": target, "lane": lane.index, "repaired": r.repaired, "bad": bad_steps(r)})
         except Exception as e:  # stop the campaign; heal with lanes_testnet.py abort/advance-to
             failure.append(f"frame {frame}: {e}")
             note({"frame": frame, "error": str(e)[:200]})
         finally:
+            session_done[frame].set()
             commit_sent[frame].set()
             committed[frame].set()
             lane_free[lane.index].set()
@@ -147,15 +194,27 @@ async def run(args) -> int:
         lane_free[lane.index].clear()
         committed[frame] = asyncio.Event()
         commit_sent[frame] = asyncio.Event()
+        session_done[frame] = asyncio.Event()
         if time.monotonic() - bh_at > 3.0:
             blockhash, bh_at = await asyncio.to_thread(session.blockhash), time.monotonic()
         # The input batch rides in the first advance's transaction: sent
         # separately it can land after the advances that read it (2330,
-        # input gap), which costs a repair pass per frame.
-        inputs = tuple(D.write_input(program, authority, a, seq, commands[(seq % count) * 4:(seq % count + 1) * 4])
-                       for seq in range(cursor + 1, cursor + 9))
+        # input gap), which costs a repair pass per frame. Advancing from
+        # cursor c reads input c, so a frame needs inputs cursor..cursor+7
+        # (those not already written). Until 10-04 this wrote cursor+1..+8:
+        # harmless inside the stream, but the last frame before capacity then
+        # asked for an input past it and every later frame was refused (2328).
+        grow = ()
+        if cursor == capacity:
+            capacity += STREAM_GROWTH
+            grow = (grow_stream(program, payer, a, capacity),)
+        inputs = grow + tuple(D.write_input(program, authority, a, seq, commands[(seq % count) * 4:(seq % count + 1) * 4])
+                              for seq in range(max(frontier, cursor), cursor + 8))
+        frontier = cursor + 8
         # Advances per transaction (--tics-per-tx; 4 x ~317k CU fit under 1.4M):
-        # fewer serial transactions, fewer chances to land out of order.
+        # fewer serial transactions, fewer chances to land out of order. (The
+        # capture cannot share a transaction with an advance: DCG refuses it,
+        # 2334, measured 10-04.)
         k = args.tics_per_tx
         steps = []
         for t in range(0, 8, k):
@@ -164,7 +223,7 @@ async def run(args) -> int:
             steps.append(LaneStep(f"f{frame}-advance-{cursor + t:08d}x{k}", ixs, limit))
         steps.append(LaneStep(f"f{frame}-capture-{cursor + 8:08d}",
                               tuple(P.capture_instructions(program, authority, a, lane, cursor + 8)), LIMITS["capture"]))
-        handle = await session.send(steps, blockhash=blockhash, epoch=frame)
+        handle = await session.send(steps, blockhash=blockhash, epoch=frame, epoch_ceiling=ceiling)
         note({"frame": frame, "sent": cursor + 8, "lane": lane.index})
         tasks.append(asyncio.create_task(lane_frame(frame, cursor, lane, handle, render[lane.index])))
         # The next frame's session chain must follow this capture: wait for it
@@ -175,9 +234,18 @@ async def run(args) -> int:
             await asyncio.sleep(0.02)
     await asyncio.gather(*tasks)
     total = time.monotonic() - t0
-    done = sum(1 for r in log if "committed" in r)
-    summary = {"frames": done, "failures": failure, "seconds": round(total, 2),
-               "frames_per_second": round(done / total, 3) if total else 0, "start_cursor": cursor0}
+    # Commits are verified (strict repair raises on a step that never
+    # landed); the session cursor cross-checks them: it advances 8 tics per
+    # captured frame, so it can run ahead of commits only when a frame failed.
+    end_cursor = session_counters(account(RPC, a.session))[1]
+    captured = (end_cursor - cursor0) // 8
+    logged = sum(1 for r in log if "committed" in r)
+    done = min(captured, logged)
+    if captured != logged and not failure:
+        failure.append(f"chain shows {captured} frames (cursor {cursor0} -> {end_cursor}), driver logged {logged}")
+    summary = {"frames": done, "frames_captured": captured, "failures": failure, "seconds": round(total, 2),
+               "frames_per_second": round(done / total, 3) if total else 0, "start_cursor": cursor0,
+               "end_cursor": end_cursor}
     print(json.dumps(summary), flush=True)
     if args.out:
         args.out.write_text(json.dumps({"summary": summary, "log": log}, indent=1) + "\n")
@@ -193,6 +261,9 @@ def main() -> int:
     ap.add_argument("--tics-per-tx", type=int, default=4, choices=(1, 2, 4, 8))
     ap.add_argument("--overlap", action="store_true", help="do not wait for a frame's capture before sending the next")
     ap.add_argument("--pipeline-commits", action="store_true", help="send each commit once the previous is sent")
+    ap.add_argument("--priority-step", type=int, default=100)
+    ap.add_argument("--repair-delay", type=float, default=1.0,
+                    help="seconds to let in-flight steps land before repair (repair checks original signatures)")
     ap.add_argument("--out", type=Path)
     return asyncio.run(run(ap.parse_args()))
 
