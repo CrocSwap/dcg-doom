@@ -91,6 +91,8 @@ async def run(args) -> int:
     for e in lane_free:
         e.set()
     committed: dict[int, asyncio.Event] = {}
+    commit_sent: dict[int, asyncio.Event] = {}
+    commits = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=1)
     log: list[dict] = []
     t0 = time.monotonic()
     failure: list[str] = []
@@ -114,17 +116,23 @@ async def run(args) -> int:
             r = await asyncio.to_thread(wait_sync, render_lane, h, watch_last=True, poll_seconds=0.03)
             note({"frame": frame, "rendered": target, "render_s": round(r.landed_seconds, 2), "repaired": r.repaired,
                   "slots": r.slots, "error": str(r.first_error)[:80] if r.first_error else None})
+            # Commits go out in frame order on one shared ordered lane: frame
+            # N's commit is sent once frame N-1's is sent (not confirmed);
+            # the newest-only guard and repair keep them in order.
             if frame > 0:
-                await committed[frame - 1].wait()
+                await (commit_sent[frame - 1] if args.pipeline_commits else committed[frame - 1]).wait()
             commit = [LaneStep(f"f{frame}-commit-{target:08d}",
                                (P.lane_commit(program, authority, a, lane, target),), LIMITS["commit"])]
-            h = await render_lane.send(commit, blockhash=await asyncio.to_thread(render_lane.blockhash), epoch=frame)
-            r = await asyncio.to_thread(wait_sync, render_lane, h, watch_last=True, poll_seconds=0.03)
+            via = commits if args.pipeline_commits else render_lane
+            h = await via.send(commit, blockhash=await asyncio.to_thread(via.blockhash), epoch=frame)
+            commit_sent[frame].set()
+            r = await asyncio.to_thread(wait_sync, via, h, watch_last=True, poll_seconds=0.03)
             note({"frame": frame, "committed": target, "lane": lane.index, "repaired": r.repaired})
         except Exception as e:  # stop the campaign; heal with lanes_testnet.py abort/advance-to
             failure.append(f"frame {frame}: {e}")
             note({"frame": frame, "error": str(e)[:200]})
         finally:
+            commit_sent[frame].set()
             committed[frame].set()
             lane_free[lane.index].set()
 
@@ -138,6 +146,7 @@ async def run(args) -> int:
         await lane_free[lane.index].wait()
         lane_free[lane.index].clear()
         committed[frame] = asyncio.Event()
+        commit_sent[frame] = asyncio.Event()
         if time.monotonic() - bh_at > 3.0:
             blockhash, bh_at = await asyncio.to_thread(session.blockhash), time.monotonic()
         # The input batch rides in the first advance's transaction: sent
@@ -160,7 +169,9 @@ async def run(args) -> int:
         tasks.append(asyncio.create_task(lane_frame(frame, cursor, lane, handle, render[lane.index])))
         # The next frame's session chain must follow this capture: wait for it
         # to land before sending (same-session ordering), but not for renders.
-        while not any(r.get("captured") == cursor + 8 for r in log) and not failure:
+        # --overlap sends the next frame as soon as its lane is free; the
+        # epoch priority keeps older frames ahead in the leader's buffer.
+        while not args.overlap and not any(r.get("captured") == cursor + 8 for r in log) and not failure:
             await asyncio.sleep(0.02)
     await asyncio.gather(*tasks)
     total = time.monotonic() - t0
@@ -180,6 +191,8 @@ def main() -> int:
     ap.add_argument("--lanes", type=int, default=3)
     ap.add_argument("--start-cursor", type=int, default=-1, help="-1: the session's cursor")
     ap.add_argument("--tics-per-tx", type=int, default=4, choices=(1, 2, 4, 8))
+    ap.add_argument("--overlap", action="store_true", help="do not wait for a frame's capture before sending the next")
+    ap.add_argument("--pipeline-commits", action="store_true", help="send each commit once the previous is sent")
     ap.add_argument("--out", type=Path)
     return asyncio.run(run(ap.parse_args()))
 

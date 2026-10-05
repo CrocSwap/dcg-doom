@@ -86,7 +86,9 @@ commits in frame order. Host `basanos-tokyo-2` (2.8 ms to RPC
 | Mac | confirm-per-step sequencer (above) | 8 | 0.107 | serial chain ~9.3 s/frame |
 | Mac | pipelined, 4 advances/tx | 3 | 0.053 | renders ~40 s/frame (see below) |
 | Tokyo | pipelined, 4 advances/tx, priority step 1 | 3 | 0.489 | includes start-up |
-| Tokyo | same | 9 | **0.627** | commits ~1.15 s apart in steady state (~0.87/s) |
+| Tokyo | same | 9 | 0.627 | commits ~1.15 s apart in steady state (~0.87/s) |
+| Tokyo | + `--overlap` (next frame sent once its lane is free) | 9 | 0.654 | captures land without repair; commit chain (~1 s per confirmed commit) now limits |
+| Tokyo | + `--pipeline-commits` (one ordered commit lane) | 12 | **0.740** | frames commit in bursts of 3 every ~3.4 s: the 3 lanes' cycle limits (~0.9/s ceiling) |
 
 Measured (testnet, journal and driver timestamps):
 
@@ -101,7 +103,10 @@ Measured (testnet, journal and driver timestamps):
 - Mac vs Tokyo: from the Mac the same session chain took ~6 s per frame;
   delivery measurements belong on the Tokyo host (owner, 10-04).
 
-Next for 3.0 frames/s: overlap frames' session chains (send the next frame
-before this capture lands) and cut the per-frame repair (ordering within a
-block); the on-chain floor is ~3 session transactions of ~1.3M requested CU
-against the 2.5M per-account block cap, about 0.12 s per frame.
+Next for 3.0 frames/s: the per-lane cycle (~3.4 s: capture lands, strips
+render, commit confirms, lane frees) over the lane count bounds throughput,
+so more lanes (this program has 3; the plan allows 4, DCG's cap to check)
+and a shorter cycle (commit without waiting for the confirmation of the
+previous frame's capture chain; fewer confirmation round trips per lane).
+The on-chain floor of the session chain is ~3 transactions of ~1.3M
+requested CU against the 2.5M per-account block cap, about 0.12 s per frame.
