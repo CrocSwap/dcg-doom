@@ -76,9 +76,11 @@ async def run(args) -> int:
     a = D.Addresses.derive(program, authority, c["session_id"])
     lanes = P.lanes_for(program, a, args.lanes)
     kp = c["key_paths"]
-    session = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]))
+    # priority_step 1: with the epoch offset the default (1000) prices an
+    # 840k-CU strip near 1 FOGO, and the node refuses it at preflight.
+    session = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=1)
     render = [OrderedLane(RPC, Pubkey.from_string(c["pubkeys"][f"lane-payer-{k}"]),
-                          signer(kp[f"lane-payer-{k}"], kp["authority"])) for k in range(args.lanes)]
+                          signer(kp[f"lane-payer-{k}"], kp["authority"]), priority_step=1) for k in range(args.lanes)]
     cursor0 = int.from_bytes(account(RPC, a.session)[112:116], "little") if args.start_cursor < 0 else args.start_cursor
     if cursor0 % 8:
         raise SystemExit(f"session cursor {cursor0} is not at a frame boundary")
@@ -110,6 +112,8 @@ async def run(args) -> int:
                       for at, n in P.render_phases()]
             h = await render_lane.send(strips, blockhash=await asyncio.to_thread(render_lane.blockhash), epoch=frame)
             r = await asyncio.to_thread(wait_sync, render_lane, h, watch_last=True, poll_seconds=0.03)
+            note({"frame": frame, "rendered": target, "render_s": round(r.landed_seconds, 2), "repaired": r.repaired,
+                  "slots": r.slots, "error": str(r.first_error)[:80] if r.first_error else None})
             if frame > 0:
                 await committed[frame - 1].wait()
             commit = [LaneStep(f"f{frame}-commit-{target:08d}",

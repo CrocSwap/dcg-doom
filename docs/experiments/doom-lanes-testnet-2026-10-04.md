@@ -71,3 +71,37 @@ sends of that chain (next step), not more lanes.
    advance transaction.
 3. Measure from a low-latency host if the owner wants (the Tokyo box is
    stopped by rule).
+
+## Pipelined lanes from the Tokyo host (10-04 evening)
+
+Driver `stunts/doom-dcg/lanes_ordered.py`: each frame's session chain (input
+batch folded into the first of two 4-advance transactions, then the capture)
+on one ordered, pipelined lane (DCG `OrderedLane`); each render lane's 12
+strips pipelined on that lane's own ordered lane once its capture lands;
+commits in frame order. Host `basanos-tokyo-2` (2.8 ms to RPC
+`64.130.44.172`), same program `9Uj6wmra…`, 3 lanes.
+
+| Host | Run | Frames | Frames/s | Notes |
+|---|---|---:|---:|---|
+| Mac | confirm-per-step sequencer (above) | 8 | 0.107 | serial chain ~9.3 s/frame |
+| Mac | pipelined, 4 advances/tx | 3 | 0.053 | renders ~40 s/frame (see below) |
+| Tokyo | pipelined, 4 advances/tx, priority step 1 | 3 | 0.489 | includes start-up |
+| Tokyo | same | 9 | **0.627** | commits ~1.15 s apart in steady state (~0.87/s) |
+
+Measured (testnet, journal and driver timestamps):
+
+- The session chain lands its capture ~1.2–1.3 s after send; most of that is
+  one repair pass per frame (an advance batch or the capture lands out of
+  order within a block). Render chains land in 0.13–0.22 s; out-of-order strips
+  are refused by the render-cursor guard (2338/2339) and resolved by repair.
+- Found: `OrderedLane`'s default priority step (1000) with the epoch offset
+  priced each 840k-CU strip near 1 FOGO; the node refused the pipelined
+  strips at preflight (each render chain then waited 20 s and was repaired
+  one transaction at a time). Priority step 1 fixed it (as in the 10-01 driver).
+- Mac vs Tokyo: from the Mac the same session chain took ~6 s per frame;
+  delivery measurements belong on the Tokyo host (owner, 10-04).
+
+Next for 3.0 frames/s: overlap frames' session chains (send the next frame
+before this capture lands) and cut the per-frame repair (ordering within a
+block); the on-chain floor is ~3 session transactions of ~1.3M requested CU
+against the 2.5M per-account block cap, about 0.12 s per frame.
