@@ -982,7 +982,7 @@ dependencies = [
 [[package]]
 name = "curve25519-dalek"
 version = "3.2.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=6d8df999e9c89683ff56b06f682f1b875e2a165d#6d8df999e9c89683ff56b06f682f1b875e2a165d"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5#4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5"
 dependencies = [
  "byteorder",
  "digest 0.9.0",
@@ -1077,17 +1077,17 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "dcg-disputes"
 version = "0.1.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=6d8df999e9c89683ff56b06f682f1b875e2a165d#6d8df999e9c89683ff56b06f682f1b875e2a165d"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5#4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5"
 
 [[package]]
 name = "dcg-kernels"
 version = "0.1.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=6d8df999e9c89683ff56b06f682f1b875e2a165d#6d8df999e9c89683ff56b06f682f1b875e2a165d"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5#4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5"
 
 [[package]]
 name = "dcg-program"
 version = "0.1.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=6d8df999e9c89683ff56b06f682f1b875e2a165d#6d8df999e9c89683ff56b06f682f1b875e2a165d"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5#4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5"
 dependencies = [
  "blake3",
  "dcg-disputes",
@@ -1105,7 +1105,7 @@ dependencies = [
 [[package]]
 name = "dcg-wire"
 version = "0.1.0"
-source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=6d8df999e9c89683ff56b06f682f1b875e2a165d#6d8df999e9c89683ff56b06f682f1b875e2a165d"
+source = "git+file:///Users/colkitt/sith/toys/crypto/durable-compute-graph?rev=4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5#4a7faf42c920ddc3338c6c3cabd2aa54f9e54ae5"
 
 [[package]]
 name = "der-parser"

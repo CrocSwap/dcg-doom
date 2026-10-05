@@ -208,7 +208,20 @@ static MANIFEST: KernelManifest = KernelManifest {
         max_compute_units: STEP_COMPUTE_CEILING,
     },
     modes: &MODES,
+    // A command the engine refuses before the tic runs (the special bit, or
+    // USE while the player is dead) is rejected: consumed with state
+    // unchanged, so it can never wedge the session (DCG design
+    // session-reject-and-ring-v1; the 10-05 1,000-frame run stopped at
+    // tic 5,310 on USE-while-dead). Sessions must open rejectable.
+    capabilities: dcg_program::kernel::KernelCapabilities::REJECTS_INPUT,
 };
+
+/// Engine refusals raised by the pre-tic guard before any state changes
+/// (`doom_sim2_guard.h`): a command with the special bit, and USE while a
+/// player is dead (a level restart, which SIM/2 does not run). The kernel
+/// rejects these with the same code.
+pub const REJECT_SPECIAL_COMMAND: u32 = 232;
+pub const REJECT_RESTART: u32 = 295;
 
 /// Resource slice view over the compact account envelope created by
 /// scripts/pack-dcg-resource.py.
@@ -1009,9 +1022,9 @@ impl StatefulKernel for DoomKernel {
         let outcome = self.transition_spans_with_outcome(input, state, output)?;
         match outcome.disposition {
             TransitionDisposition::Continue => Ok(outcome.output_bytes),
-            TransitionDisposition::HaltBefore { .. } | TransitionDisposition::HaltAfter { .. } => {
-                Err(KernelError::Refused)
-            }
+            TransitionDisposition::HaltBefore { .. }
+            | TransitionDisposition::HaltAfter { .. }
+            | TransitionDisposition::Reject { .. } => Err(KernelError::Refused),
         }
     }
 
@@ -1022,8 +1035,14 @@ impl StatefulKernel for DoomKernel {
         output: &mut [u8],
     ) -> Result<TransitionOutcome, KernelError> {
         Self::validate_spans(state)?;
-        if input.len() != 4 || output.len() < 4 || input[3] & 0x80 != 0 {
+        if input.len() != 4 || output.len() < 4 {
             return Err(KernelError::InvalidInput);
+        }
+        if input[3] & 0x80 != 0 {
+            return Ok(TransitionOutcome {
+                output_bytes: 0,
+                disposition: TransitionDisposition::Reject { code: REJECT_SPECIAL_COMMAND },
+            });
         }
         let context = self.context_ptr()?;
         if context != state[0].data.as_mut_ptr() {
@@ -1039,6 +1058,13 @@ impl StatefulKernel for DoomKernel {
                     disposition: TransitionDisposition::HaltBefore {
                         reason: step as u32,
                     },
+                });
+            }
+            if step == REJECT_RESTART as i32 || step == REJECT_SPECIAL_COMMAND as i32 {
+                // Refused by the pre-tic guard: nothing has changed yet.
+                return Ok(TransitionOutcome {
+                    output_bytes: 0,
+                    disposition: TransitionDisposition::Reject { code: step as u32 },
                 });
             }
             if step != 0 {

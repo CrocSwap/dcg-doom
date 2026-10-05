@@ -87,6 +87,7 @@ fn open_session(
     id: u64,
     source: Pubkey,
     commitment: [u8; 32],
+    lanes: u8,
 ) -> Instruction {
     let manifest = DoomKernel::default().manifest();
     let mut payload = vec![v3::WIRE_VERSION];
@@ -107,6 +108,9 @@ fn open_session(
     payload.extend_from_slice(&RESOURCE_SCHEMA.version.to_le_bytes());
     payload.extend_from_slice(&commitment);
     payload.push(1); // headerless primary state at account index zero
+    payload.push(lanes);
+    // The Doom kernel declares REJECTS_INPUT: its sessions open rejectable.
+    payload.push(v3::FEATURE_REJECTABLE);
     instruction(
         sw::TAG_OPEN_SESSION,
         payload,
@@ -209,13 +213,14 @@ fn resource_upload(
     )
 }
 
-fn create_stream(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_stream(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     instruction(
         sw::TAG_CREATE_STREAM,
         vec![v3::WIRE_VERSION, 0],
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(stream_pda(&session), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
@@ -237,7 +242,7 @@ fn grow_stream(payer: Pubkey, session: Pubkey, new_capacity: u32) -> Instruction
     )
 }
 
-fn create_state(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_state(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, STATE_LENGTHS.len() as u8];
     for len in STATE_LENGTHS {
         payload.extend_from_slice(&len.to_le_bytes());
@@ -248,6 +253,7 @@ fn create_state(payer: Pubkey, session: Pubkey) -> Instruction {
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new_readonly(resource_pda(&session), false),
             AccountMeta::new(state_pda(&session, 0), false),
             AccountMeta::new(state_pda(&session, 1), false),
@@ -342,7 +348,7 @@ fn advance(authority: Pubkey, session: Pubkey, cursor: u32, steps: u8) -> Instru
     )
 }
 
-fn create_view(payer: Pubkey, session: Pubkey, role: u8, abi: [u8; 32], len: u32) -> Instruction {
+fn create_view(payer: Pubkey, authority: Pubkey, session: Pubkey, role: u8, abi: [u8; 32], len: u32) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, role];
     payload.extend_from_slice(&abi);
     payload.extend_from_slice(&0u32.to_le_bytes());
@@ -353,13 +359,14 @@ fn create_view(payer: Pubkey, session: Pubkey, role: u8, abi: [u8; 32], len: u32
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(view_pda(&session, role), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
     )
 }
 
-fn create_workspace(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_workspace(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, v3::WORKSPACE_ROLE];
     payload.extend_from_slice(&V3_VIEW_WORKSPACE_BYTES.to_le_bytes());
     instruction(
@@ -368,13 +375,14 @@ fn create_workspace(payer: Pubkey, session: Pubkey) -> Instruction {
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(view_pda(&session, v3::WORKSPACE_ROLE), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
     )
 }
 
-fn create_scratch(payer: Pubkey, session: Pubkey, len: u32) -> Instruction {
+fn create_scratch(payer: Pubkey, authority: Pubkey, session: Pubkey, len: u32) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, v3::SCRATCH_ROLE];
     payload.extend_from_slice(&[0; 32]);
     payload.extend_from_slice(&0u32.to_le_bytes());
@@ -385,6 +393,7 @@ fn create_scratch(payer: Pubkey, session: Pubkey, len: u32) -> Instruction {
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(view_pda(&session, v3::SCRATCH_ROLE), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
@@ -774,12 +783,15 @@ async fn grow_state_spans(
 
 async fn create_and_grow_views(
     context: &mut ProgramTestContext,
+    authority: &Keypair,
     session: Pubkey,
 ) -> (u64, Vec<u64>, Vec<u64>, Vec<u64>) {
     let payer = context.payer.pubkey();
+    let auth = authority.pubkey();
     let total = SNAPSHOT_BYTES + STRIP_BYTES * 8;
     let mut create_ops = vec![create_view(
         payer,
+        auth,
         session,
         0,
         V3_SNAPSHOT_ABI,
@@ -788,15 +800,16 @@ async fn create_and_grow_views(
     for role in 1..=8 {
         create_ops.push(create_view(
             payer,
+            auth,
             session,
             role,
             V3_STRIP_ABIS[(role - 1) as usize],
             STRIP_BYTES,
         ));
     }
-    create_ops.push(create_workspace(payer, session));
-    create_ops.push(create_scratch(payer, session, total));
-    let (create_cu, create_instruction_cu) = send_many(context, create_ops, &[]).await;
+    create_ops.push(create_workspace(payer, auth, session));
+    create_ops.push(create_scratch(payer, auth, session, total));
+    let (create_cu, create_instruction_cu) = send_many(context, create_ops, &[authority]).await;
 
     let mut grow_ops = Vec::new();
     for (role, len) in [
@@ -1574,13 +1587,13 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     assert_eq!(resource_commitment, DOOM_RESOURCE_COMMITMENT);
     let open_cu = send(
         &mut context,
-        open_session(payer, authority.pubkey(), 17, RESOURCE, resource_commitment),
+        open_session(payer, authority.pubkey(), 17, RESOURCE, resource_commitment, 0),
         &[&authority],
         Ok(()),
     )
     .await;
-    let stream_cu = send(&mut context, create_stream(payer, session), &[], Ok(())).await;
-    let state_create_cu = send(&mut context, create_state(payer, session), &[], Ok(())).await;
+    let stream_cu = send(&mut context, create_stream(payer, authority.pubkey(), session), &[&authority], Ok(())).await;
+    let state_create_cu = send(&mut context, create_state(payer, authority.pubkey(), session), &[&authority], Ok(())).await;
 
     // Keep the ring backlog within the initial 512-slot allocation. Commands are
     // written up to each next ADVANCE batch rather than filling the whole
@@ -1683,7 +1696,7 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
     );
 
     let (view_create_cu, view_create_instruction_cu, view_grow_cu, view_grow_instruction_cu) =
-        create_and_grow_views(&mut context, session).await;
+        create_and_grow_views(&mut context, &authority, session).await;
     let workspace_rent_lamports = context
         .banks_client
         .get_account(view_pda(&session, v3::WORKSPACE_ROLE))
@@ -2354,13 +2367,14 @@ async fn doom_stateful_v3_matches_sim2_roots_renders_and_rejects_adversarial_inp
             18,
             WRONG_RESOURCE,
             bad_resource_commitment,
+            0,
         ),
         &[&bad_authority],
         Ok(()),
     )
     .await;
     let bad_state_create_cu =
-        send(&mut context, create_state(payer, bad_session), &[], Ok(())).await;
+        send(&mut context, create_state(payer, bad_authority.pubkey(), bad_session), &[&bad_authority], Ok(())).await;
     let (
         bad_resource_grow_cu,
         bad_resource_grow_instruction_cu,
@@ -2643,11 +2657,10 @@ async fn doom_lanes_publish_the_golden_frame_while_the_session_advances() {
     let authority = Keypair::new_from_array([0x18; 32]);
     let payer = context.payer.pubkey();
     let session = session_pda(&authority.pubkey(), 18);
-    let mut open = open_session(payer, authority.pubkey(), 18, RESOURCE, resource_root(&resource));
-    open.data.push(LANES);
+    let open = open_session(payer, authority.pubkey(), 18, RESOURCE, resource_root(&resource), LANES);
     send(&mut context, open, &[&authority], Ok(())).await;
-    send(&mut context, create_stream(payer, session), &[], Ok(())).await;
-    send(&mut context, create_state(payer, session), &[], Ok(())).await;
+    send(&mut context, create_stream(payer, authority.pubkey(), session), &[&authority], Ok(())).await;
+    send(&mut context, create_state(payer, authority.pubkey(), session), &[&authority], Ok(())).await;
     upload_sealed_resource(&mut context, &authority, session, RESOURCE, &resource).await;
     grow_state_spans(&mut context, session).await;
     send(&mut context, begin_initialization(authority.pubkey(), session), &[&authority], Ok(())).await;
@@ -2655,7 +2668,7 @@ async fn doom_lanes_publish_the_golden_frame_while_the_session_advances() {
     for phase_index in 0..phase_count {
         send(&mut context, run_initialization(authority.pubkey(), session, phase_index * 16_384, None), &[&authority], Ok(())).await;
     }
-    create_and_grow_views(&mut context, session).await;
+    create_and_grow_views(&mut context, &authority, session).await;
     let frame_bytes = SNAPSHOT_BYTES + STRIP_BYTES * 8;
     for k in 0..LANES {
         let mut rest = V3_VIEW_WORKSPACE_BYTES.to_le_bytes().to_vec();
