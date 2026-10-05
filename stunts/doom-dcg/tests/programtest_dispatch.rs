@@ -6,6 +6,7 @@
 
 use dcg_program::{hash::sha256, kernel::Kernel, stateful as sw, stateful::v3};
 use doom_dcg::{
+    REJECT_SPECIAL_COMMAND,
     DoomKernel, DOOM_KERNEL_ID, DOOM_RESOURCE_COMMITMENT, ENGINE_CONTEXT_BYTES, MODE_CONSENSUS_V3,
     MP1_ACCOUNT_BYTES, RESOURCE_BYTES, RESOURCE_KEY, RESOURCE_SCHEMA, SNAPSHOT_BYTES,
     ST1_ACCOUNT_BYTES, STATE_SCHEMA, STRIP_BYTES, V3_INITIALIZATION_PHASE_COMPUTE_UNITS,
@@ -2759,6 +2760,26 @@ async fn doom_lanes_publish_the_golden_frame_while_the_session_advances() {
     assert_eq!(sha256(&[&pixels]), decode_hex32(golden["render"]["reconstructed_frame_sha256"].as_str().unwrap()));
     let snapshot = context.banks_client.get_account(view_pda(&session, 0)).await.unwrap().unwrap();
     assert_eq!(u32_at(&snapshot.data, ACCOUNT_CURSOR_OFFSET), 1_000);
+
+    // The kernel declares REJECTS_INPUT: a command the engine refuses before
+    // the tic (here the special bit, code 232) is consumed and recorded, not
+    // a refusal that wedges the session (the 10-05 tic-5,310 case was USE
+    // while dead, code 295, refused by the same pre-tic guard).
+    send(&mut context, write_input(authority.pubkey(), session, 1_000, &[0, 0, 0, 0x80]), &[&authority], Ok(())).await;
+    let reject_cu = send(&mut context, advance(authority.pubkey(), session, 1_000, 1), &[&authority], Ok(())).await;
+    let stream = context.banks_client.get_account(stream_pda(&session)).await.unwrap().unwrap();
+    assert_eq!(u32_at(&stream.data, 76), 1_001, "the rejected command is consumed");
+    assert_eq!((u32_at(&stream.data, 120), u32_at(&stream.data, 124)), (1_000, REJECT_SPECIAL_COMMAND));
+    // The session continues: the next ordinary commands apply (the fixture
+    // has 1,000 commands, so these are written explicitly).
+    for seq in 1_001..1_003u32 {
+        send(&mut context, write_input(authority.pubkey(), session, seq, &[0, 0, 0, 0]), &[&authority], Ok(())).await;
+        send(&mut context, advance(authority.pubkey(), session, seq, 1), &[&authority], Ok(())).await;
+    }
+    let stream = context.banks_client.get_account(stream_pda(&session)).await.unwrap().unwrap();
+    assert_eq!(u32_at(&stream.data, 76), 1_003, "the session advances after a rejection");
+    let _ = (&mut cursor, &mut written, &mut capacity);
+    eprintln!("doom-lanes reject_cu={reject_cu}");
     eprintln!(
         "doom-lanes CU capture0={capture0:?} render0_snapshot_max={} render0_strips={render0b:?} capture1={capture1:?} render1_strip_max={} commit1={commit1}",
         render0a.iter().max().unwrap(),
