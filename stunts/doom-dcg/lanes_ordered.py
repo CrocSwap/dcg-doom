@@ -38,6 +38,8 @@ import testnet_driver as D
 from dcg.sequencer.ordered_lane import LaneStep, OrderedLane
 
 RPC = "http://64.130.44.172:8899"
+#: The price budget at a window's first frame, micro-lamports per CU (see main).
+PRICE_BUDGET = 75_000
 # Measured on this program (campaign-L3-nohook, getTransaction): input 48.7k,
 # advance 317k, capture 348k, strips up to 776k, commit 21.8k; requests carry
 # a margin (OrderedLane raises them to the running maximum along a lane).
@@ -109,8 +111,20 @@ async def run(args) -> int:
     # and every frame paid a repair (10-04). A ceiling of frames + 1 makes the
     # gap ~1%. The default step (1000) with the old ceiling priced an 840k-CU
     # strip near 1 FOGO; with this ceiling --priority-step 100 costs ~0.0001.
-    ceiling = args.frames + 1
-    step_price = args.priority_step
+    # Priority windows (10-05, Tokyo). A step's price is step * (n - i) +
+    # step * n * (ceiling - epoch), so the gap between a frame's steps is
+    # about 1 / (n * (ceiling - epoch)) of the price. With ceiling = frames + 1
+    # a 1,000-frame run starts near 0.03%, and the leader reordered each
+    # early frame's second advance after its capture (a repair per frame,
+    # 0.69 frames/s) until the gap passed ~0.04% near frame 200; a 250-frame
+    # run (0.13% from the start) had no repairs (3.61 frames/s). Prices
+    # therefore restart every --price-window frames (epoch = frame mod W,
+    # ceiling W + 1). Only the shared commit lane has several frames in
+    # flight, so the first commit of a window waits for the previous frame's
+    # commit to land, not just to be sent: an older commit is never outranked.
+    window = max(1, args.price_window)
+    ceiling = window + 1
+    step_price = args.priority_step or max(1, PRICE_BUDGET // (3 * ceiling))
     session = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=step_price)
     render = [OrderedLane(RPC, Pubkey.from_string(c["pubkeys"][f"lane-payer-{k}"]),
                           signer(kp[f"lane-payer-{k}"], kp["authority"]), priority_step=step_price) for k in range(args.lanes)]
@@ -162,7 +176,7 @@ async def run(args) -> int:
             strips = [LaneStep(f"f{frame}-render-{at:08d}",
                                (P.lane_run(program, authority, a, lane, target, at, n),), LIMITS["render"])
                       for at, n in P.render_phases()]
-            h = await render_lane.send(strips, blockhash=await asyncio.to_thread(render_lane.blockhash), epoch=frame, epoch_ceiling=ceiling)
+            h = await render_lane.send(strips, blockhash=await asyncio.to_thread(render_lane.blockhash), epoch=frame % window, epoch_ceiling=ceiling)
             r = await asyncio.to_thread(wait_sync, render_lane, h, watch_last=True, poll_seconds=0.03,
                                         repair_delay=args.repair_delay)
             note({"frame": frame, "rendered": target, "render_s": round(r.landed_seconds, 2), "repaired": r.repaired,
@@ -171,11 +185,12 @@ async def run(args) -> int:
             # N's commit is sent once frame N-1's is sent (not confirmed);
             # the newest-only guard and repair keep them in order.
             if frame > 0:
-                await (commit_sent[frame - 1] if args.pipeline_commits else committed[frame - 1]).wait()
+                drain = not args.pipeline_commits or frame % window == 0
+                await (committed[frame - 1] if drain else commit_sent[frame - 1]).wait()
             commit = [LaneStep(f"f{frame}-commit-{target:08d}",
                                (P.lane_commit(program, authority, a, lane, target),), LIMITS["commit"])]
             via = commits if args.pipeline_commits else render_lane
-            h = await via.send(commit, blockhash=await asyncio.to_thread(via.blockhash), epoch=frame, epoch_ceiling=ceiling)
+            h = await via.send(commit, blockhash=await asyncio.to_thread(via.blockhash), epoch=frame % window, epoch_ceiling=ceiling)
             commit_sent[frame].set()
             r = await asyncio.to_thread(wait_sync, via, h, watch_last=True, poll_seconds=0.03,
                                         repair_delay=args.repair_delay)
@@ -230,7 +245,7 @@ async def run(args) -> int:
             steps.append(LaneStep(f"f{frame}-advance-{cursor + t:08d}x{k}", ixs, limit))
         steps.append(LaneStep(f"f{frame}-capture-{cursor + 8:08d}",
                               tuple(P.capture_instructions(program, authority, a, lane, cursor + 8)), LIMITS["capture"]))
-        handle = await session.send(steps, blockhash=blockhash, epoch=frame, epoch_ceiling=ceiling)
+        handle = await session.send(steps, blockhash=blockhash, epoch=frame % window, epoch_ceiling=ceiling)
         note({"frame": frame, "sent": cursor + 8, "lane": lane.index})
         tasks.append(asyncio.create_task(lane_frame(frame, cursor, lane, handle, render[lane.index])))
         # The next frame's session chain must follow this capture: wait for it
@@ -268,7 +283,10 @@ def main() -> int:
     ap.add_argument("--tics-per-tx", type=int, default=4, choices=(1, 2, 4, 8))
     ap.add_argument("--overlap", action="store_true", help="do not wait for a frame's capture before sending the next")
     ap.add_argument("--pipeline-commits", action="store_true", help="send each commit once the previous is sent")
-    ap.add_argument("--priority-step", type=int, default=100)
+    ap.add_argument("--price-window", type=int, default=250,
+                    help="frames per priority window (prices restart; commits drain at each boundary)")
+    ap.add_argument("--priority-step", type=int, default=0,
+                    help="price step in micro-lamports/CU (default: scaled to the run length)")
     ap.add_argument("--strip-use", action="store_true", help="clear the USE button in every command")
     ap.add_argument("--repair-delay", type=float, default=1.0,
                     help="seconds to let in-flight steps land before repair (repair checks original signatures)")
