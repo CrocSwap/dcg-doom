@@ -38,6 +38,8 @@ import testnet_driver as D
 from dcg.sequencer.ordered_lane import LaneStep, OrderedLane
 
 RPC = "http://64.130.44.172:8899"
+#: The frame-0 price budget, micro-lamports per CU (see main).
+PRICE_BUDGET = 75_000
 # Measured on this program (campaign-L3-nohook, getTransaction): input 48.7k,
 # advance 317k, capture 348k, strips up to 776k, commit 21.8k; requests carry
 # a margin (OrderedLane raises them to the running maximum along a lane).
@@ -110,7 +112,14 @@ async def run(args) -> int:
     # gap ~1%. The default step (1000) with the old ceiling priced an 840k-CU
     # strip near 1 FOGO; with this ceiling --priority-step 100 costs ~0.0001.
     ceiling = args.frames + 1
-    step_price = args.priority_step
+    # The highest price a run pays is step * n * ceiling at frame 0. Above
+    # ~240,000 micro-lamports/CU (10-05, Tokyo) the second advance of each
+    # frame was dropped and every frame paid a repair until the price fell
+    # (0.69 frames/s for the first 200 frames of a 1,000-frame run); at
+    # <=75,000 a 250-frame run had no repairs (3.61 frames/s). By default the
+    # step scales with the run length so frame 0 stays near 75,000; the
+    # relative gap between steps (what orders them) does not depend on it.
+    step_price = args.priority_step or max(1, PRICE_BUDGET // (3 * ceiling))
     session = OrderedLane(RPC, payer, signer(kp["payer"], kp["authority"]), priority_step=step_price)
     render = [OrderedLane(RPC, Pubkey.from_string(c["pubkeys"][f"lane-payer-{k}"]),
                           signer(kp[f"lane-payer-{k}"], kp["authority"]), priority_step=step_price) for k in range(args.lanes)]
@@ -268,7 +277,8 @@ def main() -> int:
     ap.add_argument("--tics-per-tx", type=int, default=4, choices=(1, 2, 4, 8))
     ap.add_argument("--overlap", action="store_true", help="do not wait for a frame's capture before sending the next")
     ap.add_argument("--pipeline-commits", action="store_true", help="send each commit once the previous is sent")
-    ap.add_argument("--priority-step", type=int, default=100)
+    ap.add_argument("--priority-step", type=int, default=0,
+                    help="price step in micro-lamports/CU (default: scaled to the run length)")
     ap.add_argument("--strip-use", action="store_true", help="clear the USE button in every command")
     ap.add_argument("--repair-delay", type=float, default=1.0,
                     help="seconds to let in-flight steps land before repair (repair checks original signatures)")
