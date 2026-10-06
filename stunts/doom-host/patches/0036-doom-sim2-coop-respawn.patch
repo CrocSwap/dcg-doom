@@ -1,0 +1,19 @@
+--- a/linuxdoom-1.10/g_game.c
++++ b/linuxdoom-1.10/g_game.c
+@@ -895,12 +895,10 @@
+ { 
+     int                             i; 
+ 	 
+-    if (!netgame)
+-    {
+-	// reload the level from scratch
+-	gameaction = ga_loadlevel;  
+-    }
+-    else 
++    /* DOOM-SIM/2 respawn: a single-player reborn uses the cooperative path
++     * below (the corpse stays, the player respawns at its start spot with
++     * fresh inventory) instead of ga_loadlevel, a full level reload that the
++     * staged on-chain profile cannot run inside one tic. */
+     {
+ 	// respawn at the start
+ 

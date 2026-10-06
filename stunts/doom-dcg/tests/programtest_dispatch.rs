@@ -2778,6 +2778,47 @@ async fn doom_lanes_publish_the_golden_frame_while_the_session_advances() {
     }
     let stream = context.banks_client.get_account(stream_pda(&session)).await.unwrap().unwrap();
     assert_eq!(u32_at(&stream.data, 76), 1_003, "the session advances after a rejection");
+
+    // A dead player's use press respawns the player (engine patch 0036,
+    // 2026-10-06; before it the guard rejected the press with 295 and the
+    // session could not go on). Leave players[0] dead in the committed
+    // context, as a fatal hit would, then press use: the tic commits, the
+    // player is reborn, and the next tic spawns it at its start spot with
+    // fresh inventory. Offsets are offsetof(doom_ctx_t, players) and the
+    // player_t fields; the host and SBF layouts agree (3,440,952-byte struct).
+    const PLAYERS0: usize = 89_944;
+    const PLAYERSTATE: usize = PLAYERS0 + 8;
+    const HEALTH: usize = PLAYERS0 + 36;
+    const PST_LIVE: u32 = 0;
+    const PST_DEAD: u32 = 1;
+    const PST_REBORN: u32 = 2;
+    let primary = state_pda(&session, 0);
+    let mut engine = context.banks_client.get_account(primary).await.unwrap().unwrap();
+    assert_eq!(u32_at(&engine.data, PLAYERSTATE), PST_LIVE, "the player is alive before the hit");
+    engine.data[PLAYERSTATE..PLAYERSTATE + 4].copy_from_slice(&PST_DEAD.to_le_bytes());
+    engine.data[HEALTH..HEALTH + 4].copy_from_slice(&0i32.to_le_bytes());
+    context.set_account(&primary, &engine.into());
+    send(&mut context, write_input(authority.pubkey(), session, 1_003, &[0, 0, 0, 0x02]), &[&authority], Ok(())).await;
+    let respawn_cu = send(&mut context, advance(authority.pubkey(), session, 1_003, 1), &[&authority], Ok(())).await;
+    let stream = context.banks_client.get_account(stream_pda(&session)).await.unwrap().unwrap();
+    assert_eq!(u32_at(&stream.data, 76), 1_004, "the use press is consumed");
+    assert_eq!(
+        (u32_at(&stream.data, 120), u32_at(&stream.data, 124)),
+        (1_000, REJECT_SPECIAL_COMMAND),
+        "a dead player's use press is not a rejection"
+    );
+    let engine = context.banks_client.get_account(primary).await.unwrap().unwrap();
+    assert_eq!(u32_at(&engine.data, PLAYERSTATE), PST_REBORN, "the use press marks the player reborn");
+    for seq in 1_004..1_007u32 {
+        send(&mut context, write_input(authority.pubkey(), session, seq, &[0, 0, 0, 0]), &[&authority], Ok(())).await;
+        send(&mut context, advance(authority.pubkey(), session, seq, 1), &[&authority], Ok(())).await;
+    }
+    let engine = context.banks_client.get_account(primary).await.unwrap().unwrap();
+    assert_eq!(u32_at(&engine.data, PLAYERSTATE), PST_LIVE, "the player respawned");
+    assert_eq!(u32_at(&engine.data, HEALTH), 100, "with full health");
+    let stream = context.banks_client.get_account(stream_pda(&session)).await.unwrap().unwrap();
+    assert_eq!(u32_at(&stream.data, 76), 1_007, "the session goes on after the respawn");
+    eprintln!("doom-lanes respawn_cu={respawn_cu}");
     let _ = (&mut cursor, &mut written, &mut capacity);
     eprintln!("doom-lanes reject_cu={reject_cu}");
     eprintln!(

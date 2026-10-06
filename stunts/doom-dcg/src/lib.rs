@@ -217,9 +217,10 @@ static MANIFEST: KernelManifest = KernelManifest {
 };
 
 /// Engine refusals raised by the pre-tic guard before any state changes
-/// (`doom_sim2_guard.h`): a command with the special bit, and USE while a
-/// player is dead (a level restart, which SIM/2 does not run). The kernel
-/// rejects these with the same code.
+/// (`doom_sim2_guard.h`): a command with the special bit (232). The kernel
+/// rejects it with the same code. 295 (USE while a player is dead) is
+/// reserved: since engine patch 0036 a dead player's use press respawns the
+/// player at its start spot instead, so the guard no longer returns it.
 pub const REJECT_SPECIAL_COMMAND: u32 = 232;
 pub const REJECT_RESTART: u32 = 295;
 
