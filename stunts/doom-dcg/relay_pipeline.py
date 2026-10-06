@@ -124,6 +124,7 @@ class Pipeline:
         self.latest_frame: dict | None = None
         self.failures: list[str] = []
         self.cursor = 0
+        self.emitted_cursor = -1
         self.capacity = 0
         self.gametic = None
         self.spend_lamports = 0
@@ -157,10 +158,10 @@ class Pipeline:
         values = self.rpc("getMultipleAccounts", [keys, {"commitment": "confirmed", "dataSlice": {"offset": 0, "length": 0}}])["value"]
         return {k: (v or {}).get("lamports", 0) for k, v in zip(keys, values)}
 
-    def read_frame(self, target: int, lane: int) -> dict:
+    def read_frame(self, target: int, lane: int, commitment: str = "confirmed") -> dict:
         """The nine views after the frame at `target` committed."""
         keys = [str(self.a.views[role]) for role in range(9)]
-        values = self.rpc("getMultipleAccounts", [keys, {"commitment": "confirmed", "encoding": "base64"}])["value"]
+        values = self.rpc("getMultipleAccounts", [keys, {"commitment": commitment, "encoding": "base64"}])["value"]
         if any(v is None for v in values):
             raise RuntimeError("a view account is missing")
         datas = [base64.b64decode(v["data"][0]) for v in values]
@@ -336,11 +337,22 @@ class Pipeline:
                                         repair_delay=args.repair_delay)
                 # The views now hold this frame (newest-only publication), unless a
                 # newer one already landed; either way the page gets a whole frame.
-                record = await asyncio.to_thread(self.read_frame, target, lane.index)
-                self.frames.append({"cursor": record["cursor"], "completed_seconds": record["completed_seconds"]})
-                self.latest_frame = record
+                # A read right after the commit can still see the previous
+                # publication (RPC lag); read again until the views reach this
+                # frame, and never announce a frame older than the last one.
+                record = None
+                for _ in range(20):
+                    record = await asyncio.to_thread(self.read_frame, target, lane.index, "processed")
+                    if record["cursor"] >= target:
+                        break
+                    await asyncio.sleep(0.1)
                 self.cursor = max(self.cursor, target)
-                emit({"event": "frame", **record, "frames_completed": len(self.frames), "push": True})
+                if record and record["cursor"] > self.emitted_cursor:
+                    self.emitted_cursor = record["cursor"]
+                    self.frames.append({"cursor": record["cursor"], "completed_seconds": record["completed_seconds"]})
+                    record["frame_index"] = len(self.frames) - 1
+                    self.latest_frame = record
+                    emit({"event": "frame", **record, "frames_completed": len(self.frames), "push": True})
             except Exception as e:
                 failure.append(f"frame at {target}: {e}")
                 emit({"event": "frame_failed", "target": target, "error": str(e)[:300]})
