@@ -98,6 +98,66 @@ export const NETWORKS = {
 
   // Placeholders. Fill these in and pass {allowMainnet: true} to the reader
   // to read mainnet; the page refuses mainnet until then, on purpose.
+  // Doom on DCG (stunts/doom-dcg): a DCG stateful v3 session with render
+  // lanes, driven by stunts/doom-dcg/relay_pipeline.py behind the relayer.
+  // Frames are DCG views (a 128-byte view header, then the DOOM-RS1 strip
+  // account); the palette is read from the R-series WAD accounts, which hold
+  // the same DOOM1.WAD bytes. Session provisioned 2026-10-06 under image
+  // 04504ecd... (respawn on use).
+  "testnet-dcg": {
+    name: "testnet-dcg",
+    label: "FOGO TESTNET · DOOM ON DCG",
+    cluster: "testnet",
+    rpcHttp: "https://testnet.fogo.io",
+    rpcHttpFallback: ["http://64.130.44.172:8899"],
+    rpcWs: UNSET,
+    genesis: "9GGSFo95raqzZxWqKM5tGYvJp5iv4Dm565S4r8h5PEu9",
+    commitment: {
+      paint: "processed",
+      reconcile: "confirmed",
+    },
+    explorer: {
+      address: "https://explorer.fogo.io/address/{address}?cluster={cluster}",
+      transaction: "https://explorer.fogo.io/tx/{signature}?cluster={cluster}",
+    },
+    doom: {
+      program: "2uHBWbYEzGnjtik4fibo3eqipmgAY7pKUSL8Yp98j9vJ",
+      programImageSha256: "04504ecda9ef68ea6336de8eb01dffb64419ec544b92700bbd9f6f8ccf9260d7",
+      deployment: "dcg-lanes",
+      viewHeaderBytes: 128,
+      context: "G913rZjZ4QgT3Je79DfXQipFDrFNs6bR6g9h3XABUxoL",
+      meta: "G913rZjZ4QgT3Je79DfXQipFDrFNs6bR6g9h3XABUxoL",
+      inputBuffer: "C3HqPaXe7h8p49eLeJ8B5S6WKRYhqvaYVyWCDnnKna21",
+      authority: "4Tq9u5fucB8MDMpmA2tTz1ViXdqcebSafjajjoCkntJF",
+      snapshots: ["k5vuxr9zuXeaXomnWWy6rsZHUmnciK9jwE6AeeAMrmW"],
+      strips: [
+        [
+          "7mxS9swMrMQprRo1mayQJ4pdws8MrDqPcmPShDQSAVpq",
+          "6z3uGPjmPNtoKhWtvWHAkxBZTmTGk6cVzUCkswW8nULh",
+          "HTB6qQtt5QCN64vF9kntzQJ19JcHdmBvDKAF3cKkY5us",
+          "F1kaATwFY3AaAcqLkPxVA9dJmWPXaRwL974J8FPFebix",
+          "2VGLosLTE7juJRSgWHBzcc4BK8Akjf1KJDkUb4NG7nWU",
+          "uCykETbtWyQCggc35RnoG3oqS3Ajd2USnQ9TYvPToo9",
+          "AQJFGndr6QVZfV3z1VxMjaR8NfKTv5WuPQnh719Sgndi",
+          "E26LBDsWGhA9wfRhLrkt6EkSaxZ6CCybrFMD7DsBzahs",
+        ],
+      ],
+      inputCapacity: 512,
+      wadAccounts: [
+        "FcxYBH7PGaotLCyjitGvTvBVzJEuzLTiF73iic2Y2mbX",
+        "G9FFjAAq44k88irK7AMJJKCbv5djaV2wVApGUEes3mRA",
+        "8xpPSXWdgzYMNZikHjhnzusauuvhGyUvvoXExThBZiAn",
+        "Frr6BJzhumKngybNCWHycjbyve2NJ351dHGUSYHpBFFy",
+        "7o9eaUTDVNTJXGSk1s1Uhu1dbPv4E7L2jQEcw7L3Zz3Z",
+      ],
+      wadAccountBytes: 1048576,
+      wadHeaderBytes: 32,
+      wadImageBytes: 4196020,
+      wadSha256: "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771",
+      latestKnownFrame: UNSET,
+    },
+  },
+
   mainnet: {
     name: "mainnet",
     label: "FOGO MAINNET",

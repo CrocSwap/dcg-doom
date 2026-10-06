@@ -96,7 +96,11 @@ export async function readChainDigest(reader, record) {
   const accounts = frameAccounts(record);
   if (accounts === null) throw new Error(`frame ${record.frame_index} named no chain accounts`);
   const addresses = accounts.snapshot ? [accounts.snapshot, ...accounts.strips] : accounts.strips;
-  const {slot, payloads} = await reader.getAccounts(addresses, {dataSlice: {offset: 0, length: STRIP_HEADER_BYTES}});
+  // Doom on DCG publishes each strip in a DCG view account: a 128-byte view
+  // header, then the same DOOM-RS1 strip account. The record says how far in
+  // the strip starts; an R-series record has no such field and starts at 0.
+  const offset = Number.isInteger(record.view_header_bytes) ? record.view_header_bytes : 0;
+  const {slot, payloads} = await reader.getAccounts(addresses, {dataSlice: {offset, length: STRIP_HEADER_BYTES}});
   const strips = [];
   for (let index = 0; index < STRIP_COUNT; index += 1) {
     const payload = payloads[accounts.snapshot ? index + 1 : index];

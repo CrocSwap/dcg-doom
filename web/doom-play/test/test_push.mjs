@@ -522,6 +522,30 @@ test("the chain read asks for 128-byte headers, not 1 MiB accounts", async () =>
   assert.equal(chain.slot, 1168);
 });
 
+test("a Doom-on-DCG frame reads its strip headers past the 128-byte view header", async () => {
+  // Each strip lives in a DCG view account: a 128-byte view header, then the
+  // DOOM-RS1 strip account. The record names the offset; the read must use it.
+  const VIEW = 128;
+  const viewed = realStrips.map((strip) => {
+    const account = new Uint8Array(VIEW + strip.length);
+    account.set(Buffer.from("DVW3"), 0);
+    account.set(strip, VIEW);
+    return account;
+  });
+  let seenOffset = null;
+  const reader = {
+    getAccounts: async (addresses, {dataSlice}) => {
+      seenOffset = dataSlice.offset;
+      const all = [new Uint8Array(VIEW + 192), ...viewed];
+      return {slot: 7, payloads: addresses.map((_, i) => all[i].subarray(dataSlice.offset, dataSlice.offset + dataSlice.length))};
+    },
+  };
+  const chain = await readChainDigest(reader, {...pushedRecord(), view_header_bytes: VIEW});
+  assert.equal(seenOffset, VIEW);
+  assert.equal(chain.strips[3].digest, Buffer.from(realStrips[3].subarray(96, 128)).toString("hex"));
+  assert.equal(chain.strips[3].stripId, 3);
+});
+
 test("a chain header that has not landed yet is not a mismatch", async () => {
   const reader = {getAccounts: async () => ({slot: 1168, payloads: [null, ...Array(8).fill(null)]})};
   assert.equal(await readChainDigest(reader, pushedRecord()), null);
