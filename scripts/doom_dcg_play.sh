@@ -16,7 +16,7 @@
 # Environment:
 #   DOOM_DCG_RUN_DIR   the lanes driver's run directory (driver-config.json, keys)
 #                      default: out/runs/doom-dcg-demo-2026-10-06
-#   DCG_PYTHON         a Python with DCG's packages (solders, httpx, ...)
+#   DCG_PYTHON         a Python with the dcg package (default: this repo's .venv)
 #   SPEND_CAP          testnet FOGO cap for the session (default 2)
 #   DOOM_HEADLESS=1    headless Chrome
 #   CHROME             the Chrome binary
@@ -26,8 +26,8 @@ SESSION_SECONDS=${1:-300}
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 MAIN_OUT=${MAIN_OUT:-$REPO/out}
 DOOM_DCG_RUN_DIR=${DOOM_DCG_RUN_DIR:-$MAIN_OUT/runs/doom-dcg-demo-2026-10-06}
-DCG_ROOT=${DCG_ROOT:-$(CDPATH= cd -- "$REPO/../durable-compute-graph" && pwd -P)}
-DCG_PYTHON=${DCG_PYTHON:-$DCG_ROOT/python/.venv/bin/python}
+DCG_ROOT=${DCG_ROOT:-$REPO/.deps/durable-compute-graph}
+DCG_PYTHON=${DCG_PYTHON:-$REPO/.venv/bin/python}
 # About 0.7 testnet FOGO a minute at 3.7 frames/s (measured 2026-10-06).
 SPEND_CAP=${SPEND_CAP:-10}
 DOOM_HOST=${DOOM_HOST:-basanos-tokyo-2}
@@ -65,7 +65,7 @@ trap 'exit 143' TERM
 
 if [ "${DOOM_DCG_LOCAL:-0}" = 1 ]; then
   mark "relayer on 127.0.0.1:$RELAY_PORT (session from $DOOM_DCG_RUN_DIR)"
-  PYTHONPATH="$REPO/stunts/doom-dcg:$DCG_ROOT/python" node "$REPO/stunts/doom-relayer/server.mjs" \
+  PYTHONPATH="$REPO/stunts/doom-dcg" node "$REPO/stunts/doom-relayer/server.mjs" \
     --mode chain --network testnet-dcg --port "$RELAY_PORT" --host 127.0.0.1 \
     --keys-dir "$KEYS_DIR" --payer-key "$PAYER_KEY" \
     --python "$DCG_PYTHON" --script "$REPO/stunts/doom-dcg/relay_pipeline.py" \

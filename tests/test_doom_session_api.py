@@ -12,8 +12,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-DCG_PYTHON = Path(os.environ.get("DCG_PYTHON", ROOT.parent / "durable-compute-graph" / "python"))
-for p in (DCG_PYTHON, ROOT / "stunts" / "doom-dcg"):
+for p in (ROOT / "stunts" / "doom-dcg",):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
