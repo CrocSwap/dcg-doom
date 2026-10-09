@@ -41,7 +41,7 @@ RESOURCE_SOURCE=${DOOM_RESOURCE_SOURCE:-G9rRwB544pdp3LaeiJcKgcXdRTs6qb434sbsUyAX
 SSH=(ssh -o LogLevel=ERROR -o ConnectTimeout=15 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
 # What counts as a running relayer, either series.
 RELAYERS='[s]tunts/doom-relayer/server.mjs|[d]oom_relayer_server.py --run-dir|[r]elay_pipeline.py'
-DEPLOY_PATHS=(stunts/doom-relayer stunts/doom-dcg web/doom-play)
+DEPLOY_PATHS=(stunts/doom-relayer stunts/doom-dcg web/doom-play scripts/doom_dcg_public_probe.mjs)
 
 if [ "$ACTION" = deploy ]; then
   # Deploy committed code only: a fix in the working tree is not a fix on the
