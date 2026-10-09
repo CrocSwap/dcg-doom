@@ -41,6 +41,8 @@ RESOURCE_SOURCE=${DOOM_RESOURCE_SOURCE:-G9rRwB544pdp3LaeiJcKgcXdRTs6qb434sbsUyAX
 SSH=(ssh -o LogLevel=ERROR -o ConnectTimeout=15 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
 # What counts as a running relayer, either series.
 RELAYERS='[s]tunts/doom-relayer/server.mjs|[d]oom_relayer_server.py --run-dir|[r]elay_pipeline.py'
+# ssh joins its arguments into one remote command line: quote each one.
+remote_args() { printf '%q ' "$@"; }
 DEPLOY_PATHS=(stunts/doom-relayer stunts/doom-dcg web/doom-play scripts/doom_dcg_public_probe.mjs)
 
 if [ "$ACTION" = deploy ]; then
@@ -66,7 +68,7 @@ if [ "$ACTION" = deploy ]; then
 fi
 
 if [ "$ACTION" = status ]; then
-  "${SSH[@]}" "$HOST" bash -s -- "$LOCK" "$ROOT" "$RELAYERS" <<'STATUS'
+  "${SSH[@]}" "$HOST" "bash -s -- $(remote_args "$LOCK" "$ROOT" "$RELAYERS")" <<'STATUS'
 set -eu
 LOCK=$1; ROOT=$2; RELAYERS=$3
 echo "lock_owner=$(cat "$LOCK/owner" 2>/dev/null || echo none)"
@@ -79,7 +81,7 @@ STATUS
 fi
 
 if [ "$ACTION" = stop ]; then
-  "${SSH[@]}" "$HOST" bash -s -- "$LOCK" "$ROOT" "$RELAYERS" <<'STOP'
+  "${SSH[@]}" "$HOST" "bash -s -- $(remote_args "$LOCK" "$ROOT" "$RELAYERS")" <<'STOP'
 set -euo pipefail
 LOCK=$1; ROOT=$2; RELAYERS=$3
 OWNER=$(cat "$LOCK/owner" 2>/dev/null || true)
@@ -127,8 +129,8 @@ python3 -c 'import sys; c=float(sys.argv[1]); s=int(sys.argv[2]); v=int(sys.argv
 case "$STATE_PATH" in "$ROOT"/public-mode/*.json) ;; *) echo "DOOM_PUBLIC_STATE_PATH must be a JSON file under $ROOT/public-mode/" >&2; exit 2 ;; esac
 OWNER="doom-dcg-public:$NAME"
 
-"${SSH[@]}" "$HOST" bash -s -- "$LOCK" "$OWNER" "$NAME" "$ROOT" "$KEYS" "$PY" "$RESOURCE_SOURCE" \
-  "$CAP" "$DURATION" "$VIEWERS" "$STATE_PATH" "$ORIGIN" "$RELAYERS" <<'LAUNCH'
+"${SSH[@]}" "$HOST" "bash -s -- $(remote_args "$LOCK" "$OWNER" "$NAME" "$ROOT" "$KEYS" "$PY" "$RESOURCE_SOURCE" \
+  "$CAP" "$DURATION" "$VIEWERS" "$STATE_PATH" "$ORIGIN" "$RELAYERS")" <<'LAUNCH'
 set -euo pipefail
 LOCK=$1; OWNER=$2; NAME=$3; ROOT=$4; KEYS=$5; PY=$6; RESOURCE_SOURCE=$7
 CAP=$8; DURATION=$9; VIEWERS=${10}; STATE_PATH=${11}; ORIGIN=${12}; RELAYERS=${13}
