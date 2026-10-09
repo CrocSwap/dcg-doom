@@ -47,7 +47,7 @@ DEPLOY_PATHS=(stunts/doom-relayer stunts/doom-dcg web/doom-play scripts/doom_dcg
 
 if [ "$ACTION" = deploy ]; then
   # Deploy committed code only: a fix in the working tree is not a fix on the
-  # host (stunts/doom-relayer/start.sh says why).
+  # host: a session once ran an unfixed rsynced file while the fix sat in Git.
   dirty=$(git -C "$REPO" status --porcelain -- "${DEPLOY_PATHS[@]}")
   if [ -n "$dirty" ]; then
     echo "uncommitted changes under ${DEPLOY_PATHS[*]}; commit them first:" >&2

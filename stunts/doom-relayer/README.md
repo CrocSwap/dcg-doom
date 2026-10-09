@@ -30,11 +30,10 @@ Flags: `--mode mock|chain`, `--port`, `--slots`, `--network`, `--cors-origin`.
 
 ## Chain mode
 
-`--mode chain` binds to [`scripts/doom_relayer_server.py`](../../scripts/doom_relayer_server.py),
-which holds the measured R8m sender (`doom_r7_render_loop.fire_blind`) and the
-R8b frame pipeline open for the life of a session and takes the player's input
-as a stream over JSON lines on stdin and stdout. The relayer never sees a key:
-the keys stay in the child process, next to it on the host.
+`--mode chain` binds to [`stunts/doom-dcg/relay_pipeline.py`](../doom-dcg/relay_pipeline.py),
+which drives the DCG Doom session (three render lanes) for the life of a
+session and takes the player's key state over JSON lines on stdin and stdout.
+The relayer never sees a key: the keys stay in the child process, next to it on the host.
 
 The advance and the frame loop belong to the child, not to a request, so
 `PipelineSender.background` is true and the relayer's per-batch `advance` and

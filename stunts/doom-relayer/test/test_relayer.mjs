@@ -199,9 +199,8 @@ test("a halted mock slot refuses everything, standing in for a latched M_HALT", 
 });
 
 test("chain mode is wired, and refuses to start without keys or a script", async () => {
-  // The chain sender is a binding to scripts/doom_relayer_server.py, which
-  // holds the R8m sender and the R8b frame pipeline open for the life of a
-  // session. Constructing one does not touch the network or a key file: it is
+  // The chain sender is a binding to a pipeline process (here the DCG one,
+  // stunts/doom-dcg/relay_pipeline.py) held open for the life of a session. Constructing one does not touch the network or a key file: it is
   // the process that does both, and it is not started until init() asks.
   assert.throws(() => createSender({mode: "chain"}), (error) => {
     assert.ok(error instanceof SenderError);
@@ -221,7 +220,7 @@ test("chain mode is wired, and refuses to start without keys or a script", async
     mode: "chain",
     keysDir: "/keys",
     payerKey: "/payer.json",
-    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    script: new URL("../../doom-dcg/relay_pipeline.py", import.meta.url).pathname,
     stripRate: 16,
     advancePipelineDepth: 4,
     seconds: 600,
@@ -251,9 +250,8 @@ test("chain mode is wired, and refuses to start without keys or a script", async
   });
   // The requirements are written down so the binding can be reviewed, and the
   // one that used to be missing now points at the file that provides it.
-  assert.equal(PIPELINE_REQUIREMENTS.operations.length, 5);
-  assert.equal(PIPELINE_REQUIREMENTS.missing.longLived, undefined);
-  assert.match(PIPELINE_REQUIREMENTS.existing.longLived, /doom_relayer_server\.py/);
+  assert.ok(PIPELINE_REQUIREMENTS.operations.includes("pause"));
+  assert.match(PIPELINE_REQUIREMENTS.module, /relay_pipeline\.py/);
   assert.match(PIPELINE_REQUIREMENTS.transport, /JSON lines/);
 });
 
@@ -1065,100 +1063,6 @@ test("a batch behind the cursor is refused with a resume point, not deposited", 
   }
 });
 
-test("every flag start.sh passes reaches the child, including the reset account", () => {
-  // `argv()` is the only place a chain-mode flag becomes a process argument. A
-  // flag that is not built here is a flag the pipeline has never seen, and
-  // `start.sh` had been passing `--reset-start-account` for a dispatch: the
-  // whole RESET/9 path was unreachable from the operator's own start command.
-  const sender = createSender({
-    mode: "chain",
-    keysDir: "/keys",
-    payerKey: "/payer.json",
-    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
-    resetStartAccount: "9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1",
-    frameDeadlineSeconds: 2,
-    rpcLagDropSlots: 512,
-    rpcLagCheckSeconds: 10,
-  });
-  const argv = sender.argv();
-  assert.ok(argv.includes("--reset-start-account"));
-  assert.equal(argv[argv.indexOf("--reset-start-account") + 1], "9XpmEE9iBu5XuJj3S1H32tauME79HGXUR2hT31n9NjM1");
-  assert.equal(argv[argv.indexOf("--frame-deadline-seconds") + 1], "2");
-  assert.equal(argv[argv.indexOf("--rpc-lag-drop-slots") + 1], "512");
-  assert.equal(argv[argv.indexOf("--rpc-lag-check-seconds") + 1], "10");
-});
-
-function captureStartSettings(profile) {
-  const temporary = mkdtempSync(join(tmpdir(), "doom-start-profile-"));
-  const host = join(temporary, "host");
-  const bin = join(temporary, "bin");
-  const image = join(host, "image", "doom_sbf.so");
-  const fakePython = join(bin, "python");
-  const fakeNode = join(bin, "node");
-  const argsCapture = join(temporary, "argv.txt");
-  const limitCapture = join(temporary, "advance-limit.txt");
-  try {
-    mkdirSync(join(host, "image"), {recursive: true});
-    mkdirSync(bin, {recursive: true});
-    writeFileSync(image, "test image bytes");
-    writeFileSync(fakePython, "#!/bin/sh\nexit 0\n");
-    writeFileSync(fakeNode, [
-      "#!/bin/sh",
-      'printf \'%s\\n\' "$@" > "$ARGV_CAPTURE"',
-      'printf \'%s\\n\' "${ADVANCE_CU_LIMIT-}" > "$LIMIT_CAPTURE"',
-      "exit 0",
-      "",
-    ].join("\n"));
-    chmodSync(fakePython, 0o755);
-    chmodSync(fakeNode, 0o755);
-
-    const env = {...process.env};
-    for (const name of ["PROFILE", "BUFFERS", "SEND_RATE", "MIN_CURSOR_STEP", "ADVANCE_CU_LIMIT", "BATCH_RENDER_SENDS"]) {
-      delete env[name];
-    }
-    Object.assign(env, {
-      PROFILE: profile,
-      RELAYER_DIR: host,
-      RELAYER_REPO: fileURLToPath(new URL("../../../", import.meta.url)),
-      PIN: join(temporary, "deploy-pin.json"),
-      PY: fakePython,
-      IMAGE: image,
-      KEYS_DIR: join(temporary, "keys"),
-      PATH: `${bin}:${process.env.PATH}`,
-      ARGV_CAPTURE: argsCapture,
-      LIMIT_CAPTURE: limitCapture,
-    });
-    const start = fileURLToPath(new URL("../start.sh", import.meta.url));
-    const result = spawnSync("bash", [start, "profile-test", "10"], {encoding: "utf8", env});
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    const args = readFileSync(argsCapture, "utf8").trim().split("\n");
-    return {args, advanceCuLimit: readFileSync(limitCapture, "utf8").trim()};
-  } finally {
-    rmSync(temporary, {recursive: true, force: true});
-  }
-}
-
-test("PROFILE=fast selects the best measured settings and plain defaults stay unchanged", () => {
-  const fast = captureStartSettings("fast");
-  const value = (args, flag) => args[args.indexOf(flag) + 1];
-  assert.equal(value(fast.args, "--render-buffers"), "4");
-  assert.equal(value(fast.args, "--send-pacer-rate"), "60");
-  assert.equal(value(fast.args, "--min-cursor-step-tics"), "6");
-  assert.equal(fast.advanceCuLimit, "1400000");
-  assert.ok(!fast.args.includes("--batch-render-sends"));
-
-  const plain = captureStartSettings("");
-  assert.equal(value(plain.args, "--render-buffers"), "4");
-  assert.equal(value(plain.args, "--send-pacer-rate"), "45");
-  assert.equal(value(plain.args, "--min-cursor-step-tics"), "8");
-  assert.equal(plain.advanceCuLimit, "520000");
-  assert.ok(!plain.args.includes("--batch-render-sends"));
-
-  const publicLauncher = readFileSync(new URL("../../../scripts/doom_public.sh", import.meta.url), "utf8");
-  assert.match(publicLauncher, /ADV_TICS=6 ADV_PIPELINE_DEPTH=1/);
-  assert.doesNotMatch(publicLauncher, /ADVANCE_PIPELINE_DEPTH=1/);
-});
-
 test("the session answer names the buffer holding the latest complete frame", async () => {
   // The child reads a frame back before it counts it, so it knows which buffer
   // is whole; the viewer reads eight strip accounts that land in eight
@@ -1344,7 +1248,7 @@ test("the input bound is asked of the child, never served from a cached status",
     mode: "chain",
     keysDir: "/keys",
     payerKey: "/payer.json",
-    script: new URL("../../../scripts/doom_relayer_server.py", import.meta.url).pathname,
+    script: new URL("../../doom-dcg/relay_pipeline.py", import.meta.url).pathname,
     runDir: "/run",
   });
   sender.closed = false;
@@ -1565,46 +1469,6 @@ test("the one-buffer read path reaches the pipeline, and only when asked for", (
   );
   assert.ok(serverSource.includes('preReadSnapshot: args.get("pre-read-snapshot") != null'));
   assert.ok(serverSource.includes('overlapReadback: args.get("overlap-readback") != null'));
-  // And start.sh is the thing an operator types, so its three values have to be
-  // the three flag sets above.
-  const start = readFileSync(new URL("../start.sh", import.meta.url), "utf8");
-  assert.ok(
-    start.includes("overlap) readback_flags=(--pre-read-snapshot --overlap-readback)"),
-    "start.sh's READBACK=overlap does not ask for both flags",
-  );
-  assert.ok(start.includes("serial) readback_flags=()"), "start.sh's default is not the old serial path");
-});
-
-test("every flag start.sh passes is built in argv()", () => {
-  // The failure is a flag that exists in start.sh, in the python parser and in
-  // the node option list, and is never *built* into the child's argv -- so it
-  // never reaches the pipeline and the runbook is describing a flag the program
-  // has never seen. `--reset-start-account` sat in start.sh from 2026-09-26
-  // 00:0x with the whole RESET/9 path behind it; `--status-batch`,
-  // `--status-min-interval` and `--strip-cu-limit` were lost the same way on
-  // 2026-09-26 at 05:0x, with the pipeline running on its defaults while three
-  // numbers in the runbook said otherwise.
-  //
-  // So: read start.sh's exec line, and require each flag to appear in argv()'s
-  // own source. Conditional construction (`if (options.x) argv.push(...)`) is
-  // correct and is not the thing being tested -- being absent from argv() is.
-  const start = readFileSync(new URL("../start.sh", import.meta.url), "utf8");
-  const senderSource = readFileSync(new URL("../sender.mjs", import.meta.url), "utf8");
-  const argvSource = senderSource.slice(senderSource.indexOf("  argv() {"), senderSource.indexOf("  async start() {"));
-  const body = start.slice(start.indexOf("exec node"));
-  // The node server's own CLI flags, which start.sh passes to `server.mjs` and
-  // which argv() is not supposed to build: they configure this process, not the
-  // pipeline child. Everything else on that line is the child's.
-  const nodeOwn = new Set([
-    "--mode", "--port", "--host", "--network", "--cors-origin", "--slots",
-    "--advance-pipeline-depth", "--sweep-rate", "--input-tics-per-second",
-    "--python", "--script", "--keys-dir", "--payer-key", "--run-dir",
-  ]);
-  const passed = [...new Set([...body.matchAll(/(?<=--)[a-z][a-z0-9-]*/g)].map((match) => `--${match[0]}`))]
-    .filter((flag) => !nodeOwn.has(flag));
-  assert.ok(passed.length > 12, `start.sh's exec line looks wrong: ${passed.length} flags`);
-  const missing = passed.filter((flag) => !argvSource.includes(`"${flag}"`));
-  assert.deepEqual(missing, [], `start.sh passes ${missing.join(" ")} but argv() never builds them`);
 });
 
 test("the flags this round added are built, with their defaults intact", () => {

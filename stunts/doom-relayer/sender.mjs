@@ -12,7 +12,7 @@
 //                  page is exercised against locally, and what the API tests
 //                  run against.
 //
-//   PipelineSender   the binding to scripts/doom_relayer_server.py, which
+//   PipelineSender   the binding to stunts/doom-dcg/relay_pipeline.py, which
 //                    holds the R8m sender (scripts/doom_r7_render_loop.py
 //                    fire_blind) and the R8b frame pipeline open for the life
 //                    of a session and takes the player's input as a stream.
@@ -307,40 +307,16 @@ export class MockSender {
 
 // --------------------------------------------------------------- pipeline
 
-// The interface the Python side has to expose, written out so it can be
-// reviewed rather than guessed at. Four of the five operations already existed
-// as functions somewhere in scripts/; the fifth, a way to keep one context
-// advancing from an external source of commands, is
-// `scripts/doom_relayer_server.py`.
-//
-//   deposit        SIM2 DEPOSIT, firstSeq + up to 64 commands.  Already
-//                  derivable from the buffer and authority in scripts/
-//                  doom_sweep_testnet.py:1450 (deposit_ix).
-//   advance        SIM2 ADVANCE, optionally expected-cursor bound.
-//                  doom_sweep_testnet.py:1454 (advance_ix).
-//   snapshot       RSN/3 SNAPSHOT-LIVE into the buffer's snapshot account.
-//                  doom_r8b_tokyo_pipeline.py:1015 (snapshot_instruction).
-//   renderStrip    RENDER for one strip id.  doom_r8b_tokyo_pipeline.py:1029
-//                  (strip_instruction).
-//   longLived      scripts/doom_relayer_server.py: one process for the life of
-//                  a session, JSON lines on stdin and stdout, so the cursor
-//                  binding that ADVANCE_EXPECTED_CURSOR provides survives from
-//                  one player batch to the next.
+// The interface the pipeline process exposes: JSON lines on stdin and stdout,
+// one process for the life of a session. The DCG pipeline is
+// `stunts/doom-dcg/relay_pipeline.py`; its module docstring is the contract.
+// (The R-series pipeline it replaced, scripts/doom_relayer_server.py, stays in
+// the Basanos repository's history.)
 export const PIPELINE_REQUIREMENTS = {
-  module: "scripts/doom_relayer_server.py",
-  note: "do not edit doom_r7_render_loop.py or doom_r8b_tokyo_pipeline.py from this dispatch",
-  operations: ["deposit", "advance", "snapshot", "renderStrip", "longLived"],
-  existing: {
-    deposit: "scripts/doom_sweep_testnet.py:1450 deposit_ix",
-    advance: "scripts/doom_sweep_testnet.py:1454 advance_ix",
-    snapshot: "scripts/doom_r8b_tokyo_pipeline.py:1015 FramePipeline.snapshot_instruction",
-    renderStrip: "scripts/doom_r8b_tokyo_pipeline.py:1029 FramePipeline.strip_instruction",
-    longLived: "scripts/doom_relayer_server.py",
-  },
-  missing: {},
+  module: "stunts/doom-dcg/relay_pipeline.py",
+  operations: ["hello", "status", "key_state", "commands", "resume", "pause", "stop"],
+  events: ["started", "progress", "frame", "death", "failed", "finished"],
   transport: "JSON lines on stdin and stdout, one request and one response per line, so the relayer can hold the process open for the life of a session",
-  request: {op: "deposit", first_seq: 0, commands: "base64"},
-  response: {ok: true, signature: "base58", cursor: 0, gametic: 0, tics: 8},
 };
 
 // --------------------------------------------------------------- pipeline
@@ -370,7 +346,7 @@ export class PipelineSender {
     this.background = true;
     this.options = options;
     this.python = options.python ?? "python3";
-    this.script = options.script ?? resolve(REPO_ROOT, "scripts", "doom_relayer_server.py");
+    this.script = options.script ?? resolve(REPO_ROOT, "stunts", "doom-dcg", "relay_pipeline.py");
     this.keysDir = options.keysDir ?? null;
     this.payerKey = options.payerKey ?? null;
     if (!this.keysDir || !this.payerKey) {
@@ -853,7 +829,7 @@ export class PipelineSender {
       frontierProbes: status.frontier_probes ?? null,
       // The producer's NEXT tic to generate, which is not the same number as
       // `generated_cursor` (the end of the batch it has already published) and
-      // is what a page has to aim ahead of. See doom_relayer_server.py.
+      // is what a page has to aim ahead of. (An R-series pipeline field.)
       producerNextCursor: status.producer_next_cursor ?? null,
       // The lead the producer resolved from its own measured round trip, and
       // the round trip it read. The child publishes both in every `status` and
