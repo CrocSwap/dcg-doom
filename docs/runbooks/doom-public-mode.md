@@ -1,5 +1,10 @@
 # Public Doom mode
 
+**Public mode on the DCG program:** `scripts/doom_dcg_public.sh`, in
+[`doom-dcg-demo.md`](doom-dcg-demo.md#public-mode). The lobby behavior below
+(join, spectators, offers, heartbeats, limits) is the same there; the R-series
+launcher, rollover, and spend estimate below are not.
+
 This runbook operates the single shared testnet Doom game. It uses the existing
 R15 image, and `scripts/doom_play.sh` remains the separate owner-play launcher.
 Both launchers contend for `/tmp/doom-play-maintenance.lock` on Tokyo.

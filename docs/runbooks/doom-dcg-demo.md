@@ -89,12 +89,36 @@ Tokyo:
 The same pipeline run from the Mac reaches about 0.4 to 0.6 frames/s. Details
 are in `docs/experiments/doom-dcg-demo-2026-10-06.md`.
 
+## Public mode
+
+One shared game with spectators and the 60 s idle handoff, on this session
+(details of the lobby: [`doom-public-mode.md`](doom-public-mode.md); the
+port: `docs/experiments/doom-dcg-public-mode-2026-10-09.md`, M1391).
+
+```sh
+aws ec2 start-instances --region ap-northeast-1 --instance-ids i-01c33f014d9b485eb
+scripts/doom_dcg_public.sh deploy        # committed code only
+DOOM_PUBLIC_ORIGIN=https://<page origin> scripts/doom_dcg_public.sh start
+scripts/doom_dcg_public.sh status
+scripts/doom_dcg_public.sh stop
+```
+
+- The cap (`DOOM_PUBLIC_SPEND_CAP`, default 1,000 testnet FOGO, owner
+  2026-10-09) covers the whole run: the state file
+  (`DOOM_PUBLIC_STATE_PATH`, default `~/dcg-lane/v5/public-mode/public-state.json`)
+  keeps the run's payer baseline, so a restart continues the same run. Use a
+  new state file for a test or a new run.
+- An idle lobby pauses the pipeline: no frames and no spend until the next
+  accepted input. Active play costs about 0.6 testnet FOGO a minute.
+- Check it with the probe on the box (play, idle pause, resume):
+  `ssh basanos-tokyo-2 'cd ~/dcg-lane/v5/doom && node scripts/doom_dcg_public_probe.mjs http://127.0.0.1:8787 /tmp/probe.json'`.
+- The relayer listens on Tokyo's loopback only; publishing it and the page
+  is the owner's call.
+
 ## Not done yet
 
-- **Public mode** (spectators, idle handoff) still runs the R-series
-  relayer. The DCG pipeline answers `resume` and `stop`, but public mode's
-  rollover and pause path have not been tried with it.
 - **A live death and respawn on testnet** has not been staged. The respawn is
-  shown in the SBF ProgramTest, on the same image.
-- **The page's death banner** is not shown: the DCG pipeline does not emit
-  `death` events yet.
+  shown in the SBF ProgramTest, on the same image; the pipeline now emits
+  `death` (offline-tested), which the page's banner reads.
+- **Public mode at length:** a real browser and spectators against the DCG
+  relayer, a run restarted on the same state file, and a run reaching its cap.
