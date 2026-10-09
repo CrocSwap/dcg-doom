@@ -298,6 +298,51 @@ test("a completed public rollover requires a fresh child execution resume", asyn
   }
 });
 
+test("the DCG pipeline is paused by request, not SIGSTOP, and resumes on the next input", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "doom-dcg-pause-"));
+  const script = join(directory, "pipeline.mjs");
+  const argvPath = join(directory, "argv.json");
+  writeFileSync(script, `
+    import {createInterface} from "node:readline";
+    import {writeFileSync} from "node:fs";
+    writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)));
+    console.log(JSON.stringify({event:"started"}));
+    const ops = [];
+    createInterface({input:process.stdin}).on("line", (line) => {
+      const request = JSON.parse(line);
+      ops.push(request.op);
+      const extra = request.op === "hello" ? {backend:"doom-dcg-lanes", context:"G913rZjZ"} : {};
+      console.log(JSON.stringify({id:request.id, ok:true, ops, ...extra}));
+      if (request.op === "stop") process.exit(0);
+    });
+  `);
+  const sender = new PipelineSender({
+    mode: "chain", keysDir: "/keys", payerKey: "/payer.json", python: process.execPath, script,
+    runDir: directory, publicMode: true,
+  });
+  try {
+    await sender.start();
+    // Public mode without the R-series rollover options passes none of them.
+    const argv = JSON.parse(readFileSync(argvPath, "utf8"));
+    assert.ok(argv.includes("--public-mode"));
+    for (const flag of ["--public-maintenance-lock-owner", "--stage-cap-script", "--r14-keys-dir"]) {
+      assert.ok(!argv.includes(flag), flag);
+    }
+    assert.ok(!argv.includes("undefined"));
+    await sender.resume();
+    const paused = await sender.pause();
+    assert.deepEqual(paused.ops.slice(-1), ["pause"]);
+    assert.equal(sender.osPaused, false, "the child is not stopped");
+    assert.equal(sender.executionResumed, false);
+    const resumed = await sender.resume();
+    assert.deepEqual(resumed.ops.slice(-2), ["pause", "resume"]);
+    assert.equal(sender.executionResumed, true);
+  } finally {
+    await sender.close();
+    rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 // ---------------------------------------------------------------- API
 
 test("GET /healthz reports the pool and the mode", async () => {

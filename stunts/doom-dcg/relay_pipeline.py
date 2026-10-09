@@ -7,9 +7,9 @@ pipeline is `scripts/doom_relayer_server.py`; this one speaks the same
 protocol but drives the DCG Doom session (`stunts/doom-dcg`: a stateful v3
 session with render lanes, as `lanes_ordered.py` drives it):
 
-  stdin   {"id": 1, "op": "hello" | "status" | "key_state" | "commands" | "resume" | "stop", ...}
+  stdin   {"id": 1, "op": "hello" | "status" | "key_state" | "commands" | "resume" | "pause" | "stop", ...}
   stdout  one answer per request, carrying its `id`, plus unprompted
-          {"event": "started" | "progress" | "frame" | "finished", ...}
+          {"event": "started" | "progress" | "frame" | "death" | "failed" | "finished", ...}
 
 Each frame is eight tics. Its inputs are the player's live key state at the
 moment the frame is built (attack and use presses since the last frame are
@@ -22,6 +22,16 @@ holds a 128-byte DCG view header, then those 8,128 bytes.
 
 Keys, the session id and the program come from the lanes driver's run
 directory (`--doom-run-dir`, `driver-config.json`). Testnet only.
+
+Public mode (`stunts/doom-relayer/public-mode.mjs`) uses three more things:
+- `pause` stops building new frames; frames already sent finish, so nothing
+  is left in flight with a stale blockhash (the R-series SIGSTOPped its sender
+  instead). `resume`, or a key press, starts frames again.
+- Spend is the drop in the payer's and the lane payers' summed balance since
+  `--payer-baseline-lamports` (the run's first start, kept by the relayer
+  across restarts), so the cap holds for the whole public run, not one process.
+- `death` when the render snapshot's player state turns dead (Doom's
+  PST_DEAD), and `failed` when the pipeline gives up.
 """
 
 from __future__ import annotations
@@ -55,6 +65,13 @@ BT_USE = 0x02
 KEY_ATTACK = 1 << 6
 KEY_USE = 1 << 7
 VIEW_HEADER = 128
+# The render snapshot view: the 128-byte view header, a DOOM-RSN header whose
+# u32 at 12 is its own length, then the R3-DATA block, whose u32 at 44 is the
+# display player's playerstate (doom_sbf_resource_ri2.c).
+RSN_MAGIC = b"DOOM-RSN"
+R3_MAGIC = b"R3-DATA"
+R3_PLAYERSTATE = 44
+PST_DEAD = 1
 STRIP_ACCOUNT_BYTES = D.STRIP_BYTES  # DOOM-RS1: 128-byte header + 8,000 pixels
 LAMPORTS = 1_000_000_000
 
@@ -128,7 +145,9 @@ class Pipeline:
         self.capacity = 0
         self.gametic = None
         self.spend_lamports = 0
-        self.balances0: dict[str, int] = {}
+        self.baseline_lamports: int | None = args.payer_baseline_lamports
+        self.player_state: int | None = None
+        self.deaths = 0
 
     # --- chain reads -------------------------------------------------------------------
 
@@ -158,6 +177,14 @@ class Pipeline:
         values = self.rpc("getMultipleAccounts", [keys, {"commitment": "confirmed", "dataSlice": {"offset": 0, "length": 0}}])["value"]
         return {k: (v or {}).get("lamports", 0) for k, v in zip(keys, values)}
 
+    def note_spend(self, balances: dict[str, int]) -> None:
+        """Spend since the run's baseline: the summed payer balances' drop.
+        Funding a payer mid-run lowers it; nothing else does."""
+        self.spend_lamports = max(0, self.baseline_lamports - sum(balances.values()))
+
+    def cap_reached(self) -> bool:
+        return self.spend_lamports >= self.args.spend_cap_fogo * LAMPORTS
+
     def read_frame(self, target: int, lane: int, commitment: str = "confirmed") -> dict:
         """The nine views after the frame at `target` committed."""
         keys = [str(self.a.views[role]) for role in range(9)]
@@ -174,6 +201,7 @@ class Pipeline:
         if len(cursors) != 1 or len(gametics) != 1:
             raise RuntimeError(f"torn read: strip cursors {sorted(cursors)}")
         cursor = cursors.pop()
+        self.note_player(snapshot_player_state(datas[0]), cursor)
         pixels = bytearray(D.FRAME_PIXELS_BYTES)
         o = 0
         for row in range(D.FRAME_HEIGHT):
@@ -198,8 +226,17 @@ class Pipeline:
             # Where each strip starts inside its view account (the page's chain
             # cross-check reads the DOOM-RS1 header from there).
             "view_header_bytes": VIEW_HEADER,
+            "player_state": self.player_state,
             "completed_seconds": round(time.monotonic() - self.started, 3),
         }
+
+    def note_player(self, state: int | None, cursor: int) -> None:
+        if state is None:
+            return
+        if state == PST_DEAD and self.player_state is not None and self.player_state != PST_DEAD:
+            self.deaths += 1
+            emit({"event": "death", "cursor": cursor, "deaths": self.deaths})
+        self.player_state = state
 
     # --- the protocol -------------------------------------------------------------------
 
@@ -243,9 +280,12 @@ class Pipeline:
             "frames_per_second": round(len(recent) / 10, 2),
             "spend_fogo": round(self.spend_lamports / LAMPORTS, 6),
             "spend_cap_fogo": self.args.spend_cap_fogo,
+            "payer_baseline_lamports": self.baseline_lamports,
             "key_events": self.keys.events,
             "failures": self.failures[-5:],
             "resumed": self.resumed.is_set(),
+            "player_state": self.player_state,
+            "deaths": self.deaths,
         }
 
     async def handle(self, request: dict) -> dict:
@@ -272,6 +312,11 @@ class Pipeline:
         if op == "resume":
             self.resumed.set()
             return {"resumed": True}
+        if op == "pause":
+            # The frame loop finishes the frames it has sent and builds no more.
+            if not self.stopping:
+                self.resumed.clear()
+            return {"paused": True}
         if op == "stop":
             self.stopping = True
             self.resumed.set()
@@ -367,9 +412,12 @@ class Pipeline:
         blockhash, bh_at = None, 0.0
         frame = 0
         while not self.stopping and not failure:
+            if not self.resumed.is_set():
+                await self.resumed.wait()
+                continue
             if args.seconds and time.monotonic() - self.started > args.seconds:
                 break
-            if self.spend_lamports > args.spend_cap_fogo * LAMPORTS:
+            if self.cap_reached():
                 self.failures.append("spend cap reached")
                 break
             cursor = cursor0 + 8 * frame
@@ -417,6 +465,11 @@ class Pipeline:
             except Exception as e:
                 attempts += 1
                 self.failures.append(str(e)[:300])
+                if self.stopping:
+                    # A stop does not wait for a heal: the relayer gives the
+                    # pipeline 20 s to write its receipt and exit. The next
+                    # start heals the lanes.
+                    break
                 emit({"event": "pipeline_retry", "attempt": attempts, "error": str(e)[:300]})
                 if attempts > self.args.max_retries:
                     raise
@@ -425,8 +478,7 @@ class Pipeline:
     async def watch_spend(self) -> None:
         while not self.stopping:
             try:
-                now = await asyncio.to_thread(self.balances)
-                self.spend_lamports = sum(max(0, self.balances0.get(k, v) - v) for k, v in now.items())
+                self.note_spend(await asyncio.to_thread(self.balances))
             except Exception:
                 pass
             await asyncio.sleep(5.0)
@@ -452,7 +504,13 @@ async def main_async(args) -> int:
     threading.Thread(target=reader, daemon=True).start()
     await pipe.heal()
     await asyncio.to_thread(pipe.read_counters)
-    pipe.balances0 = await asyncio.to_thread(pipe.balances)
+    balances = await asyncio.to_thread(pipe.balances)
+    if pipe.baseline_lamports is None:
+        pipe.baseline_lamports = sum(balances.values())
+    pipe.note_spend(balances)
+    if pipe.cap_reached():
+        raise RuntimeError(f"the run has already spent {pipe.spend_lamports / LAMPORTS:.6f} FOGO of its "
+                           f"{args.spend_cap_fogo} FOGO cap; nothing was sent")
     try:
         record = await asyncio.to_thread(pipe.read_frame, pipe.cursor, -1)
         pipe.latest_frame = record
@@ -460,7 +518,10 @@ async def main_async(args) -> int:
         pass
     if not args.start_paused:
         pipe.resumed.set()
-    emit({"event": "started", "backend": "doom-dcg-lanes", "cursor": pipe.cursor, "session": str(pipe.a.session)})
+    emit({"event": "started", "backend": "doom-dcg-lanes", "cursor": pipe.cursor, "session": str(pipe.a.session),
+          # The summed payer balances at the run's baseline: public mode keeps
+          # it for every later start of the same run.
+          "payer_fogo": pipe.baseline_lamports / LAMPORTS, "spend_fogo": pipe.spend_lamports / LAMPORTS})
     producer = asyncio.create_task(pipe.produce())
     side = [asyncio.create_task(pipe.watch_spend()), asyncio.create_task(pipe.progress())]
     code = 0
@@ -471,6 +532,8 @@ async def main_async(args) -> int:
             get.cancel()
             if producer.exception():
                 emit({"event": "error", "error": str(producer.exception())[:300]})
+                emit({"event": "failed", "error": str(producer.exception())[:300],
+                      "spend_fogo": pipe.spend_lamports / LAMPORTS})
                 code = 1
             break
         line = get.result()
@@ -501,12 +564,25 @@ async def main_async(args) -> int:
     receipt = {"backend": "doom-dcg-lanes", "session": str(pipe.a.session), "program": str(pipe.program),
                "frames": len(pipe.frames), "end_cursor": pipe.cursor, "spend_fogo": pipe.spend_lamports / LAMPORTS,
                "failures": pipe.failures, "seconds": round(time.monotonic() - pipe.started, 1),
-               "key_events": pipe.keys.events}
+               "key_events": pipe.keys.events, "deaths": pipe.deaths,
+               "payer_baseline_lamports": pipe.baseline_lamports}
     if args.run_dir:
         Path(args.run_dir).mkdir(parents=True, exist_ok=True)
         (Path(args.run_dir) / "relayer-session.json").write_text(json.dumps(receipt, indent=1) + "\n")
     emit({"event": "finished", **receipt})
     return code
+
+
+def snapshot_player_state(view: bytes) -> int | None:
+    """The display player's playerstate from a render snapshot view, or None
+    if the view does not hold the expected layout."""
+    rsn = view[VIEW_HEADER:]
+    if rsn[:8] != RSN_MAGIC or len(rsn) < 16:
+        return None
+    r3 = rsn[int.from_bytes(rsn[12:16], "little"):]
+    if r3[:7] != R3_MAGIC or len(r3) < R3_PLAYERSTATE + 4:
+        return None
+    return int.from_bytes(r3[R3_PLAYERSTATE:R3_PLAYERSTATE + 4], "little")
 
 
 def main() -> int:
@@ -521,6 +597,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=0)
     ap.add_argument("--spend-cap-fogo", type=float, default=2.0)
     ap.add_argument("--start-paused", action="store_true")
+    ap.add_argument("--payer-baseline-lamports", type=int, default=None,
+                    help="summed payer balances at the run's first start (public mode); default: now")
     ap.add_argument("--max-retries", type=int, default=3)
     # The R-series flags the relayer passes (sender.mjs argv) mean nothing here.
     args, _unknown = ap.parse_known_args()

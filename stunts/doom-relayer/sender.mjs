@@ -439,9 +439,11 @@ export class PipelineSender {
     if (options.publicMode) {
       argv.push("--public-mode");
       argv.push("--public-rollover-threshold", String(options.publicRolloverThreshold ?? 57_344));
-      argv.push("--public-maintenance-lock-owner", options.publicMaintenanceLockOwner);
-      argv.push("--stage-cap-script", options.stageCapScript);
-      argv.push("--r14-keys-dir", options.r14KeysDir);
+      // The R-series pipeline's rollover needs these; the DCG pipeline (a ring
+      // input stream, no rollover) is started without them.
+      if (options.publicMaintenanceLockOwner) argv.push("--public-maintenance-lock-owner", options.publicMaintenanceLockOwner);
+      if (options.stageCapScript) argv.push("--stage-cap-script", options.stageCapScript);
+      if (options.r14KeysDir) argv.push("--r14-keys-dir", options.r14KeysDir);
     }
     if (options.estimateHorizonSeconds !== undefined && options.estimateHorizonSeconds !== null) {
       argv.push("--estimate-horizon-seconds", String(options.estimateHorizonSeconds));
@@ -574,6 +576,14 @@ export class PipelineSender {
 
   async pause() {
     if (this.closed || !this.child || this.osPaused || !this.executionResumed) return {ok: true, paused: true};
+    // The DCG pipeline pauses itself: it lets the frames it has sent land and
+    // builds no more. A SIGSTOPped child would resume its in-flight lane
+    // transactions with stale blockhashes.
+    if (this.hello?.backend === "doom-dcg-lanes") {
+      const reply = await this.request({op: "pause"});
+      this.executionResumed = false;
+      return reply;
+    }
     this.child.kill("SIGSTOP");
     this.osPaused = true;
     return {ok: true, paused: true};
