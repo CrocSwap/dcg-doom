@@ -12,6 +12,8 @@ the following files in id Software's `DOOM` repository at
 Copyright (C) 1993–1996 id Software, Inc.; current repository copyright
 notice: Copyright (c) ZeniMax Media Inc.  The upstream repository's
 `README.TXT` states: **Licensed under the GNU General Public License 2.0.**
+These adaptations are distributed under GPL v3 with the rest of this
+repository; see the repository `NOTICE.md` for the reading this relies on.
 
 The full Doom source tree and game data are deliberately not vendored here.
 The adaptations make globals explicit account-backed pointers, replace Doom's
