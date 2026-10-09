@@ -555,8 +555,15 @@ async def main_async(args) -> int:
             break
     pipe.stopping = True
     pipe.resumed.set()
+    # The relayer gives the pipeline 20 s from the stop to exit (sender.mjs
+    # close), so frames still in flight get a short grace and are then left to
+    # land or expire on chain; the receipt says so. Their lane waits run on
+    # worker threads that cannot be cancelled, which is why the process exits
+    # with os._exit after the receipt (see __main__).
     try:
-        await asyncio.wait_for(producer, timeout=60)
+        await asyncio.wait_for(producer, timeout=args.stop_grace_seconds)
+    except asyncio.TimeoutError:
+        pipe.failures.append(f"stop: frames still in flight after {args.stop_grace_seconds:g} s were left to land or expire")
     except Exception as e:
         emit({"event": "error", "error": f"stopping: {str(e)[:200]}"})
     for t in side:
@@ -600,16 +607,27 @@ def main() -> int:
     ap.add_argument("--payer-baseline-lamports", type=int, default=None,
                     help="summed payer balances at the run's first start (public mode); default: now")
     ap.add_argument("--max-retries", type=int, default=3)
+    ap.add_argument("--stop-grace-seconds", type=float, default=10.0,
+                    help="how long a stop waits for frames in flight before writing the receipt")
     # The R-series flags the relayer passes (sender.mjs argv) mean nothing here.
     args, _unknown = ap.parse_known_args()
     if not args.doom_run_dir:
         ap.error("--doom-run-dir or DOOM_DCG_RUN_DIR is required")
+    # Not asyncio.run: it joins the default executor's threads on the way
+    # out, and a lane wait abandoned at stop can hold one for minutes.
+    loop = asyncio.new_event_loop()
     try:
-        return asyncio.run(main_async(args))
+        return loop.run_until_complete(main_async(args))
     except Exception:
         emit({"event": "error", "error": traceback.format_exc()[-600:]})
         return 1
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Exit without joining worker threads still inside abandoned lane waits.
+    os._exit(code)

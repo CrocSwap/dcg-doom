@@ -102,3 +102,76 @@ def test_pause_clears_resume_and_a_key_press_resumes():
         assert pipe.resumed.is_set(), "a stopping pipeline is never re-paused"
 
     asyncio.run(run())
+
+
+FAKE_PIPELINE_HARNESS = r'''
+import asyncio, os, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import relay_pipeline as R
+
+class Fake:
+    """A pipeline whose in-flight frame blocks a worker thread for 120 s, the
+    way an abandoned lane wait does."""
+    def __init__(self, args):
+        self.args = args
+        self.keys = R.Keys()
+        self.resumed = asyncio.Event()
+        self.stopping = False
+        self.started = time.monotonic()
+        self.frames, self.failures = [], []
+        self.cursor, self.spend_lamports, self.deaths = 0, 0, 0
+        self.baseline_lamports = 0
+        self.program = "fake-program"
+        self.a = type("A", (), {"session": "fake-session"})()
+        self.latest_frame = None
+    async def heal(self): pass
+    def read_counters(self): return (0, 0, 0)
+    def balances(self): return {"payer": 0}
+    def note_spend(self, balances): pass
+    def cap_reached(self): return False
+    def read_frame(self, target, lane): raise RuntimeError("no frame")
+    async def handle(self, request):
+        if request.get("op") == "stop":
+            self.stopping = True
+            return {"stopping": True}
+        return {}
+    async def produce(self):
+        await asyncio.to_thread(time.sleep, 120)
+    async def watch_spend(self):
+        await asyncio.sleep(3600)
+    async def progress(self):
+        await asyncio.sleep(3600)
+
+R.Pipeline = Fake
+sys.argv = ["relay_pipeline.py", "--doom-run-dir", sys.argv[2], "--run-dir", sys.argv[2], "--stop-grace-seconds", "2"]
+code = R.main()
+sys.stdout.flush()
+os._exit(code)
+'''
+
+
+def test_stop_writes_the_receipt_and_exits_inside_the_relayers_window(tmp_path):
+    import json
+    import subprocess
+    import time
+
+    harness = tmp_path / "harness.py"
+    harness.write_text(FAKE_PIPELINE_HARNESS)
+    stunt = Path(R.__file__).resolve().parent
+    child = subprocess.Popen([sys.executable, str(harness), str(stunt), str(tmp_path)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert json.loads(child.stdout.readline())["event"] == "started"
+    began = time.monotonic()
+    child.stdin.write('{"id": 1, "op": "stop"}\n')
+    child.stdin.flush()
+    try:
+        child.wait(timeout=15)
+    finally:
+        if child.poll() is None:
+            child.kill()
+    elapsed = time.monotonic() - began
+    assert elapsed < 15, f"stop took {elapsed:.1f} s"
+    receipt = json.loads((tmp_path / "relayer-session.json").read_text())
+    assert any("left to land or expire" in f for f in receipt["failures"])
+    events = [json.loads(line) for line in child.stdout.read().splitlines() if line.strip()]
+    assert events[-1]["event"] == "finished"
