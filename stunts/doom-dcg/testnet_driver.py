@@ -669,7 +669,7 @@ def prepare(args: argparse.Namespace) -> None:
     if config_path.exists():
         raise RuntimeError(f"refusing to replace existing run config: {config_path}")
     if args.network == "testnet":
-        key_dir = ROOT / "out/chain/doom-dcg-p2-stopgap-2026-10-01"
+        key_dir = Path(os.environ.get("DOOM_TESTNET_KEY_DIR", ROOT / "out/chain/doom-dcg-p2-stopgap-2026-10-01"))
         urls = list(TESTNET_NODE_URLS)
         expected = TESTNET_GENESIS
     else:

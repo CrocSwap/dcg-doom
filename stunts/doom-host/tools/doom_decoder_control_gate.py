@@ -715,7 +715,7 @@ def _native_gate(
     if engine is None or not engine.exists():
         return {
             "status": "unverified",
-            "reason": "BASANOS_DOOM_ENGINE is not set to a built native executable",
+            "reason": "DOOM_ENGINE is not set to a built native executable",
             "allocation_failure_commit_unchanged": "unverified",
             "acceptance": {"all": False, "native_execution": False},
             "commands": [],
@@ -992,8 +992,8 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     engine = args.engine or (
-        Path(os.environ["BASANOS_DOOM_ENGINE"])
-        if os.environ.get("BASANOS_DOOM_ENGINE") else None
+        Path(os.environ.get("DOOM_ENGINE") or os.environ["BASANOS_DOOM_ENGINE"])
+        if os.environ.get("DOOM_ENGINE") or os.environ.get("BASANOS_DOOM_ENGINE") else None
     )
     result = run_gate(args.capture_root, engine=engine, require_native=True)
     if args.json:

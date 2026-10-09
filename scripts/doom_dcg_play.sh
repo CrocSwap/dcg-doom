@@ -26,7 +26,6 @@ SESSION_SECONDS=${1:-300}
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 MAIN_OUT=${MAIN_OUT:-$REPO/out}
 DOOM_DCG_RUN_DIR=${DOOM_DCG_RUN_DIR:-$MAIN_OUT/runs/doom-dcg-demo-2026-10-06}
-DCG_ROOT=${DCG_ROOT:-$REPO/.deps/durable-compute-graph}
 DCG_PYTHON=${DCG_PYTHON:-$REPO/.venv/bin/python}
 # About 0.7 testnet FOGO a minute at 3.7 frames/s (measured 2026-10-06).
 SPEND_CAP=${SPEND_CAP:-10}

@@ -28,7 +28,7 @@ import lanes_plan as P
 import testnet_driver as D
 
 RPC = "http://64.130.44.172:8899"
-FUNDER = D.ROOT / "out/chain/fogo-payer.json"
+FUNDER = Path(os.environ.get("DOOM_FUNDER_KEY", D.ROOT / "out/chain/fogo-payer.json"))
 FUNDING = {"payer": 1_200, "lane": 30, "authority": 1}
 
 

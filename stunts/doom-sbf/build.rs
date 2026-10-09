@@ -1361,9 +1361,15 @@ fn main() {
     if target == "sbf-solana-solana" {
         // Do not let cc discover the host compiler: the C object has to be
         // SBF, then rustc/ld.lld fold it into the program image.
+        // The platform tools cargo-build-sbf installs (--tools-version v1.51);
+        // SBF_LLVM_BIN names another copy.
+        println!("cargo:rerun-if-env-changed=SBF_LLVM_BIN");
+        let llvm_bin = env::var("SBF_LLVM_BIN").unwrap_or_else(|_| {
+            format!("{}/.cache/solana/v1.51/platform-tools/llvm/bin", env::var("HOME").expect("HOME is not set"))
+        });
         build
-            .compiler("/Users/colkitt/.cache/solana/v1.51/platform-tools/llvm/bin/clang")
-            .archiver("/Users/colkitt/.cache/solana/v1.51/platform-tools/llvm/bin/llvm-ar")
+            .compiler(format!("{llvm_bin}/clang"))
+            .archiver(format!("{llvm_bin}/llvm-ar"))
             .target("sbf-solana-solana")
             .flag("--target=sbf-solana-solana")
             .flag("-O3")
