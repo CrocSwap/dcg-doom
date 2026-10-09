@@ -1,0 +1,20 @@
+[project]
+name = "dcg-doom"
+version = "0.1.0"
+description = "Doom on DCG: the on-chain game session, its relayer pipeline and tooling"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+dependencies = [
+    "dcg-sequencer @ git+https://github.com/CrocSwap/durable-compute-graph@v0.2.0-alpha#subdirectory=python",
+    "solders==0.29.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.uv]
+package = false

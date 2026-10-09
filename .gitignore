@@ -1,0 +1,13 @@
+# Build output, caches, and local runs. Keys, the WAD and anything derived
+# from it live under these and never enter Git.
+target/
+out/
+.cache/
+.deps/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+*.so
+*.wad
+*.WAD

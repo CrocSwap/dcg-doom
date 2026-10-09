@@ -1,0 +1,25 @@
+name: offline tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - name: Python tests
+        run: uv sync && uv run pytest
+      - name: Relayer tests
+        working-directory: stunts/doom-relayer
+        run: node --test test/test_relayer.mjs test/test_public_mode.mjs
+      - name: Page tests
+        working-directory: web/doom-play
+        run: >
+          node --test test/test_input.mjs test/test_inputlog.mjs test/test_page_offline.mjs
+          test/test_palette.mjs test/test_push.mjs test/test_strip.mjs
