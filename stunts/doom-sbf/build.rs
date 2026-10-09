@@ -32,40 +32,6 @@ const NATIVE_PROVENANCE_PROFILE: &str =
 const NATIVE_SOURCE_MANIFEST_SCHEMA: &str = "DOOM-EX2-NATIVE-SOURCE-MANIFEST/3";
 
 const NATIVE_ALLOWED_CARGO_FEATURES: &[&str] = &["ctx-engine"];
-const NATIVE_RUST_MODULE_CLOSURE: &[(&str, &[&str])] = &[
-    (
-        "sweep_native",
-        &[
-            "driver/src/bin/sweep_native.rs",
-            "driver/src/bin/continuation_split_sbf.rs",
-            "driver/src/sweep_common.rs",
-            "src/lib.rs",
-            "src/ex2.rs",
-            "src/continuation_split_sbf.rs",
-            "src/resource.rs",
-            "src/resource_sbf.rs",
-            "src/simulation.rs",
-            "src/sim2.rs",
-            "src/stage.rs",
-        ],
-    ),
-    (
-        "fresh_resume_probe",
-        &[
-            "driver/src/bin/fresh_resume_probe.rs",
-            "driver/src/bin/continuation_split_sbf.rs",
-            "driver/src/sweep_common.rs",
-            "src/lib.rs",
-            "src/ex2.rs",
-            "src/continuation_split_sbf.rs",
-            "src/resource.rs",
-            "src/resource_sbf.rs",
-            "src/simulation.rs",
-            "src/sim2.rs",
-            "src/stage.rs",
-        ],
-    ),
-];
 const HOST_COMMON_FLAGS: &[&str] = &[
     "-O2",
     "-std=gnu89",
@@ -104,8 +70,6 @@ const NATIVE_BUILD_METADATA_FILES: &[&str] = &[
     "repo/stunts/doom-sbf/build.rs",
     "repo/stunts/doom-sbf/Cargo.toml",
     "repo/stunts/doom-sbf/Cargo.lock",
-    "repo/stunts/doom-sbf/driver/Cargo.toml",
-    "repo/stunts/doom-sbf/driver/Cargo.lock",
 ];
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -642,10 +606,6 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
         .collect::<Vec<_>>();
     let hotloop_flags = Vec::<String>::new();
     let host_c_defines = vec!["NORMALUNIX".to_owned(), "HEADLESS_DOOM".to_owned()];
-    let module_closure = NATIVE_RUST_MODULE_CLOSURE
-        .iter()
-        .map(|(binary, paths)| format!("{}: {}", binary, paths.join(",")))
-        .collect::<Vec<_>>();
     let (host_groups, host_header_root, host_translation_units) = match tree {
         Some(tree) if !is_sbf => host_groups_metadata(
             crate_root,
@@ -660,7 +620,7 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
         _ => ("[]".to_owned(), "null".to_owned(), "[]".to_owned()),
     };
     format!(
-        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"groups\": {}, \"group_scope\": \"exact-host-cc-build-contract/1\", \"header_root\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"exact-host-build-inputs/1\"}},\n  \"rust_module_closure\": {},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
+        "{{\n  \"target\": {},\n  \"rustc\": {{\"path\": {}, \"version\": {}}},\n  \"cargo\": {{\"path\": {}, \"version\": {}}},\n  \"c_compiler\": {{\"path\": {}, \"version\": {}}},\n  \"linker\": {{\"path\": {}, \"version\": {}}},\n  \"archiver\": {},\n  \"profile\": {{\"name\": {}, \"opt_level\": {}, \"debug\": {}, \"debug_assertions\": {}, \"overflow_checks\": {}, \"lto\": {}, \"codegen_units\": {}}},\n  \"cargo_features\": {},\n  \"rust\": {{\"rustflags\": {}, \"encoded_rustflags\": {}, \"rustc_wrapper\": {}, \"rustc_workspace_wrapper\": {}}},\n  \"c_environment\": {{\"cflags\": {}, \"cppflags\": {}, \"c_include_path\": {}}},\n  \"c_compilation\": {{\"hotloop_flags\": {}, \"hotloop_defines\": {}, \"engine_flags\": {}, \"engine_defines\": {}, \"groups\": {}, \"group_scope\": \"exact-host-cc-build-contract/1\", \"header_root\": {}, \"translation_units\": {}, \"translation_unit_scope\": \"exact-host-build-inputs/1\"}},\n  \"effective_linker_source\": \"RUSTC_LINKER-or-target-linker-or-cc-rs-compiler\"\n}}",
         json_string(target),
         json_string(&rustc_path.to_string_lossy()),
         json_string(&rustc_version),
@@ -693,7 +653,6 @@ fn build_metadata(crate_root: &Path, tree: Option<&Path>, target: &str, is_sbf: 
         host_groups,
         host_header_root,
         host_translation_units,
-        json_string_array(&module_closure),
     )
 }
 
@@ -860,12 +819,6 @@ fn source_manifest(
         &mut inputs,
     );
     for name in [
-        "driver/Cargo.toml",
-        "driver/Cargo.lock",
-        "driver/src/bin/sweep_native.rs",
-        "driver/src/bin/fresh_resume_probe.rs",
-        "driver/src/bin/continuation_split_sbf.rs",
-        "driver/src/sweep_common.rs",
         "../doom-host/build.sh",
         "../doom-host/tools/doom_controller_producer.py",
         "../doom-host/tools/doom_account_image.py",
@@ -972,25 +925,6 @@ fn source_manifest(
     writeln!(
         &mut manifest,
         "  \"input_scope\": \"conservative-source-envelope\","
-    )
-    .unwrap();
-    writeln!(
-        &mut manifest,
-        "  \"rust_module_closure\": {{\"sweep_native\": {}, \"fresh_resume_probe\": {}}},",
-        json_string_array(
-            &NATIVE_RUST_MODULE_CLOSURE[0]
-                .1
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect::<Vec<_>>()
-        ),
-        json_string_array(
-            &NATIVE_RUST_MODULE_CLOSURE[1]
-                .1
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect::<Vec<_>>()
-        )
     )
     .unwrap();
     writeln!(
