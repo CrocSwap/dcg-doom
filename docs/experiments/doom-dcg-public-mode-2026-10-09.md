@@ -49,6 +49,27 @@ The Mac run's frame rate reflects the in-flight link, not the pipeline.
 Receipts: `out/runs/doom-dcg-public-tokyo-requal-2026-10-09/`,
 `out/runs/doom-dcg-public-local-2026-10-09/`.
 
+## Soak (measured 2026-10-09 to 10-10, Tokyo)
+
+`scripts/doom_dcg_public.sh` with its own state file and an 18 FOGO cap; the
+probe looped cycles of 20 s play, 280 s idle (the lobby pauses after 60 s),
+20 s resume, joining and leaving each cycle.
+
+- 16 of 16 cycles passed: 81–96 frames in each 20 s play window (4.05–4.8
+  frames/s), 74–95 in each resume, 0 frames and flat spend in every paused
+  window.
+- 5,157 s of relayer process, 7,174 frames, cursor 71,008 (the 512-slot
+  input ring wrapped well over a hundred times with no input fault), 2,643
+  key events, no pipeline failure until the cap.
+- The cap ended the run as designed: the pipeline stopped itself at 18.03
+  testnet FOGO ("spend cap reached"), the lobby showed "Public run spend cap
+  reached. The game is paused.", and later inputs got 402
+  `spend_cap_reached`. The only probe errors were those 97 refusals and the
+  16 stream closes at each leave.
+- About 1.1 FOGO per cycle (100 s of running game per cycle).
+
+Receipts: Basanos `out/runs/doom-dcg-public-soak-2026-10-09/`.
+
 ## Not shown
 
 - A `death` event live (covered by an offline test of the snapshot parse and
@@ -56,7 +77,6 @@ Receipts: `out/runs/doom-dcg-public-tokyo-requal-2026-10-09/`,
 - The public page in a real browser against the DCG relayer, spectators and
   the offer handoff (covered by the existing offline public-mode tests, which
   do not depend on the pipeline).
-- A week-long run, restarts mid-run on the same state file, or reaching the
-  cap live.
+- A week-long run, or a restart mid-run on the same state file.
 - A stop while lanes are mid-frame can still take longer than the relayer's
   20 s close window (each lane wait is up to 20 s plus repair).
