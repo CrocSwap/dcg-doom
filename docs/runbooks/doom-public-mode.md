@@ -234,3 +234,32 @@ lamport decrease is consistent with a late landing from an already-submitted
 transaction. That finalized balance was unchanged after 60 seconds. The
 post-stop minute measured zero additional spend; it does not rule out fees
 settling between the stop receipt and the first independent balance read.
+
+## Published run 2026-10-13 (owner's go: Tokyo relayer, Cloudflare Pages, no domain)
+
+- **Page:** https://dcg-doom.pages.dev (classic Pages project `dcg-doom`,
+  created once with `--force`; later deploys without it). The upload tree is
+  `scripts/build_doom_public_page.sh out/public/doom-public-site` plus a
+  `_redirects` file with `/ /doom-public/?relayer=https://$DOOM_RELAYER_HOST 302`.
+  Deployment details (`DOOM_RELAYER_HOST`, the security group and its open
+  ports) are in `docs/runbooks/doom-public-mode.local.env`, which is not in
+  Git; ask the owner for a copy.
+- **Relayer TLS without a domain:** Caddy 2.8.4 (release checksum verified) on
+  `basanos-tokyo-2` serves `https://$DOOM_RELAYER_HOST` (an sslip.io name
+  for the instance's fixed IP) with a Let's Encrypt certificate (TLS-ALPN on 443; no account
+  email) and proxies to the loopback relayer `127.0.0.1:8787` with streaming
+  flush and a 64 KB request limit. Config `~/caddy/Caddyfile`, systemd unit
+  `doom-caddy`, access log `~/caddy/access.log` (rolled). The instance's
+  security group (`DOOM_SECURITY_GROUP`) opens only `DOOM_OPEN_PORTS`. The relayer's CORS origin is
+  the Pages origin.
+- **Dry run first** (state `dryrun-20261013.json`, cap 5, 900 s): the probe
+  through the HTTPS URL passed (113 frames in 30 s of play, 0 frames and flat
+  spend while paused, 126 frames on resume; 1.23 testnet FOGO), and the page
+  connected in Chrome.
+- **Run:** `public-20261013` (state `public-20261013.json`), started
+  2026-10-13 05:53 UTC, 604,800 s, cap 1,000 testnet FOGO, 200 viewers; the
+  payer was topped up by 500 testnet FOGO so the keys hold more than the cap.
+- **When it ends:** `scripts/doom_dcg_public.sh stop` (if still running),
+  `sudo systemctl disable --now doom-caddy`, revoke the 443 rule, stop the
+  instance. The page stays up but shows the relayer as unreachable until it is
+  redeployed or taken down.
