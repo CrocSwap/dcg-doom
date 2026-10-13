@@ -42,3 +42,5 @@ kbd { min-width:30px; border:1px solid #365968; padding:4px 5px; color:var(--ink
 .error[hidden] { display:none; }
 @media (max-width:850px) { body{padding:12px} main{grid-template-columns:1fr}.side{order:2}.screen{min-height:0}.network{font-size:7px} }
 @media (max-width:440px) { header{align-items:flex-start;flex-direction:column;gap:8px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.status-grid div:nth-child(3n){border-right:1px solid var(--line)}.status-grid div:nth-child(2n){border-right:0} }
+.credits { max-width:1180px; margin:18px auto 0; color:var(--muted); font-size:11px; line-height:1.5; }
+.credits a { color:var(--cyan); }

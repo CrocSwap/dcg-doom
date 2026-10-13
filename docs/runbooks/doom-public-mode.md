@@ -88,22 +88,23 @@ message. These are bounded recovery paths, not a week-long uptime result.
 
 ## Tokyo commands
 
-`scripts/doom_public.sh start` requires `DOOM_PUBLIC_ORIGIN` to be the exact
-HTTPS origin that will serve the static page. Defaults are a 300 FOGO cumulative
-payer-balance cap, 200 viewers, and a seven-day process duration. Set
-`DOOM_PUBLIC_SPEND_CAP` only to a value greater than zero and at most 300. The
-cap and hourly cumulative spend are stored in
-`out/public-mode/public-state.json` on Tokyo, so a relayer restart carries the
+`scripts/doom_dcg_public.sh start` requires `DOOM_PUBLIC_ORIGIN` to be the exact
+HTTPS origin that will serve the static page. Defaults are a 1,000 testnet FOGO
+cap over the whole run (payer and lane payers; owner 2026-10-09, with idle
+pause), 200 viewers, and a seven-day process duration. Set
+`DOOM_PUBLIC_SPEND_CAP` only to a value greater than zero and at most 1,000.
+The cap and cumulative spend are stored in `DOOM_PUBLIC_STATE_PATH` (under
+`~/dcg-lane/v5/public-mode/` on `basanos-tokyo-2`), so a relayer restart carries the
 same cap, payer baseline, and frame forward. The cap cannot be raised on a
 persisted run; set `DOOM_PUBLIC_STATE_PATH` to a new JSON file under
-`out/public-mode/` only when the owner deliberately starts a separate run. The relayer
+`~/dcg-lane/v5/public-mode/` only when the owner deliberately starts a separate run. The relayer
 binds only to `127.0.0.1:8787`; the start command does not open an internet
 endpoint or publish the page.
 
 ```sh
-DOOM_PUBLIC_ORIGIN=https://basanos-doom-public.pages.dev scripts/doom_public.sh start
-scripts/doom_public.sh status
-scripts/doom_public.sh stop
+DOOM_PUBLIC_ORIGIN=https://dcg-doom.pages.dev scripts/doom_dcg_public.sh start
+scripts/doom_dcg_public.sh status
+scripts/doom_dcg_public.sh stop
 ```
 
 `DOOM_PUBLIC_ESTIMATE_HORIZON` defaults to 600 seconds. It sets the active
@@ -118,7 +119,7 @@ estimate is below the remaining cap:
 
 ```sh
 DOOM_PUBLIC_SPEND_CAP=1 DOOM_PUBLIC_ESTIMATE_HORIZON=450 \
-  DOOM_PUBLIC_ORIGIN=https://basanos-doom-public.pages.dev scripts/doom_public.sh start
+  DOOM_PUBLIC_ORIGIN=https://dcg-doom.pages.dev scripts/doom_dcg_public.sh start
 ```
 
 The estimate is a preflight bound, not a promise that the run will use that
@@ -128,7 +129,7 @@ Start refuses to run when the owner launcher, another relayer, or any Tokyo
 maintenance lock is present. Stop verifies the public lock and exact run
 directory before signaling its process, then requires zero Tokyo Doom relayers
 before releasing the lock. If a start fails before health becomes ready, inspect
-the Tokyo run's `server.log` and run `scripts/doom_public.sh stop`.
+the Tokyo run's `server.log` and run `scripts/doom_dcg_public.sh stop`.
 
 ## Publish and TLS ingress (owner action)
 
@@ -139,8 +140,8 @@ already attached to the owner's Cloudflare account.
 
 ```sh
 scripts/build_doom_public_page.sh
-npx wrangler pages project create basanos-doom-public --production-branch main
-npx wrangler pages deploy out/public/doom-public-site --project-name basanos-doom-public --branch main --commit-dirty=true
+npx wrangler pages project create dcg-doom --production-branch main
+npx wrangler pages deploy out/public/doom-public-site --project-name dcg-doom --branch main --commit-dirty=true
 cloudflared tunnel create doom-public-relayer
 cloudflared tunnel route dns doom-public-relayer doom-relay.<owned-domain>
 ```
@@ -159,11 +160,11 @@ Then run the service on Tokyo and start public mode with the Pages origin:
 
 ```sh
 cloudflared tunnel run doom-public-relayer
-DOOM_PUBLIC_ORIGIN=https://basanos-doom-public.pages.dev scripts/doom_public.sh start
+DOOM_PUBLIC_ORIGIN=https://dcg-doom.pages.dev scripts/doom_dcg_public.sh start
 ```
 
 The public page URL is
-`https://basanos-doom-public.pages.dev/doom-public/?relayer=https://doom-relay.<owned-domain>`.
+`https://dcg-doom.pages.dev/doom-public/?relayer=https://doom-relay.<owned-domain>`.
 The Tokyo service stays loopback-bound; TLS terminates at Cloudflare Tunnel.
 
 ## Capacity and evidence limits
