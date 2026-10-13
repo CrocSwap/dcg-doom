@@ -11,3 +11,6 @@ __pycache__/
 *.so
 *.wad
 *.WAD
+# Deployment details (hosts, security groups, open ports) stay local.
+*.local.env
+.env
